@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- v5.0.0 split baseline live on the local forge; merge-to-GitHub mirror verified.
 - TODO: split crates/jeryu-runnerd/src/workcell.rs (1397 LOC) into
   focused submodules and restore the audit floor from 80 to 85.
 
