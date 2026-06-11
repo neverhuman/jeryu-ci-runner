@@ -1,21 +1,81 @@
 {
   "tests": {
+    ".cargo/": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify cargo configuration is parseable and local"
+    },
+    ".config/": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify local tool configuration remains parseable"
+    },
+    ".dockerignore": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify workspace metadata remains parseable"
+    },
     ".github/": {
-      "command": "just fast && just check",
+      "command": "just fast && just check && just score",
       "lane": "ci",
-      "purpose": "verify hosted workflows stay thin and local-reproducible"
+      "purpose": "verify hosted workflows stay thin, pinned, and audit-visible"
+    },
+    ".gitignore": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify workspace metadata remains parseable"
+    },
+    ".jankurai/": {
+      "command": "just score",
+      "lane": "score",
+      "purpose": "verify committed audit evidence matches the pinned Jankurai lane"
     },
     "AGENTS.md": {
       "command": "just score",
       "lane": "score",
       "purpose": "verify split metadata and agent maps"
     },
+    "CHANGELOG.md": {
+      "command": "just score",
+      "lane": "score",
+      "purpose": "verify release notes stay routed through the score lane"
+    },
+    "Cargo.lock": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify lockfile remains workspace-addressable"
+    },
     "Cargo.toml": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify workspace manifest shape"
     },
-    "bins/jeryu-ci-bin/**": {
+    "Justfile": {
+      "command": "just fast && just check && just score",
+      "lane": "ci",
+      "purpose": "verify local command wrappers remain canonical"
+    },
+    "LICENSE": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify workspace metadata remains parseable"
+    },
+    "README.md": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify root navigation remains current"
+    },
+    "VERSION": {
+      "command": "just score",
+      "lane": "score",
+      "purpose": "verify version source remains aligned with release evidence"
+    },
+    "agent/": {
+      "command": "just score",
+      "lane": "score",
+      "purpose": "verify agent metadata parses and routes proof lanes"
+    },
+    "bins/jeryu-ci-bin/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
@@ -25,127 +85,167 @@
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-agent-auth/**": {
+    "crates/jeryu-agent-auth/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-agent-stream/**": {
+    "crates/jeryu-agent-stream/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-agentbridge/**": {
+    "crates/jeryu-agentbridge/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-artifact-metadata/**": {
+    "crates/jeryu-artifact-metadata/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-cache-policy/**": {
+    "crates/jeryu-cache-policy/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-ci-compiler/**": {
+    "crates/jeryu-ci-compiler/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-ci-governor/**": {
+    "crates/jeryu-ci-governor/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-ci-ir/**": {
+    "crates/jeryu-ci-ir/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-ci-scheduler/**": {
+    "crates/jeryu-ci-scheduler/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-egress/**": {
+    "crates/jeryu-egress/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-phase7-cli/**": {
+    "crates/jeryu-phase7-cli/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-runner-core/**": {
+    "crates/jeryu-runner-core/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-runner-microvm/**": {
+    "crates/jeryu-runner-microvm/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-runner-native/**": {
+    "crates/jeryu-runner-native/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-runner-oci/**": {
+    "crates/jeryu-runner-oci/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-runner-protocol/**": {
+    "crates/jeryu-runner-protocol/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-runner-registry/**": {
+    "crates/jeryu-runner-registry/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-runnerd/**": {
+    "crates/jeryu-runnerd/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-sandbox-linux/**": {
+    "crates/jeryu-sandbox-linux/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "examples/jobs/**": {
+    "deny.toml": {
+      "command": "just security",
+      "lane": "security",
+      "purpose": "verify security policy metadata remains parseable"
+    },
+    "docs/": {
+      "command": "just check && just score",
+      "lane": "docs",
+      "purpose": "verify agent-readable docs remain routed and auditable"
+    },
+    "examples/jobs/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "images/agent-sandbox/**": {
+    "images/agent-sandbox/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "ops/agent-sandbox/**": {
+    "ops/agent-sandbox/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "policies/**": {
+    "ops/ci/": {
+      "command": "just fast && just check && just score",
+      "lane": "ci",
+      "purpose": "verify local CI wrappers are reproducible and audit-visible"
+    },
+    "ops/git-hooks/": {
+      "command": "just fast && just check && just score",
+      "lane": "ci",
+      "purpose": "verify pre-push gates delegate to local CI lanes"
+    },
+    "policies/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "tests/fixtures/github/**": {
+    "repos.manifest.toml": {
+      "command": "just check && just score",
+      "lane": "check",
+      "purpose": "verify split manifest remains parseable and routed"
+    },
+    "rust-toolchain.toml": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify local Rust toolchain metadata remains pinned"
+    },
+    "scripts/": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify helper scripts parse and stay locally reproducible"
+    },
+    "tests/": {
+      "command": "just check && just score",
+      "lane": "check",
+      "purpose": "verify negative proof evidence remains routed"
+    },
+    "tests/fixtures/github/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "tests/fixtures/native/**": {
+    "tests/fixtures/native/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
@@ -154,6 +254,21 @@
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+    },
+    "agent/tool-adoption.toml": {
+      "command": "just score",
+      "lane": "score",
+      "purpose": "verify Jankurai tool-adoption catalog coverage"
+    },
+    "db/": {
+      "command": "just check && just score",
+      "lane": "check",
+      "purpose": "verify documented data boundary policy remains routed"
+    },
+    "ops/": {
+      "command": "just fast && just check && just score",
+      "lane": "ci",
+      "purpose": "verify local ops guidance and CI wrappers stay reproducible"
     }
   },
   "workspace": "jeryu-ci-runner"

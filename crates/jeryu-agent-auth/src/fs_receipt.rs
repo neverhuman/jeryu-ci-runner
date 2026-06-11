@@ -68,20 +68,29 @@ pub(crate) fn write_private_file_atomic(
     if let Some(parent) = target.parent() {
         create_private_dir(parent)?;
     }
-    let pending = pending_sibling(target);
+    let pending = pending_sibling(target)?;
     std::fs::write(&pending, bytes).map_err(fs_error)?;
     set_file_private(&pending)?;
     std::fs::rename(&pending, target).map_err(fs_error)?;
     receipt_for_file(target)
 }
 
-fn pending_sibling(target: &Path) -> PathBuf {
+fn pending_sibling(target: &Path) -> Result<PathBuf, AgentAuthError> {
     let mut name = target
         .file_name()
         .map(|name| name.to_os_string())
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            AgentAuthError::new(
+                "agent_auth_invalid_path",
+                "materialize private file",
+                format!("target path '{}' has no file name", target.display()),
+                &["choose a target path with a file name"],
+                "docs/testing.md#workcells",
+                "rerun cargo test -p jeryu-agent-auth --jobs 40",
+            )
+        })?;
     name.push(".pending");
-    target.with_file_name(name)
+    Ok(target.with_file_name(name))
 }
 
 pub(crate) fn receipts_for_dir(path: &Path) -> Result<Vec<AuthFileReceipt>, AgentAuthError> {

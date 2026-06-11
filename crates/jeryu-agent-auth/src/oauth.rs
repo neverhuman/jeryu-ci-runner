@@ -355,11 +355,11 @@ fn parse_token(body: &str) -> Result<DeviceCredential, AgentAuthError> {
         .get("expires_in")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    let scopes = value
-        .get("scope")
-        .and_then(serde_json::Value::as_str)
-        .map(|scope| scope.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default();
+    let scopes = if let Some(scope) = value.get("scope").and_then(serde_json::Value::as_str) {
+        scope.split_whitespace().map(str::to_string).collect()
+    } else {
+        Vec::new()
+    };
     Ok(DeviceCredential {
         access_token: required_str(&value, "access_token")?,
         refresh_token: value
@@ -385,10 +385,10 @@ fn required_str(value: &serde_json::Value, field: &str) -> Result<String, AgentA
 }
 
 fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or_default()
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(elapsed) => elapsed.as_secs(),
+        Err(_) => 0,
+    }
 }
 
 fn host_bound_credential(tool: AgentToolKind) -> AgentAuthError {

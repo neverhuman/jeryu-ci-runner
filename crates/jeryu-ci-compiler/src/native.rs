@@ -117,7 +117,10 @@ fn native_job_from_maps(
         // than a swallowed error.
         job.timeout_seconds = timeout.parse::<u64>().unwrap_or(3600);
     }
-    let needs = arrays.get("needs").cloned().unwrap_or_default();
+    let needs = match arrays.get("needs") {
+        Some(needs) => needs.clone(),
+        None => Vec::new(),
+    };
     Ok(PendingJob {
         origin: id,
         job,

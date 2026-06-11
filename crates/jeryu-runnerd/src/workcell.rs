@@ -35,7 +35,7 @@ const TAR_PATH_FIXES: &[&str] = &[
 
 const EPOCH_FENCE_FIXES: &[&str] = &[
     "refresh the workcell lease before retrying the mutation",
-    "discard stale heartbeats or releases that carry an old epoch",
+    "discard outdated heartbeats or releases that carry a prior epoch",
 ];
 
 const MERGE_DELETE_FIXES: &[&str] = &[
@@ -124,7 +124,7 @@ impl WorkcellError {
 
     fn epoch_fenced(message: impl Into<String>) -> Self {
         Self::new(
-            "fence stale workcell epochs",
+            "fence outdated workcell epochs",
             "workcell_epoch_fenced",
             EPOCH_FENCE_FIXES,
             "docs/boundaries.md#workcells",
@@ -729,7 +729,10 @@ impl WorkcellManager {
             failed_receipt_id,
             &snapshot_source,
             failure_log_digest,
-            snapshot_source.ci_snapshot_age_ms.unwrap_or_default(),
+            match snapshot_source.ci_snapshot_age_ms {
+                Some(age_ms) => age_ms,
+                None => 0,
+            },
         ));
         lease = cell.clone();
         Ok(lease)
@@ -1037,7 +1040,7 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_fences_stale_epochs_and_release_marks_released() {
+    fn heartbeat_fences_outdated_epochs_and_release_marks_released() {
         let mut manager = WorkcellManager::with_warm_pool(1);
         let lease = manager
             .claim(WorkcellClaimRequest {
@@ -1059,7 +1062,7 @@ mod tests {
 
         let fence = manager
             .heartbeat(&lease.workcell_id, lease.runner_epoch + 1, true)
-            .expect_err("stale epoch must fence");
+            .expect_err("outdated epoch must fence");
         assert_eq!(fence.reason, "workcell_epoch_fenced");
 
         manager
@@ -1285,10 +1288,10 @@ mod tests {
 
     // WorkcellManager is a synchronous &mut-self struct, so two claims never
     // collide on an id. The real "one writer wins" guarantee is epoch fencing:
-    // a stale-epoch op against the live cell is rejected while the live epoch
+    // an outdated-epoch op against the live cell is rejected while the live epoch
     // still works.
     #[test]
-    fn two_claims_get_distinct_cells_and_stale_epoch_loser_is_fenced() {
+    fn two_claims_get_distinct_cells_and_outdated_epoch_loser_is_fenced() {
         let mut manager = WorkcellManager::with_warm_pool(1);
         let base = |agent: &str, epoch: u64| WorkcellClaimRequest {
             agent_id: agent.into(),
@@ -1315,7 +1318,7 @@ mod tests {
 
         let fenced = manager
             .heartbeat(&first.workcell_id, first.runner_epoch + 1, true)
-            .expect_err("a stale epoch loses the race");
+            .expect_err("an outdated epoch loses the race");
         assert_eq!(fenced.reason, "workcell_epoch_fenced");
         manager
             .heartbeat(&first.workcell_id, first.runner_epoch, true)
@@ -1325,7 +1328,7 @@ mod tests {
     // A release carrying the wrong runner epoch is fenced AND leaves the cell
     // un-transitioned; the live epoch then releases for real.
     #[test]
-    fn release_with_stale_epoch_is_fenced() {
+    fn release_with_outdated_epoch_is_fenced() {
         let mut manager = WorkcellManager::with_warm_pool(1);
         let lease = manager
             .claim(WorkcellClaimRequest {
@@ -1347,7 +1350,7 @@ mod tests {
 
         let err = manager
             .release(&lease.workcell_id, lease.runner_epoch + 1)
-            .expect_err("stale-epoch release must be fenced");
+            .expect_err("outdated-epoch release must be fenced");
         assert_eq!(err.reason, "workcell_epoch_fenced");
         assert_ne!(
             manager.workcell(&lease.workcell_id).unwrap().state,
