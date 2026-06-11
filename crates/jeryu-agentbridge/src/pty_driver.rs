@@ -35,6 +35,8 @@ use crate::driver::{
     DriverError,
 };
 
+const CLAUDE_THEME_PROMPT_BUFFER_LIMIT: usize = 16 * 1024;
+
 /// A steering command applied to a live PTY agent. Mirrors the transport-level
 /// control schema (`jeryu_agent_stream::AgentControlCommand`) 1:1 so the runtime
 /// maps between them without this SAFE crate depending on the stream crate.
@@ -475,6 +477,7 @@ impl PtyAgentDriver {
         let mut timed_out = false;
         let mut budget_exceeded = false;
         let mut terminate_at: Option<Instant> = None;
+        let mut output_filter = PtyOutputFilter::default();
 
         let exit_code = loop {
             // 1. apply pending control commands.
@@ -504,15 +507,10 @@ impl PtyAgentDriver {
             // 2. drain whatever the reader thread has produced.
             let mut over_budget = false;
             while let Ok(chunk) = rx.try_recv() {
-                used += chunk.len();
-                captured.extend_from_slice(&chunk);
-                sink.emit(AgentEvent::Stdout(
-                    String::from_utf8_lossy(&chunk).into_owned(),
-                ));
-                sink.emit(AgentEvent::Budget {
-                    used,
-                    limit: budget,
-                });
+                let Some(chunk) = output_filter.filter(chunk, &mut writer) else {
+                    continue;
+                };
+                record_pty_chunk(chunk, &mut captured, &mut used, sink, budget);
                 if used > budget {
                     over_budget = true;
                     break;
@@ -556,29 +554,20 @@ impl PtyAgentDriver {
 
         // Final drain of anything produced between the last poll and exit.
         while let Ok(chunk) = rx.try_recv() {
-            used += chunk.len();
-            captured.extend_from_slice(&chunk);
-            sink.emit(AgentEvent::Stdout(
-                String::from_utf8_lossy(&chunk).into_owned(),
-            ));
-            sink.emit(AgentEvent::Budget {
-                used,
-                limit: budget,
-            });
+            if let Some(chunk) = output_filter.filter(chunk, &mut writer) {
+                record_pty_chunk(chunk, &mut captured, &mut used, sink, budget);
+            }
         }
         let _ = reader_handle.join();
         // The reader can win the race after the pre-join drain on fast exits.
         // Drain again after join so captured stdout and emitted events agree.
         while let Ok(chunk) = rx.try_recv() {
-            used += chunk.len();
-            captured.extend_from_slice(&chunk);
-            sink.emit(AgentEvent::Stdout(
-                String::from_utf8_lossy(&chunk).into_owned(),
-            ));
-            sink.emit(AgentEvent::Budget {
-                used,
-                limit: budget,
-            });
+            if let Some(chunk) = output_filter.filter(chunk, &mut writer) {
+                record_pty_chunk(chunk, &mut captured, &mut used, sink, budget);
+            }
+        }
+        if let Some(chunk) = output_filter.take_pending() {
+            record_pty_chunk(chunk, &mut captured, &mut used, sink, budget);
         }
         if captured.len() > budget {
             captured.truncate(budget);
@@ -593,6 +582,102 @@ impl PtyAgentDriver {
             elapsed: started.elapsed(),
         })
     }
+}
+
+fn record_pty_chunk<S: AgentEventSink>(
+    chunk: Vec<u8>,
+    captured: &mut Vec<u8>,
+    used: &mut usize,
+    sink: &S,
+    budget: usize,
+) {
+    *used += chunk.len();
+    captured.extend_from_slice(&chunk);
+    sink.emit(AgentEvent::Stdout(
+        String::from_utf8_lossy(&chunk).into_owned(),
+    ));
+    sink.emit(AgentEvent::Budget {
+        used: *used,
+        limit: budget,
+    });
+}
+
+#[derive(Debug, Default)]
+struct PtyOutputFilter {
+    claude_theme: ClaudeThemePromptAutoSelect,
+}
+
+impl PtyOutputFilter {
+    fn filter<W: Write>(&mut self, chunk: Vec<u8>, writer: &mut W) -> Option<Vec<u8>> {
+        self.claude_theme.filter(chunk, writer)
+    }
+
+    fn take_pending(&mut self) -> Option<Vec<u8>> {
+        self.claude_theme.take_pending()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ClaudeThemePromptAutoSelect {
+    pending: Vec<u8>,
+    selected: bool,
+}
+
+impl ClaudeThemePromptAutoSelect {
+    fn filter<W: Write>(&mut self, chunk: Vec<u8>, writer: &mut W) -> Option<Vec<u8>> {
+        if self.selected {
+            return should_forward_after_claude_theme(&chunk).then_some(chunk);
+        }
+
+        let text = String::from_utf8_lossy(&chunk);
+        if self.pending.is_empty() && !might_be_claude_theme_prompt(&text) {
+            return Some(chunk);
+        }
+
+        self.pending.extend_from_slice(&chunk);
+        let pending_text = String::from_utf8_lossy(&self.pending);
+        if is_claude_theme_prompt(&pending_text) {
+            self.selected = true;
+            self.pending.clear();
+            let _ = writer.write_all(b"2\r");
+            let _ = writer.flush();
+            return None;
+        }
+
+        if self.pending.len() > CLAUDE_THEME_PROMPT_BUFFER_LIMIT
+            || !might_be_claude_theme_prompt(&pending_text)
+        {
+            return Some(std::mem::take(&mut self.pending));
+        }
+
+        None
+    }
+
+    fn take_pending(&mut self) -> Option<Vec<u8>> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.pending))
+        }
+    }
+}
+
+fn should_forward_after_claude_theme(chunk: &[u8]) -> bool {
+    !might_be_claude_theme_prompt(&String::from_utf8_lossy(chunk))
+}
+
+fn is_claude_theme_prompt(text: &str) -> bool {
+    text.contains("Choose the text style that looks best with your terminal")
+        && (text.contains("Syntax theme:")
+            || text.contains("Dark mode")
+            || text.contains("Monokai Extended"))
+}
+
+fn might_be_claude_theme_prompt(text: &str) -> bool {
+    text.contains("Let's get started")
+        || text.contains("Choose the text style")
+        || text.contains("Syntax theme:")
+        || text.contains("Monokai Extended")
 }
 
 struct PtyOutcome {
@@ -647,5 +732,51 @@ mod tests {
                 .any(|rule| rule.path == Path::new("/run")),
             "PTY sessions must allow reading /run for DNS resolution"
         );
+    }
+
+    #[test]
+    fn claude_theme_prompt_is_selected_and_suppressed() {
+        let prompt = "Let's get started.\r\n\r\n Choose the text style that looks best with your terminal\r\n   1. Auto\r\n > 2. Dark mode\r\n  Syntax theme: Monokai Extended";
+        let mut filter = ClaudeThemePromptAutoSelect::default();
+        let mut input = Vec::new();
+
+        let output = filter.filter(prompt.as_bytes().to_vec(), &mut input);
+
+        assert!(output.is_none(), "theme picker must not reach the UI");
+        assert_eq!(input, b"2\r");
+        assert!(filter.take_pending().is_none());
+    }
+
+    #[test]
+    fn claude_theme_prompt_can_span_chunks() {
+        let mut filter = ClaudeThemePromptAutoSelect::default();
+        let mut input = Vec::new();
+
+        assert!(
+            filter
+                .filter(b"Let's get started.\r\n".to_vec(), &mut input)
+                .is_none()
+        );
+        assert_eq!(input, b"");
+
+        let output = filter.filter(
+            b" Choose the text style that looks best with your terminal\r\n Syntax theme: Monokai Extended\r\n".to_vec(),
+            &mut input,
+        );
+
+        assert!(output.is_none(), "buffered prompt must remain hidden");
+        assert_eq!(input, b"2\r");
+    }
+
+    #[test]
+    fn non_theme_output_streams_normally() {
+        let mut filter = ClaudeThemePromptAutoSelect::default();
+        let mut input = Vec::new();
+        let output = filter
+            .filter(b"normal agent output\r\n".to_vec(), &mut input)
+            .expect("normal output is forwarded");
+
+        assert_eq!(output, b"normal agent output\r\n");
+        assert!(input.is_empty());
     }
 }
