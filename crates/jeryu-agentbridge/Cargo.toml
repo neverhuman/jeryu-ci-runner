@@ -11,8 +11,8 @@ name = "jeryu-editbot"
 path = "src/bin/jeryu-editbot.rs"
 
 [dependencies]
-jeryu-core = { git = "https://github.com/neverhuman/jeryu-core.git", tag = "jeryu-core-v4.0.0-split.0", package = "jeryu-core" }
-jeryu-proof = { git = "https://github.com/neverhuman/jeryu-core.git", tag = "jeryu-core-v4.0.0-split.0", package = "jeryu-proof" }
+jeryu-core = { git = "https://github.com/neverhuman/jeryu-core.git", tag = "jeryu-core-v5.0.0-split.0", package = "jeryu-core" }
+jeryu-proof = { git = "https://github.com/neverhuman/jeryu-core.git", tag = "jeryu-core-v5.0.0-split.0", package = "jeryu-proof" }
 jeryu-ci-scheduler = { path = "../jeryu-ci-scheduler" }
 # The in-cell agent driver reuses the runner-core policy/sandbox model and the
 # real kernel sandbox launch path. All unsafe stays in jeryu-sandbox-linux; this
