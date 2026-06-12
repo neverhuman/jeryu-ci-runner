@@ -102,6 +102,10 @@ pub fn plan_agent_session(
     container.env = vec![
         ("JERYU_BRANCH".to_string(), branch.clone()),
         ("JERYU_REAL_GIT".to_string(), "/usr/bin/git".to_string()),
+        // The branch's local cut point, so the git-guard commit gate's
+        // `jankurai diff-audit` diffs against the real base inside the
+        // `--network none` cell (which has no live `origin/main`).
+        ("JANKURAI_DIFF_BASE".to_string(), base_oid.to_string()),
     ];
 
     Ok(AgentSessionPlan {
