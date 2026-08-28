@@ -2,6 +2,8 @@ use jeryu_ci_ir::{ArtifactPath, CacheMount, RunnerClass, Step, deterministic_has
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub mod wire;
+
 pub const PROTOCOL_VERSION: &str = "jeryu.runner.v1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -549,7 +549,11 @@ dependencies = [
 name = "jeryu-runner-protocol"
 version = "5.0.0"
 dependencies = [
+ "hex",
  "jeryu-ci-ir",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
