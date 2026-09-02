@@ -281,9 +281,9 @@ jq -e \
    (.decision.ratchet.new_hard_findings | length) == 0 and
    .decision.ratchet.policy_changed == false and
    .decision.ratchet.passed == true' \
-  .jankurai/repo-score.json >/dev/null
-cp .jankurai/repo-score.json target/jankurai/repo-score.json
-cp .jankurai/repo-score.md target/jankurai/repo-score.md
+  target/jankurai/repo-score.json >/dev/null
+cp target/jankurai/repo-score.json .jankurai/repo-score.json
+cp target/jankurai/repo-score.md .jankurai/repo-score.md
 
 if [[ "$(git rev-parse --verify 'HEAD^{commit}')" != "${current_head}" ||
       "$(git rev-parse --verify "${BASE_REF}^{commit}")" != "${base_commit}" ||
