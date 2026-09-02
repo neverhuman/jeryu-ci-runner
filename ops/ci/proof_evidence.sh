@@ -109,8 +109,8 @@ jankurai proof-verify . \
   --evidence-index target/jankurai/evidence-index.json \
   --out target/jankurai/proof-verification.json \
   --md target/jankurai/proof-verification.md
-jq -e '.schema_version == "1.0.0" and .verdict == "valid" and
-       (.issues | length) == 0' \
+jq -e '.schema_version == "1.0.0" and .verdict == "pass" and
+       ((.issues // []) | length) == 0' \
   target/jankurai/proof-verification.json >/dev/null
 
 # Proofbind/proofmark remain diagnostic in Jankurai 1.6.10: required mode
@@ -265,7 +265,7 @@ jq -n \
     proof_verification_sha256:$verification_sha256,security_sha256:$security_sha256,
     supply_chain_sha256:$supply_chain_sha256,sbom_sha256:$sbom_sha256,
     baseline_score:$baseline_score,baseline_sha256:$baseline_sha256,
-    proof_verification:"valid",proofmark_mode:"advisory",
+    proof_verification:"pass",proofmark_mode:"advisory",
     proofmark_review_obligations:$proofmark_review,
     synthetic_fallbacks:0,conclusion:"success"}' \
   > target/jankurai/proof-evidence-summary.json

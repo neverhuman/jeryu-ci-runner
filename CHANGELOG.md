@@ -24,6 +24,8 @@
 - Bound every CI-library Jankurai invocation to the physical pinned Cargo
   binary, including proof commands replayed through a login shell, with hostile
   custody, version, and PATH-shadowing regression coverage.
+- Aligned proof verification with the pinned Jankurai schema's successful
+  `pass` verdict while retaining fail-closed rejection of every reported issue.
 
 ## jeryu-ci-runner-v5.0.0-split.0 - 2026-06-11
 - MAJOR: first standalone split-family release; the legacy monorepo
