@@ -28,6 +28,12 @@ time order, and oversized or duplicate body collections. Steps, environment entr
 mounts, artifact declarations, result digests, and cache receipts have explicit count and size
 bounds.
 
+Repository identity preserves the hosted forge's exact case. Owners remain canonical lowercase;
+repository components use the same closed ASCII punctuation rules while admitting case-sensitive
+names such as `jeryu/redlineDB`. An assigned lease acknowledgement is invalid when the server's
+own timestamp falls outside the half-open grant interval, and a result cannot be submitted before
+its recorded finish time.
+
 `WireJobRequest::execution_digest` uses an explicit length-framed SHA-256 encoding of every job
 field: all request and fencing IDs, runner class, ordered steps (including commands, reusable
 actions, environment, and working directories), ordered cache declarations (including mode),

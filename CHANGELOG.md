@@ -1,7 +1,11 @@
 # Changelog
 
 ## Unreleased
-- v5.0.0 split baseline live on the local forge; merge-to-GitHub mirror verified.
+- Hardened runner-wire repository identity and time ordering for the hosted
+  fleet: case-sensitive repository components are preserved, expired lease
+  acknowledgements fail closed, and results cannot precede their finish time.
+- v5.0.0 split baseline is present on the protected hosted forge; this runner
+  wire tranche remains unmerged until its governed hosted checks and review land.
 - TODO: split crates/jeryu-runnerd/src/workcell.rs (1397 LOC) into
   focused submodules and restore the audit floor from 80 to 85.
 

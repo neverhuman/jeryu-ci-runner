@@ -189,7 +189,23 @@ pub(super) fn validate_repository(value: &str) -> Result<(), WireError> {
         return Err(WireError::new(WireErrorCode::InvalidField, "repository"));
     }
     validate_label("repository", owner)?;
-    validate_label("repository", repository)
+    let valid_repository = !repository.is_empty()
+        && repository.len() <= MAX_LABEL_BYTES
+        && repository
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        && repository
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && repository
+            .as_bytes()
+            .last()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && !repository.contains("..");
+    valid_repository
+        .then_some(())
+        .ok_or_else(|| WireError::new(WireErrorCode::InvalidField, "repository"))
 }
 
 pub(super) fn validate_check(value: &str) -> Result<(), WireError> {

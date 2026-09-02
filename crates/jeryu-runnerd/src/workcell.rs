@@ -729,10 +729,7 @@ impl WorkcellManager {
             failed_receipt_id,
             &snapshot_source,
             failure_log_digest,
-            match snapshot_source.ci_snapshot_age_ms {
-                Some(age_ms) => age_ms,
-                None => 0,
-            },
+            snapshot_source.ci_snapshot_age_ms.unwrap_or_default(),
         ));
         lease = cell.clone();
         Ok(lease)

@@ -4,6 +4,9 @@ use jeryu_runner_protocol::{Heartbeat, JobOutcome, JobRequest, JobResult, Runner
 use serde_json::{Value, json};
 
 const NOW: u64 = 1_787_900_000_000;
+const RESULT_STARTED: u64 = NOW + 1_000;
+const RESULT_FINISHED: u64 = NOW + 2_000;
+const RESULT_SUBMITTED: u64 = RESULT_FINISHED + 1;
 const HEAD: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const SECRET: &str = "planted-registration-credential";
 
@@ -96,8 +99,8 @@ fn result() -> WireJobResult {
         job_id: "job-01".to_string(),
         outcome: JobOutcome::Success,
         exit_code: Some(0),
-        started_at_millis: NOW + 1_000,
-        finished_at_millis: NOW + 2_000,
+        started_at_millis: RESULT_STARTED,
+        finished_at_millis: RESULT_FINISHED,
         artifact_digests: vec![digest('b')],
         cache_receipts: vec!["fnv64:0123456789abcdef".to_string()],
         log_digest: digest('c'),
@@ -149,10 +152,15 @@ fn all_request_ack_pairs_round_trip_and_bind() {
         .validate_for(&lease_request)
         .unwrap();
 
-    let result_request = ResultRequest::new(context(), result(), NOW + 6).unwrap();
+    let result_request = ResultRequest::new(context(), result(), RESULT_SUBMITTED).unwrap();
     let parsed = ResultRequest::from_json(&result_request.to_json().unwrap()).unwrap();
     parsed.validate_for(&grant()).unwrap();
-    let result_ack = ResultAck::new(&result_request, ResultDecision::Accepted, NOW + 7).unwrap();
+    let result_ack = ResultAck::new(
+        &result_request,
+        ResultDecision::Accepted,
+        RESULT_SUBMITTED + 1,
+    )
+    .unwrap();
     ResultAck::from_json(&result_ack.to_json().unwrap())
         .unwrap()
         .validate_for(&result_request)
@@ -232,6 +240,55 @@ fn scalar_collection_and_body_bounds_fail_closed() {
 }
 
 #[test]
+fn case_sensitive_repository_and_message_time_order_are_fail_closed() {
+    let assigned = LeaseRequest::new("lease-poll-01", context().runner(), NOW).unwrap();
+    for invalid_server_time in [NOW - 1, NOW + 60_000] {
+        assert_eq!(
+            LeaseAck::assigned(&assigned, grant(), invalid_server_time)
+                .unwrap_err()
+                .field(),
+            "server_time_unix_millis"
+        );
+    }
+    LeaseAck::assigned(&assigned, grant(), NOW).expect("lease start is inclusive");
+    LeaseAck::assigned(&assigned, grant(), NOW + 59_999).expect("lease expiry is exclusive");
+
+    assert_eq!(
+        ResultRequest::new(context(), result(), RESULT_FINISHED - 1)
+            .unwrap_err()
+            .field(),
+        "submitted_at_unix_millis"
+    );
+    ResultRequest::new(context(), result(), RESULT_FINISHED)
+        .expect("submission at finish is valid");
+
+    let redline_job = job();
+    let mut redline = context_for(&redline_job);
+    redline.repository = "jeryu/redlineDB".to_string();
+    LeaseGrant::new(redline, NOW, NOW + 60_000, redline_job)
+        .expect("case-sensitive hosted repository identity");
+
+    for invalid in [
+        "Jeryu/redlineDB",
+        "jeryu/redline DB",
+        "jeryu/-redlineDB",
+        "jeryu/redlineDB-",
+        "jeryu/redline..DB",
+    ] {
+        let job = job();
+        let mut context = context_for(&job);
+        context.repository = invalid.to_string();
+        assert_eq!(
+            LeaseGrant::new(context, NOW, NOW + 60_000, job)
+                .unwrap_err()
+                .field(),
+            "repository",
+            "invalid repository was accepted: {invalid}"
+        );
+    }
+}
+
+#[test]
 fn stale_context_and_receipt_replays_are_rejected() {
     let mut stale_grant = grant();
     stale_grant.context.runner_epoch += 1;
@@ -240,8 +297,8 @@ fn stale_context_and_receipt_replays_are_rejected() {
         WireErrorCode::ContextMismatch
     );
 
-    let base = ResultRequest::new(context(), result(), NOW + 10).unwrap();
-    let replay = ResultRequest::new(context(), result(), NOW + 10).unwrap();
+    let base = ResultRequest::new(context(), result(), RESULT_SUBMITTED).unwrap();
+    let replay = ResultRequest::new(context(), result(), RESULT_SUBMITTED).unwrap();
     assert_eq!(base.receipt_id, replay.receipt_id);
 
     for mutate in [
@@ -256,7 +313,7 @@ fn stale_context_and_receipt_replays_are_rejected() {
         let mut changed_result = result();
         changed_result.runner_epoch = changed.runner_epoch;
         changed_result.lease_id = changed.lease_id.clone();
-        let changed = ResultRequest::new(changed, changed_result, NOW + 10).unwrap();
+        let changed = ResultRequest::new(changed, changed_result, RESULT_SUBMITTED).unwrap();
         assert_ne!(base.receipt_id, changed.receipt_id);
     }
 
@@ -266,7 +323,7 @@ fn stale_context_and_receipt_replays_are_rejected() {
         tampered.validate().unwrap_err().code(),
         WireErrorCode::ReceiptMismatch
     );
-    let mut ack = ResultAck::new(&base, ResultDecision::Duplicate, NOW + 11).unwrap();
+    let mut ack = ResultAck::new(&base, ResultDecision::Duplicate, RESULT_SUBMITTED + 1).unwrap();
     ack.context.head_sha = "b".repeat(40);
     assert_eq!(
         ack.validate_for(&base).unwrap_err().code(),
@@ -330,7 +387,7 @@ fn every_job_field_is_bound_to_the_lease_digest() {
 
 #[test]
 fn provenance_is_validated_and_bound_to_result_receipts() {
-    let base = ResultRequest::new(context(), result(), NOW + 10).unwrap();
+    let base = ResultRequest::new(context(), result(), RESULT_SUBMITTED).unwrap();
     let mutations: [fn(&mut ExecutionContext); 7] = [
         |ctx| ctx.job_digest = digest('2'),
         |ctx| ctx.protected_policy_sha = "c".repeat(40),
@@ -343,14 +400,14 @@ fn provenance_is_validated_and_bound_to_result_receipts() {
     for mutate in mutations {
         let mut changed_context = context();
         mutate(&mut changed_context);
-        let changed = ResultRequest::new(changed_context, result(), NOW + 10).unwrap();
+        let changed = ResultRequest::new(changed_context, result(), RESULT_SUBMITTED).unwrap();
         assert_ne!(base.receipt_id, changed.receipt_id);
     }
 
     let mut invalid = context();
     invalid.toolchain_digest = "sha256:not-a-digest".to_string();
     assert_eq!(
-        ResultRequest::new(invalid, result(), NOW + 10)
+        ResultRequest::new(invalid, result(), RESULT_SUBMITTED)
             .unwrap_err()
             .field(),
         "toolchain_digest"

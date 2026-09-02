@@ -180,6 +180,7 @@ impl ValidateWire for LeaseAck {
         validate_header(&self.protocol_version, &self.message_type, LEASE_ACK)?;
         validate_id("request_id", &self.request_id)?;
         self.runner.validate_wire()?;
+        validate_timestamp("server_time_unix_millis", self.server_time_unix_millis)?;
         match (&self.decision, &self.lease) {
             (LeaseDecision::Assigned, Some(lease)) => {
                 lease.validate_wire()?;
@@ -187,6 +188,14 @@ impl ValidateWire for LeaseAck {
                     return Err(WireError::new(
                         WireErrorCode::ContextMismatch,
                         "lease_ack.lease",
+                    ));
+                }
+                if self.server_time_unix_millis < lease.leased_at_unix_millis
+                    || self.server_time_unix_millis >= lease.expires_at_unix_millis
+                {
+                    return Err(WireError::new(
+                        WireErrorCode::InvalidField,
+                        "server_time_unix_millis",
                     ));
                 }
             }
@@ -198,7 +207,7 @@ impl ValidateWire for LeaseAck {
             }
             (_, None) => {}
         }
-        validate_timestamp("server_time_unix_millis", self.server_time_unix_millis)
+        Ok(())
     }
 }
 

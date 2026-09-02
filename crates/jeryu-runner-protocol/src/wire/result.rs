@@ -71,7 +71,14 @@ impl ValidateWire for ResultRequest {
         if self.receipt_id != result_receipt_id(&self.context, &self.result) {
             return Err(WireError::new(WireErrorCode::ReceiptMismatch, "receipt_id"));
         }
-        validate_timestamp("submitted_at_unix_millis", self.submitted_at_unix_millis)
+        validate_timestamp("submitted_at_unix_millis", self.submitted_at_unix_millis)?;
+        if self.submitted_at_unix_millis < self.result.finished_at_unix_millis {
+            return Err(WireError::new(
+                WireErrorCode::InvalidField,
+                "submitted_at_unix_millis",
+            ));
+        }
+        Ok(())
     }
 }
 
