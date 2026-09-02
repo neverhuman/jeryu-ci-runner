@@ -66,7 +66,7 @@
       "purpose": "verify root navigation remains current"
     },
     "VERSION": {
-      "command": "just check && just security && just score",
+      "command": "just fast && just check && just security && just score",
       "lane": "ci",
       "purpose": "bind the exact split.1 source identity to Cargo packages, security evidence, and SBOM metadata"
     },
