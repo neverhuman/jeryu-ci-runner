@@ -187,7 +187,7 @@ fi
   cd "${baseline_parent}/repo"
   mkdir -p .jankurai
   jankurai audit . --mode advisory --json .jankurai/repo-score.json \
-    --md .jankurai/repo-score.md \
+    --md .jankurai/repo-score.md --policy agent/audit-policy.toml \
     --fail-under "${effective_floor}" --full --no-score-history
 )
 cp "${baseline_parent}/repo/.jankurai/repo-score.json" \
@@ -208,13 +208,7 @@ jq -e --arg base "${short_base}" \
    .decision.passed == true' \
   target/jankurai/accepted-baseline.json >/dev/null
 
-jankurai audit . --mode ratchet \
-  --baseline target/jankurai/accepted-baseline.json \
-  --json target/jankurai/repo-score.json \
-  --md target/jankurai/repo-score.md \
-  --fail-under "${effective_floor}" \
-  --repair-queue-jsonl target/jankurai/repair-queue.jsonl \
-  --full --no-score-history
+jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --policy agent/audit-policy.toml --fail-under "${effective_floor}" --repair-queue-jsonl target/jankurai/repair-queue.jsonl --full --no-score-history
 
 short_head="${current_head:0:7}"
 jq -e --arg head "${short_head}" --argjson changed "${expected_changed}" \

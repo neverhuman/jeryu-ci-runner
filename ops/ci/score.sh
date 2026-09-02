@@ -17,8 +17,7 @@ for path in "${required[@]}"; do
 done
 mkdir -p .jankurai target/jankurai
 floor="$(audit_effective_floor agent/audit-policy.toml)"
-jankurai audit . --full --mode advisory --fail-under "${floor}" \
-  --json .jankurai/repo-score.json --md .jankurai/repo-score.md
+jankurai audit . --full --mode advisory --policy agent/audit-policy.toml --fail-under "${floor}" --json .jankurai/repo-score.json --md .jankurai/repo-score.md
 require_tool jq
 score="$(jq -er '.score | select(type == "number") | floor' \
   .jankurai/repo-score.json)"
