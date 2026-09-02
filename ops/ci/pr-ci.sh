@@ -5,6 +5,8 @@
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$repo_root"
+# shellcheck source=ops/ci/hosted-git-env.sh
+source "${repo_root}/ops/ci/hosted-git-env.sh"
 
 # jeryu governs the worker count from live load; never default high.
 if [ -n "${JERYU_CI_JOBS:-}" ]; then
@@ -35,12 +37,13 @@ fi
 echo "[pr-ci] (jobs=$JOBS) standard lanes" >&2
 bash ops/ci/fast.sh
 JERYU_SPLIT_FULL_CHECK=1 bash ops/ci/check.sh
+just contract-drift
 bash ops/ci/score.sh
-bash ops/ci/security.sh
+JERYU_SECURITY_NETWORK=1 bash ops/ci/security.sh
 bash ops/ci/artifact_support.sh
 
 echo "[pr-ci] workspace test suite (sandbox runtime tests need real namespaces; see deploy pr-ci precedent)" >&2
-cargo nextest run --workspace --exclude jeryu-sandbox-linux --build-jobs "$JOBS" --test-threads "$JOBS"
+cargo nextest run --locked --workspace --exclude jeryu-sandbox-linux --build-jobs "$JOBS" --test-threads "$JOBS"
 if [ "${JERYU_SKIP_SANDBOX_MATRIX:-0}" != "1" ]; then
   echo "[pr-ci] sandbox escape matrix (docker)" >&2
   bash tests/sandbox_escape_matrix.sh

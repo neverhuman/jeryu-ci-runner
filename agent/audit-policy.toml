@@ -1,12 +1,9 @@
 schema_version = "1.0.0"
 workspace = "jeryu-ci-runner"
-# Calibrated floor: with the circular `.jankurai/` self-scan exclusion in
-# place (carried from the monorepo policy), this repo's honest score is 83.
-# The dominant drag is code-shape category dilution after the split: the
-# inherited crates/jeryu-runnerd/src/workcell.rs (1397 LOC) now dominates a
-# small repo's largest-file statistics. Floor returns to 85 when the
-# workcell module split lands (tracked in CHANGELOG Unreleased).
-minimum_score = 80
+# The workcell test-module split and real proof/security/contract adoption
+# restored the repository to the fleet merge floor. Keep it fail-closed at 91;
+# future regressions must be repaired rather than absorbed here.
+minimum_score = 91
 hard_findings_allowed = 0
 required_tool = "jankurai"
 required_tool_version = "1.6.10"

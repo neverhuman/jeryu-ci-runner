@@ -13,7 +13,6 @@ allow = [
   "MIT",
   "Unicode-3.0",
   "Unlicense",
-  "Zlib",
 ]
 confidence-threshold = 0.8
 exceptions = []
@@ -27,4 +26,7 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# Cargo identity stays on this historical immutable source while the checked-in
+# transport overlay and source gate require the effective network destination
+# to be git.neverhuman.org.
+allow-git = ["https://github.com/neverhuman/jeryu-core.git"]

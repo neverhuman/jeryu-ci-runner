@@ -55,6 +55,8 @@ paths stable where practical so ownership remains auditable.
 - `crates/jeryu-ci-governor/**`
 - `crates/jeryu-phase7-cli/**`
 - `bins/jeryu-ci-bin/**`
+- `contracts/**`
+- `schemas/**`
 - `tests/fixtures/github/**`
 - `tests/fixtures/native/**`
 - `tests/sandbox_escape_matrix.sh`
@@ -70,4 +72,19 @@ paths stable where practical so ownership remains auditable.
 - `just check`
 - `just score`
 - `just security`
+- `just contract-drift`
 - `just artifact-support`
+
+`just security` is the full networked supply-chain gate. It requires pinned
+Gitleaks, Actionlint, Cargo Audit, Cargo Deny, and Syft binaries; validates the
+immutable Cargo lock and Core tag/support ref; proves the effective Git
+destination is `git.neverhuman.org`; and emits a CycloneDX SBOM. Cargo's
+historical source spelling remains unchanged so the Rust graph keeps one crate
+identity. Host CI sources `ops/ci/hosted-git-env.sh` before every Cargo entrypoint;
+caller-supplied Git configuration is accepted only when it is byte-identical to
+the checked-in policy, then canonicalized to that reviewed path.
+
+`just contract-drift` binds the checked JSON Schema to all serialized Rust fields,
+message discriminators, wire enums, and public collection bounds. Rust serde
+and `ValidateWire` remain the runtime authority for cross-field, identity,
+credential-name, digest, timestamp, and path invariants.

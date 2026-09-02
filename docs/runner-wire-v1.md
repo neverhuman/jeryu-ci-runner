@@ -5,6 +5,13 @@ AtomicSoul-native runner. It is a pure protocol leaf: this repository does not y
 AtomicSoul HTTP route, network client, credential loader, durable runner registry, service unit,
 or live xbabe3 registration.
 
+The checked draft 2020-12 structural mirror is
+[`schemas/jeryu.runner.v1.schema.json`](../schemas/jeryu.runner.v1.schema.json),
+with consumer guidance in [`contracts/README.md`](../contracts/README.md). Rust
+serde plus `ValidateWire` remain the runtime authority, including cross-field,
+reserved environment-name, and byte-length checks that are intentionally not
+delegated to a generic schema validator.
+
 ## Contract
 
 Every top-level message carries exact `protocol_version = "jeryu.runner.v1"` and one fixed

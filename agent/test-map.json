@@ -1,9 +1,9 @@
 {
   "tests": {
     ".cargo/": {
-      "command": "just check",
-      "lane": "check",
-      "purpose": "verify cargo configuration is parseable and local"
+      "command": "just security && just check",
+      "lane": "security",
+      "purpose": "verify Cargo configuration and exact hosted Git transport policy"
     },
     ".config/": {
       "command": "just check",
@@ -66,9 +66,9 @@
       "purpose": "verify root navigation remains current"
     },
     "VERSION": {
-      "command": "just score",
-      "lane": "score",
-      "purpose": "verify version source remains aligned with release evidence"
+      "command": "just check && just security && just score",
+      "lane": "ci",
+      "purpose": "bind the exact split.1 source identity to Cargo packages, security evidence, and SBOM metadata"
     },
     "agent/": {
       "command": "just score",
@@ -84,6 +84,11 @@
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+    },
+    "contracts/": {
+      "command": "just contract-drift",
+      "lane": "contract",
+      "purpose": "verify contract navigation and runtime-authority guidance"
     },
     "crates/jeryu-agent-auth/": {
       "command": "just check",
@@ -161,9 +166,9 @@
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
     "crates/jeryu-runner-protocol/": {
-      "command": "just check",
-      "lane": "check",
-      "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+      "command": "just contract-drift && cargo test --locked -p jeryu-runner-protocol",
+      "lane": "contract",
+      "purpose": "verify runner wire behavior and checked schema remain source-bound"
     },
     "crates/jeryu-runner-registry/": {
       "command": "just check",
@@ -171,9 +176,9 @@
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
     "crates/jeryu-runnerd/": {
-      "command": "just check",
-      "lane": "check",
-      "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+      "command": "cargo test --locked -p jeryu-runnerd",
+      "lane": "test",
+      "purpose": "verify runnerd behavior and hostile hosted dependency transport cases"
     },
     "crates/jeryu-sandbox-linux/": {
       "command": "just check",
@@ -206,9 +211,9 @@
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
     "ops/ci/": {
-      "command": "just fast && just check && just score",
+      "command": "just fast && just check && just security && just score",
       "lane": "ci",
-      "purpose": "verify local CI wrappers are reproducible and audit-visible"
+      "purpose": "verify host CI wrappers and fail-closed security gates"
     },
     "ops/git-hooks/": {
       "command": "just fast && just check && just score",
@@ -223,7 +228,7 @@
     "repos.manifest.toml": {
       "command": "just check && just score",
       "lane": "check",
-      "purpose": "verify split manifest remains parseable and routed"
+      "purpose": "fail closed if this non-authority product acquires a local authority manifest"
     },
     "rust-toolchain.toml": {
       "command": "just check",
@@ -234,6 +239,11 @@
       "command": "just check",
       "lane": "check",
       "purpose": "verify helper scripts parse and stay locally reproducible"
+    },
+    "schemas/": {
+      "command": "just contract-drift",
+      "lane": "contract",
+      "purpose": "verify checked wire schema cannot drift from Rust serde shapes"
     },
     "tests/": {
       "command": "just check && just score",
@@ -255,6 +265,11 @@
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
+    "tools/": {
+      "command": "just security",
+      "lane": "security",
+      "purpose": "verify the canonical security lane and its evidence"
+    },
     "agent/tool-adoption.toml": {
       "command": "just score",
       "lane": "score",
@@ -266,9 +281,9 @@
       "purpose": "verify documented data boundary policy remains routed"
     },
     "ops/": {
-      "command": "just fast && just check && just score",
+      "command": "just fast && just check && just security && just score",
       "lane": "ci",
-      "purpose": "verify local ops guidance and CI wrappers stay reproducible"
+      "purpose": "verify host CI wrappers, security gates, and evidence stay reproducible"
     }
   },
   "workspace": "jeryu-ci-runner"

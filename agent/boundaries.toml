@@ -4,7 +4,7 @@ profile = "rust-workspace"
 required_check = "jeryu-ci-runner/required"
 
 [split]
-cross_repo_dependency_policy = "pinned-public-git-tags"
+cross_repo_dependency_policy = "pinned-immutable-tags-hosted-transport"
 local_path_patches = false
 
 cargo_members = [

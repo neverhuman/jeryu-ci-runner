@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# shellcheck source=ops/ci/hosted-git-env.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hosted-git-env.sh"
+
 require_tool() {
   local name="$1"
   command -v "$name" >/dev/null 2>&1 || {

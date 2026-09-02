@@ -12,7 +12,10 @@ score:
   ./ops/ci/score.sh # jankurai audit repo-score
 
 security:
-  ./ops/ci/security.sh # gitleaks cargo audit npm audit syft
+  JERYU_SECURITY_NETWORK=1 ./tools/security-lane.sh
+
+contract-drift:
+  cargo test -p jeryu-runner-protocol --locked --test schema_contract_drift
 
 artifact-support:
   ./ops/ci/artifact_support.sh

@@ -2,10 +2,28 @@
 set -euo pipefail
 
 source ops/ci/lib.sh
+require_tool jq
+expected_release_identity='jeryu-ci-runner-v5.0.0-split.1'
+if [[ ! -f VERSION || -L VERSION || "$(stat -c '%h' -- VERSION)" != 1 ||
+      "$(wc -l < VERSION)" != 1 || "$(<VERSION)" != "${expected_release_identity}" ||
+      "$(tail -c 1 VERSION | od -An -tx1 | tr -d '[:space:]')" != 0a ]]; then
+  printf 'VERSION must be the exact one-link release identity %s\n' \
+    "${expected_release_identity}" >&2
+  exit 1
+fi
 if [[ -f Cargo.toml ]]; then
-  cargo metadata --format-version 1 --no-deps >/dev/null
+  cargo_metadata="$(cargo metadata --locked --format-version 1 --no-deps)"
+  mapfile -t workspace_versions < <(
+    jq -r '[.workspace_members[] as $member | .packages[] |
+      select(.id == $member) | .version] | unique[]' <<< "${cargo_metadata}"
+  )
+  if [[ "${#workspace_versions[@]}" -ne 1 ||
+        "${workspace_versions[0]}" != 5.0.0 ]]; then
+    printf 'workspace package versions must all equal VERSION major/minor/patch 5.0.0\n' >&2
+    exit 1
+  fi
   if [[ "${JERYU_SPLIT_FULL_CHECK:-0}" == "1" ]]; then
-    cargo check --workspace --all-targets --jobs "${JERYU_CI_JOBS:-40}"
+    cargo check --locked --workspace --all-targets --jobs "${JERYU_CI_JOBS:-40}"
   fi
 fi
 
@@ -19,22 +37,11 @@ if [[ -f package.json ]]; then
   fi
 fi
 
-if [[ -f repos.manifest.toml ]]; then
-  python3 - <<'PY'
-from pathlib import Path
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
-data = tomllib.loads(Path("repos.manifest.toml").read_text())
-repos = data.get("repo", [])
-if not repos:
-    raise SystemExit("repos.manifest.toml has no [[repo]] entries")
-if "jeryu" not in data.get("required_repos", []):
-    raise SystemExit("repos.manifest.toml must require the public portal repo")
-PY
+if [[ -e repos.manifest.toml || -L repos.manifest.toml ]]; then
+  printf 'jeryu-ci-runner may not own an authority repos.manifest.toml\n' >&2
+  exit 1
 fi
-for script in scripts/*.sh ops/ci/*.sh; do
+for script in scripts/*.sh ops/ci/*.sh tools/*.sh; do
   [[ -e "$script" ]] || continue
   bash -n "$script"
 done

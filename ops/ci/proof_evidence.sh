@@ -1,97 +1,264 @@
 #!/usr/bin/env bash
+# Generate exact-head proof artifacts only from commands that actually ran.
 set -euo pipefail
-source ops/ci/lib.sh
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "${ROOT}"
+# shellcheck source=ops/ci/lib.sh
+source "${ROOT}/ops/ci/lib.sh"
+require_tool jq
 require_jankurai
 
-mkdir -p   .jankurai   target/jankurai/security   target/jankurai/proofbind   target/jankurai/proofmark   target/jankurai/rust   target/jankurai/coverage
+BASE_REF="${JERYU_JANKURAI_BASE_REF:-origin/main}"
+if [[ "${BASE_REF}" != origin/main ]]; then
+  printf 'proof evidence base must be protected origin/main, got %s\n' "${BASE_REF}" >&2
+  exit 1
+fi
+base_commit="$(git rev-parse --verify "${BASE_REF}^{commit}")" || {
+  printf 'missing proof evidence base: %s\n' "${BASE_REF}" >&2
+  exit 1
+}
+current_head="$(git rev-parse --verify 'HEAD^{commit}')"
+if ! git merge-base --is-ancestor "${base_commit}" "${current_head}"; then
+  printf 'proof head is not a descendant of protected base: base=%s head=%s\n' \
+    "${base_commit}" "${current_head}" >&2
+  exit 1
+fi
+if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+  printf 'proof evidence requires a clean exact-head checkout\n' >&2
+  exit 1
+fi
+if [[ "$(git remote get-url origin)" != \
+      'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' ]]; then
+  printf 'proof origin is not the hosted source repository\n' >&2
+  exit 1
+fi
 
-# Catalog CI commands retained verbatim for Jankurai tool-adoption detection:
-# jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md
-# jankurai proofbind verify . --changed-from origin/main
-# jankurai proofmark rust . --obligations target/jankurai/proofbind/obligations.json
-# cargo run -p jankurai -- copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md
-# jankurai security run . --out target/jankurai/security/evidence.json
-# cargo test -p jankurai --test language_bad_behavior
-# jankurai ux audit --config agent/ux-qa.toml --out target/jankurai/ux-qa.json
-# jankurai migrate . --analyze --json target/jankurai/migration-report.json
-# jankurai rust witness build .
-# jankurai vibe coverage --source agent/vibe-coverage.toml --tips tips/vibe_coding --json target/jankurai/vibe-coverage.json --md target/jankurai/vibe-coverage.md
-# jankurai coverage audit . --config agent/coverage-sources.toml --json target/jankurai/coverage/coverage-audit.json --md target/jankurai/coverage/coverage-audit.md
+mkdir -p \
+  .jankurai \
+  target/jankurai \
+  target/jankurai/copy-code \
+  target/jankurai/proofbind \
+  target/jankurai/proofmark \
+  target/jankurai/rust \
+  target/jankurai/security
 
-jankurai audit . --mode advisory   --json .jankurai/repo-score.json   --md .jankurai/repo-score.md   --repair-queue-jsonl target/jankurai/repair-queue.jsonl   --full   --no-score-history
+mapfile -d '' -t changed_paths < <(
+  git diff --no-ext-diff --name-only -z --diff-filter=ACDMRT \
+    "${BASE_REF}...${current_head}" | LC_ALL=C sort -zu
+)
+if [[ "${#changed_paths[@]}" -eq 0 ]]; then
+  printf 'proof evidence refuses an empty protected-main change set\n' >&2
+  exit 1
+fi
+expected_changed="$(
+  printf '%s\0' "${changed_paths[@]}" |
+    jq -Rs 'split("\u0000") | map(select(length > 0)) | sort | unique'
+)"
+for changed_path in "${changed_paths[@]}"; do
+  if [[ ! -e "${changed_path}" && ! -L "${changed_path}" ]]; then
+    printf 'Jankurai 1.6.10 cannot safely classify deleted proof path: %s\n' \
+      "${changed_path}" >&2
+    exit 1
+  fi
+done
+
+receipt_dir="target/jankurai/proof-receipts/run-${current_head:0:12}-$$"
+jankurai proof . --changed-from origin/main --out target/jankurai/proof-plan.json --md target/jankurai/proof-plan.md
+jankurai prove . --plan target/jankurai/proof-plan.json --out-dir "${receipt_dir}" --evidence-index target/jankurai/evidence-index.json
+
+jq -e \
+  --arg head "${current_head}" \
+  --argjson changed "${expected_changed}" \
+  '.schema_version == "1.0.0" and
+   .git_head == $head and
+   (.changed_paths | sort | unique) == $changed and
+   (.risk_notes | length) == 0 and
+   (.human_approval_requirements | length) == 0 and
+   ([.route_decisions[] | select(.decision != "pass")] | length) == 0 and
+   (.commands | length) > 0' \
+  target/jankurai/proof-plan.json >/dev/null
+jq -e \
+  --arg head "${current_head}" \
+  --arg receipt_dir "${receipt_dir}" \
+  --argjson changed "${expected_changed}" \
+  '.schema_version == "1.2.0" and
+   .git_head == $head and
+   .receipt_dir == $receipt_dir and
+   (.changed_paths | sort | unique) == $changed and
+   (.failed_receipts | length) == 0 and
+   (.receipts | length) == (.commands | length) and
+   (.receipts | length) > 0' \
+  target/jankurai/evidence-index.json >/dev/null
+for receipt in "${receipt_dir}"/*.json; do
+  [[ -f "${receipt}" && ! -L "${receipt}" ]] || {
+    printf 'missing regular proof receipt in %s\n' "${receipt_dir}" >&2
+    exit 1
+  }
+  jq -e \
+    --arg head "${current_head}" \
+    '.schema_version == "1.9.0" and .git_head == $head and
+     .dirty_worktree == false and .exit_code == 0 and
+     (.command | type == "string" and length > 0) and
+     (.log_sha256 | test("^sha256:[0-9a-f]{64}$"))' \
+    "${receipt}" >/dev/null
+done
+
+jankurai proof-verify . \
+  --plan target/jankurai/proof-plan.json \
+  --evidence-index target/jankurai/evidence-index.json \
+  --out target/jankurai/proof-verification.json \
+  --md target/jankurai/proof-verification.md
+jq -e '.schema_version == "1.0.0" and .verdict == "valid" and
+       (.issues | length) == 0' \
+  target/jankurai/proof-verification.json >/dev/null
+
+# Proofbind/proofmark remain diagnostic in Jankurai 1.6.10: required mode
+# incorrectly demands Rust line/mutation evidence for non-Rust contract prose.
+# They still run without fallbacks, against the exact extant changed surface,
+# and their unresolved review count is retained in the summary below.
+jankurai proofbind verify . --changed-from origin/main --mode advisory --proof-receipts "${receipt_dir}" --out target/jankurai/proofbind/surface-witness.json --obligations-out target/jankurai/proofbind/obligations.json --md target/jankurai/proofbind/proofbind.md
+jankurai proofmark rust . --obligations target/jankurai/proofbind/obligations.json --changed-from origin/main --mode advisory --out target/jankurai/proofmark/proofmark-receipt.json --proof-receipt target/jankurai/proofmark/proof-receipt.json --md target/jankurai/proofmark/proofmark.md
+
+jankurai copy-code . --json target/jankurai/copy-code/report.json --md target/jankurai/copy-code/report.md
+jankurai rust map . --out-dir target/jankurai/rust
+jankurai rust witness build . --out target/jankurai/rust/witness-graph.json
+jankurai rust diagnose . --out target/jankurai/rust/compile-packets.json
+jankurai security run . --out target/jankurai/security/evidence.json --script tools/security-lane.sh --strict --profile ci
+
+# Build the ratchet baseline from authenticated protected main, never from the
+# candidate. The no-local clone is exact-SHA isolation and is always removed.
+baseline_parent="$(mktemp -d "${TMPDIR:-/tmp}/jeryu-ci-runner-baseline.XXXXXXXX")"
+cleanup_baseline() {
+  case "${baseline_parent}" in
+    "${TMPDIR:-/tmp}"/jeryu-ci-runner-baseline.*)
+      rm -rf -- "${baseline_parent}"
+      ;;
+    *)
+      printf 'refusing to remove unexpected baseline path: %s\n' \
+        "${baseline_parent}" >&2
+      return 1
+      ;;
+  esac
+}
+baseline_signal() {
+  local exit_code="$1"
+  trap - EXIT HUP INT TERM
+  cleanup_baseline || true
+  exit "${exit_code}"
+}
+trap cleanup_baseline EXIT
+trap 'baseline_signal 129' HUP
+trap 'baseline_signal 130' INT
+trap 'baseline_signal 143' TERM
+git clone --quiet --no-local --no-hardlinks --single-branch --branch main \
+  'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' \
+  "${baseline_parent}/repo"
+if [[ "$(git -C "${baseline_parent}/repo" rev-parse 'HEAD^{commit}')" != \
+      "${base_commit}" ||
+      -n "$(git -C "${baseline_parent}/repo" status --porcelain=v1 \
+        --untracked-files=all)" ]]; then
+  printf 'protected-main baseline clone drifted or is dirty\n' >&2
+  exit 1
+fi
+(
+  cd "${baseline_parent}/repo"
+  mkdir -p .jankurai
+  jankurai audit . --mode advisory --json .jankurai/repo-score.json \
+    --md .jankurai/repo-score.md --policy agent/audit-policy.toml --full \
+    --no-score-history
+)
+cp "${baseline_parent}/repo/.jankurai/repo-score.json" \
+  target/jankurai/accepted-baseline.json
+baseline_score="$(jq -er '.score | select(type == "number") | floor' \
+  target/jankurai/accepted-baseline.json)"
+baseline_sha256="$(sha256sum target/jankurai/accepted-baseline.json | \
+  awk '{print $1}')"
+trap - EXIT HUP INT TERM
+cleanup_baseline
+
+short_base="${base_commit:0:7}"
+jq -e --arg base "${short_base}" \
+  '.git.head == $base and .git.dirty_worktree == false and
+   (.score | type == "number") and .decision.passed == true' \
+  target/jankurai/accepted-baseline.json >/dev/null
+
+jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --policy agent/audit-policy.toml --repair-queue-jsonl target/jankurai/repair-queue.jsonl --full --no-score-history
+
+short_head="${current_head:0:7}"
+jq -e --arg head "${short_head}" --argjson changed "${expected_changed}" \
+  '.schema_version == "1.0.0" and .git_head == $head and
+   (.changed_paths | sort | unique) == $changed and
+   (.summary.changed_surface_count | type == "number")' \
+  target/jankurai/proofbind/surface-witness.json >/dev/null
+jq -e --arg head "${short_head}" \
+  '.schema_version == "1.0.0" and .git_head == $head and
+   (.summary.total_obligations | type == "number") and
+   (.summary.satisfied_obligations | type == "number") and
+   (.summary.review_obligations | type == "number") and
+   (.summary.verdict == "pass" or .summary.verdict == "review")' \
+  target/jankurai/proofmark/proofmark-receipt.json >/dev/null
+jq -e --arg head "${current_head}" \
+  '.schema_version == "1.0.0" and .git_head == $head and
+   .lane == "security" and .wrapper.path == "tools/security-lane.sh" and
+   .wrapper.strict == true and .exit_code == 0 and
+   ([.commands[] | select(.status == "ran" and .exit_code == 0)] | length) >= 1' \
+  target/jankurai/security/evidence.json >/dev/null
+jq -e '.schema_version == "1.0.0" and (.classes | type == "array")' \
+  target/jankurai/copy-code/report.json >/dev/null
+jq -e '.schema_version == "1.0.0" and (.nodes | type == "array") and
+       (.edges | type == "array")' \
+  target/jankurai/rust/witness-graph.json >/dev/null
+
+# Bind and revalidate the protected-main ratchet output at the repository's
+# fleet-wide merge floor.
+jq -e \
+  --arg head "${short_head}" \
+  --argjson baseline_score "${baseline_score}" \
+  '.git.head == $head and .git.dirty_worktree == false and
+   .score >= 91 and (.caps_applied | length) == 0 and
+   .decision.hard_findings == 0 and .decision.passed == true and
+   .decision.ratchet.baseline_score == $baseline_score' \
+  .jankurai/repo-score.json >/dev/null
 cp .jankurai/repo-score.json target/jankurai/repo-score.json
 cp .jankurai/repo-score.md target/jankurai/repo-score.md
-cp .jankurai/repo-score.json target/jankurai/accepted-baseline.json
 
-if ! jankurai security run . --out target/jankurai/security/evidence.json; then
-  printf '{"schema_version":"jeryu.split.security/v1","status":"local-script-fallback","checks":["ops/ci/security.sh"]}
-' > target/jankurai/security/evidence.json
+if [[ "$(git rev-parse --verify 'HEAD^{commit}')" != "${current_head}" ||
+      "$(git rev-parse --verify "${BASE_REF}^{commit}")" != "${base_commit}" ||
+      "$(git remote get-url origin)" != \
+        'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' ||
+      -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+  printf 'proof commands changed the exact head, protected base, origin, or tracked tree\n' >&2
+  exit 1
 fi
 
-changed_args=(--changed agent/tool-adoption.toml)
-if git rev-parse --verify origin/main >/dev/null 2>&1; then
-  if ! jankurai proofbind verify . --changed-from origin/main; then
-    jankurai proofbind verify . "${changed_args[@]}" || true
-  fi
-else
-  jankurai proofbind verify . "${changed_args[@]}" || true
-fi
-[ -s target/jankurai/proofbind/surface-witness.json ] || printf '{"schema_version":"jeryu.proofbind.surface/v1","status":"no-local-base"}
-' > target/jankurai/proofbind/surface-witness.json
-[ -s target/jankurai/proofbind/obligations.json ] || printf '[]
-' > target/jankurai/proofbind/obligations.json
+proofmark_review="$(jq -er '.summary.review_obligations' \
+  target/jankurai/proofmark/proofmark-receipt.json)"
+jq -n \
+  --arg head "${current_head}" \
+  --arg base "${base_commit}" \
+  --arg receipt_dir "${receipt_dir}" \
+  --arg plan_sha256 "$(sha256sum target/jankurai/proof-plan.json | awk '{print $1}')" \
+  --arg evidence_index_sha256 "$(sha256sum target/jankurai/evidence-index.json | awk '{print $1}')" \
+  --arg verification_sha256 "$(sha256sum target/jankurai/proof-verification.json | awk '{print $1}')" \
+  --arg security_sha256 "$(sha256sum target/jankurai/security/evidence.json | awk '{print $1}')" \
+  --arg baseline_sha256 "${baseline_sha256}" \
+  --argjson changed_count "${#changed_paths[@]}" \
+  --argjson receipt_count "$(jq -er '.receipts | length' target/jankurai/evidence-index.json)" \
+  --argjson proofmark_review "${proofmark_review}" \
+  --argjson baseline_score "${baseline_score}" \
+  '{schema_version:"jeryu.ci-runner.proof-evidence/v1",git_head:$head,
+    base_commit:$base,dirty_worktree:false,changed_path_count:$changed_count,
+    receipt_count:$receipt_count,receipt_dir:$receipt_dir,
+    proof_plan_sha256:$plan_sha256,evidence_index_sha256:$evidence_index_sha256,
+    proof_verification_sha256:$verification_sha256,security_sha256:$security_sha256,
+    baseline_score:$baseline_score,baseline_sha256:$baseline_sha256,
+    proof_verification:"valid",proofmark_mode:"advisory",
+    proofmark_review_obligations:$proofmark_review,
+    synthetic_fallbacks:0,conclusion:"success"}' \
+  > target/jankurai/proof-evidence-summary.json
 
-jankurai proofmark rust . --obligations target/jankurai/proofbind/obligations.json || true
-[ -s target/jankurai/proofmark/proofmark-receipt.json ] || printf '{"schema_version":"jeryu.proofmark/v1","status":"no-local-obligations"}
-' > target/jankurai/proofmark/proofmark-receipt.json
-[ -s target/jankurai/proofmark/proof-receipt.json ] || printf '{"schema_version":"jeryu.proofmark.proof/v1","status":"no-local-obligations"}
-' > target/jankurai/proofmark/proof-receipt.json
-
-jankurai copy-code . --json target/jankurai/copy-code.json --md target/jankurai/copy-code.md || true
-[ -s target/jankurai/copy-code.json ] || printf '{"schema_version":"jankurai.copy-code/v1","classes":[]}
-' > target/jankurai/copy-code.json
-[ -s target/jankurai/copy-code.md ] || printf '# Copy-code evidence
-
-No local copy-code report was produced.
-' > target/jankurai/copy-code.md
-
-printf 'language bad-behavior detectors are covered by jankurai audit/security for this split repo
-' > target/jankurai/language-bad-behavior.log
-jankurai rust witness build . --out target/jankurai/rust/witness-graph.json || true
-[ -s target/jankurai/rust/witness-graph.json ] || printf '{"schema_version":"jankurai.rust-witness/v1","nodes":[],"edges":[]}
-' > target/jankurai/rust/witness-graph.json
-
-if [ -f agent/ux-qa.toml ]; then
-  jankurai ux audit --config agent/ux-qa.toml --out target/jankurai/ux-qa.json || true
-fi
-[ -s target/jankurai/ux-qa.json ] || printf '{"schema_version":"jankurai.ux-qa/v1","status":"not-applicable"}
-' > target/jankurai/ux-qa.json
-
-if [ -d db/migrations ]; then
-  jankurai migrate . --analyze --out target/jankurai/migration-report.json --md target/jankurai/migration-report.md || true
-fi
-[ -s target/jankurai/migration-report.json ] || printf '{"schema_version":"jankurai.migration/v1","status":"no-owned-migrations"}
-' > target/jankurai/migration-report.json
-
-if [ -f agent/vibe-coverage.toml ]; then
-  jankurai vibe coverage --source agent/vibe-coverage.toml --tips tips/vibe_coding --json target/jankurai/vibe-coverage.json --md target/jankurai/vibe-coverage.md || true
-fi
-[ -s target/jankurai/vibe-coverage.json ] || printf '{"schema_version":"jankurai.vibe-coverage/v1","status":"not-applicable"}
-' > target/jankurai/vibe-coverage.json
-[ -s target/jankurai/vibe-coverage.md ] || printf '# Vibe coverage
-
-Not applicable for this split repo.
-' > target/jankurai/vibe-coverage.md
-
-if [ -f agent/coverage-sources.toml ]; then
-  jankurai coverage audit . --config agent/coverage-sources.toml --json target/jankurai/coverage/coverage-audit.json --md target/jankurai/coverage/coverage-audit.md || true
-fi
-[ -s target/jankurai/coverage/coverage-audit.json ] || printf '{"schema_version":"jankurai.coverage/v1","status":"not-applicable"}
-' > target/jankurai/coverage/coverage-audit.json
-[ -s target/jankurai/coverage/coverage-audit.md ] || printf '# Coverage audit
-
-Not applicable for this split repo.
-' > target/jankurai/coverage/coverage-audit.md
-
-printf 'proof evidence ok
-'
+printf 'proof evidence ok: head=%s base=%s paths=%s receipts=%s proofmark_review=%s\n' \
+  "${current_head}" "${base_commit}" "${#changed_paths[@]}" \
+  "$(jq -r '.receipts | length' target/jankurai/evidence-index.json)" \
+  "${proofmark_review}"
