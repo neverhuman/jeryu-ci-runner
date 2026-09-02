@@ -1,6 +1,12 @@
 # jeryu-ci-runner
 
+[![Release status: candidate; required check pending](docs/status-candidate.svg)](docs/release.md)
+
 CI IR, scheduler, runner fabric, workcells, sandboxing, agent execution substrate.
+
+Start with the repository's canonical [`AGENTS.md`](AGENTS.md) before changing
+source or running a release lane. It defines the hosted dependency identity,
+required evidence, and generated-file boundaries that this README summarizes.
 
 The strict endpoint-neutral `jeryu.runner.v1` JSON contract is documented in
 [`docs/runner-wire-v1.md`](docs/runner-wire-v1.md). It is protocol-only; no AtomicSoul runner is
@@ -9,6 +15,31 @@ installed or registered by this repository state.
 This repository was seeded from Jeryu source commit `cbecf7caa0e932c76a341b2521e66e911233860d` by
 `ops/split/materialize.py`. It is part of the seven-repo Jeryu split family and keeps source
 paths stable where practical so ownership remains auditable.
+
+## Status
+
+This source remains a **candidate**, not a runtime registration or public
+release. `git.neverhuman.org` is the Git transport source of truth. A topic is
+green only when its exact commit has the real `jeryu-ci-runner/required` check,
+the fleet score and hard-finding gates pass, and an independent review is bound
+to that same head. A `jankurai/proof` check is useful corroboration, but it does
+not substitute for the protected required context.
+
+## Quick Start
+
+Use the pinned Rust toolchain and locked dependency graph from the repository
+root:
+
+```bash
+just fast
+just check
+just contract-drift
+```
+
+Run `just security` before proposing a release-relevant change. It is the
+networked supply-chain lane and therefore also verifies that dependency
+transport reaches only `git.neverhuman.org` without changing Cargo's stable
+source identities.
 
 ## Owned Cargo Packages
 

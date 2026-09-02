@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- Split oversized sandbox launch, workcell, agent-driver, OAuth, registry, OCI,
+  and fleet source into focused implementation and test modules without
+  changing public Rust paths, serialized contracts, syscall ordering,
+  fail-closed behavior, or test coverage; added truthful hosted-status and
+  quick-start navigation to the repository entrypoint.
 - Hardened runner-wire repository identity and time ordering for the hosted
   fleet: case-sensitive repository components are preserved, expired lease
   acknowledgements fail closed, and results cannot precede their finish time.
