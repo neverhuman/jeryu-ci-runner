@@ -26,6 +26,8 @@
   custody, version, and PATH-shadowing regression coverage.
 - Aligned proof verification with the pinned Jankurai schema's successful
   `pass` verdict while retaining fail-closed rejection of every reported issue.
+- Compare protected-main and candidate scores under the same authenticated
+  non-regressing audit policy so floor increases cannot invalidate the ratchet.
 
 ## jeryu-ci-runner-v5.0.0-split.0 - 2026-06-11
 - MAJOR: first standalone split-family release; the legacy monorepo

@@ -9,6 +9,14 @@ source "${ROOT}/ops/ci/lib.sh"
 require_tool jq
 require_jankurai
 
+candidate_policy="${ROOT}/agent/audit-policy.toml"
+if [[ ! -f "${candidate_policy}" || -L "${candidate_policy}" ||
+      "$(stat -c '%h' -- "${candidate_policy}")" != 1 ||
+      "$(realpath -- "${candidate_policy}")" != "${candidate_policy}" ]]; then
+  printf 'candidate audit policy must be a canonical one-link regular file\n' >&2
+  exit 1
+fi
+
 BASE_REF="${JERYU_JANKURAI_BASE_REF:-origin/main}"
 if [[ "${BASE_REF}" != origin/main ]]; then
   printf 'proof evidence base must be protected origin/main, got %s\n' "${BASE_REF}" >&2
@@ -147,6 +155,39 @@ baseline_signal() {
   cleanup_baseline || true
   exit "${exit_code}"
 }
+
+policy_floor() {
+  awk -F '=' '
+    /^[[:space:]]*minimum_score[[:space:]]*=/ {
+      count += 1
+      value = $2
+      sub(/[[:space:]]*#.*/, "", value)
+      gsub(/[[:space:]]/, "", value)
+      if (value !~ /^[0-9]+$/) exit 2
+      floor = value
+    }
+    END {
+      if (count != 1) exit 3
+      print floor
+    }
+  ' "$1"
+}
+
+policy_semantics_sha256() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    /^[[:space:]]*minimum_score[[:space:]]*=/ {
+      print "minimum_score=<ratchet-floor>"
+      next
+    }
+    {
+      sub(/[[:space:]]+$/, "")
+      print
+    }
+  ' "$1" | sha256sum | awk '{print $1}'
+}
+
 trap cleanup_baseline EXIT
 trap 'baseline_signal 129' HUP
 trap 'baseline_signal 130' INT
@@ -161,11 +202,36 @@ if [[ "$(git -C "${baseline_parent}/repo" rev-parse 'HEAD^{commit}')" != \
   printf 'protected-main baseline clone drifted or is dirty\n' >&2
   exit 1
 fi
+baseline_policy="${baseline_parent}/repo/agent/audit-policy.toml"
+if [[ ! -f "${baseline_policy}" || -L "${baseline_policy}" ||
+      "$(stat -c '%h' -- "${baseline_policy}")" != 1 ||
+      "$(realpath -- "${baseline_policy}")" != "${baseline_policy}" ]]; then
+  printf 'protected-main audit policy must be a canonical one-link regular file\n' >&2
+  exit 1
+fi
+candidate_floor="$(policy_floor "${candidate_policy}")" || {
+  printf 'candidate audit policy must contain one integer minimum_score\n' >&2
+  exit 1
+}
+baseline_floor="$(policy_floor "${baseline_policy}")" || {
+  printf 'protected-main audit policy must contain one integer minimum_score\n' >&2
+  exit 1
+}
+if (( candidate_floor < 91 || candidate_floor < baseline_floor )); then
+  printf 'candidate audit floor regressed: candidate=%s protected-main=%s\n' \
+    "${candidate_floor}" "${baseline_floor}" >&2
+  exit 1
+fi
+if [[ "$(policy_semantics_sha256 "${candidate_policy}")" != \
+      "$(policy_semantics_sha256 "${baseline_policy}")" ]]; then
+  printf 'audit policy changed outside comments and minimum_score\n' >&2
+  exit 1
+fi
 (
   cd "${baseline_parent}/repo"
   mkdir -p .jankurai
   jankurai audit . --mode advisory --json .jankurai/repo-score.json \
-    --md .jankurai/repo-score.md --policy agent/audit-policy.toml --full \
+    --md .jankurai/repo-score.md --policy "${candidate_policy}" --full \
     --no-score-history
 )
 cp "${baseline_parent}/repo/.jankurai/repo-score.json" \
