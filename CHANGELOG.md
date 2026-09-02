@@ -28,6 +28,8 @@
   `pass` verdict while retaining fail-closed rejection of every reported issue.
 - Compare protected-main and candidate scores under byte-identical policies and
   the same effective floor-91 override, preserving Jankurai's strict ratchet.
+- Validate pinned copy-code and Rust witness artifacts against their emitted
+  typed contracts, including zero hard copies and per-crate witness hashes.
 
 ## jeryu-ci-runner-v5.0.0-split.0 - 2026-06-11
 - MAJOR: first standalone split-family release; the legacy monorepo

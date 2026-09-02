@@ -238,10 +238,31 @@ jq -e --arg head "${current_head}" \
      "hosted-dependency-sources", "syft-1.40.0-cyclonedx"] - .checks |
      length) == 0' \
   target/security/evidence.json >/dev/null
-jq -e '.schema_version == "1.0.0" and (.classes | type == "array")' \
+jq -e --arg root "${ROOT}" \
+  '.schema_version == "1.1.0" and
+   .generated_by == "jankurai copy-code" and
+   .auditor_version == "1.6.10" and .repo == $root and
+   (.status == "pass" or .status == "review") and
+   (.classes | type == "array") and
+   .summary.hard_classes == 0 and .summary.hard_instances == 0 and
+   (.summary.warning_classes | type == "number") and
+   (.summary.warning_instances | type == "number") and
+   all(.classes[];
+     .hard_fail == false and (.instances | type == "array"))' \
   target/jankurai/copy-code/report.json >/dev/null
-jq -e '.schema_version == "1.0.0" and (.nodes | type == "array") and
-       (.edges | type == "array")' \
+jq -e --arg root "${ROOT}" \
+  '(.generated_at | type == "string" and length > 0) and
+   .workspace_root == $root and
+   (.crates | type == "array" and length > 0) and
+   all(.crates[];
+     (.name | type == "string" and length > 0) and
+     (.interface_hash | type == "string" and test("^[0-9a-f]{64}$")) and
+     (.implementation_hash | type == "string" and test("^[0-9a-f]{64}$")) and
+     (.pub_items | type == "array") and
+     (.direct_deps | type == "array") and
+     (.reverse_deps | type == "array") and
+     (.file_count | type == "number" and . > 0) and
+     (.total_lines | type == "number" and . > 0))' \
   target/jankurai/rust/witness-graph.json >/dev/null
 
 # Bind and revalidate the protected-main ratchet output at the repository's
