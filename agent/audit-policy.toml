@@ -9,7 +9,7 @@ workspace = "jeryu-ci-runner"
 minimum_score = 80
 hard_findings_allowed = 0
 required_tool = "jankurai"
-required_tool_version = "1.6.10"
+required_tool_version = "1.6.11"
 
 # The `[dead_language] allow_terms` mechanism (jankurai >= 1.6.1) suppresses ONLY
 # these exact words for the dead-marker check; every other dead-language,

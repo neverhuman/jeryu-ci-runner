@@ -10,6 +10,10 @@ const HOSTED: &str = "https://git.neverhuman.org/git/jeryu/jeryu-core.git";
 const TAG: &str = "jeryu-core-v5.0.0-split.0";
 const COMMIT: &str = "0e29dc90673ffdf9959aaaa1f05482301f15fabe";
 const SUPPORT_REF: &str = "refs/heads/preserve/hosted-cargo/jeryu-core-v5.0.0-split.0";
+const GOVERNED_JANKURAI: &str = "/home/ubuntu/.jeryu/bin/jankurai";
+const GOVERNED_JANKURAI_VERSION: &str = "jankurai 1.6.11";
+const GOVERNED_JANKURAI_SHA256: &str =
+    "9e6b8857a26f6004d4c74e510e13b06d880f2e2ae0c89502698889ed690c5d6c";
 
 struct Scratch(PathBuf);
 
@@ -138,25 +142,58 @@ fn write_fake_jankurai(path: &Path, version: &str, marker: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set fake Jankurai mode");
 }
 
-fn run_library_jankurai(cargo_home: &Path, earlier_path: &Path) -> Output {
+fn run_library_jankurai(
+    earlier_path: &Path,
+    governed_override: Option<&Path>,
+    receipt_override: Option<&Path>,
+    allow_test_receipt: bool,
+) -> Output {
     let root = root();
     let mut command = Command::new("bash");
     command
         .args([
             "-lc",
-            "export PATH=\"$2:$PATH\"; cd \"$1\"; source ops/ci/lib.sh; require_jankurai; jankurai --version",
+            "export PATH=\"$2:$PATH\"; cd \"$1\"; source ops/ci/lib.sh; require_jankurai; printf 'command=%s\\nfile=%s\\nversion=' \"$(command -v jankurai)\" \"$(type -P -- jankurai)\"; jankurai --version",
             "_",
             root.to_str().expect("UTF-8 workspace root"),
             earlier_path.to_str().expect("UTF-8 hostile PATH"),
         ])
-        .env("CARGO_HOME", cargo_home)
+        .env("CARGO_HOME", earlier_path)
         .env("JERYU_JANKURAI_BIN", earlier_path.join("jankurai"))
         .env(
             "GIT_CONFIG_GLOBAL",
             root.join(".cargo/hosted-gitconfig"),
-        );
+        )
+        .env_remove("JAIN_RELEASE_CI")
+        .env_remove("JERYU_GOVERNED_JANKURAI_BIN")
+        .env_remove("JERYU_JANKURAI_RECEIPT")
+        .env_remove("JERYU_JANKURAI_RECEIPT_SHA256")
+        .env_remove("JERYU_JANKURAI_ALLOW_TEST_RECEIPT");
+    if let Some(path) = governed_override {
+        command.env("JERYU_GOVERNED_JANKURAI_BIN", path);
+    }
+    if let Some(path) = receipt_override {
+        command.env("JERYU_JANKURAI_RECEIPT", path);
+    }
+    if allow_test_receipt {
+        command.env("JERYU_JANKURAI_ALLOW_TEST_RECEIPT", "1");
+    }
     scrub_git_config_env(&mut command);
     command.output().expect("run CI library in a login shell")
+}
+
+fn sha256_file(path: &Path) -> String {
+    let output = Command::new("sha256sum")
+        .arg(path)
+        .output()
+        .expect("run sha256sum");
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8(output.stdout)
+        .expect("UTF-8 sha256sum output")
+        .split_whitespace()
+        .next()
+        .expect("SHA-256 field")
+        .to_owned()
 }
 
 #[test]
@@ -314,28 +351,29 @@ fn source_helper_rejects_unsafe_caller_configs_and_scrubs_injections() {
 }
 
 #[test]
-fn login_shell_proof_replay_uses_only_the_pinned_jankurai_binary() {
+fn login_shell_proof_replay_uses_only_the_governed_jankurai_binary() {
     let scratch = Scratch::new();
-    let cargo_home = scratch.0.join("cargo-home");
-    let pinned = cargo_home.join("bin/jankurai");
-    let pinned_marker = scratch.0.join("pinned-ran");
     let hostile_bin = scratch.0.join("hostile-bin");
     let hostile = hostile_bin.join("jankurai");
     let hostile_marker = scratch.0.join("hostile-ran");
-    write_fake_jankurai(&pinned, "jankurai 1.6.10", &pinned_marker, 0o755);
     write_fake_jankurai(&hostile, "jankurai 99.0.0", &hostile_marker, 0o755);
 
-    let output = run_library_jankurai(&cargo_home, &hostile_bin);
+    let output = run_library_jankurai(&hostile_bin, None, None, false);
     assert!(
         output.status.success(),
-        "pinned Jankurai was not selected: {}",
+        "governed Jankurai was not selected: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8 Jankurai version"),
-        "jankurai 1.6.10\n"
+        format!(
+            "command=jankurai\nfile={GOVERNED_JANKURAI}\nversion={GOVERNED_JANKURAI_VERSION}\n"
+        )
     );
-    assert!(pinned_marker.is_file(), "pinned Jankurai did not run");
+    assert_eq!(
+        sha256_file(Path::new(GOVERNED_JANKURAI)),
+        GOVERNED_JANKURAI_SHA256
+    );
     assert!(
         !hostile_marker.exists(),
         "an earlier PATH Jankurai was executed"
@@ -343,7 +381,7 @@ fn login_shell_proof_replay_uses_only_the_pinned_jankurai_binary() {
 }
 
 #[test]
-fn pinned_jankurai_custody_and_version_fail_closed() {
+fn governed_jankurai_custody_identity_and_receipt_fail_closed() {
     let scratch = Scratch::new();
     let hostile_bin = scratch.0.join("hostile-bin");
     let hostile_marker = scratch.0.join("hostile-ran");
@@ -354,93 +392,125 @@ fn pinned_jankurai_custody_and_version_fail_closed() {
         0o755,
     );
 
-    let missing_home = scratch.0.join("missing-home");
-    let missing = run_library_jankurai(&missing_home, &hostile_bin);
+    let missing = scratch.0.join("missing-jankurai");
+    let missing_result = run_library_jankurai(&hostile_bin, Some(&missing), None, false);
     assert!(
-        !missing.status.success(),
-        "missing pinned binary was accepted"
+        !missing_result.status.success(),
+        "missing governed binary was accepted"
     );
 
-    let symlink_home = scratch.0.join("symlink-home");
     let symlink_target = scratch.0.join("symlink-target");
     write_fake_jankurai(
         &symlink_target,
-        "jankurai 1.6.10",
+        GOVERNED_JANKURAI_VERSION,
         &scratch.0.join("symlink-ran"),
         0o755,
     );
-    fs::create_dir_all(symlink_home.join("bin")).expect("create symlink bin directory");
-    symlink(&symlink_target, symlink_home.join("bin/jankurai")).expect("create Jankurai symlink");
+    let symlink_path = scratch.0.join("symlink-jankurai");
+    symlink(&symlink_target, &symlink_path).expect("create Jankurai symlink");
     assert!(
-        !run_library_jankurai(&symlink_home, &hostile_bin)
+        !run_library_jankurai(&hostile_bin, Some(&symlink_path), None, false)
             .status
             .success(),
-        "symlinked pinned binary was accepted"
+        "symlinked governed binary was accepted"
     );
 
     let symlink_parent_target = scratch.0.join("symlink-parent-target");
     write_fake_jankurai(
         &symlink_parent_target.join("bin/jankurai"),
-        "jankurai 1.6.10",
+        GOVERNED_JANKURAI_VERSION,
         &scratch.0.join("symlink-parent-ran"),
         0o755,
     );
     let symlink_parent_home = scratch.0.join("symlink-parent-home");
     symlink(&symlink_parent_target, &symlink_parent_home).expect("create Jankurai parent symlink");
     assert!(
-        !run_library_jankurai(&symlink_parent_home, &hostile_bin)
-            .status
-            .success(),
-        "pinned binary beneath a symlinked parent was accepted"
+        !run_library_jankurai(
+            &hostile_bin,
+            Some(&symlink_parent_home.join("bin/jankurai")),
+            None,
+            false,
+        )
+        .status
+        .success(),
+        "governed binary beneath a symlinked parent was accepted"
     );
 
-    let hardlink_home = scratch.0.join("hardlink-home");
-    let hardlink_source = scratch.0.join("hardlink-source");
-    write_fake_jankurai(
-        &hardlink_source,
-        "jankurai 1.6.10",
-        &scratch.0.join("hardlink-ran"),
-        0o755,
-    );
-    fs::create_dir_all(hardlink_home.join("bin")).expect("create hardlink bin directory");
-    fs::hard_link(&hardlink_source, hardlink_home.join("bin/jankurai"))
-        .expect("create Jankurai hardlink");
+    let hardlink_path = scratch.0.join("hardlink/jankurai");
+    fs::create_dir_all(hardlink_path.parent().expect("hardlink parent"))
+        .expect("create hardlink directory");
+    fs::copy(GOVERNED_JANKURAI, &hardlink_path).expect("copy governed Jankurai fixture");
+    let hardlink_alias = scratch.0.join("hardlink/jankurai-alias");
+    fs::hard_link(&hardlink_path, &hardlink_alias).expect("create Jankurai hardlink");
+    let hardlink_result = run_library_jankurai(&hostile_bin, Some(&hardlink_path), None, false);
     assert!(
-        !run_library_jankurai(&hardlink_home, &hostile_bin)
-            .status
-            .success(),
-        "hardlinked pinned binary was accepted"
+        !hardlink_result.status.success(),
+        "hard-linked governed binary was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&hardlink_result.stderr)
+            .contains("governed jankurai custody mismatch: expected one link"),
+        "hard-linked governed binary did not fail at custody validation: {}",
+        String::from_utf8_lossy(&hardlink_result.stderr)
     );
 
-    let non_executable_home = scratch.0.join("non-executable-home");
+    let non_executable = scratch.0.join("non-executable-jankurai");
     write_fake_jankurai(
-        &non_executable_home.join("bin/jankurai"),
-        "jankurai 1.6.10",
+        &non_executable,
+        GOVERNED_JANKURAI_VERSION,
         &scratch.0.join("non-executable-ran"),
         0o644,
     );
     assert!(
-        !run_library_jankurai(&non_executable_home, &hostile_bin)
+        !run_library_jankurai(&hostile_bin, Some(&non_executable), None, false)
             .status
             .success(),
-        "non-executable pinned binary was accepted"
+        "non-executable governed binary was accepted"
     );
 
-    let wrong_version_home = scratch.0.join("wrong-version-home");
+    let wrong_version_path = scratch.0.join("wrong-version/jankurai");
     write_fake_jankurai(
-        &wrong_version_home.join("bin/jankurai"),
-        "jankurai 1.6.11",
+        &wrong_version_path,
+        "jankurai 1.6.10",
         &scratch.0.join("wrong-version-ran"),
         0o755,
     );
-    let wrong_version = run_library_jankurai(&wrong_version_home, &hostile_bin);
+    let wrong_version = run_library_jankurai(&hostile_bin, Some(&wrong_version_path), None, false);
     assert!(
         !wrong_version.status.success(),
-        "wrong pinned version was accepted"
+        "wrong governed version was accepted"
+    );
+    let wrong_version_stderr = String::from_utf8_lossy(&wrong_version.stderr);
+    assert!(
+        wrong_version_stderr.contains("governed jankurai identity mismatch"),
+        "unexpected wrong-version failure: {wrong_version_stderr}"
+    );
+
+    let wrong_digest_path = scratch.0.join("wrong-digest/jankurai");
+    write_fake_jankurai(
+        &wrong_digest_path,
+        GOVERNED_JANKURAI_VERSION,
+        &scratch.0.join("wrong-digest-ran"),
+        0o755,
     );
     assert!(
-        String::from_utf8_lossy(&wrong_version.stderr)
-            .contains("expected jankurai 1.6.10, got jankurai 1.6.11")
+        !run_library_jankurai(&hostile_bin, Some(&wrong_digest_path), None, false)
+            .status
+            .success(),
+        "wrong governed digest was accepted"
+    );
+
+    assert!(
+        !run_library_jankurai(&hostile_bin, None, Some(Path::new("/dev/null")), false)
+            .status
+            .success(),
+        "malformed explicit receipt was accepted"
+    );
+    assert!(
+        !run_library_jankurai(&hostile_bin, None, None, true)
+            .status
+            .success(),
+        "release receipt was accepted as test-mode authority"
     );
     assert!(
         !hostile_marker.exists(),

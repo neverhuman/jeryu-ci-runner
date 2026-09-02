@@ -10,7 +10,7 @@ unique branch, and the agent works there and submits to jeryu for PR CI.
 - This repo's **prefetched build dependencies** (cargo + npm caches) so the first build
   is warm and no network is needed.
 - The agent CLIs: **Codex, Jekko, Claude**.
-- The pinned **jankurai** auditor (**1.6.10**, rev-locked) at
+- The pinned **jankurai** auditor (**1.6.11**, identity-locked) at
   `/opt/rust/cargo/bin/jankurai` — the runtime is `--network none`, so the auditor must
   ship in the image for the in-sandbox CI lanes to audit offline.
 - The **`jeryu-git` guard installed as `git`** (deny-by-default allowlist — only

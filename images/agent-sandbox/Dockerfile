@@ -41,9 +41,32 @@ RUN cargo fetch --locked || cargo fetch || true
 # inside the sandbox can never cargo-install it at session time. Bumping the pin means
 # bumping it there first, then rebuilding this image.
 FROM rust:1.95-slim-bookworm AS jankurai-build
-ARG JANKURAI_REPO=https://github.com/neverhuman/jankurai.git
-ARG JANKURAI_REV=68bd6114373cf407a930011b76669af306cb0cb1
-ARG JANKURAI_VERSION="jankurai 1.6.10"
+ARG JANKURAI_REPO="http://127.0.0.1:8787/git/jeryu/jankurai.git"
+ARG JANKURAI_REV="b88562fdb124aa86dedd70ab972e7d0d87e58be1"
+ARG JANKURAI_VERSION="jankurai 1.6.11"
+ARG JANKURAI_BUILD_CONTEXT_SHA256="889d19f86fc390b0f0cf0bd6ecb4d451c51a2d6fb328e5520e4310e7ee5dedd6"
+ARG JANKURAI_BUILD_COMMAND="cargo install --locked --offline --path /opt/jeryu/jankurai/crates/jankurai --root /opt/jeryu/out --bin jankurai"
+ARG JANKURAI_RUSTFLAGS="--remap-path-prefix=/opt/jeryu/jankurai=/jankurai-build/source --remap-path-prefix=/opt/jeryu/vendor=/jankurai-build/vendor --remap-path-prefix=/opt/jeryu/target=/jankurai-build/target --remap-path-prefix=/usr/local/cargo=/jankurai-build/cargo"
+ARG JANKURAI_BUILD_ENVIRONMENT="CARGO_NET_OFFLINE=true,HOME=/tmp,LANG=C,LC_ALL=C,SOURCE_DATE_EPOCH=0,TZ=UTC"
+ARG JANKURAI_CARGO_CONFIG_SHA256="b8982c761d62e447f2d1653c199d2d58e6b2de6c5a6f8ddba3d38e47b7f863d6"
+ARG JANKURAI_VENDOR_FILE_COUNT="14889"
+ARG JANKURAI_VENDOR_FILES_SHA256="a7e332f4495d9748ea020ae8ee37c4240f0f035059799bd3dc74497437143d99"
+ARG JANKURAI_GLIBC_VERSION="ldd (Debian GLIBC 2.36-9+deb12u14) 2.36"
+ARG JANKURAI_LINKER_VERSION="GNU ld (GNU Binutils for Debian) 2.40"
+ARG JANKURAI_BUILDER_IMAGE_ID="sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082"
+ARG JANKURAI_BUILDER_IMAGE="rust@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082"
+ARG JANKURAI_PACKAGE_PATH="crates/jankurai"
+ARG JANKURAI_BUILD_MODE="oci-vendor-locked-offline-workspace-member-v2"
+ARG JANKURAI_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+ARG JANKURAI_CARGO_VERSION="cargo 1.95.0 (f2d3ce0bd 2026-03-21)"
+ARG JANKURAI_RUSTC_VERSION="rustc 1.95.0 (59807616e 2026-04-14)"
+ARG JANKURAI_RUST_TOOLCHAIN="1.95.0"
+ARG JANKURAI_BINARY_SHA256="9e6b8857a26f6004d4c74e510e13b06d880f2e2ae0c89502698889ed690c5d6c"
+ARG JANKURAI_CARGO_LOCK_SHA256="b9acb981c326226a687d0b6703e4f7ee303148e9e1a6dda1aa03d77988820f6a"
+ARG JANKURAI_SOURCE_ARCHIVE_SHA256="903a231eca8f6a1f050953b603d5a278a1606abcdf47434eb1b45262d74068aa"
+ARG JANKURAI_SOURCE_TREE="611229e54938c0e8808896e369fd54d095d258f7"
+ARG JANKURAI_SEMVER="1.6.11"
+ARG JANKURAI_TAG="v1.6.11-deadlang-precision-split.3"
 ENV CARGO_HOME=/opt/rust/cargo
 RUN apt-get update && apt-get install -y --no-install-recommends \
       git ca-certificates \
@@ -82,7 +105,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # ops/ci/common.sh derives from CARGO_HOME (${CARGO_HOME}/bin/jankurai), so the CI lanes
 # need zero changes, and JERYU_JANKURAI_BIN pins lanes to this binary — never a bare
 # `jankurai` PATH lookup a stale build could shadow.
-ARG JANKURAI_VERSION="jankurai 1.6.10"
+ARG JANKURAI_VERSION="jankurai 1.6.11"
 COPY --from=jankurai-build /opt/rust/cargo/bin/jankurai /opt/rust/cargo/bin/jankurai
 ENV JERYU_JANKURAI_BIN=/opt/rust/cargo/bin/jankurai
 RUN /opt/rust/cargo/bin/jankurai --version | grep -qx "${JANKURAI_VERSION}"
