@@ -124,7 +124,7 @@ jankurai copy-code . --json target/jankurai/copy-code/report.json --md target/ja
 jankurai rust map . --out-dir target/jankurai/rust
 jankurai rust witness build . --out target/jankurai/rust/witness-graph.json
 jankurai rust diagnose . --out target/jankurai/rust/compile-packets.json
-jankurai security run . --out target/jankurai/security/evidence.json --script tools/security-lane.sh --strict --profile ci
+JERYU_SECURITY_NETWORK=1 jankurai security run . --out target/jankurai/security/evidence.json --script tools/security-lane.sh --strict --profile ci
 
 # Build the ratchet baseline from authenticated protected main, never from the
 # candidate. The no-local clone is exact-SHA isolation and is always removed.
@@ -204,6 +204,15 @@ jq -e --arg head "${current_head}" \
    .wrapper.strict == true and .exit_code == 0 and
    ([.commands[] | select(.status == "ran" and .exit_code == 0)] | length) >= 1' \
   target/jankurai/security/evidence.json >/dev/null
+jq -e --arg head "${current_head}" \
+  '.schema_version == "jeryu.split.security/v2" and .git_head == $head and
+   .network_dependency_checks == true and .conclusion == "success" and
+   .source_name == "jeryu-ci-runner" and
+   .source_version == "jeryu-ci-runner-v5.0.0-split.1" and
+   (["cargo-audit-0.22.1", "cargo-deny-0.19.8",
+     "hosted-dependency-sources", "syft-1.40.0-cyclonedx"] - .checks |
+     length) == 0' \
+  target/security/evidence.json >/dev/null
 jq -e '.schema_version == "1.0.0" and (.classes | type == "array")' \
   target/jankurai/copy-code/report.json >/dev/null
 jq -e '.schema_version == "1.0.0" and (.nodes | type == "array") and
@@ -242,6 +251,8 @@ jq -n \
   --arg evidence_index_sha256 "$(sha256sum target/jankurai/evidence-index.json | awk '{print $1}')" \
   --arg verification_sha256 "$(sha256sum target/jankurai/proof-verification.json | awk '{print $1}')" \
   --arg security_sha256 "$(sha256sum target/jankurai/security/evidence.json | awk '{print $1}')" \
+  --arg supply_chain_sha256 "$(sha256sum target/security/evidence.json | awk '{print $1}')" \
+  --arg sbom_sha256 "$(sha256sum target/security/sbom.cdx.json | awk '{print $1}')" \
   --arg baseline_sha256 "${baseline_sha256}" \
   --argjson changed_count "${#changed_paths[@]}" \
   --argjson receipt_count "$(jq -er '.receipts | length' target/jankurai/evidence-index.json)" \
@@ -252,6 +263,7 @@ jq -n \
     receipt_count:$receipt_count,receipt_dir:$receipt_dir,
     proof_plan_sha256:$plan_sha256,evidence_index_sha256:$evidence_index_sha256,
     proof_verification_sha256:$verification_sha256,security_sha256:$security_sha256,
+    supply_chain_sha256:$supply_chain_sha256,sbom_sha256:$sbom_sha256,
     baseline_score:$baseline_score,baseline_sha256:$baseline_sha256,
     proof_verification:"valid",proofmark_mode:"advisory",
     proofmark_review_obligations:$proofmark_review,
