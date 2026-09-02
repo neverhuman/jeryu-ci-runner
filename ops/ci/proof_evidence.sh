@@ -16,6 +16,7 @@ if [[ ! -f "${candidate_policy}" || -L "${candidate_policy}" ||
   printf 'candidate audit policy must be a canonical one-link regular file\n' >&2
   exit 1
 fi
+effective_floor="$(audit_effective_floor "${candidate_policy}")"
 
 BASE_REF="${JERYU_JANKURAI_BASE_REF:-origin/main}"
 if [[ "${BASE_REF}" != origin/main ]]; then
@@ -156,38 +157,6 @@ baseline_signal() {
   exit "${exit_code}"
 }
 
-policy_floor() {
-  awk -F '=' '
-    /^[[:space:]]*minimum_score[[:space:]]*=/ {
-      count += 1
-      value = $2
-      sub(/[[:space:]]*#.*/, "", value)
-      gsub(/[[:space:]]/, "", value)
-      if (value !~ /^[0-9]+$/) exit 2
-      floor = value
-    }
-    END {
-      if (count != 1) exit 3
-      print floor
-    }
-  ' "$1"
-}
-
-policy_semantics_sha256() {
-  awk '
-    /^[[:space:]]*#/ { next }
-    /^[[:space:]]*$/ { next }
-    /^[[:space:]]*minimum_score[[:space:]]*=/ {
-      print "minimum_score=<ratchet-floor>"
-      next
-    }
-    {
-      sub(/[[:space:]]+$/, "")
-      print
-    }
-  ' "$1" | sha256sum | awk '{print $1}'
-}
-
 trap cleanup_baseline EXIT
 trap 'baseline_signal 129' HUP
 trap 'baseline_signal 130' INT
@@ -209,30 +178,17 @@ if [[ ! -f "${baseline_policy}" || -L "${baseline_policy}" ||
   printf 'protected-main audit policy must be a canonical one-link regular file\n' >&2
   exit 1
 fi
-candidate_floor="$(policy_floor "${candidate_policy}")" || {
-  printf 'candidate audit policy must contain one integer minimum_score\n' >&2
-  exit 1
-}
-baseline_floor="$(policy_floor "${baseline_policy}")" || {
-  printf 'protected-main audit policy must contain one integer minimum_score\n' >&2
-  exit 1
-}
-if (( candidate_floor < 91 || candidate_floor < baseline_floor )); then
-  printf 'candidate audit floor regressed: candidate=%s protected-main=%s\n' \
-    "${candidate_floor}" "${baseline_floor}" >&2
-  exit 1
-fi
-if [[ "$(policy_semantics_sha256 "${candidate_policy}")" != \
-      "$(policy_semantics_sha256 "${baseline_policy}")" ]]; then
-  printf 'audit policy changed outside comments and minimum_score\n' >&2
+if [[ "$(sha256sum "${candidate_policy}" | awk '{print $1}')" != \
+      "$(sha256sum "${baseline_policy}" | awk '{print $1}')" ]]; then
+  printf 'candidate audit policy must be byte-identical to protected main\n' >&2
   exit 1
 fi
 (
   cd "${baseline_parent}/repo"
   mkdir -p .jankurai
   jankurai audit . --mode advisory --json .jankurai/repo-score.json \
-    --md .jankurai/repo-score.md --policy "${candidate_policy}" --full \
-    --no-score-history
+    --md .jankurai/repo-score.md \
+    --fail-under "${effective_floor}" --full --no-score-history
 )
 cp "${baseline_parent}/repo/.jankurai/repo-score.json" \
   target/jankurai/accepted-baseline.json
@@ -245,11 +201,20 @@ cleanup_baseline
 
 short_base="${base_commit:0:7}"
 jq -e --arg base "${short_base}" \
+  --argjson floor "${effective_floor}" \
   '.git.head == $base and .git.dirty_worktree == false and
-   (.score | type == "number") and .decision.passed == true' \
+   (.score | type == "number") and .decision.minimum_score == $floor and
+   .decision.hard_findings == 0 and (.caps_applied | length) == 0 and
+   .decision.passed == true' \
   target/jankurai/accepted-baseline.json >/dev/null
 
-jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --policy agent/audit-policy.toml --repair-queue-jsonl target/jankurai/repair-queue.jsonl --full --no-score-history
+jankurai audit . --mode ratchet \
+  --baseline target/jankurai/accepted-baseline.json \
+  --json target/jankurai/repo-score.json \
+  --md target/jankurai/repo-score.md \
+  --fail-under "${effective_floor}" \
+  --repair-queue-jsonl target/jankurai/repair-queue.jsonl \
+  --full --no-score-history
 
 short_head="${current_head:0:7}"
 jq -e --arg head "${short_head}" --argjson changed "${expected_changed}" \
@@ -290,10 +255,17 @@ jq -e '.schema_version == "1.0.0" and (.nodes | type == "array") and
 jq -e \
   --arg head "${short_head}" \
   --argjson baseline_score "${baseline_score}" \
+  --argjson floor "${effective_floor}" \
   '.git.head == $head and .git.dirty_worktree == false and
-   .score >= 91 and (.caps_applied | length) == 0 and
+   .score >= $floor and .decision.minimum_score == $floor and
+   (.caps_applied | length) == 0 and
    .decision.hard_findings == 0 and .decision.passed == true and
-   .decision.ratchet.baseline_score == $baseline_score' \
+   .decision.ratchet.baseline_score == $baseline_score and
+   .decision.ratchet.score_delta >= 0 and
+   (.decision.ratchet.new_caps | length) == 0 and
+   (.decision.ratchet.new_hard_findings | length) == 0 and
+   .decision.ratchet.policy_changed == false and
+   .decision.ratchet.passed == true' \
   .jankurai/repo-score.json >/dev/null
 cp .jankurai/repo-score.json target/jankurai/repo-score.json
 cp .jankurai/repo-score.md target/jankurai/repo-score.md

@@ -10,6 +10,40 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hosted-git-env.sh"
 # process put the pinned Cargo bin first. Keep every library consumer bound to
 # the repository's pinned Cargo installation instead.
 readonly JERYU_JANKURAI_BIN="${CARGO_HOME:-${HOME}/.cargo}/bin/jankurai"
+# Jankurai 1.6.10 fingerprints the repository policy even when --fail-under
+# supplies a stricter run-local threshold. Keep the fleet floor centralized so
+# candidate and protected-main ratchet reports receive the identical override.
+readonly JERYU_FLEET_MINIMUM_SCORE=91
+
+audit_effective_floor() {
+  local policy_path="$1"
+  local configured_floor
+  configured_floor="$({
+    awk -F '=' '
+      /^[[:space:]]*minimum_score[[:space:]]*=/ {
+        count += 1
+        value = $2
+        sub(/[[:space:]]*#.*/, "", value)
+        gsub(/[[:space:]]/, "", value)
+        if (value !~ /^[0-9]+$/) exit 2
+        floor = value
+      }
+      END {
+        if (count != 1) exit 3
+        print floor
+      }
+    ' "${policy_path}"
+  })" || {
+    printf 'audit policy must contain one integer minimum_score: %s\n' \
+      "${policy_path}" >&2
+    return 1
+  }
+  if (( configured_floor > JERYU_FLEET_MINIMUM_SCORE )); then
+    printf '%s\n' "${configured_floor}"
+  else
+    printf '%s\n' "${JERYU_FLEET_MINIMUM_SCORE}"
+  fi
+}
 
 validate_jankurai_binary() {
   local physical
