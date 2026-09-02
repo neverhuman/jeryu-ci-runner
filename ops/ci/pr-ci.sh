@@ -19,9 +19,10 @@ fi
 export JERYU_CI_JOBS="$JOBS"
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$JOBS}"
 
-# The pinned jankurai 1.6.10 lives in ~/.cargo/bin; ~/.local/bin shadows it with
-# 1.5.1 on this host. Resolve the pinned auditor first so audit semantics cannot
-# drift mid-lane (see ops/ci/ensure-jankurai.sh).
+# The pinned Jankurai 1.6.10 lives in ~/.cargo/bin. Other host installations
+# may appear earlier on PATH, so resolve the pinned auditor first; scripts that
+# source lib.sh additionally invoke its physical path so login-shell proof
+# replay cannot change audit semantics (see ops/ci/ensure-jankurai.sh).
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 
 # jankurai pin: jeryu-tool/tool-manifest.toml is the family-wide source of truth.

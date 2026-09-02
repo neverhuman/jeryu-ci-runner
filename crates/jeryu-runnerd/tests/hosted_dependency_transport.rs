@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -122,6 +122,41 @@ fn source_helper(helper: &Path, global: &Path, body: &str) -> Output {
         .env("GIT_CONFIG_GLOBAL", global);
     scrub_git_config_env(&mut command);
     command.output().expect("run hosted Git environment helper")
+}
+
+fn write_fake_jankurai(path: &Path, version: &str, marker: &Path, mode: u32) {
+    fs::create_dir_all(path.parent().expect("fake Jankurai parent"))
+        .expect("create fake Jankurai bin directory");
+    fs::write(
+        path,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' '{version}'\nprintf ran > '{}'\n",
+            marker.display()
+        ),
+    )
+    .expect("write fake Jankurai");
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).expect("set fake Jankurai mode");
+}
+
+fn run_library_jankurai(cargo_home: &Path, earlier_path: &Path) -> Output {
+    let root = root();
+    let mut command = Command::new("bash");
+    command
+        .args([
+            "-lc",
+            "export PATH=\"$2:$PATH\"; cd \"$1\"; source ops/ci/lib.sh; require_jankurai; jankurai --version",
+            "_",
+            root.to_str().expect("UTF-8 workspace root"),
+            earlier_path.to_str().expect("UTF-8 hostile PATH"),
+        ])
+        .env("CARGO_HOME", cargo_home)
+        .env("JERYU_JANKURAI_BIN", earlier_path.join("jankurai"))
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            root.join(".cargo/hosted-gitconfig"),
+        );
+    scrub_git_config_env(&mut command);
+    command.output().expect("run CI library in a login shell")
 }
 
 #[test]
@@ -275,5 +310,140 @@ fn source_helper_rejects_unsafe_caller_configs_and_scrubs_injections() {
         scrubbed.status.success(),
         "Git config injection was not scrubbed: {}",
         String::from_utf8_lossy(&scrubbed.stderr)
+    );
+}
+
+#[test]
+fn login_shell_proof_replay_uses_only_the_pinned_jankurai_binary() {
+    let scratch = Scratch::new();
+    let cargo_home = scratch.0.join("cargo-home");
+    let pinned = cargo_home.join("bin/jankurai");
+    let pinned_marker = scratch.0.join("pinned-ran");
+    let hostile_bin = scratch.0.join("hostile-bin");
+    let hostile = hostile_bin.join("jankurai");
+    let hostile_marker = scratch.0.join("hostile-ran");
+    write_fake_jankurai(&pinned, "jankurai 1.6.10", &pinned_marker, 0o755);
+    write_fake_jankurai(&hostile, "jankurai 99.0.0", &hostile_marker, 0o755);
+
+    let output = run_library_jankurai(&cargo_home, &hostile_bin);
+    assert!(
+        output.status.success(),
+        "pinned Jankurai was not selected: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("UTF-8 Jankurai version"),
+        "jankurai 1.6.10\n"
+    );
+    assert!(pinned_marker.is_file(), "pinned Jankurai did not run");
+    assert!(
+        !hostile_marker.exists(),
+        "an earlier PATH Jankurai was executed"
+    );
+}
+
+#[test]
+fn pinned_jankurai_custody_and_version_fail_closed() {
+    let scratch = Scratch::new();
+    let hostile_bin = scratch.0.join("hostile-bin");
+    let hostile_marker = scratch.0.join("hostile-ran");
+    write_fake_jankurai(
+        &hostile_bin.join("jankurai"),
+        "jankurai 99.0.0",
+        &hostile_marker,
+        0o755,
+    );
+
+    let missing_home = scratch.0.join("missing-home");
+    let missing = run_library_jankurai(&missing_home, &hostile_bin);
+    assert!(
+        !missing.status.success(),
+        "missing pinned binary was accepted"
+    );
+
+    let symlink_home = scratch.0.join("symlink-home");
+    let symlink_target = scratch.0.join("symlink-target");
+    write_fake_jankurai(
+        &symlink_target,
+        "jankurai 1.6.10",
+        &scratch.0.join("symlink-ran"),
+        0o755,
+    );
+    fs::create_dir_all(symlink_home.join("bin")).expect("create symlink bin directory");
+    symlink(&symlink_target, symlink_home.join("bin/jankurai")).expect("create Jankurai symlink");
+    assert!(
+        !run_library_jankurai(&symlink_home, &hostile_bin)
+            .status
+            .success(),
+        "symlinked pinned binary was accepted"
+    );
+
+    let symlink_parent_target = scratch.0.join("symlink-parent-target");
+    write_fake_jankurai(
+        &symlink_parent_target.join("bin/jankurai"),
+        "jankurai 1.6.10",
+        &scratch.0.join("symlink-parent-ran"),
+        0o755,
+    );
+    let symlink_parent_home = scratch.0.join("symlink-parent-home");
+    symlink(&symlink_parent_target, &symlink_parent_home).expect("create Jankurai parent symlink");
+    assert!(
+        !run_library_jankurai(&symlink_parent_home, &hostile_bin)
+            .status
+            .success(),
+        "pinned binary beneath a symlinked parent was accepted"
+    );
+
+    let hardlink_home = scratch.0.join("hardlink-home");
+    let hardlink_source = scratch.0.join("hardlink-source");
+    write_fake_jankurai(
+        &hardlink_source,
+        "jankurai 1.6.10",
+        &scratch.0.join("hardlink-ran"),
+        0o755,
+    );
+    fs::create_dir_all(hardlink_home.join("bin")).expect("create hardlink bin directory");
+    fs::hard_link(&hardlink_source, hardlink_home.join("bin/jankurai"))
+        .expect("create Jankurai hardlink");
+    assert!(
+        !run_library_jankurai(&hardlink_home, &hostile_bin)
+            .status
+            .success(),
+        "hardlinked pinned binary was accepted"
+    );
+
+    let non_executable_home = scratch.0.join("non-executable-home");
+    write_fake_jankurai(
+        &non_executable_home.join("bin/jankurai"),
+        "jankurai 1.6.10",
+        &scratch.0.join("non-executable-ran"),
+        0o644,
+    );
+    assert!(
+        !run_library_jankurai(&non_executable_home, &hostile_bin)
+            .status
+            .success(),
+        "non-executable pinned binary was accepted"
+    );
+
+    let wrong_version_home = scratch.0.join("wrong-version-home");
+    write_fake_jankurai(
+        &wrong_version_home.join("bin/jankurai"),
+        "jankurai 1.6.11",
+        &scratch.0.join("wrong-version-ran"),
+        0o755,
+    );
+    let wrong_version = run_library_jankurai(&wrong_version_home, &hostile_bin);
+    assert!(
+        !wrong_version.status.success(),
+        "wrong pinned version was accepted"
+    );
+    assert!(
+        String::from_utf8_lossy(&wrong_version.stderr)
+            .contains("expected jankurai 1.6.10, got jankurai 1.6.11")
+    );
+    assert!(
+        !hostile_marker.exists(),
+        "hostile PATH binary ran during a fail-closed case"
     );
 }

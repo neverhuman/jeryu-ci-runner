@@ -21,6 +21,9 @@
 - Corrected the inherited stale v4 `VERSION` byte through the next immutable
   v5 split.1 identity and bound that exact identity into CI and SBOM metadata;
   the already-published split.0 tag remains untouched.
+- Bound every CI-library Jankurai invocation to the physical pinned Cargo
+  binary, including proof commands replayed through a login shell, with hostile
+  custody, version, and PATH-shadowing regression coverage.
 
 ## jeryu-ci-runner-v5.0.0-split.0 - 2026-06-11
 - MAJOR: first standalone split-family release; the legacy monorepo
