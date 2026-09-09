@@ -7,8 +7,8 @@ use jeryu_runner_core::policy::PolicyDecision;
 use jeryu_runner_core::receipt::{Receipt, ReceiptStatus, now_ms};
 use jeryu_runner_core::sandbox::SandboxPlan;
 use jeryu_sandbox_linux::capability::SandboxCapabilities;
-use jeryu_sandbox_linux::launch::spawn_sandboxed;
-use jeryu_sandbox_linux::watchdog::run_with_watchdog;
+use jeryu_sandbox_linux::launch::spawn_sandboxed_owned;
+use jeryu_sandbox_linux::watchdog::{TerminationScope, WatchdogOptions, run_owned_with_watchdog};
 use std::fs;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -33,10 +33,10 @@ impl NativeRunner {
     /// Execute a job under the REAL native syscall sandbox.
     ///
     /// The pipeline is: probe host capabilities once (cached) -> validate the
-    /// plan -> resolve the enforcement level -> `spawn_sandboxed` (applies
+    /// plan -> resolve the enforcement level -> `spawn_sandboxed_owned` (applies
     /// `PR_SET_NO_NEW_PRIVS`, cgroups, Landlock, seccomp, namespaces via
-    /// `pre_exec`, FAIL-CLOSED) -> `run_with_watchdog` (group-kill on timeout)
-    /// -> `verify_enforcement` (prove enforcement from `/proc/<pid>/status`).
+    /// `pre_exec`, FAIL-CLOSED) -> `verify_enforcement` while the child is live
+    /// -> bounded output/cancellation supervision and verified cleanup.
     ///
     /// Enforcement state is first-class and honest: when the host degrades a
     /// primitive (e.g. unprivileged user namespaces are blocked, or cgroup
@@ -50,8 +50,35 @@ impl NativeRunner {
         decision: &PolicyDecision,
         plan: &SandboxPlan,
     ) -> RunnerResult<Receipt> {
+        self.execute_with_options(job, decision, plan, WatchdogOptions::default())
+    }
+
+    /// Execute with bounded capture, private spools and cooperative cancellation.
+    /// Options are validated before spawn. Cancellation and output overflow use
+    /// the existing failed status; no wire-protocol variant is introduced.
+    pub fn execute_with_options(
+        &self,
+        job: &JobRequest,
+        decision: &PolicyDecision,
+        plan: &SandboxPlan,
+        options: WatchdogOptions,
+    ) -> RunnerResult<Receipt> {
         job.validate()?;
         validate_native_plan(job, plan)?;
+        options.capture.validate()?;
+        if options.cancellation.is_cancelled() {
+            let now = now_ms();
+            return Ok(Receipt::new(
+                job,
+                decision,
+                plan,
+                ReceiptStatus::Failed,
+                None,
+                now,
+                now,
+                "cancelled before sandbox launch",
+            ));
+        }
         fs::create_dir_all(&job.workspace)?;
 
         let caps = cached_capabilities();
@@ -59,7 +86,7 @@ impl NativeRunner {
         let env = sanitized_native_env(job, plan);
 
         let started = now_ms();
-        let child = match spawn_sandboxed(job, plan, caps, &env) {
+        let child = match spawn_sandboxed_owned(job, plan, caps, &env) {
             Ok(child) => child,
             Err(err) => {
                 let finished = now_ms();
@@ -83,7 +110,7 @@ impl NativeRunner {
 
         let timeout = Duration::from_millis(job.timeout_ms.max(1));
         let finished;
-        let result = match run_with_watchdog(child, timeout) {
+        let result = match run_owned_with_watchdog(child, timeout, options) {
             Ok(outcome) => {
                 finished = now_ms();
                 outcome
@@ -103,7 +130,9 @@ impl NativeRunner {
             }
         };
 
-        let status = if result.timed_out {
+        let status = if result.cancelled || result.output_limit_exceeded {
+            ReceiptStatus::Failed
+        } else if result.timed_out {
             ReceiptStatus::TimedOut
         } else if result.exit_code == Some(0) {
             ReceiptStatus::Passed
@@ -113,6 +142,12 @@ impl NativeRunner {
 
         let mut message = summarize_output(&result.stdout, &result.stderr);
         message.push_str(&format!(" enforcement={}", enforcement_summary(&report)));
+        let scope = match result.termination_scope {
+            TerminationScope::OwnedCgroup => "owned-cgroup",
+            TerminationScope::ProcessGroup => "process-group-only",
+        };
+        message.push_str(&format!(" termination_scope={scope} cancelled={} output_limit_exceeded={} stdout_digest={} stderr_digest={}",
+            result.cancelled, result.output_limit_exceeded, result.stdout_sha256, result.stderr_sha256));
         if result.timed_out {
             message.push_str(&format!(
                 " timed_out_after_ms={}",
@@ -196,7 +231,11 @@ fn summarize_output(stdout: &[u8], stderr: &[u8]) -> String {
 fn lossy_limit(bytes: &[u8], limit: usize) -> String {
     let mut value = String::from_utf8_lossy(bytes).to_string();
     if value.len() > limit {
-        value.truncate(limit);
+        let mut boundary = limit;
+        while !value.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        value.truncate(boundary);
         value.push_str("...[truncated]");
     }
     value
@@ -229,6 +268,84 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static EXECUTION_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn output_summary_handles_multibyte_boundary_and_invalid_utf8() {
+        let input = "€".repeat(2000);
+        let summary = lossy_limit(input.as_bytes(), 4096);
+        assert!(summary.ends_with("...[truncated]"));
+        assert!(summary.len() <= 4096 + "...[truncated]".len());
+        assert!(lossy_limit(&[0xff; 4097], 4096).ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn cancellation_before_launch_uses_failed_status_without_running_command() {
+        let workspace = temp_dir();
+        let job = JobRequest {
+            job_id: "cancelled".into(),
+            repo_id: "repo".into(),
+            commit_sha: "abc".into(),
+            workspace: workspace.clone(),
+            command: "/bin/false".into(),
+            args: Vec::new(),
+            env: Default::default(),
+            trust_tier: TrustTier::T1ProtectedInternal,
+            requested_runner: None,
+            network_policy: NetworkPolicy::Deny,
+            secret_policy: SecretPolicy::Default,
+            token_policy: TokenPolicy::ReadOnly,
+            timeout_ms: 1000,
+            fork: false,
+        };
+        let decision = select_runner(&job).unwrap();
+        let plan = SandboxPlan::from_decision(&job.workspace, &decision);
+        let options = WatchdogOptions::default();
+        options.cancellation.cancel();
+        let receipt = NativeRunner::new()
+            .execute_with_options(&job, &decision, &plan, options)
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Failed);
+        assert_eq!(receipt.exit_code, None);
+        assert!(receipt.message.contains("cancelled before sandbox launch"));
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn successful_exit_with_output_overflow_receipts_failure() {
+        let _guard = EXECUTION_GUARD.lock().unwrap();
+        let workspace = temp_dir();
+        let job = JobRequest {
+            job_id: "overflow".into(),
+            repo_id: "repo".into(),
+            commit_sha: "abc".into(),
+            workspace: workspace.clone(),
+            command: "/bin/echo".into(),
+            args: vec!["too much output".into()],
+            env: Default::default(),
+            trust_tier: TrustTier::T1ProtectedInternal,
+            requested_runner: None,
+            network_policy: NetworkPolicy::Deny,
+            secret_policy: SecretPolicy::Default,
+            token_policy: TokenPolicy::ReadOnly,
+            timeout_ms: 1000,
+            fork: false,
+        };
+        let decision = select_runner(&job).unwrap();
+        let plan = SandboxPlan::from_decision(&job.workspace, &decision);
+        let mut options = WatchdogOptions::default();
+        options.capture.max_bytes_per_stream = 4;
+        let receipt = NativeRunner::new()
+            .execute_with_options(&job, &decision, &plan, options)
+            .unwrap();
+        assert_eq!(receipt.status, ReceiptStatus::Failed);
+        assert!(
+            receipt.message.contains("output_limit_exceeded=true"),
+            "{}",
+            receipt.message
+        );
+        assert!(receipt.message.contains("termination_scope="));
+        fs::remove_dir(workspace).unwrap();
+    }
 
     fn temp_dir() -> PathBuf {
         static COUNTER: AtomicU64 = AtomicU64::new(0);

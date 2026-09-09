@@ -150,3 +150,141 @@ fn watchdog_kills_runaway_under_sandbox() {
 
     let _ = std::fs::remove_dir_all(&ws);
 }
+
+fn cgroup_test_capabilities(parent: std::path::PathBuf) -> SandboxCapabilities {
+    // This fixture selects only cgroup and no_new_privs. The launch performs
+    // their real syscalls; the other primitives are explicitly not qualified
+    // by the two cgroup lifecycle cases below.
+    SandboxCapabilities {
+        user_namespace: false,
+        mount_namespace: false,
+        pid_namespace: false,
+        landlock_abi: None,
+        seccomp_bpf: false,
+        cgroup_v2_subtree: Some(parent),
+        no_new_privs: true,
+    }
+}
+
+#[test]
+fn owned_launch_refuses_fake_cgroup_before_executing_job() {
+    use jeryu_sandbox_linux::launch::spawn_sandboxed_owned;
+    let ws = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let j = job(
+        ws.path().to_owned(),
+        "/bin/sh",
+        vec!["-c".into(), "touch executed".into()],
+    );
+    let decision = select_runner(&j).unwrap();
+    let plan = SandboxPlan::from_decision(&j.workspace, &decision);
+    let result = spawn_sandboxed_owned(
+        &j,
+        &plan,
+        &cgroup_test_capabilities(parent.path().to_owned()),
+        &sandbox_env(),
+    );
+    let error = result
+        .err()
+        .expect("ordinary files cannot provide cgroup custody");
+    assert_eq!(error.code(), "cgroup_control_failed");
+    assert!(!ws.path().join("executed").exists());
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 0);
+}
+
+#[test]
+#[ignore = "requires an allocated, exclusive delegated JERYU_TEST_CGROUP_PARENT; not ordinary-host qualification"]
+fn owned_cgroup_kills_escaped_groups_and_removes_only_its_leaf() {
+    use jeryu_sandbox_linux::launch::spawn_sandboxed_owned;
+    use jeryu_sandbox_linux::watchdog::{
+        TerminationScope, WatchdogOptions, run_owned_with_watchdog,
+    };
+    let parent = std::path::PathBuf::from(
+        std::env::var_os("JERYU_TEST_CGROUP_PARENT")
+            .expect("explicit delegated test parent required"),
+    );
+    assert!(parent.is_absolute());
+    assert!(
+        !std::fs::symlink_metadata(&parent)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    for cancel in [false, true] {
+        let ws = tempfile::tempdir().unwrap();
+        let j = job(
+            ws.path().to_owned(),
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                "/usr/bin/setsid /bin/sh -c 'echo escaped:$$; exec /bin/sleep 30' & /bin/sleep 30"
+                    .into(),
+            ],
+        );
+        let decision = select_runner(&j).unwrap();
+        let mut plan = SandboxPlan::from_decision(&j.workspace, &decision);
+        plan.require_cgroup = true;
+        let child = spawn_sandboxed_owned(
+            &j,
+            &plan,
+            &cgroup_test_capabilities(parent.clone()),
+            &sandbox_env(),
+        )
+        .unwrap();
+        // Do not assert between launch and cleanup: even an observation failure
+        // must reach the watchdog and stop this test's owned processes.
+        let membership = std::fs::read_to_string(format!("/proc/{}/cgroup", child.id()));
+        let options = WatchdogOptions::default();
+        let token = options.cancellation.clone();
+        let canceller = cancel.then(|| {
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                token.cancel();
+            })
+        });
+        let timeout = if cancel {
+            Duration::from_secs(10)
+        } else {
+            Duration::from_millis(200)
+        };
+        let result = run_owned_with_watchdog(child, timeout, options);
+        if let Some(canceller) = canceller {
+            canceller.join().unwrap();
+        }
+        let out = result.unwrap();
+        let membership = membership.unwrap();
+        let relative = membership
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap();
+        let leaf = std::path::Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'));
+        assert_eq!(leaf.parent(), Some(parent.as_path()));
+        assert!(
+            leaf.file_name()
+                .unwrap()
+                .as_encoded_bytes()
+                .starts_with(b"jeryu-job-")
+        );
+        assert_eq!(out.termination_scope, TerminationScope::OwnedCgroup);
+        assert_eq!(out.cancelled, cancel);
+        assert_eq!(out.timed_out, !cancel);
+        let output = std::str::from_utf8(&out.stdout).unwrap();
+        let escaped = output
+            .lines()
+            .find_map(|line| line.strip_prefix("escaped:"))
+            .expect("escaped-group child actually executed");
+        let escaped: u32 = escaped.parse().unwrap();
+        match std::fs::read(format!("/proc/{escaped}/stat")) {
+            Ok(stat) => {
+                let end = stat.iter().rposition(|b| *b == b')').unwrap();
+                assert!(
+                    matches!(stat[end + 2], b'Z' | b'X'),
+                    "escaped group still executes"
+                );
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+        }
+        assert!(!leaf.exists(), "owned cgroup must be empty and removed");
+        assert!(parent.is_dir(), "delegated parent must remain");
+    }
+}

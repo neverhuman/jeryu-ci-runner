@@ -9,16 +9,8 @@ use super::*;
 pub(super) fn build_payload(
     plan: &SandboxPlan,
     caps: &SandboxCapabilities,
-) -> SandboxResult<SandboxPayload> {
-    let cgroup_procs = match &caps.cgroup_v2_subtree {
-        Some(parent) => Some(create_cgroup(
-            parent,
-            &plan.cgroup_limits,
-            plan.require_cgroup,
-        )?),
-        None => None,
-    };
-
+    owned: bool,
+) -> SandboxResult<(SandboxPayload, Option<CgroupControl>)> {
     let landlock = match caps.landlock_abi {
         Some(abi) if !plan.landlock_rules.is_empty() => Some(LandlockPayload {
             abi,
@@ -36,18 +28,55 @@ pub(super) fn build_payload(
         None
     };
 
-    Ok(SandboxPayload {
-        cgroup_procs,
-        apply_user_ns: plan.user_namespace && caps.user_namespace,
-        apply_mount_ns: plan.mount_namespace && caps.mount_namespace,
-        apply_pid_ns: plan.pid_namespace && caps.pid_namespace,
-        landlock,
-        seccomp_bpf,
-        pty_slave_fd: None,
-        rlimits: RlimitFallback {
-            memory_max_bytes: plan.cgroup_limits.memory_max_bytes,
+    // Finish fallible compilation before creating a managed cgroup leaf.
+    let mut cgroup = match (&caps.cgroup_v2_subtree, owned) {
+        (Some(parent), true) => Some(
+            CgroupControl::create(parent, &plan.cgroup_limits, plan.require_cgroup)
+                .map_err(|error| SandboxError::new("cgroup_control_failed", error.to_string()))?,
+        ),
+        _ => None,
+    };
+    let cgroup_procs_fd = match &mut cgroup {
+        Some(control) => match control.procs() {
+            Ok(file) => Some(file),
+            Err(error) => {
+                let cleanup = control
+                    .cleanup()
+                    .err()
+                    .map(|error| format!("; cleanup unresolved: {error}"))
+                    .unwrap_or_default();
+                return Err(SandboxError::new(
+                    "cgroup_control_failed",
+                    format!("owned_cgroup={}: {error}{cleanup}", control.label()),
+                ));
+            }
         },
-    })
+        None => None,
+    };
+    let cgroup_procs = match (&caps.cgroup_v2_subtree, owned) {
+        (Some(parent), false) => Some(create_cgroup(
+            parent,
+            &plan.cgroup_limits,
+            plan.require_cgroup,
+        )?),
+        _ => None,
+    };
+    Ok((
+        SandboxPayload {
+            cgroup_procs,
+            cgroup_procs_fd,
+            apply_user_ns: plan.user_namespace && caps.user_namespace,
+            apply_mount_ns: plan.mount_namespace && caps.mount_namespace,
+            apply_pid_ns: plan.pid_namespace && caps.pid_namespace,
+            landlock,
+            seccomp_bpf,
+            pty_slave_fd: None,
+            rlimits: RlimitFallback {
+                memory_max_bytes: plan.cgroup_limits.memory_max_bytes,
+            },
+        },
+        cgroup,
+    ))
 }
 
 /// Compile the seccomp allowlist into a BPF program in the parent (allocates),
@@ -88,7 +117,8 @@ pub(super) fn apply_in_child(payload: &SandboxPayload) -> std::io::Result<()> {
     // 1. Session / process-group setup for the watchdog's group-kill. A PTY
     //    child needs its own SESSION (setsid) to acquire a controlling tty; a
     //    piped child just needs its own process group (setpgid). Either way the
-    //    child becomes a group leader, so the watchdog's kill(-pgid) reaps it.
+    //    child becomes a group leader. Group signals cannot reach descendants
+    //    that create another group; the owned cgroup supplies that boundary.
     if payload.pty_slave_fd.is_some() {
         // SAFETY: setsid() creates a new session + process group led by this
         // process; no pointer args, no shared state, async-signal-safe.
@@ -115,6 +145,27 @@ pub(super) fn apply_in_child(payload: &SandboxPayload) -> std::io::Result<()> {
     if let Some(procs) = &payload.cgroup_procs {
         let pid = std::process::id().to_string();
         write_proc_file(procs, pid.as_bytes())?;
+    }
+    if let Some(procs) = &payload.cgroup_procs_fd {
+        // Kernel cgroup.procs accepts zero as the calling process. The already
+        // opened descriptor is tied to the parent's exact owned leaf; no path
+        // resolution, formatting or allocation is needed after fork.
+        // SAFETY: procs is live and b"0" is readable for the duration of write.
+        loop {
+            let written = unsafe { libc::write(procs.as_raw_fd(), b"0".as_ptr().cast(), 1) };
+            if written == 1 {
+                break;
+            }
+            let error = IoError::last_os_error();
+            if written == -1 && error.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(if written == -1 {
+                error
+            } else {
+                IoError::new(ErrorKind::WriteZero, "cgroup join write incomplete")
+            });
+        }
     }
 
     // 2b. setrlimit fallback (best-effort, NON-fatal): a backstop for memory and

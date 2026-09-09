@@ -589,6 +589,7 @@ dependencies = [
  "libc",
  "nix",
  "seccompiler",
+ "sha2",
  "tempfile",
 ]
 

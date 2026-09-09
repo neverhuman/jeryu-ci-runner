@@ -3,7 +3,7 @@
 //!
 //! Ordering inside the child (between `fork` and `execvp`) matters:
 //!
-//! 1. `setpgid(0, 0)` so the watchdog can group-kill the whole subtree.
+//! 1. `setpgid(0, 0)` for group-scoped signaling (descendants can leave a group).
 //! 2. join the cgroup subtree (write our pid) so limits bind before exec.
 //! 3. `PR_SET_NO_NEW_PRIVS` (always, non-negotiable).
 //! 4. unshare namespaces *only where the kernel allows* (degraded-skip here).
@@ -28,6 +28,7 @@ use pty::wire_pty_slave;
 use report::classify;
 
 use crate::capability::{EnforcementLevel, SandboxCapabilities};
+use crate::watchdog::termination::CgroupControl;
 use jeryu_runner_core::job::JobRequest;
 use jeryu_runner_core::sandbox::{LandlockRule, SandboxPlan};
 use std::collections::BTreeMap;
@@ -127,6 +128,7 @@ impl EnforcementReport {
 /// the parent BEFORE the fork; `pre_exec` only replays syscalls.
 struct SandboxPayload {
     cgroup_procs: Option<PathBuf>,
+    cgroup_procs_fd: Option<std::fs::File>,
     apply_user_ns: bool,
     apply_mount_ns: bool,
     apply_pid_ns: bool,
@@ -223,9 +225,9 @@ pub enum GroupSignal {
 }
 
 /// Deliver `signal` to the process GROUP led by `leader_pid`. The sandboxed
-/// child is a group/session leader (`setpgid`/`setsid` in `pre_exec`), so this
-/// reaps its descendants too. A failure (e.g. the group already exited) is
-/// ignored — the caller is tearing down regardless.
+/// child is a group/session leader (`setpgid`/`setsid` in `pre_exec`). This legacy
+/// helper ignores signal errors and supplies no termination or reaping proof;
+/// descendants may leave the group. The owned watchdog uses checked signaling.
 pub fn signal_group(leader_pid: u32, signal: GroupSignal) {
     let sig = match signal {
         GroupSignal::Interrupt => libc::SIGINT,
@@ -283,12 +285,48 @@ pub fn spawn_sandboxed_with_io(
     env: &BTreeMap<String, String>,
     io: ChildIo,
 ) -> SandboxResult<Child> {
+    spawn_inner(job, plan, caps, env, io, false).map(|owned| owned.child)
+}
+
+/// A live child plus its exact launch-created cgroup. Consume with
+/// `run_owned_with_watchdog`; dropping this value is not a shutdown operation.
+pub struct SupervisedChild {
+    pub(crate) child: Child,
+    pub(crate) cgroup: Option<CgroupControl>,
+}
+
+impl SupervisedChild {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+}
+
+/// Piped native launch with cgroup lifecycle custody. If a delegated cgroup is
+/// admitted, all control descriptors must open successfully before spawning.
+/// The compatibility raw-Child/PTY APIs retain their existing launch behavior.
+pub fn spawn_sandboxed_owned(
+    job: &JobRequest,
+    plan: &SandboxPlan,
+    caps: &SandboxCapabilities,
+    env: &BTreeMap<String, String>,
+) -> SandboxResult<SupervisedChild> {
+    spawn_inner(job, plan, caps, env, ChildIo::Piped, true)
+}
+
+fn spawn_inner(
+    job: &JobRequest,
+    plan: &SandboxPlan,
+    caps: &SandboxCapabilities,
+    env: &BTreeMap<String, String>,
+    io: ChildIo,
+    owned: bool,
+) -> SandboxResult<SupervisedChild> {
     let level = caps.enforcement_level(plan);
     if let EnforcementLevel::Unavailable { reason } = &level {
         return Err(SandboxError::new("sandbox_unavailable", reason.clone()));
     }
 
-    let mut payload = build_payload(plan, caps)?;
+    let (mut payload, mut cgroup) = build_payload(plan, caps, owned)?;
     let cgroup_cleanup = payload.cgroup_procs.clone();
 
     let mut cmd = Command::new(&job.command);
@@ -324,8 +362,19 @@ pub fn spawn_sandboxed_with_io(
     }
 
     match cmd.spawn() {
-        Ok(child) => Ok(child),
+        Ok(child) => Ok(SupervisedChild { child, cgroup }),
         Err(err) => {
+            if let Some(cgroup) = &mut cgroup
+                && let Err(cleanup) = cgroup.cleanup()
+            {
+                return Err(SandboxError::new(
+                    "process_start_failed",
+                    format!(
+                        "owned_cgroup={}: {err}; cgroup cleanup unresolved: {cleanup}",
+                        cgroup.label()
+                    ),
+                ));
+            }
             // Best-effort: remove the cgroup we created if exec never happened.
             if let Some(dir) = cgroup_cleanup.as_deref().and_then(std::path::Path::parent) {
                 let _ = std::fs::remove_dir(dir);

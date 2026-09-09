@@ -28,8 +28,11 @@ pub mod watchdog;
 pub use capability::{EnforcementLevel, SandboxCapabilities};
 pub use escape::{EscapeVerdict, run_in_forked_child};
 pub use launch::{
-    ChildIo, EnforcementReport, GroupSignal, SandboxError, SandboxResult, open_pty, resize_pty,
-    signal_group, spawn_command_on_pty, spawn_sandboxed, spawn_sandboxed_with_io,
-    verify_enforcement,
+    ChildIo, EnforcementReport, GroupSignal, SandboxError, SandboxResult, SupervisedChild,
+    open_pty, resize_pty, signal_group, spawn_command_on_pty, spawn_sandboxed,
+    spawn_sandboxed_owned, spawn_sandboxed_with_io, verify_enforcement,
 };
-pub use watchdog::{WatchdogOutcome, run_with_watchdog};
+pub use watchdog::{
+    Cancellation, CaptureOptions, TerminationScope, WatchdogOptions, WatchdogOutcome,
+    run_owned_with_watchdog, run_with_watchdog, run_with_watchdog_options,
+};
