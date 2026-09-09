@@ -1,128 +1,140 @@
-//! Fail-closed cgroup-v2 construction for sandboxed children.
+//! Fail-closed cgroup-v2 construction for the raw-Child compatibility path.
 
 use super::{SandboxError, SandboxResult};
+use crate::cgroup_fs::{
+    enable_memory_and_pids, open_parent, openat, remove_exact, require_cgroup2, unique_leaf_name,
+    write_control,
+};
 use jeryu_runner_core::sandbox::CgroupLimits;
-use std::path::{Path, PathBuf};
+use std::ffi::{CStr, CString};
+use std::fs::File;
+use std::io;
+use std::os::fd::AsRawFd;
+use std::path::Path;
 
-/// Create a fresh child cgroup under the delegated `parent`, enable controllers,
-/// and write the limits. Returns the path to its `cgroup.procs` (where the child
-/// writes its own pid in `pre_exec`).
+/// Only retained until spawn succeeds. The raw Child API does not transfer an
+/// owned-cgroup lifetime to its caller; this guard closes failed-launch cleanup.
+pub(super) struct CgroupCleanup {
+    parent: File,
+    directory: File,
+    name: CString,
+}
+
+impl CgroupCleanup {
+    pub(super) fn cleanup(&self) -> io::Result<()> {
+        remove_exact(&self.parent, &self.directory, &self.name)
+    }
+
+    pub(super) fn label(&self) -> String {
+        self.name.to_string_lossy().into_owned()
+    }
+}
+
+/// A cached or supplied parent must pass live controller admission. Parent,
+/// leaf, limit writes and child migration stay bound to those opened identities.
 pub(super) fn create_cgroup(
     parent: &Path,
     limits: &CgroupLimits,
     require_cgroup: bool,
-) -> SandboxResult<PathBuf> {
-    create_cgroup_with_writer(parent, limits, require_cgroup, |path, data| {
-        std::fs::write(path, data)
-    })
+) -> SandboxResult<(File, CgroupCleanup)> {
+    let parent = open_parent(parent)
+        .map_err(|error| SandboxError::new("cgroup_parent_unavailable", error.to_string()))?;
+    // An optional cgroup policy permits an absent subtree, not a partially
+    // enabled parent whose otherwise unlimited child may have invalid topology.
+    enable_memory_and_pids(&parent)
+        .map_err(|error| SandboxError::new("cgroup_controllers_unavailable", error.to_string()))?;
+    let _ = write_control(&parent, c"cgroup.subtree_control", b"+cpu");
+    let name = unique_leaf_name("jeryu-job")
+        .map_err(|error| SandboxError::new("cgroup_create_failed", error.to_string()))?;
+    // SAFETY: parent is held and name is one generated component. mkdirat is
+    // exclusive; no preexisting directory can be adopted or removed here.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(SandboxError::new(
+            "cgroup_create_failed",
+            io::Error::last_os_error().to_string(),
+        ));
+    }
+    let directory = openat(&parent, &name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(|error| {
+        SandboxError::new(
+            "cgroup_create_failed",
+            format!(
+                "owned_cgroup={}: created leaf could not be opened; cleanup unresolved: {error}",
+                name.to_string_lossy()
+            ),
+        )
+    })?;
+    let cleanup = CgroupCleanup {
+        parent,
+        directory,
+        name,
+    };
+    let setup: SandboxResult<File> = (|| {
+        require_cgroup2(&cleanup.directory)
+            .map_err(|error| SandboxError::new("cgroup_create_failed", error.to_string()))?;
+        write_limits(limits, require_cgroup, |name, data| {
+            write_control(&cleanup.directory, name, data)
+        })?;
+        let procs = openat(&cleanup.directory, c"cgroup.procs", libc::O_WRONLY)
+            .and_then(|procs| {
+                require_cgroup2(&procs)?;
+                Ok(procs)
+            })
+            .map_err(|error| SandboxError::new("cgroup_procs_unavailable", error.to_string()))?;
+        Ok(procs)
+    })();
+    match setup {
+        Ok(procs) => Ok((procs, cleanup)),
+        Err(error) => {
+            let disposition = match cleanup.cleanup() {
+                Ok(()) => "empty leaf removed".to_string(),
+                Err(error) => format!("cleanup unresolved: {error}"),
+            };
+            Err(SandboxError::new(
+                error.code(),
+                format!(
+                    "owned_cgroup={}: {}; {disposition}",
+                    cleanup.label(),
+                    error.message()
+                ),
+            ))
+        }
+    }
 }
 
-fn create_cgroup_with_writer(
-    parent: &Path,
+fn write_limits(
     limits: &CgroupLimits,
-    require_cgroup: bool,
-    write_file: impl Fn(&Path, &[u8]) -> std::io::Result<()>,
-) -> SandboxResult<PathBuf> {
-    // Ensure the parent delegates the load-bearing controllers we need to
-    // children. Strict agent plans fail closed if memory or pids delegation
-    // cannot be enabled; ordinary CI jobs keep the older best-effort posture.
-    enable_cgroup_controller(
-        parent,
-        "memory",
-        require_cgroup,
-        "cgroup_memory_controller_enable_failed",
-        &write_file,
-    )?;
-    enable_cgroup_controller(
-        parent,
-        "pids",
-        require_cgroup,
-        "cgroup_pids_controller_enable_failed",
-        &write_file,
-    )?;
-    // CPU weight remains a tuning hint; do not refuse a strict memory/pids jail
-    // merely because CPU delegation is absent.
-    let _ = write_file(&parent.join("cgroup.subtree_control"), b"+cpu");
-
-    let name = format!("jeryu-job-{}.scope", jeryu_runner_core::receipt::now_ms());
-    let dir = parent.join(name);
-    std::fs::create_dir(&dir)
-        .map_err(|err| SandboxError::new("cgroup_create_failed", err.to_string()))?;
-
-    // Best-effort for ordinary CI; mandatory for strict agent workcells.
-    if let Err(err) = write_cgroup_limit(
-        &dir,
-        "memory.max",
-        limits.memory_max_bytes.to_string().as_bytes(),
-        require_cgroup,
-        "cgroup_memory_max_write_failed",
-        &write_file,
-    ) {
-        let _ = std::fs::remove_dir(&dir);
-        return Err(err);
+    strict: bool,
+    write_file: impl Fn(&CStr, &[u8]) -> io::Result<()>,
+) -> SandboxResult<()> {
+    for (name, bytes, code) in [
+        (
+            c"memory.max",
+            limits.memory_max_bytes.to_string(),
+            "cgroup_memory_max_write_failed",
+        ),
+        (
+            c"pids.max",
+            limits.pids_max.to_string(),
+            "cgroup_pids_max_write_failed",
+        ),
+    ] {
+        if let Err(error) = write_file(name, bytes.as_bytes())
+            && strict
+        {
+            return Err(SandboxError::new(
+                code,
+                format!(
+                    "failed to write cgroup limit {}: {error}",
+                    name.to_string_lossy()
+                ),
+            ));
+        }
     }
-    if let Err(err) = write_cgroup_limit(
-        &dir,
-        "pids.max",
-        limits.pids_max.to_string().as_bytes(),
-        require_cgroup,
-        "cgroup_pids_max_write_failed",
-        &write_file,
-    ) {
-        let _ = std::fs::remove_dir(&dir);
-        return Err(err);
-    }
-    // cpu.weight in cgroup-v2 is 1..=10000; the plan uses the same scale band.
     let _ = write_file(
-        &dir.join("cpu.weight"),
+        c"cpu.weight",
         limits.cpu_weight.clamp(1, 10_000).to_string().as_bytes(),
     );
-
-    Ok(dir.join("cgroup.procs"))
-}
-
-fn enable_cgroup_controller(
-    parent: &Path,
-    controller: &'static str,
-    require_cgroup: bool,
-    strict_error_code: &'static str,
-    write_file: &impl Fn(&Path, &[u8]) -> std::io::Result<()>,
-) -> SandboxResult<()> {
-    let path = parent.join("cgroup.subtree_control");
-    let token = format!("+{controller}");
-    match write_file(&path, token.as_bytes()) {
-        Ok(()) => Ok(()),
-        Err(err) if require_cgroup => Err(SandboxError::new(
-            strict_error_code,
-            format!(
-                "failed to enable cgroup controller {controller} at {}: {err}",
-                path.display()
-            ),
-        )),
-        Err(_) => Ok(()),
-    }
-}
-
-fn write_cgroup_limit(
-    dir: &Path,
-    filename: &'static str,
-    data: &[u8],
-    require_cgroup: bool,
-    strict_error_code: &'static str,
-    write_file: &impl Fn(&Path, &[u8]) -> std::io::Result<()>,
-) -> SandboxResult<()> {
-    let path = dir.join(filename);
-    match write_file(&path, data) {
-        Ok(()) => Ok(()),
-        Err(err) if require_cgroup => Err(SandboxError::new(
-            strict_error_code,
-            format!(
-                "failed to write cgroup limit {filename} at {}: {err}",
-                path.display()
-            ),
-        )),
-        Err(_) => Ok(()),
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -138,90 +150,51 @@ mod tests {
         }
     }
 
-    fn forced_write_failure() -> std::io::Error {
-        std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
+    fn forced_write_failure() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
             "forced cgroup write failure",
         )
     }
 
     #[test]
-    fn strict_cgroup_requires_memory_controller_enable() {
-        let parent = tempfile::tempdir().expect("temp cgroup parent");
-        let err = create_cgroup_with_writer(parent.path(), &test_limits(), true, |path, data| {
-            if path.file_name().and_then(|name| name.to_str()) == Some("cgroup.subtree_control")
-                && data == b"+memory"
-            {
-                Err(forced_write_failure())
-            } else {
-                Ok(())
-            }
-        })
-        .expect_err("strict cgroup must fail closed when memory controller enable fails");
-
-        assert_eq!(err.code(), "cgroup_memory_controller_enable_failed");
-        assert!(err.message().contains("memory"));
-    }
-
-    #[test]
-    fn strict_cgroup_requires_pids_controller_enable() {
-        let parent = tempfile::tempdir().expect("temp cgroup parent");
-        let err = create_cgroup_with_writer(parent.path(), &test_limits(), true, |path, data| {
-            if path.file_name().and_then(|name| name.to_str()) == Some("cgroup.subtree_control")
-                && data == b"+pids"
-            {
-                Err(forced_write_failure())
-            } else {
-                Ok(())
-            }
-        })
-        .expect_err("strict cgroup must fail closed when pids controller enable fails");
-
-        assert_eq!(err.code(), "cgroup_pids_controller_enable_failed");
-        assert!(err.message().contains("pids"));
+    fn supplied_non_cgroup_parent_is_rejected_for_both_policies() {
+        for strict in [false, true] {
+            let parent = tempfile::tempdir().expect("temp cgroup parent");
+            let control = parent.path().join("cgroup.subtree_control");
+            std::fs::write(&control, b"memory pids\n").unwrap();
+            let result = create_cgroup(parent.path(), &test_limits(), strict);
+            let error = match result {
+                Err(error) => error,
+                Ok(_) => panic!("a claimed subtree must be an actual cgroup"),
+            };
+            assert_eq!(error.code(), "cgroup_parent_unavailable");
+            assert_eq!(std::fs::read(control).unwrap(), b"memory pids\n");
+            assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+        }
     }
 
     #[test]
     fn strict_cgroup_requires_memory_and_pids_limit_writes() {
         for (filename, expected_code) in [
-            ("memory.max", "cgroup_memory_max_write_failed"),
-            ("pids.max", "cgroup_pids_max_write_failed"),
+            (c"memory.max", "cgroup_memory_max_write_failed"),
+            (c"pids.max", "cgroup_pids_max_write_failed"),
         ] {
-            let parent = tempfile::tempdir().expect("temp cgroup parent");
-            let err =
-                create_cgroup_with_writer(parent.path(), &test_limits(), true, |path, _data| {
-                    if path.file_name().and_then(|name| name.to_str()) == Some(filename) {
-                        Err(forced_write_failure())
-                    } else {
-                        Ok(())
-                    }
-                })
-                .expect_err("strict cgroup must fail closed when load-bearing limit writes fail");
-
-            assert_eq!(err.code(), expected_code);
-            assert!(err.message().contains(filename));
-            assert!(
-                std::fs::read_dir(parent.path())
-                    .expect("read temp parent")
-                    .next()
-                    .is_none(),
-                "failed strict cgroup setup should clean up its empty child directory"
-            );
+            let error = write_limits(&test_limits(), true, |name, _| {
+                if name == filename {
+                    Err(forced_write_failure())
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("strict load-bearing limit writes must succeed");
+            assert_eq!(error.code(), expected_code);
+            assert!(error.message().contains(filename.to_str().unwrap()));
         }
     }
 
     #[test]
     fn non_strict_cgroup_limit_writes_remain_best_effort() {
-        let parent = tempfile::tempdir().expect("temp cgroup parent");
-        let procs =
-            create_cgroup_with_writer(parent.path(), &test_limits(), false, |_path, _data| {
-                Err(forced_write_failure())
-            })
-            .expect("non-strict cgroup setup keeps best-effort write behavior");
-
-        assert_eq!(
-            procs.file_name().and_then(|name| name.to_str()),
-            Some("cgroup.procs")
-        );
+        write_limits(&test_limits(), false, |_, _| Err(forced_write_failure())).unwrap();
     }
 }

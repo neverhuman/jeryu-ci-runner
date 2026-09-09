@@ -1,6 +1,6 @@
 //! Private fork-safe sandbox payload construction and child setup.
 
-use super::cgroup::create_cgroup;
+use super::cgroup::{CgroupCleanup, create_cgroup};
 use super::pty::wire_pty_slave;
 use super::*;
 
@@ -10,7 +10,7 @@ pub(super) fn build_payload(
     plan: &SandboxPlan,
     caps: &SandboxCapabilities,
     owned: bool,
-) -> SandboxResult<(SandboxPayload, Option<CgroupControl>)> {
+) -> SandboxResult<(SandboxPayload, Option<CgroupControl>, Option<CgroupCleanup>)> {
     let landlock = match caps.landlock_abi {
         Some(abi) if !plan.landlock_rules.is_empty() => Some(LandlockPayload {
             abi,
@@ -36,7 +36,7 @@ pub(super) fn build_payload(
         ),
         _ => None,
     };
-    let cgroup_procs_fd = match &mut cgroup {
+    let mut cgroup_procs_fd = match &mut cgroup {
         Some(control) => match control.procs() {
             Ok(file) => Some(file),
             Err(error) => {
@@ -53,17 +53,16 @@ pub(super) fn build_payload(
         },
         None => None,
     };
-    let cgroup_procs = match (&caps.cgroup_v2_subtree, owned) {
-        (Some(parent), false) => Some(create_cgroup(
-            parent,
-            &plan.cgroup_limits,
-            plan.require_cgroup,
-        )?),
+    let cgroup_cleanup = match (&caps.cgroup_v2_subtree, owned) {
+        (Some(parent), false) => {
+            let (procs, cleanup) = create_cgroup(parent, &plan.cgroup_limits, plan.require_cgroup)?;
+            cgroup_procs_fd = Some(procs);
+            Some(cleanup)
+        }
         _ => None,
     };
     Ok((
         SandboxPayload {
-            cgroup_procs,
             cgroup_procs_fd,
             apply_user_ns: plan.user_namespace && caps.user_namespace,
             apply_mount_ns: plan.mount_namespace && caps.mount_namespace,
@@ -76,6 +75,7 @@ pub(super) fn build_payload(
             },
         },
         cgroup,
+        cgroup_cleanup,
     ))
 }
 
@@ -142,10 +142,6 @@ pub(super) fn apply_in_child(payload: &SandboxPayload) -> std::io::Result<()> {
     // 2. Join the cgroup so limits bind before exec. Writing our pid to
     //    cgroup.procs migrates us. Failure here is fail-closed: if the plan
     //    expected cgroup enforcement and we cannot join, refuse to exec.
-    if let Some(procs) = &payload.cgroup_procs {
-        let pid = std::process::id().to_string();
-        write_proc_file(procs, pid.as_bytes())?;
-    }
     if let Some(procs) = &payload.cgroup_procs_fd {
         // Kernel cgroup.procs accepts zero as the calling process. The already
         // opened descriptor is tied to the parent's exact owned leaf; no path
@@ -329,11 +325,4 @@ fn apply_landlock(payload: &LandlockPayload) -> Result<(), String> {
 
     ruleset.restrict_self().map_err(|e| e.to_string())?;
     Ok(())
-}
-
-/// Write to a `/proc` or cgroup control file, returning a useful error.
-fn write_proc_file(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut file = std::fs::OpenOptions::new().write(true).open(path)?;
-    file.write_all(data)
 }

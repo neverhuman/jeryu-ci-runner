@@ -1,13 +1,16 @@
 //! A cgroup control belongs to one launch-created leaf, never a submitted path.
 
+use crate::cgroup_fs::{
+    enable_memory_and_pids, open_parent, openat, remove_exact, require_cgroup2, unique_leaf_name,
+    write_control,
+};
 use jeryu_runner_core::sandbox::CgroupLimits;
 use std::ffi::{CStr, CString};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
 pub(crate) struct CgroupControl {
@@ -19,68 +22,9 @@ pub(crate) struct CgroupControl {
     events: File,
 }
 
-fn openat(directory: &File, name: &CStr, flags: i32) -> io::Result<File> {
-    // SAFETY: directory and name are live, and the returned descriptor is owned.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful openat returned a new descriptor.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn require_cgroup2(file: &File) -> io::Result<()> {
-    // SAFETY: fstatfs initializes this structure through a valid pointer.
-    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut filesystem) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if filesystem.f_type != 0x6367_7270 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "expected cgroup v2",
-        ));
-    }
-    Ok(())
-}
-
-fn write_control(directory: &File, name: &CStr, bytes: &[u8]) -> io::Result<()> {
-    let mut file = openat(directory, name, libc::O_WRONLY)?;
-    require_cgroup2(&file)?;
-    file.write_all(bytes)
-}
-
-fn remove_exact(parent: &File, directory: &File, name: &CStr) -> io::Result<()> {
-    let current = openat(parent, name, libc::O_RDONLY | libc::O_DIRECTORY)?;
-    let expected = directory.metadata()?;
-    let observed = current.metadata()?;
-    if (observed.dev(), observed.ino()) != (expected.dev(), expected.ino()) {
-        return Err(io::Error::other(
-            "owned cgroup name was replaced; cleanup unresolved",
-        ));
-    }
-    // Only this leaf is removed. Kernel cgroup rmdir refuses populated groups
-    // and groups with children. No recursive deletion or path-following occurs.
-    // SAFETY: parent is held and name is a single generated component.
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
 impl CgroupControl {
     pub(crate) fn create(parent: &Path, limits: &CgroupLimits, strict: bool) -> io::Result<Self> {
-        let parent = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(parent)?;
-        require_cgroup2(&parent)?;
+        let parent = open_parent(parent)?;
         let metadata = parent.metadata()?;
         // The delegated parent belongs to this supervisor identity. Job access
         // to it must separately be denied by the execution sandbox/service.
@@ -91,21 +35,9 @@ impl CgroupControl {
                 "cgroup parent must be supervisor-owned and not writable by other users",
             ));
         }
-        for controller in [b"+memory".as_slice(), b"+pids".as_slice()] {
-            let result = write_control(&parent, c"cgroup.subtree_control", controller);
-            if strict {
-                result?;
-            }
-        }
+        enable_memory_and_pids(&parent)?;
         let _ = write_control(&parent, c"cgroup.subtree_control", b"+cpu");
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        let name = CString::new(format!(
-            "jeryu-job-{}-{}-{}.scope",
-            std::process::id(),
-            jeryu_runner_core::receipt::now_ms(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ))
-        .map_err(io::Error::other)?;
+        let name = unique_leaf_name("jeryu-job")?;
         // SAFETY: mkdirat exclusively creates one leaf under the held parent.
         if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
             return Err(io::Error::last_os_error());

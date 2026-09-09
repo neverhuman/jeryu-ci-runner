@@ -48,11 +48,34 @@ this cooperative filesystem boundary. Job confinement must separately deny
 cgroup control and migration access. `OwnedCgroup` describes the verified
 cgroup, not an installed service identity or authority qualification.
 
-The raw-Child and PTY launch APIs preserve their existing setup path. Their
+The raw-Child and PTY launch entrypoints retain their public APIs. Their
 callers do not gain the new owned-cgroup lifecycle automatically. In particular,
 AgentBridge's PTY reader join, session driver ownership, API WebState lifetime,
 service shutdown and cancellation fencing remain separate work. No worker
 daemon, server transport, publication, registration or installation is added.
+
+## Cgroup admission
+
+Every selected cgroup parent, including cached or caller-supplied capabilities,
+must be an actual cgroup-v2 directory. Probe and launch submit one combined
+`+pids +memory` request and require bounded readback containing both bare kernel
+controller names before creating a leaf. CPU enablement remains optional and
+follows that gate. An ordinary job can still run with no admitted cgroup and an
+explicit degraded report; a supplied parent that fails live admission is an
+error. The existing strict-plan policy for memory/pids limit writes is unchanged.
+
+Concurrent probes use exclusive PID/time/counter names and retain parent, leaf
+and membership descriptors. They never remove a preexisting name. The child
+writes zero through the inherited membership descriptor without allocating or
+resolving a path after fork. Interrupted writes/waits retry; successful admission
+also requires removal of the exact empty probe leaf. Unresolved cleanup emits
+its owned leaf identity. This still assumes cooperative exclusive lifecycle
+custody against same-identity directory replacement, as above.
+
+Raw-Child launches also bind parent admission, limit writes and child membership
+to opened descriptors. Failed launches remove only their exact empty leaf or
+report its unresolved identity. This does not give raw callers the owned-cgroup
+watchdog or change their process-group termination scope.
 
 ## Verification lanes
 
@@ -81,6 +104,23 @@ cancellation, and verifies the owned leaf is removed while the parent remains.
 It qualifies this cgroup lifecycle only; other sandbox primitives are explicitly
 outside that fixture. A missing or unusable delegation is outstanding runtime
 qualification, never a successful complete-tree receipt.
+
+The additional probe regression must be selected explicitly in the same kind
+of allocated parent, with the test process inside its populated supervisor
+subgroup. It proves two concurrent real migrations clean up only their own
+leaves, and that probing the populated subgroup fails without changing its
+controller state or creating a leaf:
+
+```sh
+JERYU_TEST_CGROUP_PARENT=/sys/fs/cgroup/approved-worker-test-parent \
+CARGO_BUILD_JOBS=2 cargo test --locked -p jeryu-sandbox-linux --lib \
+  capability::tests::delegated_cgroup_probe_checks_topology_and_concurrent_ownership \
+  -- --ignored --exact --nocapture
+```
+
+Until that selected execution and the existing lifecycle regression pass, their
+runtime qualification remains outstanding. This correction alone does not
+establish the cause or resolution of Deploy's intermittent `errno95` failure.
 
 Kernel semantics: [cgroup v2 control and population files](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)
 and [waitid observation without reaping](https://man7.org/linux/man-pages/man2/wait.2.html).

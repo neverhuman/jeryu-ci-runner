@@ -167,6 +167,35 @@ fn cgroup_test_capabilities(parent: std::path::PathBuf) -> SandboxCapabilities {
 }
 
 #[test]
+fn raw_launch_refuses_supplied_fake_cgroups_for_both_policies() {
+    for strict in [false, true] {
+        let ws = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let control = parent.path().join("cgroup.subtree_control");
+        std::fs::write(&control, b"memory pids\n").unwrap();
+        let request = job(
+            ws.path().to_owned(),
+            "/bin/sh",
+            vec!["-c".into(), "touch executed".into()],
+        );
+        let decision = select_runner(&request).unwrap();
+        let mut plan = SandboxPlan::from_decision(&request.workspace, &decision);
+        plan.require_cgroup = strict;
+        let error = spawn_sandboxed(
+            &request,
+            &plan,
+            &cgroup_test_capabilities(parent.path().to_owned()),
+            &sandbox_env(),
+        )
+        .expect_err("supplied capabilities cannot admit an ordinary filesystem");
+        assert_eq!(error.code(), "cgroup_parent_unavailable");
+        assert!(!ws.path().join("executed").exists());
+        assert_eq!(std::fs::read(control).unwrap(), b"memory pids\n");
+        assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
 fn owned_launch_refuses_fake_cgroup_before_executing_job() {
     use jeryu_sandbox_linux::launch::spawn_sandboxed_owned;
     let ws = tempfile::tempdir().unwrap();

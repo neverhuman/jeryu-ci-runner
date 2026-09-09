@@ -139,3 +139,112 @@ fn blocked_userns_degrades_with_named_missing() {
         other => panic!("expected degraded, got {other:?}"),
     }
 }
+
+#[test]
+fn cgroup_probe_rejects_fake_control_directory_without_creating_leaf() {
+    let parent = tempfile::tempdir().unwrap();
+    std::fs::create_dir(parent.path().join("cgroup.subtree_control")).unwrap();
+    assert!(!cgroup_subtree_is_enforceable(parent.path()));
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn cgroup_probe_rejects_regular_control_files_without_mutation() {
+    let parent = tempfile::tempdir().unwrap();
+    let control = parent.path().join("cgroup.subtree_control");
+    // Even caller-supplied bare names cannot make an ordinary filesystem a
+    // valid delegated cgroup. Actual enable/readback semantics have separate
+    // failure tests in cgroup_fs.
+    std::fs::write(&control, b"memory pids\n").unwrap();
+    assert!(!cgroup_subtree_is_enforceable(parent.path()));
+    assert_eq!(std::fs::read(&control).unwrap(), b"memory pids\n");
+    assert_eq!(std::fs::read_dir(parent.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn colliding_probe_name_preserves_existing_directory_and_bytes() {
+    let parent = tempfile::tempdir().unwrap();
+    let path = parent.path().join("existing.scope");
+    std::fs::create_dir(&path).unwrap();
+    std::fs::write(path.join("owner"), b"another probe").unwrap();
+    let parent_fd = std::fs::File::open(parent.path()).unwrap();
+    assert!(create_probe_directory(&parent_fd, c"existing.scope").is_err());
+    assert_eq!(std::fs::read(path.join("owner")).unwrap(), b"another probe");
+}
+
+#[test]
+fn simultaneous_probe_directories_have_distinct_owned_identities() {
+    use crate::cgroup_fs::{remove_exact, unique_leaf_name};
+    use std::collections::BTreeSet;
+
+    let root = tempfile::tempdir().unwrap();
+    let parent = std::fs::File::open(root.path()).unwrap();
+    let previous = root
+        .path()
+        .join(format!("jeryu-cap-probe-{}.scope", std::process::id()));
+    std::fs::create_dir(&previous).unwrap();
+    let barrier = std::sync::Barrier::new(8);
+    let leaves = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                scope.spawn(|| {
+                    let name = unique_leaf_name("jeryu-cap-probe").unwrap();
+                    let leaf = create_probe_directory(&parent, &name);
+                    barrier.wait();
+                    (name, leaf.unwrap())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let names: BTreeSet<_> = leaves.iter().map(|(name, _)| name.to_bytes()).collect();
+    assert_eq!(names.len(), 8);
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 9);
+    for (name, leaf) in leaves {
+        remove_exact(&parent, &leaf, &name).unwrap();
+    }
+    assert!(previous.is_dir());
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+#[ignore = "requires an explicitly allocated delegated cgroup parent"]
+fn delegated_cgroup_probe_checks_topology_and_concurrent_ownership() {
+    let parent = PathBuf::from(
+        std::env::var_os("JERYU_TEST_CGROUP_PARENT")
+            .expect("an explicitly delegated test parent is required"),
+    );
+    let current = PathBuf::from("/sys/fs/cgroup").join(
+        current_cgroup_rel()
+            .expect("cgroup v2 membership")
+            .trim_start_matches('/'),
+    );
+    assert!(current.starts_with(&parent) && current != parent);
+    crate::cgroup_fs::open_parent(&parent).expect("real delegated cgroup v2 parent");
+    let entries = |path: &std::path::Path| {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let before = entries(&parent);
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| cgroup_subtree_is_enforceable(&parent));
+        let b = scope.spawn(|| cgroup_subtree_is_enforceable(&parent));
+        assert!(a.join().unwrap());
+        assert!(b.join().unwrap());
+    });
+    assert_eq!(entries(&parent), before, "probe leaves must be removed");
+
+    // The allocated supervisor child contains this process. It cannot enable
+    // the domain memory controller for children while retaining its processes.
+    let control = current.join("cgroup.subtree_control");
+    let before_control = std::fs::read(&control).unwrap();
+    let before_entries = entries(&current);
+    assert!(!cgroup_subtree_is_enforceable(&current));
+    assert_eq!(std::fs::read(control).unwrap(), before_control);
+    assert_eq!(entries(&current), before_entries);
+}

@@ -20,6 +20,7 @@
 //! enforcement level degrades honestly and the escape suite emits skip-with-receipt.
 
 pub mod capability;
+mod cgroup_fs;
 pub mod escape;
 pub mod launch;
 pub mod seccomp_rules;

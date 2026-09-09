@@ -35,7 +35,7 @@ use std::collections::BTreeMap;
 use std::io::{Error as IoError, ErrorKind};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 /// Error raised when the sandbox cannot be applied or the process cannot start.
@@ -127,7 +127,6 @@ impl EnforcementReport {
 /// Compiled, fork-safe sandbox payload. Everything that allocates is built in
 /// the parent BEFORE the fork; `pre_exec` only replays syscalls.
 struct SandboxPayload {
-    cgroup_procs: Option<PathBuf>,
     cgroup_procs_fd: Option<std::fs::File>,
     apply_user_ns: bool,
     apply_mount_ns: bool,
@@ -326,8 +325,7 @@ fn spawn_inner(
         return Err(SandboxError::new("sandbox_unavailable", reason.clone()));
     }
 
-    let (mut payload, mut cgroup) = build_payload(plan, caps, owned)?;
-    let cgroup_cleanup = payload.cgroup_procs.clone();
+    let (mut payload, mut cgroup, cgroup_cleanup) = build_payload(plan, caps, owned)?;
 
     let mut cmd = Command::new(&job.command);
     cmd.args(&job.args)
@@ -375,9 +373,16 @@ fn spawn_inner(
                     ),
                 ));
             }
-            // Best-effort: remove the cgroup we created if exec never happened.
-            if let Some(dir) = cgroup_cleanup.as_deref().and_then(std::path::Path::parent) {
-                let _ = std::fs::remove_dir(dir);
+            if let Some(cleanup) = cgroup_cleanup
+                && let Err(error) = cleanup.cleanup()
+            {
+                return Err(SandboxError::new(
+                    "process_start_failed",
+                    format!(
+                        "owned_cgroup={}: {err}; cgroup cleanup unresolved: {error}",
+                        cleanup.label()
+                    ),
+                ));
             }
             Err(SandboxError::new(
                 "process_start_failed",

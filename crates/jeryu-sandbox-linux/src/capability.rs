@@ -370,40 +370,101 @@ fn cgroup_has_controllers(dir: &std::path::Path, needed: &[&str]) -> bool {
     needed.iter().all(|c| tokens.contains(c))
 }
 
-/// Prove a subtree can actually ENFORCE limits by (1) creating a leaf cgroup
-/// under it and (2) having a throwaway child migrate itself into that leaf. Only
-/// when the child's write to `cgroup.procs` succeeds do we trust the subtree:
-/// directory mode bits and a successful mkdir are NOT sufficient evidence.
+/// Require actual memory/pids delegation, then prove that a throwaway child can
+/// join an exclusively created leaf. Migration into an unlimited child alone
+/// does not establish controller enforcement.
 fn cgroup_subtree_is_enforceable(dir: &std::path::Path) -> bool {
+    use crate::cgroup_fs::{
+        enable_memory_and_pids, open_parent, openat, remove_exact, require_cgroup2,
+        unique_leaf_name,
+    };
+    use std::os::fd::AsRawFd;
+
+    let Ok(parent) = open_parent(dir) else {
+        return false;
+    };
+    if enable_memory_and_pids(&parent).is_err() {
+        return false;
+    }
+    let Ok(name) = unique_leaf_name("jeryu-cap-probe") else {
+        return false;
+    };
+    let leaf = match create_probe_directory(&parent, &name) {
+        Ok(leaf) => leaf,
+        Err(error) => {
+            eprintln!("cgroup capability probe: {error}");
+            return false;
+        }
+    };
+    let joined = openat(&leaf, c"cgroup.procs", libc::O_WRONLY)
+        .and_then(|procs| {
+            require_cgroup2(&procs)?;
+            Ok(probe_cgroup_join(procs.as_raw_fd()))
+        })
+        .unwrap_or(false);
+    // rmdir independently refuses populated groups. A failed cleanup is not
+    // successful admission, even if the child's migration was observed.
+    let removed = match remove_exact(&parent, &leaf, &name) {
+        Ok(()) => true,
+        Err(error) => {
+            eprintln!(
+                "cgroup capability probe owned_cgroup={}: cleanup unresolved: {error}",
+                name.to_string_lossy()
+            );
+            false
+        }
+    };
+    joined && removed
+}
+
+fn create_probe_directory(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> std::io::Result<std::fs::File> {
+    use crate::cgroup_fs::openat;
+    use std::os::fd::AsRawFd;
+
+    // No preexisting name is ever removed, including a prior process's leaf.
+    // SAFETY: parent is held and name is one generated component.
+    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    openat(parent, name, libc::O_RDONLY | libc::O_DIRECTORY).map_err(|error| {
+        std::io::Error::other(format!(
+            "owned_cgroup={}: created probe could not be opened; cleanup unresolved: {error}",
+            name.to_string_lossy()
+        ))
+    })
+}
+
+fn probe_cgroup_join(procs_fd: std::os::fd::RawFd) -> bool {
+    use nix::errno::Errno;
     use nix::sys::wait::{WaitStatus, waitpid};
     use nix::unistd::{ForkResult, fork};
 
-    // Ensure controllers are delegated to children before we create a leaf.
-    let _ = std::fs::write(dir.join("cgroup.subtree_control"), b"+pids +memory");
-
-    let leaf = dir.join(format!("jeryu-cap-probe-{}.scope", std::process::id()));
-    let _ = std::fs::remove_dir(&leaf);
-    if std::fs::create_dir(&leaf).is_err() {
-        return false;
-    }
-    let procs = leaf.join("cgroup.procs");
-
-    // SAFETY: child only writes its pid to cgroup.procs and _exit()s.
-    let joined = match unsafe { fork() } {
+    // SAFETY: the child only writes zero (its own PID) through the already open
+    // cgroup.procs descriptor and exits. No allocation or path lookup follows
+    // fork, which may run concurrently with another capability cache's probe.
+    match unsafe { fork() } {
         Ok(ForkResult::Child) => {
-            let ok = std::fs::write(&procs, std::process::id().to_string()).is_ok();
-            // SAFETY: _exit is async-signal-safe and ends the child immediately.
-            unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+            loop {
+                // SAFETY: the inherited fd and the one-byte buffer are live.
+                let written = unsafe { libc::write(procs_fd, b"0".as_ptr().cast(), 1) };
+                if written == -1 && Errno::last() == Errno::EINTR {
+                    continue;
+                }
+                // SAFETY: _exit is async-signal-safe and ends only this child.
+                unsafe { libc::_exit(if written == 1 { 0 } else { 1 }) };
+            }
         }
-        Ok(ForkResult::Parent { child }) => {
-            matches!(waitpid(child, None), Ok(WaitStatus::Exited(_, 0)))
-        }
+        Ok(ForkResult::Parent { child }) => loop {
+            match waitpid(child, None) {
+                Err(Errno::EINTR) => continue,
+                result => break matches!(result, Ok(WaitStatus::Exited(_, 0))),
+            }
+        },
         Err(_) => false,
-    };
-
-    // The child has exited, so the leaf is empty again and can be removed.
-    let _ = std::fs::remove_dir(&leaf);
-    joined
+    }
 }
 
 /// `PR_SET_NO_NEW_PRIVS` is process-global and irreversible, so we probe it in
