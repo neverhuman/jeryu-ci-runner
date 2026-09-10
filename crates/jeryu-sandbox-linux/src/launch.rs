@@ -131,7 +131,7 @@ struct SandboxPayload {
     apply_user_ns: bool,
     apply_mount_ns: bool,
     apply_pid_ns: bool,
-    landlock: Option<LandlockPayload>,
+    landlock: Option<OwnedFd>,
     seccomp_bpf: Option<seccompiler::BpfProgram>,
     /// Slave end of an allocated PTY to become the child's controlling terminal
     /// (stdin/stdout/stderr). `None` keeps the default piped/null stdio.
@@ -147,11 +147,6 @@ struct SandboxPayload {
 #[derive(Clone, Copy)]
 struct RlimitFallback {
     memory_max_bytes: u64,
-}
-
-struct LandlockPayload {
-    abi: i32,
-    rules: Vec<LandlockRule>,
 }
 
 /// Spawn `job`'s command under the sandbox described by `plan`, given the probed
@@ -325,7 +320,8 @@ fn spawn_inner(
         return Err(SandboxError::new("sandbox_unavailable", reason.clone()));
     }
 
-    let (mut payload, mut cgroup, cgroup_cleanup) = build_payload(plan, caps, owned)?;
+    let (mut payload, mut cgroup, cgroup_cleanup) =
+        build_payload(plan, caps, &job.workspace, owned)?;
 
     let mut cmd = Command::new(&job.command);
     cmd.args(&job.args)
@@ -350,8 +346,10 @@ fn spawn_inner(
 
     // SAFETY: the closure runs in the forked child between fork() and exec().
     // Every call inside is a direct syscall (setpgid, prctl, unshare, write,
-    // landlock_*, seccomp) or a syscall-only helper from the landlock/seccompiler
-    // crates. No parent allocator state is mutated, and any failure is returned
+    // landlock_restrict_self, seccomp) or the syscall-only seccompiler helper.
+    // Landlock construction and path lookup have already finished in the parent.
+    // Child errors retain raw errno without allocating diagnostic strings.
+    // No parent allocator state is mutated, and any failure is returned
     // as an Err which makes the spawn fail closed (the job is never exec'd with
     // a partial sandbox).
     // SAFETY: pre_exec runs the fail-closed child setup above; no shared state.
