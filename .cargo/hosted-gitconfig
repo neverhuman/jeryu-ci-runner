@@ -7,17 +7,11 @@
 [credential "https://git.neverhuman.org"]
 	helper = /home/ubuntu/.config/jeryu/bin/git-credential-neverhuman-org
 
-# The current hosted smart-HTTP service rejects Git's compressed upload-pack
-# request body. Keep this setting host-scoped until the service is repaired.
-[http "https://git.neverhuman.org"]
-	postBuffer = 1
-
-# Git 2.43 aborts (remote-curl.c "rpc->buf should be larger than
-# LARGE_PACKET_MAX") when a protocol v2 command request meets postBuffer = 1,
-# and the hosted service now advertises v2. Pin the v0 exchange, whose
-# ref advertisement needs no request body. Only this overlay's Git children see it.
-[protocol]
-	version = 0
+# No http.postBuffer here on purpose. A host-scoped postBuffer = 1 used to sit
+# in this overlay for a smart-HTTP defect the hosted service no longer has: it
+# accepts gzip upload-pack bodies. With protocol v2 advertised, that setting
+# makes Git 2.43 abort in remote-curl.c ("rpc->buf should be larger than
+# LARGE_PACKET_MAX"), so the overlay keeps Git's defaults and protocol v2.
 
 [url "https://git.neverhuman.org/git/jeryu/jeryu-core.git"]
 	insteadOf = https://github.com/neverhuman/jeryu-core.git

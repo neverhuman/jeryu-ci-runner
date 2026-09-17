@@ -212,8 +212,14 @@ fn cargo_identity_and_effective_transport_are_exact() {
     assert!(
         overlay.contains("helper = /home/ubuntu/.config/jeryu/bin/git-credential-neverhuman-org")
     );
-    assert!(overlay.contains("[http \"https://git.neverhuman.org\"]\n\tpostBuffer = 1"));
-    assert!(overlay.contains("[protocol]\n\tversion = 0"));
+    assert!(
+        !overlay.to_lowercase().contains("postbuffer"),
+        "a tiny http.postBuffer aborts Git 2.43 under protocol v2"
+    );
+    assert!(
+        !overlay.contains("[protocol]"),
+        "the overlay must not pin a Git protocol version"
+    );
     assert_eq!(effective_url(&overlay_path, SOURCE), HOSTED);
 
     let pin_policy =

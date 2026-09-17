@@ -76,12 +76,12 @@ if [[ "$(config_file "${overlay}" --get-all credential.helper)" != '' ]] ||
   printf 'hosted Git overlay credential-helper policy differs from the exact default\n' >&2
   exit 1
 fi
-if [[ "$(config_file "${overlay}" --get http.https://git.neverhuman.org.postbuffer)" != 1 ]]; then
-  printf 'hosted Git overlay is missing the exact smart-HTTP compatibility setting\n' >&2
+if [[ -n "$(config_file "${overlay}" --get-all http.https://git.neverhuman.org.postBuffer)" ]]; then
+  printf 'hosted Git overlay must not set http.postBuffer: a tiny buffer aborts Git 2.43 under protocol v2\n' >&2
   exit 1
 fi
-if [[ "$(config_file "${overlay}" --get-all protocol.version)" != 0 ]]; then
-  printf 'hosted Git overlay must pin protocol v0 alongside the postBuffer setting\n' >&2
+if [[ -n "$(config_file "${overlay}" --get-all protocol.version)" ]]; then
+  printf 'hosted Git overlay must not pin a Git protocol version; the hosted service speaks v2\n' >&2
   exit 1
 fi
 if [[ ! -f "${credential_helper}" || -L "${credential_helper}" ||
