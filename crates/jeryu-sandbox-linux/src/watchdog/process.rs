@@ -7,21 +7,13 @@ use std::time::Instant;
 /// Observe exit without reaping. Keeping the leader as a child reserves its PID
 /// until the final group signal; we never signal a group after reaping it.
 pub(super) fn exited(pid: i32) -> io::Result<bool> {
-    // SAFETY: waitid writes to the initialized siginfo for our direct child.
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let result = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if result == -1 {
-        return Err(io::Error::last_os_error());
+    use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    match waitid(Id::Pid(nix::unistd::Pid::from_raw(pid)), flags) {
+        Ok(WaitStatus::StillAlive) => Ok(false),
+        Ok(status) => Ok(status.pid() == Some(nix::unistd::Pid::from_raw(pid))),
+        Err(errno) => Err(io::Error::from(errno)),
     }
-    // SAFETY: a successful waitid populated the SIGCHLD siginfo union.
-    Ok(unsafe { info.si_pid() } == pid)
 }
 
 pub(super) fn is_group_leader(pid: i32) -> io::Result<bool> {

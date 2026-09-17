@@ -34,12 +34,8 @@ pub(crate) fn openat(directory: &File, name: &CStr, flags: i32) -> io::Result<Fi
 }
 
 pub(crate) fn require_cgroup2(file: &File) -> io::Result<()> {
-    // SAFETY: fstatfs initializes this structure through a valid pointer.
-    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut filesystem) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    if filesystem.f_type != 0x6367_7270 {
+    let filesystem = nix::sys::statfs::fstatfs(file).map_err(io::Error::from)?;
+    if filesystem.filesystem_type() != nix::sys::statfs::CGROUP2_SUPER_MAGIC {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "expected cgroup v2",

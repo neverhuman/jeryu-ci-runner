@@ -14,6 +14,13 @@ score:
 security:
   JERYU_SECURITY_NETWORK=1 ./tools/security-lane.sh
 
+# Narrow per-package lanes for fast agent iteration (nextest runs tests in parallel processes).
+test-sandbox:
+  cargo nextest run -p jeryu-sandbox-linux --locked
+
+test-native:
+  cargo nextest run -p jeryu-runner-native --locked
+
 contract-drift:
   cargo test -p jeryu-runner-protocol --locked --test schema_contract_drift
 

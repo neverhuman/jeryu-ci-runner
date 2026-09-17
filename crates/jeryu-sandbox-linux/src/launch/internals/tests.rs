@@ -29,8 +29,7 @@ fn check_child(check: impl FnOnce() -> i32) {
     let pid = unsafe { libc::fork() };
     assert!(pid >= 0, "fork: {}", IoError::last_os_error());
     if pid == 0 {
-        // SAFETY: _exit terminates this child without inherited cleanup handlers.
-        unsafe { libc::_exit(check()) };
+        crate::forked_child::terminate(check());
     }
     check_reaped_child(pid);
 }
@@ -250,12 +249,10 @@ fn prepared_ruleset_avoids_closed_standard_stream_slots() {
             // SAFETY: stdout is the parent's open transcript; PROOF is live.
             let written = unsafe { libc::write(1, PROOF.as_ptr().cast(), PROOF.len()) };
             if written != PROOF.len() as isize {
-                // SAFETY: terminate the isolated process without unwinding.
-                unsafe { libc::_exit(4) };
+                crate::forked_child::terminate(4);
             }
         }
-        // SAFETY: immediately terminate this isolated process without unwinding.
-        unsafe { libc::_exit(result) };
+        crate::forked_child::terminate(result);
     }
     let workspace = tempfile::tempdir().unwrap();
     let transcript = tempfile::NamedTempFile::new().unwrap();

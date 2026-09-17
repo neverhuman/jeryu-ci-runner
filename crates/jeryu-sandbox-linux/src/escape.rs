@@ -57,8 +57,7 @@ pub fn run_in_forked_child<F: FnOnce() -> u8>(body: F) -> EscapeVerdict {
     match unsafe { fork() } {
         Ok(ForkResult::Child) => {
             let code = body();
-            // SAFETY: `_exit` is async-signal-safe and ends the child at once.
-            unsafe { libc::_exit(code as i32) };
+            crate::forked_child::terminate(code as i32);
         }
         Ok(ForkResult::Parent { child }) => match waitpid(child, None) {
             Ok(WaitStatus::Exited(_, 0)) => EscapeVerdict::Blocked,
