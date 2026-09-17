@@ -1,5 +1,19 @@
 # Changelog
 
+## jeryu-ci-runner-v5.0.0-split.2
+- Give the sandbox cgroup capability probe a unique leaf per probe and verify
+  cgroup admission before job cgroups are created. Parallel probes in one
+  process no longer remove each other's leaf, so the sandbox stops falling back
+  to a cgroup it cannot join and failing job starts with EOPNOTSUPP (os error
+  95) under systemd-managed sessions such as the PR gate runner slots.
+- Replace `mem::zeroed` for `statfs` and `siginfo_t` with nix `fstatfs` and
+  `waitid`, and confine the post-fork `_exit` to one module with real child
+  exit-status assertions.
+- Drop `http.postBuffer` and the Git protocol v0 pin from the hosted Cargo Git
+  overlay: the hosted forge accepts gzip upload-pack bodies, and the tiny
+  buffer is what aborts Git 2.43 under protocol v2. CI now fails if either
+  setting reappears.
+
 ## Unreleased
 - Fence scheduler transitions by the complete lease, runner epoch and current
   scheduler time. Expiration consumes retry attempts, cancellation is terminal,
