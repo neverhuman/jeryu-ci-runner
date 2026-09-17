@@ -80,6 +80,10 @@ if [[ "$(config_file "${overlay}" --get http.https://git.neverhuman.org.postbuff
   printf 'hosted Git overlay is missing the exact smart-HTTP compatibility setting\n' >&2
   exit 1
 fi
+if [[ "$(config_file "${overlay}" --get-all protocol.version)" != 0 ]]; then
+  printf 'hosted Git overlay must pin protocol v0 alongside the postBuffer setting\n' >&2
+  exit 1
+fi
 if [[ ! -f "${credential_helper}" || -L "${credential_helper}" ||
       ! -x "${credential_helper}" ||
       "$(stat -c '%u:%g:%a:%h' -- "${credential_helper}")" != \

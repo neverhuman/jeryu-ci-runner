@@ -213,6 +213,7 @@ fn cargo_identity_and_effective_transport_are_exact() {
         overlay.contains("helper = /home/ubuntu/.config/jeryu/bin/git-credential-neverhuman-org")
     );
     assert!(overlay.contains("[http \"https://git.neverhuman.org\"]\n\tpostBuffer = 1"));
+    assert!(overlay.contains("[protocol]\n\tversion = 0"));
     assert_eq!(effective_url(&overlay_path, SOURCE), HOSTED);
 
     let pin_policy =

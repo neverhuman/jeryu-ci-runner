@@ -10,7 +10,7 @@ fi
 
 hosted_git_env_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 hosted_git_env_overlay="${hosted_git_env_root}/.cargo/hosted-gitconfig"
-hosted_git_env_overlay_sha256='8a9e02724c1af6c2e3d2edd74e94bbdedd39ffe6a65afecb346893a73d582e45'
+hosted_git_env_overlay_sha256='10748c340c454fb3a2c5f6603fa86a46aa5e38be97ae0863bcb8b0f141b7b842'
 hosted_git_env_caller_global="${GIT_CONFIG_GLOBAL-}"
 
 # Command-scoped configuration, tracing, askpass, and TLS overrides can bypass
