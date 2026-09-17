@@ -12,7 +12,7 @@ readonly CARGO_AUDIT_VERSION='cargo-audit-audit 0.22.1'
 readonly CARGO_DENY_VERSION='cargo-deny 0.19.8'
 readonly SYFT_VERSION='1.40.0'
 readonly SOURCE_NAME='jeryu-ci-runner'
-readonly SOURCE_VERSION='jeryu-ci-runner-v5.0.0-split.1'
+readonly SOURCE_VERSION='jeryu-ci-runner-v5.0.0-split.2'
 checks=()
 
 require_tool gitleaks

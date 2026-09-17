@@ -233,7 +233,7 @@ jq -e --arg head "${current_head}" \
   '.schema_version == "jeryu.split.security/v2" and .git_head == $head and
    .network_dependency_checks == true and .conclusion == "success" and
    .source_name == "jeryu-ci-runner" and
-   .source_version == "jeryu-ci-runner-v5.0.0-split.1" and
+   .source_version == "jeryu-ci-runner-v5.0.0-split.2" and
    (["cargo-audit-0.22.1", "cargo-deny-0.19.8",
      "hosted-dependency-sources", "syft-1.40.0-cyclonedx"] - .checks |
      length) == 0' \

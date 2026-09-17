@@ -3,7 +3,7 @@ set -euo pipefail
 
 source ops/ci/lib.sh
 require_tool jq
-expected_release_identity='jeryu-ci-runner-v5.0.0-split.1'
+expected_release_identity='jeryu-ci-runner-v5.0.0-split.2'
 if [[ ! -f VERSION || -L VERSION || "$(stat -c '%h' -- VERSION)" != 1 ||
       "$(wc -l < VERSION)" != 1 || "$(<VERSION)" != "${expected_release_identity}" ||
       "$(tail -c 1 VERSION | od -An -tx1 | tr -d '[:space:]')" != 0a ]]; then
