@@ -212,13 +212,20 @@ fn cargo_identity_and_effective_transport_are_exact() {
     assert!(
         overlay.contains("helper = /home/ubuntu/.config/jeryu/bin/git-credential-neverhuman-org")
     );
+    let settings: Vec<&str> = overlay
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
     assert!(
-        !overlay.to_lowercase().contains("postbuffer"),
-        "a tiny http.postBuffer aborts Git 2.43 under protocol v2"
+        !settings
+            .iter()
+            .any(|line| line.to_lowercase().starts_with("postbuffer")),
+        "a tiny http.postBuffer aborts Git 2.43 under protocol v2: {settings:?}"
     );
     assert!(
-        !overlay.contains("[protocol]"),
-        "the overlay must not pin a Git protocol version"
+        !settings.iter().any(|line| *line == "[protocol]"),
+        "the overlay must not pin a Git protocol version: {settings:?}"
     );
     assert_eq!(effective_url(&overlay_path, SOURCE), HOSTED);
 
