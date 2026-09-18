@@ -41,6 +41,8 @@
 #   REDTEAM_MODEL          opus
 #   REDTEAM_BUDGET_USD     20                   per-PR spend cap for the agent
 #   REDTEAM_TIMEOUT        2400                 per-PR agent timeout, seconds
+#   REDTEAM_MAX_BLOB_BYTES 1000000              an added/changed binary or archive over this size
+#                          holds mechanically unless its sha256 appears in the diff
 #   REDTEAM_MAX_DIFF_BYTES 20000000             larger reviewed diffs (lock files excluded) are not
 #                          approved (left for a human)
 #   REDTEAM_STATE          ~/.local/state/pr-redteam   receipts, git cache, locks
@@ -58,6 +60,7 @@ model="${REDTEAM_MODEL:-opus}"
 budget="${REDTEAM_BUDGET_USD:-20}"
 agent_timeout="${REDTEAM_TIMEOUT:-2400}"
 max_diff_bytes="${REDTEAM_MAX_DIFF_BYTES:-20000000}"
+max_blob_bytes="${REDTEAM_MAX_BLOB_BYTES:-1000000}"
 state="${REDTEAM_STATE:-$HOME/.local/state/pr-redteam}"
 claude_bin="${REDTEAM_CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/claude")}"
 
@@ -156,6 +159,25 @@ run_agent() { # review-dir tag sha work-dir
     return 1
   fi
   jq -c '.structured_output' "$out"
+}
+
+# Added or changed files over REDTEAM_MAX_BLOB_BYTES that are binary (per git) or archive/library
+# by extension, and whose sha256 appears nowhere in the diff — i.e. nothing in the change pins them.
+# One JSON object {path, size, sha256} per line; empty output means nothing to hold.
+unpinned_blobs() { # git-dir base head diff.patch
+  local g="$1" b="$2" h="$3" patch="$4" added deleted path size digest
+  while IFS=$'\t' read -r added deleted path; do
+    [ -n "$path" ] || continue
+    size="$(git --git-dir="$g" cat-file -s "$h:$path" 2>/dev/null)" || continue
+    [ "$size" -gt "$max_blob_bytes" ] || continue
+    if [ "$added" != "-" ] \
+       && ! [[ "$path" =~ \.(tar|tgz|gz|bz2|xz|zst|zip|7z|jar|war|whl|so|a|dylib|dll|exe|bin|img|iso|deb|rpm)$ ]]; then
+      continue
+    fi
+    digest="$(git --git-dir="$g" cat-file blob "$h:$path" | sha256sum | cut -c1-64)"
+    grep -qiF "$digest" "$patch" && continue
+    jq -nc --arg p "$path" --argjson s "$size" --arg d "$digest" '{path: $p, size: $s, sha256: $d}'
+  done < <(git --git-dir="$g" diff --numstat --no-renames --diff-filter=AM "$b...$h")
 }
 
 # The full verdict contract, checked before anything is published. `block` is valid exactly when a
@@ -287,6 +309,16 @@ review_one() { # owner/name number dry-run force include-drafts
   esac
   if grep -qE '^\+.*-----BEGIN [A-Z ]*PRIVATE KEY-----' "$d/diff.patch"; then
     decision=hold
+  fi
+  # Unreviewable payloads hold mechanically. The agent cannot open a binary, and its severity for
+  # "a blob I can't inspect" was seen to flip between runs on the same file; this rule cannot.
+  local blobs; blobs="$(unpinned_blobs "$cache" "$base_sha" "$sha" "$d/diff.patch")"
+  if [ -n "$blobs" ]; then
+    decision=hold
+    verdict="$(jq -c --slurpfile b <(printf '%s\n' "$blobs") '.verdict = "block" | .findings =
+      ([$b[] | {severity: "critical", title: "Unpinned binary or archive (\(.size) bytes)", file: .path,
+        detail: "Adds or changes a \(.size)-byte binary/archive that cannot be reviewed as text, and nothing in the diff pins its sha256. pr-redteam holds these mechanically, whatever the agent concluded: record the digest in a checked manifest or verification step, or fetch the artifact from a verified source.",
+        evidence: "sha256 \(.sha256)"}] + .findings)' <<<"$verdict")"
   fi
   local body; body="$(render_body "$verdict" "$decision" "$sha")"
   local receipt; receipt="$(receipt_path "$repo" "$number" "$sha")"; mkdir -p "$(dirname "$receipt")"
@@ -462,7 +494,7 @@ while [ $# -gt 0 ]; do
     --jobs) jobs="$2"; shift ;;
     --repo) only_repo="$2"; shift ;;
     --pr) only_pr="$2"; shift ;;
-    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
   esac
   shift
 done
@@ -499,6 +531,8 @@ case "$cmd" in
     ;;
   heartbeat) # report liveness to jeryu's /runners page; safe to run from a short timer
     heartbeat ;;
+  _blobs) # internal/testing: git-dir base head diff.patch -> unpinned binaries (no forge calls)
+    unpinned_blobs "$1" "$2" "$3" "$4" ;;
   _agent) # internal/testing: review-dir tag sha -> verdict JSON (no forge calls)
     w="$(mktemp -d "$state/work/agent.XXXXXX")"; trap 'rm -rf "$w"' EXIT
     [ -f "$1/signals.txt" ] || signals "$1"
