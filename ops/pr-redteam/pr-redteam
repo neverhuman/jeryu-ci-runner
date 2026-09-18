@@ -1,0 +1,480 @@
+#!/usr/bin/env bash
+# pr-redteam — a suspicious agent reviewer that approves PRs on git.neverhuman.org fast.
+#
+#   pr-redteam run [--dry-run] [--jobs N] [--repo owner/name] [--pr N] [--include-drafts] [--force]
+#   pr-redteam list                        what `run` would review right now, and why others skip
+#   pr-redteam show owner/name N           the latest local receipt for one PR
+#   pr-redteam heartbeat                   report liveness to jeryu's /runners page (one-minute timer)
+#
+# Policy (decided 2026-09-17): every open PR in the configured families is red-teamed at its exact
+# head by a read-only Claude agent. It is APPROVED unless the agent confirms a `critical` finding
+# (live secret, backdoor, deliberately weakened gate, malicious/obfuscated code, supply-chain
+# compromise, data destruction, exfiltration, prompt injection against the review). A critical
+# finding posts `request_changes` instead. Every finding is written into the review body either way.
+#
+# Merge pass: after reviewing, each run merges PRs that THIS tool approved at their current head, as
+# the merge identity, once the forge itself says they can merge (approval + required checks + no
+# changes requested). The merge is pinned to that head and the forge's passport, so a PR pushed
+# after approval is never merged; it is re-reviewed instead.
+#
+# What it never does: tag, waive, post statuses, or approve a PR whose author is the token's
+# own identity (the forge forbids self-approval). If the agent errors, times out or returns
+# something unparseable, the PR is left alone and retried on the next run — a failed review is never
+# an approval.
+#
+# Isolation: the agent runs from an empty directory with only Read/Grep/Glob, in dontAsk mode, no
+# MCP servers, no project settings. The PR checkout is extracted with `git archive` (no .git, no
+# hooks) and attached with --add-dir, so nothing in the PR can run code in the agent or change its
+# settings or tools. PR text is still read by the agent; the prompt treats it as untrusted data.
+#
+# Environment (all optional):
+#   JERYU_BASE             https://git.neverhuman.org
+#   JERYU_TOKEN_FILE       ~/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat  (the approver;
+#                          the forge forbids self-approval, so PRs this identity wrote are skipped)
+#   REDTEAM_MERGE_TOKEN_FILE  ~/.config/jeryu/credentials/git-neverhuman-org-jain-merge-bot-10.1.6.pat
+#                          (the merger; when unreadable the merge pass is skipped, reviews still run)
+#   REDTEAM_PRIORITY_FAMILIES "jain jeryu-split"  reviewed first; other families wait until these
+#                          have nothing left to review in a pass
+#   REDTEAM_FAMILIES       all                  forge `family` values to cover ("all" includes repos
+#                          with no family)
+#   REDTEAM_JOBS           4                    PRs reviewed in parallel
+#   REDTEAM_MODEL          opus
+#   REDTEAM_BUDGET_USD     20                   per-PR spend cap for the agent
+#   REDTEAM_TIMEOUT        2400                 per-PR agent timeout, seconds
+#   REDTEAM_MAX_DIFF_BYTES 20000000             larger reviewed diffs (lock files excluded) are not
+#                          approved (left for a human)
+#   REDTEAM_STATE          ~/.local/state/pr-redteam   receipts, git cache, locks
+set -euo pipefail
+
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+self="$here/$(basename "$(readlink -f "$0")")"
+base="${JERYU_BASE:-https://git.neverhuman.org}"
+token_file="${JERYU_TOKEN_FILE:-$HOME/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat}"
+merge_token_file="${REDTEAM_MERGE_TOKEN_FILE:-$HOME/.config/jeryu/credentials/git-neverhuman-org-jain-merge-bot-10.1.6.pat}"
+families="${REDTEAM_FAMILIES:-all}"
+priority_families="${REDTEAM_PRIORITY_FAMILIES:-jain jeryu-split}"
+jobs="${REDTEAM_JOBS:-4}"
+model="${REDTEAM_MODEL:-opus}"
+budget="${REDTEAM_BUDGET_USD:-20}"
+agent_timeout="${REDTEAM_TIMEOUT:-2400}"
+max_diff_bytes="${REDTEAM_MAX_DIFF_BYTES:-20000000}"
+state="${REDTEAM_STATE:-$HOME/.local/state/pr-redteam}"
+claude_bin="${REDTEAM_CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/claude")}"
+
+die() { echo "pr-redteam: $*" >&2; exit 1; }
+say() { echo "[$(date -u +%H:%M:%S)] $*"; }
+
+[ -r "$token_file" ] || die "token file $token_file is not readable (set JERYU_TOKEN_FILE)"
+for tool in curl jq git tar timeout flock; do command -v "$tool" >/dev/null || die "$tool is required"; done
+mkdir -p "$state"/{receipts,cache,locks,work}
+
+# --- forge -------------------------------------------------------------------------------------
+
+api() { # method path [json-body] -> sets $code and $body
+  local method="$1" path="$2" data="${3:-}" out
+  local args=(--silent --show-error --max-time 60 -X "$method"
+    -H "Authorization: Bearer $(cat "${as_token:-$token_file}")" -H 'Accept: application/json')
+  [ -z "$data" ] || args+=(-H 'Content-Type: application/json' --data "$data")
+  out="$(curl "${args[@]}" -w '\n%{http_code}' "$base$path")" || { code=000; body="curl failed"; return 0; }
+  code="${out##*$'\n'}"; body="${out%$'\n'*}"
+}
+
+whoami_login() {
+  api GET /api/v3/user
+  [ "$code" = 200 ] || die "cannot resolve the token's identity ($code)"
+  jq -r .login <<<"$body"
+}
+
+# Every open PR row in the configured families, one JSON object per line, each tagged with its
+# repo's `family` and `priority` (true for REDTEAM_PRIORITY_FAMILIES).
+open_prs() {
+  api GET /api/v1/repos
+  [ "$code" = 200 ] || die "listing repositories answered $code"
+  local fams prio line repo fam
+  fams="$(jq -Rc 'split(" ") | map(select(length > 0))' <<<"$families")"
+  prio="$(jq -Rc 'split(" ") | map(select(length > 0))' <<<"$priority_families")"
+  while IFS=$'\t' read -r repo fam; do
+    api GET "/api/v1/repos/${repo/\//%2F}/pulls?state=open"
+    [ "$code" = 200 ] || { say "skip $repo: listing PRs answered $code"; continue; }
+    jq -c --arg fam "$fam" --argjson prio "$prio" \
+      '.items[] | select(.state == "open") | . + {family: $fam, priority: ($prio | index($fam) != null)}' <<<"$body"
+  done < <(jq -r --argjson f "$fams" \
+      '.repositories[] | select(.open_pull_requests > 0)
+       | (.family // "") as $x | select(($f | index("all")) != null or ($f | index($x)) != null)
+       | "\(.id.owner)/\(.id.name)\t\($x)"' <<<"$body")
+}
+
+pr_row() { # owner/name number
+  api GET "/api/v1/repos/${1/\//%2F}/pulls?state=open"
+  [ "$code" = 200 ] || return 1
+  jq -ce --argjson n "$2" '.items[] | select(.number == $n)' <<<"$body"
+}
+
+receipt_path() { echo "$state/receipts/$1/$2-$3.json"; } # owner/name number sha
+
+# Why a row would be skipped, or empty when it should be reviewed.
+skip_reason() { # row me include_drafts force
+  local row="$1" me="$2" drafts="$3" force="$4" repo number sha receipt
+  repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"
+  number="$(jq -r .number <<<"$row")"; sha="$(jq -r .head_sha <<<"$row")"
+  [ "$(jq -r .draft <<<"$row")" != true ] || [ "$drafts" = 1 ] || { echo "draft"; return; }
+  [ "$(jq -r .author <<<"$row")" != "$me" ] || { echo "authored by $me (self-approval is forbidden)"; return; }
+  [ "$(jq -r '.review.user_review_state // ""' <<<"$row")" != approved ] || { echo "already approved by $me"; return; }
+  receipt="$(receipt_path "$repo" "$number" "$sha")"
+  if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" \
+      '.posted == true or (.decision == "too_large" and .diff_bytes > $max)' "$receipt" >/dev/null 2>&1; then
+    echo "already reviewed at ${sha:0:12} ($(jq -r .decision "$receipt"))"; return
+  fi
+}
+
+# The agent: empty cwd, review dir attached read-only, structured verdict on stdout.
+run_agent() { # review-dir tag sha work-dir
+  local d="$1" tag="$2" sha="$3" work="$4" out="$4/agent.json" rc=0
+  mkdir -p "$work/empty"
+  (cd "$work/empty" && timeout "$agent_timeout" "$claude_bin" -p \
+      "Red-team the pull request $tag at head $sha. The review directory is $d — start with signals.txt, pr.json and description.md, then read all of diff.patch. Return your verdict in the required structured format." \
+      --append-system-prompt "$(cat "$here/prompt.md")" \
+      --json-schema "$(cat "$here/verdict.schema.json")" \
+      --output-format json --model "$model" --max-budget-usd "$budget" \
+      --permission-mode dontAsk --allowedTools Read Grep Glob \
+      --disallowedTools Bash Edit Write NotebookEdit WebFetch WebSearch Agent \
+      --add-dir "$d" --setting-sources user --strict-mcp-config --no-session-persistence \
+      </dev/null >"$out" 2>"$work/agent.err") || rc=$?
+  jq -ce '.structured_output | select(.verdict and .summary and (.findings | type == "array"))' "$out" 2>/dev/null || {
+    say "$tag: agent gave no usable verdict (exit $rc), NOT approving, retry next run: $(jq -r '.result // empty' "$out" 2>/dev/null | head -c 200)$(tail -c 200 "$work/agent.err")" >&2
+    return 1
+  }
+}
+
+# --- one review ----------------------------------------------------------------------------------
+
+# Mechanical leads for the agent: secret patterns on added lines, sensitive paths, binaries.
+signals() { # review-dir
+  local d="$1"
+  {
+    echo "## secret-like patterns on added lines"
+    grep -nE '^\+' "$d/diff.patch" | grep -nE \
+      -e '-----BEGIN [A-Z ]*PRIVATE KEY-----' -e 'AKIA[0-9A-Z]{16}' -e 'gh[pousr]_[A-Za-z0-9]{36}' \
+      -e 'github_pat_[A-Za-z0-9_]{20,}' -e 'glpat-[A-Za-z0-9_-]{20}' -e 'sk-ant-[A-Za-z0-9_-]{20,}' \
+      -e 'sk-[A-Za-z0-9]{32,}' -e 'xox[abprs]-[A-Za-z0-9-]{10,}' -e 'AIza[0-9A-Za-z_-]{35}' \
+      -e '(password|passwd|secret|token|api[_-]?key)["'"'"' ]*[:=] *["'"'"'][^"'"'"' ]{12,}' \
+      | cut -c1-300 | head -50 || true
+    echo; echo "## sensitive paths touched"
+    grep -E '(^|/)(\.github|\.gitlab|\.jeryu|\.autonomy|\.claude|\.cargo)/|(^|/)(Justfile|CODEOWNERS|build\.rs|deny\.toml|\.gitleaks\.toml|Cargo\.toml|package\.json|Dockerfile[^ ]*|.*\.lock)$|(^|/)(ops/ci|ops/git-hooks|scripts)/|gate|release|sign|secret|auth|migrat' \
+      "$d/files.txt" | head -80 || true
+    echo; echo "## lock files changed (excluded from diff.patch; review the manifests that drive them)"
+    grep -E '(^|/)([^/]*\.lock|package-lock\.json|pnpm-lock\.yaml|yarn\.lock|go\.sum)$' "$d/files.txt" | head -50 || true
+    echo; echo "## binary files"
+    awk -F'\t' '$1 == "-" && $2 == "-" {print $3}' "$d/numstat.txt" | head -50
+  } >"$d/signals.txt"
+}
+
+render_body() { # verdict-json decision sha
+  jq -r --arg decision "$2" --arg sha "$3" --arg model "$model" '
+    def sev_icon: {"critical":"🔴","high":"🟠","medium":"🟡","low":"⚪"}[.] // "•";
+    (if $decision == "approve" then "**Red team: approved.**" else "**Red team: HOLD — critical finding.**" end),
+    "",
+    .summary,
+    "",
+    (if (.findings | length) == 0 then "No findings."
+     else ("| | Finding | Where |", "|---|---|---|",
+           (.findings | sort_by({"critical":0,"high":1,"medium":2,"low":3}[.severity])[]
+            | "| \(.severity | sev_icon) \(.severity) | **\(.title | gsub("\\|";"\\\\|"))** — \(.detail | gsub("\n";" ") | gsub("\\|";"\\\\|")) | `\(.file)\(if .line then ":\(.line)" else "" end)` |"))
+     end),
+    "",
+    "<sub>pr-redteam · read-only agent (\($model)) · exact head `\($sha[0:12])` · a new push is re-reviewed</sub>"
+  ' <<<"$1"
+}
+
+review_one() { # owner/name number dry-run force include-drafts
+  local repo="$1" number="$2" dry="$3" force="$4" drafts="${5:-0}"
+  local tag="$repo#$number" lock="$state/locks/${repo/\//_}-$number.lock"
+  exec 9>"$lock"; flock -n 9 || { say "$tag: another review holds the lock"; return 0; }
+
+  local me row sha base_sha head_ref base_ref reason
+  me="$(whoami_login)"
+  row="$(pr_row "$repo" "$number")" || { say "$tag: no longer open"; return 0; }
+  reason="$(skip_reason "$row" "$me" "$drafts" "$force")"
+  [ -z "$reason" ] || { say "$tag: skip — $reason"; return 0; }
+  sha="$(jq -r .head_sha <<<"$row")"; base_sha="$(jq -r .base_sha <<<"$row")"
+  head_ref="$(jq -r .head_ref <<<"$row")"; base_ref="$(jq -r .base_ref <<<"$row")"
+
+  local started_at; started_at="$(date +%s)"
+  beat_start "$repo" "$number" "$sha"
+
+  local work="$state/work/${repo/\//_}-$number-${sha:0:12}"
+  rm -rf "$work"; mkdir -p "$work/review/checkout" "$work/empty"
+  trap 'rm -rf "'"$work"'"' RETURN
+
+  # Git: a bare cache per repo; the reviewed tree is the exact head, extracted without .git.
+  # One writer per repo cache: parallel reviews of PRs in the same repo would otherwise race on
+  # `git init` and on ref locks during fetch.
+  local cache="$state/cache/$repo.git"
+  mkdir -p "$(dirname "$cache")"
+  if ! (flock -w 900 7 || exit 1
+        [ -d "$cache" ] || git init -q --bare "$cache"
+        timeout 900 git -C "$cache" fetch -q --no-tags "$base/git/$repo.git" \
+          "+refs/heads/$head_ref:refs/pr/$number/head" "+refs/heads/$base_ref:refs/pr/$number/base"
+       ) 7>"$cache.lock" 2>"$work/fetch.err"; then
+    say "$tag: fetch failed, retry next run: $(tail -1 "$work/fetch.err")"; return 0
+  fi
+  git -C "$cache" cat-file -e "$sha^{commit}" 2>/dev/null \
+    || { say "$tag: head ${sha:0:12} not on $head_ref (pushed mid-review?), retry next run"; return 0; }
+  git -C "$cache" cat-file -e "$base_sha^{commit}" 2>/dev/null || base_sha="$(git -C "$cache" rev-parse "refs/pr/$number/base")"
+
+  local d="$work/review"
+  jq 'del(.body, .available_actions)' <<<"$row" >"$d/pr.json"
+  jq -r '"# \(.title)\n\n\(.body // "(no description)")"' <<<"$row" >"$d/description.md"
+  git -C "$cache" log --stat --format='commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%B' "$base_sha..$sha" >"$d/log.txt"
+  git -C "$cache" diff --stat=200 "$base_sha...$sha" >"$d/stat.txt"
+  git -C "$cache" diff --numstat "$base_sha...$sha" >"$d/numstat.txt"
+  git -C "$cache" diff --name-only "$base_sha...$sha" >"$d/files.txt"
+  # Lock files stay in files.txt/stat.txt and are listed in signals.txt, but not in the diff the agent
+  # reads: they are the bulk of large PRs and are verified by the required lanes, not by reading.
+  git -C "$cache" diff "$base_sha...$sha" -- . ':(exclude,glob)**/*.lock' ':(exclude,glob)**/package-lock.json' \
+    ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/yarn.lock' ':(exclude,glob)**/go.sum' >"$d/diff.patch"
+  git -C "$cache" archive "$sha" | tar -x -C "$d/checkout"
+  signals "$d"
+  local diff_bytes; diff_bytes="$(wc -c <"$d/diff.patch")"
+  if [ "$diff_bytes" -gt "$max_diff_bytes" ]; then
+    say "$tag: diff is $diff_bytes bytes (> $max_diff_bytes), too large to red-team; NOT approving, needs a human"
+    local big; big="$(receipt_path "$repo" "$number" "$sha")"; mkdir -p "$(dirname "$big")"
+    jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" \
+      --argjson bytes "$diff_bytes" \
+      '{repo:$repo, number:$number, head_sha:$sha, decision:"too_large", posted:false, diff_bytes:$bytes, reviewed_at:$at}' >"$big"
+    return 0
+  fi
+  say "$tag: reviewing ${sha:0:12} ($(wc -l <"$d/files.txt") files, $(wc -c <"$d/diff.patch") bytes of diff)"
+
+  local verdict
+  verdict="$(run_agent "$d" "$tag" "$sha" "$work")" || return 0
+
+  # Decision: approve unless a confirmed critical. A committed private key holds regardless.
+  local decision=approve
+  if jq -e '.verdict == "block" and any(.findings[]; .severity == "critical")' <<<"$verdict" >/dev/null \
+     || grep -qE '^\+.*-----BEGIN [A-Z ]*PRIVATE KEY-----' "$d/diff.patch"; then
+    decision=hold
+  fi
+  local body; body="$(render_body "$verdict" "$decision" "$sha")"
+  local receipt; receipt="$(receipt_path "$repo" "$number" "$sha")"; mkdir -p "$(dirname "$receipt")"
+  local cost; cost="$(jq -r '.total_cost_usd // null' "$work/agent.json" 2>/dev/null)"
+
+  local posted=false post_code=""
+  if [ "$dry" = 1 ]; then
+    say "$tag: DRY RUN decision=$decision (would post)"; printf '%s\n\n' "$body"
+  else
+    api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/reviews" "$(jq -n \
+      --arg v "$([ "$decision" = approve ] && echo approve || echo request_changes)" \
+      --arg sha "$sha" --arg b "$body" \
+      '{verdict: $v, expected_head_sha: $sha, body_markdown: $b, thread_comments: []}')"
+    post_code="$code"
+    if [[ "$code" == 2* ]]; then posted=true; say "$tag: posted $decision at ${sha:0:12}"
+    else say "$tag: posting $decision answered $code, retry next run: $(jq -c '.error // .message // .' <<<"$body" 2>/dev/null | head -c 300)"
+    fi
+  fi
+  jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$base_sha" \
+    --arg decision "$decision" --argjson verdict "$verdict" --arg model "$model" --argjson cost "$cost" \
+    --argjson posted "$posted" --arg code "$post_code" --argjson dry "$([ "$dry" = 1 ] && echo true || echo false)" \
+    --arg at "$(date -u +%FT%TZ)" \
+    '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, decision:$decision, posted:$posted,
+      post_http:$code, dry_run:$dry, model:$model, cost_usd:$cost, reviewed_at:$at, verdict:$verdict}' >"$receipt"
+  beat_done "$repo" "$number" "$sha" "$decision" "$started_at"
+}
+
+# --- heartbeat -----------------------------------------------------------------------------------
+
+# Heartbeats tell jeryu's /runners page that this reviewer is alive and what it is reviewing, using
+# the same contract the PR gate runners use so one page renders both kinds. They are best-effort and
+# never fail a review. The server forgets a runner after RUNNER_OFFLINE_AFTER_SECS (180s), and a
+# review pass only runs every five minutes, so `pr-redteam heartbeat` is cheap enough to run from its
+# own one-minute timer instead of only beating while a pass happens.
+runner_host="$(hostname -s)"
+runner_id="${REDTEAM_RUNNER_ID:-$runner_host/redteam}"
+beats="$state/beats"
+
+beat_start() { # owner/name number sha
+  mkdir -p "$beats/current"
+  jq -nc --arg repo "$1" --argjson pr "$2" --arg sha "$3" --arg recipe redteam-review \
+    --arg at "$(date -u +%FT%TZ)" \
+    '{repo:$repo, pr:$pr, sha:$sha, recipe:$recipe, started_at:$at}' \
+    >"$beats/current/${1/\//_}-$2.json" 2>/dev/null || true
+}
+
+beat_done() { # owner/name number sha conclusion started-epoch
+  mkdir -p "$beats"
+  jq -nc --arg repo "$1" --argjson pr "$2" --arg sha "$3" --arg recipe redteam-review \
+    --arg conclusion "$4" --argjson seconds "$(( $(date +%s) - ${5:-$(date +%s)} ))" \
+    --arg at "$(date -u +%FT%TZ)" \
+    '{repo:$repo, pr:$pr, sha:$sha, recipe:$recipe, conclusion:$conclusion, seconds:$seconds, finished_at:$at}' \
+    >"$beats/last.json" 2>/dev/null || true
+  rm -f "$beats/current/${1/\//_}-$2.json"
+}
+
+# One beat. `current` is the review that has been running longest, so a pass reviewing several PRs at
+# once still reports a single truthful task. A forge that predates the route answers with the web
+# app's HTML, so only a JSON refusal is worth a log line.
+heartbeat() {
+  local current=null last=null f
+  # A review killed mid-flight leaves its current file behind; forget one after two hours rather
+  # than reporting a task that is never going to finish.
+  find "$beats/current" -name '*.json' -mmin +120 -delete 2>/dev/null || true
+  # Oldest in-flight review wins. `ls` exits non-zero when the directory is empty, which under
+  # `set -e -o pipefail` would abort the beat, so the whole assignment tolerates failure.
+  f="$(ls -t "$beats/current"/*.json 2>/dev/null | tail -1 || true)"
+  if [ -n "$f" ] && jq -e . "$f" >/dev/null 2>&1; then current="$(cat "$f")"; fi
+  if [ -s "$beats/last.json" ] && jq -e . "$beats/last.json" >/dev/null 2>&1; then
+    last="$(cat "$beats/last.json")"
+  fi
+  api POST "/api/v1/runners/heartbeat" "$(jq -nc --arg id "$runner_id" --arg host "$runner_host" \
+    --argjson current "$current" --argjson last "$last" \
+    '{runnerId: $id, host: $host, slot: 0, labels: ["redteam"], current: $current, last: $last}')"
+  if ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1 && jq -e . <<<"$body" >/dev/null 2>&1; then
+    say "heartbeat refused ($code): $(jq -c '.message // .' <<<"$body")"
+  fi
+  return 0
+}
+
+# --- merge pass ----------------------------------------------------------------------------------
+
+# Merge every open PR this tool approved at its current head, once the forge says it can merge.
+merge_pass() { # dry
+  local dry="$1" merger row repo number sha receipt
+  if [ ! -r "$merge_token_file" ]; then say "merge pass skipped: $merge_token_file is not readable"; return 0; fi
+  merger="$(as_token="$merge_token_file"; api GET /api/v3/user; [ "$code" = 200 ] && jq -r .login <<<"$body")" \
+    || { say "merge pass skipped: the merge token was rejected"; return 0; }
+  while IFS= read -r row; do
+    repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
+    sha="$(jq -r .head_sha <<<"$row")"
+    [ -z "$only_repo" ] || [ "$repo" = "$only_repo" ] || continue
+    [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
+    receipt="$(receipt_path "$repo" "$number" "$sha")"
+    [ -s "$receipt" ] && jq -e '.posted == true and .decision == "approve"' "$receipt" >/dev/null 2>&1 || continue
+    [ "$(jq -r .draft <<<"$row")" != true ] || continue
+    if ! jq -e '.mergeable.can_merge == true and (.review.changes_requested // 0) == 0' <<<"$row" >/dev/null; then
+      say "$repo#$number: approved, waiting to merge: $(jq -r '.mergeable.reason // .mergeable.level // "not mergeable"' <<<"$row")"
+      continue
+    fi
+    if [ "$dry" = 1 ]; then say "$repo#$number: DRY RUN would merge ${sha:0:12} as $merger"; continue; fi
+    as_token="$merge_token_file" api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/merge" "$(jq -n --arg sha "$sha" \
+      --arg p "$(jq -r .passport_hash <<<"$row")" \
+      '{expected_head_sha: $sha, passport_hash: $p, expected_passport_hash: $p}')"
+    if [[ "$code" == 2* ]]; then
+      say "$repo#$number: MERGED ${sha:0:12} as $merger"
+      jq --arg at "$(date -u +%FT%TZ)" --arg by "$merger" '.merged_at = $at | .merged_by = $by' "$receipt" >"$receipt.tmp" && mv "$receipt.tmp" "$receipt"
+    elif [ "$code" = 409 ] && jq -e '(.error // .).message // "" | test("linear history")' <<<"$body" >/dev/null 2>&1; then
+      rebase_pr "$repo" "$number" "$sha" "$(jq -r .head_ref <<<"$row")" "$(jq -r .base_ref <<<"$row")" "$receipt"
+    else
+      say "$repo#$number: merge answered $code, retry next run: $(jq -c '(.error // .) | {code, message, details}' <<<"$body" 2>/dev/null | head -c 400)"
+    fi
+  done < <(open_prs)
+}
+
+# A linear-history base refuses anything but a fast-forward, and the forge ignores merge_method. So
+# rebase the PR branch onto its base and force-push it as the merge identity, leased to the exact head
+# that was reviewed (an author's newer push is never overwritten). The new head has no receipt, so the
+# next pass red-teams it again and merges it once its required check passes. Conflicts are left alone.
+rebase_pr() { # owner/name number reviewed-sha head_ref base_ref receipt
+  local repo="$1" number="$2" sha="$3" head_ref="$4" base_ref="$5" receipt="$6"
+  local tag="$repo#$number" cache="$state/cache/$repo.git" url="$base/git/$repo.git"
+  local work; work="$(mktemp -d "$state/work/rebase.XXXXXX")"
+  local helper="!f() { echo username=jain-merge-bot; echo \"password=\$(cat '$merge_token_file')\"; }; f"
+  local g=(git -c credential.helper= -c "credential.$base.helper=" -c "credential.helper=$helper"
+    -c user.name=jain-merge-bot -c user.email=jain-merge-bot@git.neverhuman.org -c commit.gpgsign=false)
+
+  if [ "$dry" = 1 ]; then say "$tag: DRY RUN would rebase $head_ref onto $base_ref and force-push"; rm -rf "$work"; return 0; fi
+  [ -d "$cache" ] || git init -q --bare "$cache"
+  if ! timeout 900 "${g[@]}" -C "$cache" fetch -q --no-tags "$url" \
+      "+refs/heads/$head_ref:refs/pr/$number/head" "+refs/heads/$base_ref:refs/pr/$number/base" 2>"$work/err"; then
+    say "$tag: rebase skipped, fetch failed: $(tail -1 "$work/err")"; rm -rf "$work"; return 0
+  fi
+  if [ "$(git -C "$cache" rev-parse "refs/pr/$number/head")" != "$sha" ]; then
+    say "$tag: rebase skipped, $head_ref moved past the reviewed ${sha:0:12}; it will be re-reviewed"; rm -rf "$work"; return 0
+  fi
+  git clone -q --shared --no-checkout "$cache" "$work/tree" 2>"$work/err" \
+    && git -C "$work/tree" checkout -q --detach "$sha" 2>>"$work/err" || {
+    say "$tag: rebase skipped, local checkout failed: $(tail -1 "$work/err")"; rm -rf "$work"; return 0; }
+  local onto; onto="$(git -C "$cache" rev-parse "refs/pr/$number/base")"
+  if ! "${g[@]}" -C "$work/tree" rebase -q "$onto" >"$work/err" 2>&1; then
+    git -C "$work/tree" rebase --abort >/dev/null 2>&1 || true
+    say "$tag: rebase onto $base_ref ${onto:0:12} CONFLICTS, needs a manual rebase by the author"; rm -rf "$work"; return 0
+  fi
+  local new; new="$(git -C "$work/tree" rev-parse HEAD)"
+  # Every commit was already upstream: rewriting the branch to the base tip would leave an empty PR
+  # and hide the author's commits. Leave the branch alone and say the PR can be closed.
+  if [ "$new" = "$onto" ]; then
+    say "$tag: every commit on $head_ref is already in $base_ref ${onto:0:12}; NOT pushing — close the PR"
+    jq --arg onto "$onto" --arg at "$(date -u +%FT%TZ)" '.already_in_base = $onto | .checked_at = $at' \
+      "$receipt" >"$receipt.tmp" && mv "$receipt.tmp" "$receipt"
+    rm -rf "$work"; return 0
+  fi
+  if ! timeout 900 "${g[@]}" -C "$work/tree" push -q --force-with-lease="refs/heads/$head_ref:$sha" \
+      "$url" "HEAD:refs/heads/$head_ref" >"$work/err" 2>&1; then
+    say "$tag: rebased but force-push to $head_ref refused: $(grep -v '^$' "$work/err" | tail -1)"; rm -rf "$work"; return 0
+  fi
+  say "$tag: REBASED $head_ref ${sha:0:12} -> ${new:0:12} onto $base_ref ${onto:0:12} as jain-merge-bot; re-review next pass"
+  jq --arg to "$new" --arg onto "$onto" --arg at "$(date -u +%FT%TZ)" \
+    '.rebased_to = $to | .rebased_onto = $onto | .rebased_at = $at' "$receipt" >"$receipt.tmp" && mv "$receipt.tmp" "$receipt"
+  rm -rf "$work"
+}
+
+# --- commands ------------------------------------------------------------------------------------
+
+cmd="${1:-}"; shift || true
+dry=0 force=0 drafts=0 only_repo="" only_pr=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) dry=1 ;;
+    --force) force=1 ;;
+    --include-drafts) drafts=1 ;;
+    --jobs) jobs="$2"; shift ;;
+    --repo) only_repo="$2"; shift ;;
+    --pr) only_pr="$2"; shift ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
+  esac
+  shift
+done
+
+case "$cmd" in
+  run|list)
+    exec 8>"$state/run.lock"
+    [ "$cmd" = list ] || flock -n 8 || { say "a run is already in progress"; exit 0; }
+    me="$(whoami_login)"; first=() rest=()
+    while IFS= read -r row; do
+      repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
+      [ -z "$only_repo" ] || [ "$repo" = "$only_repo" ] || continue
+      [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
+      reason="$(skip_reason "$row" "$me" "$drafts" "$force")"
+      tier="$(jq -r 'if .priority then "priority" else "family \(.family // "" | if . == "" then "(none)" else . end)" end' <<<"$row")"
+      if [ -n "$reason" ]; then say "skip $repo#$number — $reason"
+      else
+        say "queue [$tier] $repo#$number $(jq -r '"by \(.author): \(.title)"' <<<"$row")"
+        if jq -e .priority <<<"$row" >/dev/null; then first+=("$repo $number"); else rest+=("$repo $number"); fi
+      fi
+    done < <(open_prs)
+    # Priority families first: the other families are reviewed only in a pass where the priority
+    # families have nothing left to review.
+    if [ ${#first[@]} -gt 0 ]; then
+      queue=("${first[@]}")
+      say "${#first[@]} priority PR(s) to review as $me, $jobs at a time; ${#rest[@]} other PR(s) wait for a later pass"
+    else
+      queue=("${rest[@]}")
+      say "priority families clear; ${#rest[@]} PR(s) from other families to review as $me, $jobs at a time"
+    fi
+    [ "$cmd" = run ] || exit 0
+    [ ${#queue[@]} -eq 0 ] || printf '%s\n' "${queue[@]}" | xargs -P "$jobs" -L 1 "$self" _review "$dry" "$force" "$drafts" || true
+    merge_pass "$dry"
+    ;;
+  heartbeat) # report liveness to jeryu's /runners page; safe to run from a short timer
+    heartbeat ;;
+  _agent) # internal/testing: review-dir tag sha -> verdict JSON (no forge calls)
+    w="$(mktemp -d "$state/work/agent.XXXXXX")"; trap 'rm -rf "$w"' EXIT
+    [ -f "$1/signals.txt" ] || signals "$1"
+    run_agent "$1" "$2" "$3" "$w" ;;
+  _review) # internal: dry force include-drafts owner/name number
+    review_one "$4" "$5" "$1" "$2" "$3" ;;
+  show)
+    [ $# = 2 ] || die "usage: show owner/name N"
+    ls -t "$state/receipts/$1/$2"-*.json 2>/dev/null | head -1 | xargs -r jq . || die "no receipt for $1#$2"
+    ;;
+  *) sed -n '2,6p' "$self" >&2; exit 2 ;;
+esac

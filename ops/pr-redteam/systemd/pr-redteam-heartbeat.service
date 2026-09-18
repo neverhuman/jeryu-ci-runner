@@ -1,0 +1,15 @@
+# Tell jeryu's /runners page that this reviewer is alive, and what it is reviewing right now. One
+# cheap POST per start; pr-redteam-heartbeat.timer starts it every minute because the server forgets
+# a runner after 180s while a review pass only runs every five minutes. It never reviews or merges.
+[Unit]
+Description=pr-redteam: report runner liveness to jeryu
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=JERYU_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat
+ExecStart=@REDTEAM_DIR@/pr-redteam heartbeat
+Nice=15
+TimeoutStartSec=2min

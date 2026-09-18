@@ -1,0 +1,10 @@
+[Unit]
+Description=pr-redteam every 5 minutes (a run in progress is never doubled: the script holds a lock)
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+Unit=pr-redteam.service
+
+[Install]
+WantedBy=timers.target

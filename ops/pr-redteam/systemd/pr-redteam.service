@@ -1,0 +1,21 @@
+# Red-team every open family PR on git.neverhuman.org and approve it unless a critical finding is
+# confirmed, then merge what the forge says can merge. One pass per start; pr-redteam.timer starts it.
+# See pr-redteam's header for the policy. Installed as a --user unit by install.sh, which fills in
+# @REDTEAM_DIR@ with the directory it was run from (a checkout of this repo, or any copy).
+[Unit]
+Description=pr-redteam: suspicious agent review + approval of open forge PRs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment="REDTEAM_PRIORITY_FAMILIES=jain jeryu-split"
+Environment=REDTEAM_FAMILIES=all
+Environment=REDTEAM_JOBS=4
+Environment=REDTEAM_MODEL=opus
+Environment=JERYU_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat
+Environment=REDTEAM_MERGE_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-jain-merge-bot-10.1.6.pat
+ExecStart=@REDTEAM_DIR@/pr-redteam run
+Nice=10
+TimeoutStartSec=6h

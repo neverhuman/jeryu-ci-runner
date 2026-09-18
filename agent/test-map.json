@@ -220,6 +220,11 @@
       "lane": "ci",
       "purpose": "verify pre-push gates delegate to local CI lanes"
     },
+    "ops/pr-redteam/": {
+      "command": "ops/pr-redteam/test/canary.sh",
+      "lane": "ci",
+      "purpose": "verify the PR red-team blocks a fabricated malicious PR (planted key, weakened required lane, prompt injection)"
+    },
     "policies/": {
       "command": "just check",
       "lane": "check",

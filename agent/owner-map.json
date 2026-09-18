@@ -45,6 +45,7 @@
     "ops/agent-sandbox/": "jeryu-ci-runner",
     "ops/ci/": "ops",
     "ops/git-hooks/": "ops",
+    "ops/pr-redteam/": "ops",
     "policies/": "jeryu-ci-runner",
     "repos.manifest.toml": "split",
     "rust-toolchain.toml": "workspace",

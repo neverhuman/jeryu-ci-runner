@@ -1,0 +1,10 @@
+[Unit]
+Description=pr-redteam heartbeat every minute (jeryu forgets a runner after 180s)
+
+[Timer]
+OnBootSec=1min
+OnUnitInactiveSec=1min
+Unit=pr-redteam-heartbeat.service
+
+[Install]
+WantedBy=timers.target
