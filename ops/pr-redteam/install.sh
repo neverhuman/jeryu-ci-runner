@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install pr-redteam as a systemd --user timer on this host and start a first pass.
+# Stage pr-redteam user units; activation belongs to the existing service owner.
 # Run it from wherever pr-redteam lives (a checkout of this repo is fine); the unit is written with
 # that absolute path, so a `git pull` in the checkout updates what the timer runs.
 set -euo pipefail
@@ -8,6 +8,15 @@ here="$(cd "$(dirname "$0")" && pwd)"
 command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ] || { echo "claude CLI not found" >&2; exit 1; }
 
 units="$HOME/.config/systemd/user"
+# Replacing an active or enabled unit would change its next execution. Require the
+# service owner to stop/disable it explicitly before staging replacement source.
+for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-redteam-heartbeat.timer; do
+  if systemctl --user is-active --quiet "$unit" || systemctl --user is-enabled --quiet "$unit"; then
+    echo "$unit is active or enabled; its service owner must stop/disable it before installation" >&2
+    exit 1
+  fi
+done
+[[ "$here" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "unit source path contains unsupported characters" >&2; exit 1; }
 mkdir -p "$units"
 # The review unit is written with this directory's path; replacing a symlink from an older install is fine.
 rm -f "$units/pr-redteam.service" "$units/pr-redteam.timer"
@@ -17,9 +26,5 @@ rm -f "$units/pr-redteam-heartbeat.service" "$units/pr-redteam-heartbeat.timer"
 sed "s#@REDTEAM_DIR@#$here#g" "$here/systemd/pr-redteam-heartbeat.service" >"$units/pr-redteam-heartbeat.service"
 cp "$here/systemd/pr-redteam-heartbeat.timer" "$units/pr-redteam-heartbeat.timer"
 systemctl --user daemon-reload
-systemctl --user enable --now pr-redteam.timer
-systemctl --user enable --now pr-redteam-heartbeat.timer
-systemctl --user start --no-block pr-redteam.service
-loginctl show-user "$USER" -p Linger | grep -q yes \
-  || echo "note: linger is off; run 'sudo loginctl enable-linger $USER' so the timer survives logout"
-echo "installed from $here; follow with: journalctl --user -u pr-redteam -f"
+echo "units staged from $here; no review or heartbeat was started"
+echo "the existing service owner must independently qualify and authorize activation"

@@ -1,56 +1,68 @@
 #!/usr/bin/env bash
-# Offline, deterministic: a failed or malformed review must never become an approval.
-# A fake `claude` (REDTEAM_CLAUDE) emits each case; `pr-redteam _agent` must reject every bad one and
-# accept exactly the two valid ones. No network, no model, no real token.
-#   test/verdict-validation.sh      exit 0 when every case behaves
+# Exercise the actual process/envelope/schema boundary with an offline CLI fixture.
 set -euo pipefail
+umask 077
 here="$(cd "$(dirname "$0")/.." && pwd)"
 t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
-
-cat >"$t/fake-claude" <<'F'
+cat >"$t/fake-claude" <<'FIXTURE'
 #!/usr/bin/env bash
-if [ "${1:-}" = "--version" ]; then echo "${FAKE_VERSION:-9.9.9} (Claude Code)"; exit 0; fi
+if [[ "${1:-}" == --version ]]; then echo "${FAKE_VERSION:-9.9.9} (Claude Code)"; exit 0; fi
 ok='{"verdict":"approve","summary":"fine","findings":[]}'
 crit='{"severity":"critical","title":"t","file":"f","detail":"d","evidence":"e"}'
-env() { printf '{"type":"result","subtype":"%s","is_error":%s,"structured_output":%s}\n' "$1" "$2" "$3"; }
+emit() { printf '{"type":"result","subtype":"success","is_error":false,"structured_output":%s}\n' "$1"; }
 case "$FAKE_CASE" in
-  valid_approve)          env success false "$ok" ;;
-  valid_block)            env success false "{\"verdict\":\"block\",\"summary\":\"bad\",\"findings\":[$crit]}" ;;
-  approve_then_exit42)    env success false "$ok"; exit 42 ;;
-  approve_then_timeout)   env success false "$ok"; sleep 30 ;;
-  invalid_verdict_enum)   env success false '{"verdict":"reject","summary":"x","findings":[]}' ;;
-  approve_with_critical)  env success false "{\"verdict\":\"approve\",\"summary\":\"x\",\"findings\":[$crit]}" ;;
-  block_without_critical) env success false '{"verdict":"block","summary":"x","findings":[]}' ;;
-  envelope_is_error)      env error_during_execution true "$ok" ;;
-  missing_summary)        env success false '{"verdict":"approve","findings":[]}' ;;
-  bad_severity)           env success false '{"verdict":"approve","summary":"x","findings":[{"severity":"urgent","title":"t","file":"f","detail":"d","evidence":"e"}]}' ;;
-  no_output)              exit 0 ;;
+  valid_approve) emit "$ok" ;;
+  valid_block) emit "{\"verdict\":\"block\",\"summary\":\"bad\",\"findings\":[$crit]}" ;;
+  valid_high_block) emit "{\"verdict\":\"block\",\"summary\":\"bad\",\"findings\":[${crit/critical/high}]}" ;;
+  explicit_hold) emit '{"verdict":"block","summary":"review incomplete","findings":[]}' ;;
+  approve_then_exit42) emit "$ok"; exit 42 ;;
+  approve_then_timeout) emit "$ok"; sleep 30 ;;
+  invalid_verdict_enum) emit '{"verdict":"reject","summary":"x","findings":[]}' ;;
+  approve_with_critical) emit "{\"verdict\":\"approve\",\"summary\":\"x\",\"findings\":[$crit]}" ;;
+  approve_with_high) emit "{\"verdict\":\"approve\",\"summary\":\"x\",\"findings\":[${crit/critical/high}]}" ;;
+  envelope_is_error) emit "$ok" | jq '.is_error=true' ;;
+  missing_error_flag) emit "$ok" | jq 'del(.is_error)' ;;
+  wrong_envelope_type) emit "$ok" | jq '.type="message"' ;;
+  multiple_envelopes) emit "$ok"; emit "$ok" ;;
+  missing_summary) emit '{"verdict":"approve","findings":[]}' ;;
+  empty_summary) emit '{"verdict":"approve","summary":"","findings":[]}' ;;
+  extra_property) emit "$ok" | jq '.structured_output.extra=true' ;;
+  bad_severity) emit "{\"verdict\":\"block\",\"summary\":\"x\",\"findings\":[${crit/critical/urgent}]}" ;;
+  null_line|fractional_line|zero_line|extra_finding_property|missing_evidence|empty_evidence)
+    v="{\"verdict\":\"block\",\"summary\":\"x\",\"findings\":[$crit]}"
+    case "$FAKE_CASE" in
+      null_line) filter='.structured_output.findings[0].line=null' ;;
+      fractional_line) filter='.structured_output.findings[0].line=1.5' ;;
+      zero_line) filter='.structured_output.findings[0].line=0' ;;
+      extra_finding_property) filter='.structured_output.findings[0].extra=true' ;;
+      missing_evidence) filter='del(.structured_output.findings[0].evidence)' ;;
+      empty_evidence) filter='.structured_output.findings[0].evidence=""' ;;
+    esac
+    emit "$v" | jq "$filter" ;;
+  no_output) exit 0 ;;
 esac
-F
+FIXTURE
 chmod +x "$t/fake-claude"
-
 mkdir -p "$t/review" "$t/state"
 : >"$t/review/diff.patch"; : >"$t/review/files.txt"; : >"$t/review/numstat.txt"
-echo dummy >"$t/token"
-
-run() { # case -> stdout of _agent, exit status preserved
-  FAKE_CASE="${1%%:*}" FAKE_VERSION="${FAKE_VERSION:-9.9.9}" REDTEAM_CLAUDE_VERSION=9.9.9 \
-  REDTEAM_CLAUDE="$t/fake-claude" REDTEAM_TIMEOUT=3 REDTEAM_STATE="$t/state" \
+printf 'dummy\n' >"$t/token"
+run() {
+  FAKE_CASE="$1" FAKE_VERSION="${FAKE_VERSION:-9.9.9}" REDTEAM_CLAUDE_VERSION=9.9.9 \
+    REDTEAM_CLAUDE="$t/fake-claude" REDTEAM_TIMEOUT=1 REDTEAM_STATE="$t/state" \
     JERYU_TOKEN_FILE="$t/token" "$here/pr-redteam" _agent "$t/review" "x/y#1" 0000000000000000000000000000000000000000 2>/dev/null
 }
-
 fail=0
 for c in approve_then_exit42 approve_then_timeout invalid_verdict_enum approve_with_critical \
-         block_without_critical envelope_is_error missing_summary bad_severity no_output; do
-  if out="$(run "$c")"; then echo "FAIL $c: accepted -> $out"; fail=1; else echo "ok   $c: rejected"; fi
+         approve_with_high envelope_is_error missing_error_flag wrong_envelope_type multiple_envelopes \
+         missing_summary empty_summary extra_property bad_severity null_line fractional_line zero_line \
+         extra_finding_property missing_evidence empty_evidence no_output; do
+  if out="$(run "$c")"; then echo "FAIL $c: accepted -> $out"; fail=1; else echo "ok $c: rejected"; fi
 done
-# A valid approval from an unpinned CLI version must still post nothing.
 if out="$(FAKE_VERSION=0.0.1 run valid_approve)"; then
   echo "FAIL cli_version_mismatch: accepted -> $out"; fail=1
-else
-  echo "ok   cli_version_mismatch: rejected"
-fi
-for c in valid_approve valid_block; do
-  if out="$(run "$c")" && [ -n "$out" ]; then echo "ok   $c: accepted"; else echo "FAIL $c: rejected"; fail=1; fi
+else echo "ok cli_version_mismatch: rejected"; fi
+for c in valid_approve valid_block valid_high_block explicit_hold; do
+  if out="$(run "$c")" && [[ -n "$out" ]]; then echo "ok $c: accepted"; else echo "FAIL $c: rejected"; fail=1; fi
 done
-[ "$fail" = 0 ] && echo "VERDICT VALIDATION PASS" || { echo "VERDICT VALIDATION FAIL"; exit 1; }
+((fail == 0))
+echo 'VERDICT VALIDATION PASS'

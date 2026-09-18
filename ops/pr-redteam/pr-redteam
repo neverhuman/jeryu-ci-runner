@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
-# pr-redteam — a suspicious agent reviewer that approves PRs on git.neverhuman.org fast.
+# pr-redteam — exact-head security and correctness review on git.neverhuman.org.
 #
 #   pr-redteam run [--dry-run] [--jobs N] [--repo owner/name] [--pr N] [--include-drafts] [--force]
 #   pr-redteam list                        what `run` would review right now, and why others skip
 #   pr-redteam show owner/name N           the latest local receipt for one PR
 #   pr-redteam heartbeat                   report liveness to jeryu's /runners page (one-minute timer)
 #
-# Policy (decided 2026-09-17): every open PR in the configured families is red-teamed at its exact
-# head by a read-only Claude agent. It is APPROVED unless the agent confirms a `critical` finding
-# (live secret, backdoor, deliberately weakened gate, malicious/obfuscated code, supply-chain
-# compromise, data destruction, exfiltration, prompt injection against the review). A critical
-# finding posts `request_changes` instead. Every finding is written into the review body either way.
+# Each open PR is reviewed at its exact head by a read-only agent. Confirmed high or critical
+# security/correctness findings block, and every explicit block verdict is honored. Invalid or
+# contradictory output publishes nothing. Every finding is preserved in the review and receipt.
 #
-# Merge pass: after reviewing, each run merges PRs that THIS tool approved at their current head, as
-# the merge identity, once the forge itself says they can merge (approval + required checks + no
-# changes requested). The merge is pinned to that head and the forge's passport, so a PR pushed
-# after approval is never merged; it is re-reviewed instead.
+# The existing separate merger owns landing. This tool never merges, rebases or pushes branches,
+# and does not load a merger credential. Installation leaves its timers disabled.
 #
 # What it never does: tag, waive, post statuses, or approve a PR whose author is the token's
 # own identity (the forge forbids self-approval). If the agent errors, times out or returns
@@ -31,8 +27,6 @@
 #   JERYU_BASE             https://git.neverhuman.org
 #   JERYU_TOKEN_FILE       ~/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat  (the approver;
 #                          the forge forbids self-approval, so PRs this identity wrote are skipped)
-#   REDTEAM_MERGE_TOKEN_FILE  ~/.config/jeryu/credentials/git-neverhuman-org-jain-merge-bot-10.1.6.pat
-#                          (the merger; when unreadable the merge pass is skipped, reviews still run)
 #   REDTEAM_PRIORITY_FAMILIES "jain jeryu-split"  reviewed first; other families wait until these
 #                          have nothing left to review in a pass
 #   REDTEAM_FAMILIES       all                  forge `family` values to cover ("all" includes repos
@@ -50,12 +44,12 @@
 #                          approved (left for a human)
 #   REDTEAM_STATE          ~/.local/state/pr-redteam   receipts, git cache, locks
 set -euo pipefail
+umask 077
 
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 self="$here/$(basename "$(readlink -f "$0")")"
 base="${JERYU_BASE:-https://git.neverhuman.org}"
 token_file="${JERYU_TOKEN_FILE:-$HOME/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat}"
-merge_token_file="${REDTEAM_MERGE_TOKEN_FILE:-$HOME/.config/jeryu/credentials/git-neverhuman-org-jain-merge-bot-10.1.6.pat}"
 families="${REDTEAM_FAMILIES:-all}"
 priority_families="${REDTEAM_PRIORITY_FAMILIES:-jain jeryu-split}"
 jobs="${REDTEAM_JOBS:-4}"
@@ -72,17 +66,38 @@ die() { echo "pr-redteam: $*" >&2; exit 1; }
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
 [ -r "$token_file" ] || die "token file $token_file is not readable (set JERYU_TOKEN_FILE)"
-for tool in curl jq git tar timeout flock; do command -v "$tool" >/dev/null || die "$tool is required"; done
+for tool in curl jq git tar timeout flock sync sha256sum; do command -v "$tool" >/dev/null || die "$tool is required"; done
 mkdir -p "$state"/{receipts,cache,locks,work}
+# A successful receipt is reusable only for the same review implementation and
+# declared model/CLI inputs. Hosted approval alone does not establish that match.
+review_input_identity() {
+  {
+    (cd "$here" && sha256sum pr-redteam prompt.md verdict.schema.json validate-verdict.jq)
+    if [[ -f "$claude_bin" ]]; then sha256sum "$claude_bin"; else printf 'cli-unavailable\n'; fi
+    printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes"
+  } | sha256sum | cut -c1-64
+}
+review_identity="$(review_input_identity)"
+
 
 # --- forge -------------------------------------------------------------------------------------
 
 api() { # method path [json-body] -> sets $code and $body
-  local method="$1" path="$2" data="${3:-}" out
-  local args=(--silent --show-error --max-time 60 -X "$method"
-    -H "Authorization: Bearer $(cat "${as_token:-$token_file}")" -H 'Accept: application/json')
+  local method="$1" path="$2" data="${3:-}" out credential secret
+  # Check the destination before opening the reviewer credential.
+  [[ "$base" == https://git.neverhuman.org ]] || die "credential-bearing API requires the canonical hosted HTTPS origin"
+  [[ "$path" == /api/v1/* || "$path" == /api/v3/* ]] || die "unexpected hosted API path"
+  credential="$token_file"
+  [[ -f "$credential" && ! -L "$credential" ]] || die "token must be a regular non-symlink file"
+  [[ "$(stat -c '%a:%u' -- "$credential")" == "600:$(id -u)" ]] || die "token must be owned by this user with mode0600"
+  secret="$(cat -- "$credential")" || die "cannot read token file"
+  [[ "$secret" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] || die "token is not a valid bearer value"
+  local args=(--disable --silent --show-error --max-time 60 --proto '=https'
+    --config - -X "$method" -H 'Accept: application/json')
   [ -z "$data" ] || args+=(-H 'Content-Type: application/json' --data "$data")
-  out="$(curl "${args[@]}" -w '\n%{http_code}' "$base$path")" || { code=000; body="curl failed"; return 0; }
+  # The validated bearer travels through stdin, never argv, a model setting, or a temp file.
+  out="$(printf 'header = "Authorization: Bearer %s"\n' "$secret" |
+    curl "${args[@]}" -w '\n%{http_code}' "$base$path")" || { code=000; body="curl failed"; return 0; }
   code="${out##*$'\n'}"; body="${out%$'\n'*}"
 }
 
@@ -97,7 +112,7 @@ whoami_login() {
 open_prs() {
   api GET /api/v1/repos
   [ "$code" = 200 ] || die "listing repositories answered $code"
-  local fams prio line repo fam
+  local fams prio repo fam
   fams="$(jq -Rc 'split(" ") | map(select(length > 0))' <<<"$families")"
   prio="$(jq -Rc 'split(" ") | map(select(length > 0))' <<<"$priority_families")"
   while IFS=$'\t' read -r repo fam; do
@@ -126,10 +141,9 @@ skip_reason() { # row me include_drafts force
   number="$(jq -r .number <<<"$row")"; sha="$(jq -r .head_sha <<<"$row")"
   [ "$(jq -r .draft <<<"$row")" != true ] || [ "$drafts" = 1 ] || { echo "draft"; return; }
   [ "$(jq -r .author <<<"$row")" != "$me" ] || { echo "authored by $me (self-approval is forbidden)"; return; }
-  [ "$(jq -r '.review.user_review_state // ""' <<<"$row")" != approved ] || { echo "already approved by $me"; return; }
   receipt="$(receipt_path "$repo" "$number" "$sha")"
-  if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" \
-      '.posted == true or (.decision == "too_large" and .diff_bytes > $max)' "$receipt" >/dev/null 2>&1; then
+  if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" --arg identity "$review_identity" --arg base "$(jq -r .base_sha <<< "$row")" \
+      '.review_identity == $identity and .base_sha == $base and (.posted == true or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
     echo "already reviewed at ${sha:0:12} ($(jq -r .decision "$receipt"))"; return
   fi
 }
@@ -154,30 +168,25 @@ run_agent() { # review-dir tag sha work-dir
       --disallowedTools Bash Edit Write NotebookEdit WebFetch WebSearch Agent \
       --add-dir "$d" --setting-sources user --strict-mcp-config --no-session-persistence \
       </dev/null >"$out" 2>"$work/agent.err") || rc=$?
-  # A review counts only if the process exited 0, the envelope reports success, and the verdict is
-  # complete, well-typed and self-consistent. Anything else posts nothing and is retried next run:
-  # a crash, a timeout after partial output, or a malformed verdict must never become an approval.
-  local why=""
-  if [ "$rc" != 0 ]; then
-    why="agent exited $rc"
-  elif ! jq -e '.is_error != true and .subtype == "success"' "$out" >/dev/null 2>&1; then
-    why="agent envelope is not a success"
-  elif ! jq -e "$verdict_valid" "$out" >/dev/null 2>&1; then
-    why="verdict failed schema/consistency validation"
-  fi
-  if [ -n "$why" ]; then
-    say "$tag: no usable verdict ($why), NOT approving, retry next run: $(jq -r '.result // empty' "$out" 2>/dev/null | head -c 200)$(tail -c 200 "$work/agent.err")" >&2
+  # A failed process or malformed/contradictory result cannot publish a review.
+  if ((rc != 0)); then
+    say "$tag: agent process exited $rc; no review published; retry required" >&2
     return 1
   fi
-  jq -c '.structured_output' "$out"
+  # Validate the actual closed schema, including exactly one successful envelope.
+  jq --slurpfile schema "$here/verdict.schema.json" -cse \
+    -f "$here/validate-verdict.jq" "$out" 2>/dev/null || {
+    say "$tag: invalid or contradictory agent result; no review published; retry required" >&2
+    return 1
+  }
 }
 
 # Added or changed files over REDTEAM_MAX_BLOB_BYTES that are binary (per git) or archive/library
 # by extension, and whose sha256 appears nowhere in the diff — i.e. nothing in the change pins them.
 # One JSON object {path, size, sha256} per line; empty output means nothing to hold.
 unpinned_blobs() { # git-dir base head diff.patch
-  local g="$1" b="$2" h="$3" patch="$4" added deleted path size digest
-  while IFS=$'\t' read -r added deleted path; do
+  local g="$1" b="$2" h="$3" patch="$4" added _deleted path size digest
+  while IFS=$'\t' read -r added _deleted path; do
     [ -n "$path" ] || continue
     size="$(git --git-dir="$g" cat-file -s "$h:$path" 2>/dev/null)" || continue
     [ "$size" -gt "$max_blob_bytes" ] || continue
@@ -190,22 +199,6 @@ unpinned_blobs() { # git-dir base head diff.patch
     jq -nc --arg p "$path" --argjson s "$size" --arg d "$digest" '{path: $p, size: $s, sha256: $d}'
   done < <(git --git-dir="$g" diff --numstat --no-renames --diff-filter=AM "$b...$h")
 }
-
-# The full verdict contract, checked before anything is published. `block` is valid exactly when a
-# `critical` finding exists: an approve that names a critical, or a block without one, is
-# inconsistent and posts nothing.
-verdict_valid='.structured_output as $v
-  | ($v | type) == "object"
-  and ($v.verdict == "approve" or $v.verdict == "block")
-  and ($v.summary | type) == "string" and ($v.summary | length) > 0
-  and ($v.findings | type) == "array"
-  and all($v.findings[];
-        (. | type) == "object"
-        and (.severity as $s | ["critical", "high", "medium", "low"] | index($s)) != null
-        and (.title | type) == "string" and (.file | type) == "string"
-        and (.detail | type) == "string" and (.evidence | type) == "string"
-        and ((.line == null) or ((.line | type) == "number")))
-  and (($v.verdict == "block") == any($v.findings[]; .severity == "critical"))'
 
 # --- one review ----------------------------------------------------------------------------------
 
@@ -233,7 +226,7 @@ signals() { # review-dir
 render_body() { # verdict-json decision sha
   jq -r --arg decision "$2" --arg sha "$3" --arg model "$model" '
     def sev_icon: {"critical":"🔴","high":"🟠","medium":"🟡","low":"⚪"}[.] // "•";
-    (if $decision == "approve" then "**Red team: approved.**" else "**Red team: HOLD — critical finding.**" end),
+    (if $decision == "approve" then "**Red team: approved.**" else "**Red team: HOLD — changes or further review required.**" end),
     "",
     .summary,
     "",
@@ -245,6 +238,30 @@ render_body() { # verdict-json decision sha
     "",
     "<sub>pr-redteam · read-only agent (\($model)) · exact head `\($sha[0:12])` · a new push is re-reviewed</sub>"
   ' <<<"$1"
+}
+
+# Keep the admitted attempt visible across process death and archive each terminal
+# result. The per-PR flock is held before reading/recovering the previous claim.
+store_receipt() { # destination; JSON on stdin
+  local destination="$1" temporary
+  temporary="$(mktemp "${destination}.XXXXXX")"
+  cat > "$temporary"
+  sync "$temporary"
+  mv -f -- "$temporary" "$destination"
+  sync "$(dirname "$destination")"
+}
+
+finish_review_attempt() { # latest receipt, attempt history, repo, number, sha, start, work
+  local receipt="$1" history="$2" repo="$3" number="$4" sha="$5" started="$6" work="$7" decision
+  if jq -e '.decision == "reviewing"' "$receipt" > /dev/null; then
+    jq --arg at "$(date -u +%FT%TZ)" \
+      '.decision="failed" | .posted=false | .finished_at=$at | .reason="controller ended before publication"' \
+      "$receipt" | store_receipt "$receipt"
+  fi
+  cat "$receipt" | store_receipt "$history"
+  decision="$(jq -r .decision "$receipt")"
+  beat_done "$repo" "$number" "$sha" "$decision" "$started"
+  rm -rf -- "$work"
 }
 
 review_one() { # owner/name number dry-run force include-drafts
@@ -260,12 +277,32 @@ review_one() { # owner/name number dry-run force include-drafts
   sha="$(jq -r .head_sha <<<"$row")"; base_sha="$(jq -r .base_sha <<<"$row")"
   head_ref="$(jq -r .head_ref <<<"$row")"; base_ref="$(jq -r .base_ref <<<"$row")"
 
-  local started_at; started_at="$(date +%s)"
+  local started_at receipt history work
+  started_at="$(date +%s)"
+  receipt="$(receipt_path "$repo" "$number" "$sha")"
+  mkdir -p "$(dirname "$receipt")" "$state/attempts/$repo"
+  # Flush newly created receipt/attempt parents before admitting the worker.
+  sync -f "$state"
+  # A pending receipt after acquiring the exclusive lock is a recovery obligation.
+  if [[ -s "$receipt" ]] && jq -e '.decision == "reviewing"' "$receipt" >/dev/null; then
+    history="$(mktemp "$state/attempts/$repo/$number-$sha-recovered.XXXXXX.json")"
+    jq --arg at "$(date -u +%FT%TZ)" \
+      '.decision="interrupted" | .posted=false | .recovered_at=$at | .reason="previous holder lost the review lock"' \
+      "$receipt" | store_receipt "$history"
+  fi
+  history="$(mktemp "$state/attempts/$repo/$number-$sha.XXXXXX.json")"
+  work="$state/work/${repo/\//_}-$number-${sha:0:12}"
+  jq -nc --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$base_sha" \
+    --arg at "$(date -u +%FT%TZ)" --argjson pid "$BASHPID" --arg identity "$review_identity" \
+    '{repo:$repo,number:$number,head_sha:$sha,base_sha:$base,decision:"reviewing",posted:false,started_at:$at,pid:$pid,review_identity:$identity}' \
+    | store_receipt "$receipt"
+  trap 'finish_review_attempt "$receipt" "$history" "$repo" "$number" "$sha" "$started_at" "$work"; trap - RETURN EXIT INT TERM' RETURN
+  trap 'exit 143' TERM
+  trap 'exit 130' INT
+  trap 'finish_review_attempt "$receipt" "$history" "$repo" "$number" "$sha" "$started_at" "$work"' EXIT
   beat_start "$repo" "$number" "$sha"
 
-  local work="$state/work/${repo/\//_}-$number-${sha:0:12}"
   rm -rf "$work"; mkdir -p "$work/review/checkout" "$work/empty"
-  trap 'rm -rf "'"$work"'"' RETURN
 
   # Git: a bare cache per repo; the reviewed tree is the exact head, extracted without .git.
   # One writer per repo cache: parallel reviews of PRs in the same repo would otherwise race on
@@ -301,8 +338,8 @@ review_one() { # owner/name number dry-run force include-drafts
     say "$tag: diff is $diff_bytes bytes (> $max_diff_bytes), too large to red-team; NOT approving, needs a human"
     local big; big="$(receipt_path "$repo" "$number" "$sha")"; mkdir -p "$(dirname "$big")"
     jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" \
-      --argjson bytes "$diff_bytes" \
-      '{repo:$repo, number:$number, head_sha:$sha, decision:"too_large", posted:false, diff_bytes:$bytes, reviewed_at:$at}' >"$big"
+      --argjson bytes "$diff_bytes" --arg identity "$review_identity" --arg base "$base_sha" \
+      '{repo:$repo, number:$number, head_sha:$sha, decision:"too_large", posted:false, diff_bytes:$bytes, reviewed_at:$at, review_identity:$identity, base_sha:$base}' | store_receipt "$big"
     return 0
   fi
   say "$tag: reviewing ${sha:0:12} ($(wc -l <"$d/files.txt") files, $(wc -c <"$d/diff.patch") bytes of diff)"
@@ -332,9 +369,13 @@ review_one() { # owner/name number dry-run force include-drafts
         evidence: "sha256 \(.sha256)"}] + .findings)' <<<"$verdict")"
   fi
   local body; body="$(render_body "$verdict" "$decision" "$sha")"
-  local receipt; receipt="$(receipt_path "$repo" "$number" "$sha")"; mkdir -p "$(dirname "$receipt")"
+  # The latest receipt was admitted before the worker started.
   local cost; cost="$(jq -r '.total_cost_usd // null' "$work/agent.json" 2>/dev/null)"
 
+  if [[ "$(review_input_identity)" != "$review_identity" ]]; then
+    say "$tag: review inputs changed during execution; no review published; requalification required"
+    return 0
+  fi
   local posted=false post_code=""
   if [ "$dry" = 1 ]; then
     say "$tag: DRY RUN decision=$decision (would post)"; printf '%s\n\n' "$body"
@@ -344,17 +385,17 @@ review_one() { # owner/name number dry-run force include-drafts
       --arg sha "$sha" --arg b "$body" \
       '{verdict: $v, expected_head_sha: $sha, body_markdown: $b, thread_comments: []}')"
     post_code="$code"
+    [[ "$code" == 2* ]] || decision=publication_rejected
     if [[ "$code" == 2* ]]; then posted=true; say "$tag: posted $decision at ${sha:0:12}"
     else say "$tag: posting $decision answered $code, retry next run: $(jq -c '.error // .message // .' <<<"$body" 2>/dev/null | head -c 300)"
     fi
   fi
   jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$base_sha" \
-    --arg decision "$decision" --argjson verdict "$verdict" --arg model "$model" --argjson cost "$cost" \
+    --arg decision "$decision" --argjson verdict "$verdict" --arg model "$model" --argjson cost "$cost" --arg identity "$review_identity" \
     --argjson posted "$posted" --arg code "$post_code" --argjson dry "$([ "$dry" = 1 ] && echo true || echo false)" \
     --arg at "$(date -u +%FT%TZ)" \
     '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, decision:$decision, posted:$posted,
-      post_http:$code, dry_run:$dry, model:$model, cost_usd:$cost, reviewed_at:$at, verdict:$verdict}' >"$receipt"
-  beat_done "$repo" "$number" "$sha" "$decision" "$started_at"
+      post_http:$code, dry_run:$dry, model:$model, cost_usd:$cost, reviewed_at:$at, verdict:$verdict,review_identity:$identity}' | store_receipt "$receipt"
 }
 
 # --- heartbeat -----------------------------------------------------------------------------------
@@ -410,89 +451,6 @@ heartbeat() {
   return 0
 }
 
-# --- merge pass ----------------------------------------------------------------------------------
-
-# Merge every open PR this tool approved at its current head, once the forge says it can merge.
-merge_pass() { # dry
-  local dry="$1" merger row repo number sha receipt
-  if [ ! -r "$merge_token_file" ]; then say "merge pass skipped: $merge_token_file is not readable"; return 0; fi
-  merger="$(as_token="$merge_token_file"; api GET /api/v3/user; [ "$code" = 200 ] && jq -r .login <<<"$body")" \
-    || { say "merge pass skipped: the merge token was rejected"; return 0; }
-  while IFS= read -r row; do
-    repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
-    sha="$(jq -r .head_sha <<<"$row")"
-    [ -z "$only_repo" ] || [ "$repo" = "$only_repo" ] || continue
-    [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
-    receipt="$(receipt_path "$repo" "$number" "$sha")"
-    [ -s "$receipt" ] && jq -e '.posted == true and .decision == "approve"' "$receipt" >/dev/null 2>&1 || continue
-    [ "$(jq -r .draft <<<"$row")" != true ] || continue
-    if ! jq -e '.mergeable.can_merge == true and (.review.changes_requested // 0) == 0' <<<"$row" >/dev/null; then
-      say "$repo#$number: approved, waiting to merge: $(jq -r '.mergeable.reason // .mergeable.level // "not mergeable"' <<<"$row")"
-      continue
-    fi
-    if [ "$dry" = 1 ]; then say "$repo#$number: DRY RUN would merge ${sha:0:12} as $merger"; continue; fi
-    as_token="$merge_token_file" api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/merge" "$(jq -n --arg sha "$sha" \
-      --arg p "$(jq -r .passport_hash <<<"$row")" \
-      '{expected_head_sha: $sha, passport_hash: $p, expected_passport_hash: $p}')"
-    if [[ "$code" == 2* ]]; then
-      say "$repo#$number: MERGED ${sha:0:12} as $merger"
-      jq --arg at "$(date -u +%FT%TZ)" --arg by "$merger" '.merged_at = $at | .merged_by = $by' "$receipt" >"$receipt.tmp" && mv "$receipt.tmp" "$receipt"
-    elif [ "$code" = 409 ] && jq -e '(.error // .).message // "" | test("linear history")' <<<"$body" >/dev/null 2>&1; then
-      rebase_pr "$repo" "$number" "$sha" "$(jq -r .head_ref <<<"$row")" "$(jq -r .base_ref <<<"$row")" "$receipt"
-    else
-      say "$repo#$number: merge answered $code, retry next run: $(jq -c '(.error // .) | {code, message, details}' <<<"$body" 2>/dev/null | head -c 400)"
-    fi
-  done < <(open_prs)
-}
-
-# A linear-history base refuses anything but a fast-forward, and the forge ignores merge_method. So
-# rebase the PR branch onto its base and force-push it as the merge identity, leased to the exact head
-# that was reviewed (an author's newer push is never overwritten). The new head has no receipt, so the
-# next pass red-teams it again and merges it once its required check passes. Conflicts are left alone.
-rebase_pr() { # owner/name number reviewed-sha head_ref base_ref receipt
-  local repo="$1" number="$2" sha="$3" head_ref="$4" base_ref="$5" receipt="$6"
-  local tag="$repo#$number" cache="$state/cache/$repo.git" url="$base/git/$repo.git"
-  local work; work="$(mktemp -d "$state/work/rebase.XXXXXX")"
-  local helper="!f() { echo username=jain-merge-bot; echo \"password=\$(cat '$merge_token_file')\"; }; f"
-  local g=(git -c credential.helper= -c "credential.$base.helper=" -c "credential.helper=$helper"
-    -c user.name=jain-merge-bot -c user.email=jain-merge-bot@git.neverhuman.org -c commit.gpgsign=false)
-
-  if [ "$dry" = 1 ]; then say "$tag: DRY RUN would rebase $head_ref onto $base_ref and force-push"; rm -rf "$work"; return 0; fi
-  [ -d "$cache" ] || git init -q --bare "$cache"
-  if ! timeout 900 "${g[@]}" -C "$cache" fetch -q --no-tags "$url" \
-      "+refs/heads/$head_ref:refs/pr/$number/head" "+refs/heads/$base_ref:refs/pr/$number/base" 2>"$work/err"; then
-    say "$tag: rebase skipped, fetch failed: $(tail -1 "$work/err")"; rm -rf "$work"; return 0
-  fi
-  if [ "$(git -C "$cache" rev-parse "refs/pr/$number/head")" != "$sha" ]; then
-    say "$tag: rebase skipped, $head_ref moved past the reviewed ${sha:0:12}; it will be re-reviewed"; rm -rf "$work"; return 0
-  fi
-  git clone -q --shared --no-checkout "$cache" "$work/tree" 2>"$work/err" \
-    && git -C "$work/tree" checkout -q --detach "$sha" 2>>"$work/err" || {
-    say "$tag: rebase skipped, local checkout failed: $(tail -1 "$work/err")"; rm -rf "$work"; return 0; }
-  local onto; onto="$(git -C "$cache" rev-parse "refs/pr/$number/base")"
-  if ! "${g[@]}" -C "$work/tree" rebase -q "$onto" >"$work/err" 2>&1; then
-    git -C "$work/tree" rebase --abort >/dev/null 2>&1 || true
-    say "$tag: rebase onto $base_ref ${onto:0:12} CONFLICTS, needs a manual rebase by the author"; rm -rf "$work"; return 0
-  fi
-  local new; new="$(git -C "$work/tree" rev-parse HEAD)"
-  # Every commit was already upstream: rewriting the branch to the base tip would leave an empty PR
-  # and hide the author's commits. Leave the branch alone and say the PR can be closed.
-  if [ "$new" = "$onto" ]; then
-    say "$tag: every commit on $head_ref is already in $base_ref ${onto:0:12}; NOT pushing — close the PR"
-    jq --arg onto "$onto" --arg at "$(date -u +%FT%TZ)" '.already_in_base = $onto | .checked_at = $at' \
-      "$receipt" >"$receipt.tmp" && mv "$receipt.tmp" "$receipt"
-    rm -rf "$work"; return 0
-  fi
-  if ! timeout 900 "${g[@]}" -C "$work/tree" push -q --force-with-lease="refs/heads/$head_ref:$sha" \
-      "$url" "HEAD:refs/heads/$head_ref" >"$work/err" 2>&1; then
-    say "$tag: rebased but force-push to $head_ref refused: $(grep -v '^$' "$work/err" | tail -1)"; rm -rf "$work"; return 0
-  fi
-  say "$tag: REBASED $head_ref ${sha:0:12} -> ${new:0:12} onto $base_ref ${onto:0:12} as jain-merge-bot; re-review next pass"
-  jq --arg to "$new" --arg onto "$onto" --arg at "$(date -u +%FT%TZ)" \
-    '.rebased_to = $to | .rebased_onto = $onto | .rebased_at = $at' "$receipt" >"$receipt.tmp" && mv "$receipt.tmp" "$receipt"
-  rm -rf "$work"
-}
-
 # --- commands ------------------------------------------------------------------------------------
 
 cmd="${1:-}"; shift || true
@@ -538,7 +496,7 @@ case "$cmd" in
     fi
     [ "$cmd" = run ] || exit 0
     [ ${#queue[@]} -eq 0 ] || printf '%s\n' "${queue[@]}" | xargs -P "$jobs" -L 1 "$self" _review "$dry" "$force" "$drafts" || true
-    merge_pass "$dry"
+    # Publication ends at a review. The existing separate merger owns landing.
     ;;
   heartbeat) # report liveness to jeryu's /runners page; safe to run from a short timer
     heartbeat ;;

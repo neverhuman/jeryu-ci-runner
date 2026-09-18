@@ -221,9 +221,9 @@
       "purpose": "verify pre-push gates delegate to local CI lanes"
     },
     "ops/pr-redteam/": {
-      "command": "ops/pr-redteam/test/verdict-validation.sh && ops/pr-redteam/test/binary-payload.sh && ops/pr-redteam/test/canary.sh",
+      "command": "bash ops/pr-redteam/test/required.sh",
       "lane": "ci",
-      "purpose": "verify review verdict validation, the CLI version pin and the size rule for opaque files (offline), plus the end-to-end canary"
+      "purpose": "offline verdict, credential transport, publication/retry, history preservation and inactive installation regressions; paid live-model canary is separately owner-qualified"
     },
     "policies/": {
       "command": "just check",

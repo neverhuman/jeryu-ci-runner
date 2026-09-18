@@ -1,85 +1,76 @@
 # pr-redteam
 
-A red-team agent whose one job is to be suspicious of every open pull request on
-git.neverhuman.org, and to approve it fast unless it finds something very serious.
+Review pull requests on `git.neverhuman.org` at their exact head. Confirmed high or
+critical security/correctness findings block. An explicit block verdict always
+holds; failed processes, incomplete output and contradictory approvals publish
+nothing. Findings and terminal attempt receipts remain available for review.
 
-- **Scope:** open, non-draft PRs in every repo (`REDTEAM_FAMILIES=all`). The `jain` and
-  `jeryu-split` families (`REDTEAM_PRIORITY_FAMILIES`) go first: other families are reviewed only in
-  a pass where the priority families have nothing left to review. Merging covers every family.
-- **Size:** diffs over 20 MB, not counting lock files (`REDTEAM_MAX_DIFF_BYTES`), are left for a
-  human. Lock files are listed for the agent but not included in the diff it reads.
-- **Approves** as the token's identity (PRagent by default) at the exact head SHA, with the summary
-  and every finding in the review body.
-- **Holds** (`request_changes`) only on a confirmed `critical` finding: a live secret, backdoor,
-  deliberately weakened gate, malicious or obfuscated code, supply-chain compromise, data
-  destruction, exfiltration, or prompt injection against the review. A committed private key holds
-  regardless of the agent.
-- **Merges** (as `jain-merge-bot`, `REDTEAM_MERGE_TOKEN_FILE`) each PR it approved, once the forge
-  says `can_merge` (approval + passing required checks + no changes requested), pinned to the
-  reviewed head and passport. A push after approval is re-reviewed, never merged as-is. If the merge
-  token is missing or rejected, the merge pass is skipped and reviews continue.
-- **Rebases** a PR the forge refuses with "base requires linear history" (the forge ignores
-  `merge_method`): the branch is rebased onto its base and force-pushed as `jain-merge-bot`, leased
-  to the reviewed head so a newer author push is never overwritten. The new head is re-reviewed and
-  merges once its required check passes. On a conflict nothing is pushed; the author must rebase.
-- **Never** tags, waives or posts statuses. It skips PRs the token's own identity wrote
-  (the forge forbids self-approval) and drafts (`--include-drafts` to cover them).
-- **Fails closed:** if the agent errors, times out or returns no valid verdict, nothing is posted
-  and the PR is retried on the next run.
-- **Re-reviews on push:** receipts are keyed by head SHA, so a new push gets a fresh review.
+The existing separate merger owns acceptance and landing. This controller never
+merges, rebases, pushes, tags, waives checks or posts required statuses. It does
+not read a merger credential. Installation stages inactive units; it does not
+authorize or start automated review.
 
-## Use
+## Qualification
+
+`bash test/required.sh` runs offline verdict, binary-payload, credential-transport,
+publication/recovery and installation checks. The actual repository required lane
+runs this suite. Tests use local fixture repositories, dummy credentials and
+stand-in model/forge processes. They cover malformed and failed model results,
+publication refusal, restart, duplicate dispatch, worker loss and changed heads.
+
+`test/canary.sh` is a separate paid live-model qualification for the service owner.
+It requires the exact pinned CLI and selected model. Offline source qualification
+does not establish the live model's accuracy, sandbox confinement, or service
+activation approval.
+
+## Commands
 
 ```sh
-./pr-redteam list                                  # the queue, and why the rest skip
-./pr-redteam run --dry-run --repo veox/jain-web --pr 16   # review, print the body, post nothing
-./pr-redteam run                                   # review and post for the whole queue
-./pr-redteam show veox/jain-web 16                 # latest local receipt
-./pr-redteam heartbeat                             # one liveness beat to jeryu's /runners page
-test/canary.sh                                     # a fabricated malicious PR must be blocked
+./pr-redteam list
+./pr-redteam run --dry-run --repo veox/jain-web --pr 16
+./pr-redteam run --repo veox/jain-web --pr 16
+./pr-redteam show veox/jain-web 16
+./pr-redteam heartbeat
 ```
 
-## As a service (xbabe0 — the only host with the `claude` CLI)
+The reviewer skips its own authored PRs, drafts unless explicitly included, and
+successfully posted reviews at the current head with matching controller, prompt,
+schema, model, CLI executable and version inputs. Each changed head needs a new
+review. The forge receives the exact expected head and can reject publication
+if it moved while the model was running. Rejected publication remains retryable.
 
-```sh
-./install.sh            # writes the user units for THIS directory, enables the 5-minute timer,
-                        # and starts a first pass
-journalctl --user -u pr-redteam -f
-systemctl --user disable --now pr-redteam.timer     # stop
-```
+`JERYU_TOKEN_FILE` selects the existing approval credential by path. API calls
+require `https://git.neverhuman.org`, an owned mode0600 nonsymlink regular token
+file and a valid bearer value. The bearer travels through curl configuration
+stdin, with curlrc disabled, and is absent from curl argv. This transport guard
+is separate from model/process credential confinement.
 
-The unit's `ExecStart` is the absolute path `install.sh` was run from, so running it from a checkout
-of this repo means a `git pull` updates what the timer runs. Re-run `install.sh` after moving the
-directory.
+State lives in `REDTEAM_STATE` (default `~/.local/state/pr-redteam`). The per-PR
+lock excludes concurrent reviews. Receipts record admitted attempts before model
+execution; a killed worker leaves a visible pending claim. The next holder
+archives it as interrupted before retrying. Terminal attempts remain under
+`attempts/`, latest receipts under `receipts/`, and current work is removed when
+an attempt terminates normally or recovers. Failed attempts never count as an
+approval. Operators should investigate pending claims when no worker owns them.
 
-Two timers are installed: `pr-redteam.timer` reviews every five minutes, and
-`pr-redteam-heartbeat.timer` beats every minute.
+## Installation and service ownership
 
-## Showing up on jeryu's /runners page
+`./install.sh` stages four user units and reloads their definitions. It refuses
+to replace active or enabled units. The existing service owner must explicitly
+stop/disable an earlier installation, qualify the selected source/model/CLI, and
+separately authorize activation. The script never starts or enables a timer.
 
-`pr-redteam heartbeat` POSTs to `/api/v1/runners/heartbeat` using the same contract the PR gate
-runners use, so one page renders both kinds of runner; this one labels itself `redteam` and reports
-the review it is running plus the last one it finished. It is best-effort and never fails a review.
+The units reference this source directory by absolute path. Treat any later
+source update as a service change requiring its owner's custody and qualification.
+The reviewer timer invokes only review publication; the separate merger remains
+outside this controller. Heartbeats report liveness through Jeryu's existing
+runner-reporting allowlist. An authorization refusal is logged, not bypassed.
 
-It beats from its own one-minute timer rather than only during a pass, because jeryu marks a runner
-offline after 180s (`RUNNER_OFFLINE_AFTER_SECS`) and a pass only runs every five minutes.
+## Review isolation
 
-The forge only accepts heartbeats from accounts listed in its `JERYU_RUNNER_REPORTERS` allowlist. A
-refusal is logged once and otherwise ignored:
-
-```
-heartbeat refused (403): "this account may not report runner heartbeats (JERYU_RUNNER_REPORTERS)"
-```
-
-## Isolation
-
-The agent runs `claude -p` from an empty directory with only `Read`, `Grep` and `Glob`, in
-`dontAsk` mode, with no MCP servers and user settings only. The PR tree comes from `git archive`
-(no `.git`, no hooks) and is attached with `--add-dir`. What that guarantees: nothing in the PR can
-run code in the reviewer or change its settings, tools or MCP servers. What it does not: every file
-in the PR is still text the agent reads, including files that look like instructions (a `CLAUDE.md`,
-comments, the description). The real defence there is the prompt, which declares all PR content
-untrusted data and makes instructions aimed at the reviewer a critical finding — a model-level
-control, not a sandbox one.
-
-State (receipts, bare git caches, locks) is in `~/.local/state/pr-redteam`.
+The model runs from an empty working directory with Read/Grep/Glob, no MCP
+servers, and user settings only. PR contents are an exact-head Git archive with
+no `.git` or hooks. The prompt treats source, descriptions and repository
+instructions as untrusted data. These controls are not evidence of sealed
+execution or protection against every model prompt injection. The live service
+owner must qualify its actual filesystem, credential and tool boundaries.

@@ -68,6 +68,9 @@ bash "$JERYU_TOOL_RENDER" --check --repo "$consumer_repo" \
 --repo-root "$consumer_repo=$repo_root"
 fi
 
+echo "[pr-ci] offline review-controller regression suite" >&2
+bash ops/pr-redteam/test/required.sh
+
 echo "[pr-ci] (jobs=$JOBS) standard lanes" >&2
 bash ops/ci/fast.sh
 JERYU_SPLIT_FULL_CHECK=1 bash ops/ci/check.sh

@@ -1,23 +1,65 @@
 {
   "type": "object",
   "additionalProperties": false,
-  "required": ["verdict", "summary", "findings"],
+  "required": [
+    "verdict",
+    "summary",
+    "findings"
+  ],
   "properties": {
-    "verdict": { "type": "string", "enum": ["approve", "block"] },
-    "summary": { "type": "string" },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "approve",
+        "block"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
     "findings": {
       "type": "array",
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["severity", "title", "file", "detail", "evidence"],
+        "required": [
+          "severity",
+          "title",
+          "file",
+          "detail",
+          "evidence"
+        ],
         "properties": {
-          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
-          "title": { "type": "string" },
-          "file": { "type": "string" },
-          "line": { "type": "integer" },
-          "detail": { "type": "string" },
-          "evidence": { "type": "string" }
+          "severity": {
+            "type": "string",
+            "enum": [
+              "critical",
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          },
+          "file": {
+            "type": "string",
+            "minLength": 1
+          },
+          "line": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1
+          },
+          "evidence": {
+            "type": "string",
+            "minLength": 1
+          }
         }
       }
     }
