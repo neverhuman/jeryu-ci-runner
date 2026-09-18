@@ -6,7 +6,9 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
 cat >"$t/fake-claude" <<'FIXTURE'
 #!/usr/bin/env bash
-if [[ "${1:-}" == --version ]]; then echo "${FAKE_VERSION:-9.9.9} (Claude Code)"; exit 0; fi
+fixture_root="$(dirname "$0")"
+if [[ "${1:-}" == --version ]]; then printf '%s (Claude Code)\n' "$(cat "$fixture_root/version")"; exit 0; fi
+FAKE_CASE="$(cat "$fixture_root/case")"
 ok='{"verdict":"approve","summary":"fine","findings":[]}'
 crit='{"severity":"critical","title":"t","file":"f","detail":"d","evidence":"e"}'
 emit() { printf '{"type":"result","subtype":"success","is_error":false,"structured_output":%s}\n' "$1"; }
@@ -47,7 +49,9 @@ mkdir -p "$t/review" "$t/state"
 : >"$t/review/diff.patch"; : >"$t/review/files.txt"; : >"$t/review/numstat.txt"
 printf 'dummy\n' >"$t/token"
 run() {
-  FAKE_CASE="$1" FAKE_VERSION="${FAKE_VERSION:-9.9.9}" REDTEAM_CLAUDE_VERSION=9.9.9 \
+  printf '%s\n' "$1" > "$t/case"
+  printf '%s\n' "${FAKE_VERSION:-9.9.9}" > "$t/version"
+  REDTEAM_CLAUDE_VERSION=9.9.9 \
     REDTEAM_CLAUDE="$t/fake-claude" REDTEAM_TIMEOUT=1 REDTEAM_STATE="$t/state" \
     JERYU_TOKEN_FILE="$t/token" "$here/pr-redteam" _agent "$t/review" "x/y#1" 0000000000000000000000000000000000000000 2>/dev/null
 }

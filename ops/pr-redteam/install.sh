@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Stage pr-redteam user units; activation belongs to the existing service owner.
-# Run it from wherever pr-redteam lives (a checkout of this repo is fine); the unit is written with
-# that absolute path, so a `git pull` in the checkout updates what the timer runs.
+# Run from the custodied source directory. Every later source change requires
+# the service owner's stopped handoff, qualification and separate activation.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 [ -x "$here/pr-redteam" ] || { echo "no executable pr-redteam next to $0" >&2; exit 1; }

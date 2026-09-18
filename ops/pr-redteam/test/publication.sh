@@ -71,11 +71,17 @@ cat > "$t/bin/model" <<'FIXTURE'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ "${1:-}" == --version ]]; then echo '9.9.9 (Claude Code)'; exit 0; fi
+PUBLISH_FIXTURE="$(dirname "$(dirname "$0")")"
 printf 'called\n' >> "$PUBLISH_FIXTURE/model-calls"
 touch "$PUBLISH_FIXTURE/model-started"
 while [[ -e "$PUBLISH_FIXTURE/gate" ]]; do sleep 0.05; done
 if [[ -e "$PUBLISH_FIXTURE/model-fail" ]]; then exit 42; fi
-printf '{"type":"result","subtype":"success","is_error":false,"structured_output":%s}\n' "$(cat "$PUBLISH_FIXTURE/verdict")"
+if [[ -e "$PUBLISH_FIXTURE/model-leak" ]]; then
+  jq -nc --arg secret "$(cat "$PUBLISH_FIXTURE/token")" \
+    '{type:"result",subtype:"success",is_error:false,structured_output:{verdict:"approve",summary:$secret,findings:[]}}'
+else
+  printf '{"type":"result","subtype":"success","is_error":false,"structured_output":%s}\n' "$(cat "$PUBLISH_FIXTURE/verdict")"
+fi
 FIXTURE
 chmod +x "$t/bin/"*
 printf '{"verdict":"approve","summary":"fixture review complete","findings":[]}\n' > "$t/verdict"
@@ -151,6 +157,15 @@ touch "$t/model-fail"
 review
 jq -e '.decision == "failed" and .posted == false' "$(receipt)" > /dev/null
 rm "$t/model-fail"
+posts_before="$(count "$t/posts")"
+touch "$t/model-leak"
+review
+jq -e '.decision == "failed" and .posted == false' "$(receipt)" > /dev/null
+[[ "$(count "$t/posts")" == "$posts_before" ]]
+if grep -RFq 'fixture-bearer' "$t/state" "$t/controller.log"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
+rm "$t/model-leak"
+echo 'ok credential-bearing result never published or stored as a review'
+
 printf '{"verdict":"block","summary":"evidence incomplete","findings":[]}\n' > "$t/verdict"
 review
 jq -e '.posted == true and .decision == "hold"' "$(receipt)" > /dev/null

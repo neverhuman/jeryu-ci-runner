@@ -19,7 +19,7 @@
 # an approval.
 #
 # Isolation: the agent runs from an empty directory with only Read/Grep/Glob, in dontAsk mode, no
-# MCP servers, no project settings. The PR checkout is extracted with `git archive` (no .git, no
+# MCP servers or customizations, and restricted file tools. The PR checkout is extracted with `git archive` (no .git, no
 # hooks) and attached with --add-dir, so nothing in the PR can run code in the agent or change its
 # settings or tools. PR text is still read by the agent; the prompt treats it as untrusted data.
 #
@@ -66,7 +66,7 @@ die() { echo "pr-redteam: $*" >&2; exit 1; }
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
 [ -r "$token_file" ] || die "token file $token_file is not readable (set JERYU_TOKEN_FILE)"
-for tool in curl jq git tar timeout flock sync sha256sum; do command -v "$tool" >/dev/null || die "$tool is required"; done
+for tool in curl jq git tar timeout flock sync sha256sum base64 od; do command -v "$tool" >/dev/null || die "$tool is required"; done
 mkdir -p "$state"/{receipts,cache,locks,work}
 # A successful receipt is reusable only for the same review implementation and
 # declared model/CLI inputs. Hosted approval alone does not establish that match.
@@ -148,32 +148,73 @@ skip_reason() { # row me include_drafts force
   fi
 }
 
+# Preserve only the CLI's declared authentication/runtime inputs. Forge and
+# merger authority, arbitrary service secrets, and agent configuration do not
+# enter the model process. Values stay in the environment, never argv.
+model_process() (
+  local name
+  while IFS= read -r name; do
+    case "$name" in
+      HOME|PATH|LANG|LC_ALL|TERM|TZ|TMPDIR|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|ANTHROPIC_BASE_URL|CLAUDE_CODE_OAUTH_TOKEN|CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC|HTTP_PROXY|HTTPS_PROXY|ALL_PROXY|NO_PROXY|http_proxy|https_proxy|all_proxy|no_proxy) ;;
+      *) unset "$name" || exit 1 ;;
+    esac
+  done < <(compgen -e)
+  while IFS= read -r name; do export -nf "${name?}"; done < <(compgen -A function)
+  export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+  exec "$@"
+)
+
+# Refuse current credential material before printing a verdict or storing a
+# public review receipt. Decode JSON strings first, including escaped content;
+# check the raw bearer plus common encodings without putting them in argv.
+review_output_safe() { # private model output file
+  local secret strings encoded hex
+  [[ -f "$token_file" && ! -L "$token_file" ]] || return 1
+  [[ "$(stat -c '%a:%u' -- "$token_file")" == "600:$(id -u)" ]] || return 1
+  secret="$(cat -- "$token_file")" || return 1
+  [[ "$secret" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] || return 1
+  strings="$(jq -er '.. | strings' "$1")" || return 1
+  encoded="$(printf '%s' "$secret" | base64 -w0)"
+  hex="$(printf '%s' "$secret" | od -An -tx1 | tr -d ' \n')"
+  [[ "$strings" != *"$secret"* && "$strings" != *"$encoded"* && "$strings" != *"$hex"* ]] || return 1
+  # Token fragments spread across JSON fields or whitespace cannot hide the
+  # current bearer from this additional check.
+  strings="$(printf '%s' "$strings" | tr -d '[:space:]')"
+  [[ "$strings" != *"$secret"* ]]
+}
+
 # The agent: empty cwd, review dir attached read-only, structured verdict on stdout.
 run_agent() { # review-dir tag sha work-dir
   local d="$1" tag="$2" sha="$3" work="$4" out="$4/agent.json" rc=0
   mkdir -p "$work/empty"
   # Only the pinned CLI may review: an auto-updated `claude` is a different tool until someone
   # reviews the bump. A missing pin or a mismatch posts nothing.
-  local have; have="$("$claude_bin" --version 2>/dev/null | awk '{print $1; exit}')"
+  local have; have="$(model_process "$claude_bin" --version 2>/dev/null | awk '{print $1; exit}')"
   if [ -z "$claude_version_pin" ] || [ "$have" != "$claude_version_pin" ]; then
-    say "$tag: no usable verdict (claude CLI is '${have:-missing}', pinned '${claude_version_pin:-unset}'), NOT approving; bump claude-cli.version in a reviewed change" >&2
+    say "$tag: CLI version does not match the selected pin; no review published" >&2
     return 1
   fi
-  (cd "$work/empty" && timeout "$agent_timeout" "$claude_bin" -p \
+  (cd "$work/empty" && model_process timeout "$agent_timeout" "$claude_bin" --restricted --safe-mode -p \
       "Red-team the pull request $tag at head $sha. The review directory is $d — start with signals.txt, pr.json and description.md, then read all of diff.patch. Return your verdict in the required structured format." \
       --append-system-prompt "$(cat "$here/prompt.md")" \
       --json-schema "$(cat "$here/verdict.schema.json")" \
       --output-format json --model "$model" --max-budget-usd "$budget" \
-      --permission-mode dontAsk --allowedTools Read Grep Glob \
+      --permission-mode dontAsk --tools Read Grep Glob --allowedTools "Read(/$d/**)" Grep Glob \
       --disallowedTools Bash Edit Write NotebookEdit WebFetch WebSearch Agent \
-      --add-dir "$d" --setting-sources user --strict-mcp-config --no-session-persistence \
+      --add-dir "$d" --strict-mcp-config --mcp-config '{"mcpServers":{}}' --no-session-persistence \
       </dev/null >"$out" 2>"$work/agent.err") || rc=$?
   # A failed process or malformed/contradictory result cannot publish a review.
   if ((rc != 0)); then
     say "$tag: agent process exited $rc; no review published; retry required" >&2
     return 1
   fi
+  if ! review_output_safe "$out"; then
+    rm -f -- "$out" "$work/agent.err"
+    say "$tag: unsafe or unreadable model output; no review published" >&2
+    return 1
+  fi
   # Validate the actual closed schema, including exactly one successful envelope.
+
   jq --slurpfile schema "$here/verdict.schema.json" -cse \
     -f "$here/validate-verdict.jq" "$out" 2>/dev/null || {
     say "$tag: invalid or contradictory agent result; no review published; retry required" >&2

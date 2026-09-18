@@ -68,9 +68,22 @@ runner-reporting allowlist. An authorization refusal is logged, not bypassed.
 
 ## Review isolation
 
-The model runs from an empty working directory with Read/Grep/Glob, no MCP
-servers, and user settings only. PR contents are an exact-head Git archive with
-no `.git` or hooks. The prompt treats source, descriptions and repository
-instructions as untrusted data. These controls are not evidence of sealed
-execution or protection against every model prompt injection. The live service
-owner must qualify its actual filesystem, credential and tool boundaries.
+The pinned CLI runs from an empty directory with `--restricted --safe-mode`, an
+explicit Read/Grep/Glob tool set and no MCP servers or customizations. Restricted
+mode confines file tools to the empty working directory and exact PR review
+archive. The model process receives only declared CLI authentication/runtime
+variables; reviewer/merger paths and arbitrary service secrets are removed.
+OAuth/provider authentication remains the existing service owner's responsibility.
+The shipped unit contains no merger credential path.
+
+Before a verdict can be printed, stored as a review receipt, or published, the
+controller decodes its JSON strings and refuses the current reviewer bearer and
+common encoded forms. Unsafe raw output is removed without echoing it. This is
+an additional publication guard, not proof against every possible encoding or a
+claim of OS-level isolation. Exact CLI behavior is owner-qualified before service
+activation. A source merge does not establish sealed execution.
+
+The CLI2.1.276 version/help readback confirms these flags; the official
+[CLI reference](https://code.claude.com/docs/en/cli-reference) documents restricted
+mode from2.1.248 and safe mode. PR text is still untrusted input to the model;
+correctness/security qualification must include the actual model and host.

@@ -11,7 +11,7 @@ set -euo pipefail
 printf '%s\n' "$@" > "$TRANSPORT_FIXTURE/argv"
 cat > "$TRANSPORT_FIXTURE/stdin"
 [[ "$1" == --disable ]]
-! grep -q 'fixture-bearer' "$TRANSPORT_FIXTURE/argv"
+if grep -q 'fixture-bearer' "$TRANSPORT_FIXTURE/argv"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 grep -q '^header = "Authorization: Bearer fixture-bearer"$' "$TRANSPORT_FIXTURE/stdin"
 grep -q '^--proto$' "$TRANSPORT_FIXTURE/argv"
 grep -q '^=https$' "$TRANSPORT_FIXTURE/argv"
@@ -29,7 +29,7 @@ check() {
   run "$base" "$token" || rc=$?
   if [[ "$expected" == pass ]]; then
     [[ "$rc" == 0 && -s "$t/stdin" ]]
-    ! grep -q fixture-bearer "$t/out"
+    if grep -q fixture-bearer "$t/out"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
   else [[ "$rc" != 0 && ! -e "$t/argv" ]]; fi
   printf 'ok %s\n' "$name"
 }
