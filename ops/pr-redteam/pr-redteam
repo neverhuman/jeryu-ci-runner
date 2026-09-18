@@ -38,7 +38,10 @@
 #   REDTEAM_FAMILIES       all                  forge `family` values to cover ("all" includes repos
 #                          with no family)
 #   REDTEAM_JOBS           4                    PRs reviewed in parallel
-#   REDTEAM_MODEL          opus
+#   REDTEAM_MODEL          claude-opus-5        an exact model id, never an alias, so what reviews
+#                          cannot change without a reviewed commit
+#   REDTEAM_CLAUDE_VERSION (claude-cli.version) the only `claude` CLI version allowed to review; any
+#                          other version posts nothing until the pin is bumped in a reviewed change
 #   REDTEAM_BUDGET_USD     20                   per-PR spend cap for the agent
 #   REDTEAM_TIMEOUT        2400                 per-PR agent timeout, seconds
 #   REDTEAM_MAX_BLOB_BYTES 1000000              an added/changed binary or archive over this size
@@ -56,7 +59,8 @@ merge_token_file="${REDTEAM_MERGE_TOKEN_FILE:-$HOME/.config/jeryu/credentials/gi
 families="${REDTEAM_FAMILIES:-all}"
 priority_families="${REDTEAM_PRIORITY_FAMILIES:-jain jeryu-split}"
 jobs="${REDTEAM_JOBS:-4}"
-model="${REDTEAM_MODEL:-opus}"
+model="${REDTEAM_MODEL:-claude-opus-5}"
+claude_version_pin="${REDTEAM_CLAUDE_VERSION:-$(tr -d '[:space:]' <"$(dirname "$(readlink -f "$0")")/claude-cli.version" 2>/dev/null)}"
 budget="${REDTEAM_BUDGET_USD:-20}"
 agent_timeout="${REDTEAM_TIMEOUT:-2400}"
 max_diff_bytes="${REDTEAM_MAX_DIFF_BYTES:-20000000}"
@@ -134,6 +138,13 @@ skip_reason() { # row me include_drafts force
 run_agent() { # review-dir tag sha work-dir
   local d="$1" tag="$2" sha="$3" work="$4" out="$4/agent.json" rc=0
   mkdir -p "$work/empty"
+  # Only the pinned CLI may review: an auto-updated `claude` is a different tool until someone
+  # reviews the bump. A missing pin or a mismatch posts nothing.
+  local have; have="$("$claude_bin" --version 2>/dev/null | awk '{print $1; exit}')"
+  if [ -z "$claude_version_pin" ] || [ "$have" != "$claude_version_pin" ]; then
+    say "$tag: no usable verdict (claude CLI is '${have:-missing}', pinned '${claude_version_pin:-unset}'), NOT approving; bump claude-cli.version in a reviewed change" >&2
+    return 1
+  fi
   (cd "$work/empty" && timeout "$agent_timeout" "$claude_bin" -p \
       "Red-team the pull request $tag at head $sha. The review directory is $d — start with signals.txt, pr.json and description.md, then read all of diff.patch. Return your verdict in the required structured format." \
       --append-system-prompt "$(cat "$here/prompt.md")" \

@@ -13,7 +13,7 @@ Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 Environment="REDTEAM_PRIORITY_FAMILIES=jain jeryu-split"
 Environment=REDTEAM_FAMILIES=all
 Environment=REDTEAM_JOBS=4
-Environment=REDTEAM_MODEL=opus
+Environment=REDTEAM_MODEL=claude-opus-5
 Environment=JERYU_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat
 Environment=REDTEAM_MERGE_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-jain-merge-bot-10.1.6.pat
 ExecStart=@REDTEAM_DIR@/pr-redteam run

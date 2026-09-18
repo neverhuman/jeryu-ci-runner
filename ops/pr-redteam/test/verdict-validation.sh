@@ -9,6 +9,7 @@ t="$(mktemp -d)"; trap 'rm -rf "$t"' EXIT
 
 cat >"$t/fake-claude" <<'F'
 #!/usr/bin/env bash
+if [ "${1:-}" = "--version" ]; then echo "${FAKE_VERSION:-9.9.9} (Claude Code)"; exit 0; fi
 ok='{"verdict":"approve","summary":"fine","findings":[]}'
 crit='{"severity":"critical","title":"t","file":"f","detail":"d","evidence":"e"}'
 env() { printf '{"type":"result","subtype":"%s","is_error":%s,"structured_output":%s}\n' "$1" "$2" "$3"; }
@@ -33,7 +34,8 @@ mkdir -p "$t/review" "$t/state"
 echo dummy >"$t/token"
 
 run() { # case -> stdout of _agent, exit status preserved
-  FAKE_CASE="$1" REDTEAM_CLAUDE="$t/fake-claude" REDTEAM_TIMEOUT=3 REDTEAM_STATE="$t/state" \
+  FAKE_CASE="${1%%:*}" FAKE_VERSION="${FAKE_VERSION:-9.9.9}" REDTEAM_CLAUDE_VERSION=9.9.9 \
+  REDTEAM_CLAUDE="$t/fake-claude" REDTEAM_TIMEOUT=3 REDTEAM_STATE="$t/state" \
     JERYU_TOKEN_FILE="$t/token" "$here/pr-redteam" _agent "$t/review" "x/y#1" 0000000000000000000000000000000000000000 2>/dev/null
 }
 
@@ -42,6 +44,12 @@ for c in approve_then_exit42 approve_then_timeout invalid_verdict_enum approve_w
          block_without_critical envelope_is_error missing_summary bad_severity no_output; do
   if out="$(run "$c")"; then echo "FAIL $c: accepted -> $out"; fail=1; else echo "ok   $c: rejected"; fi
 done
+# A valid approval from an unpinned CLI version must still post nothing.
+if out="$(FAKE_VERSION=0.0.1 run valid_approve)"; then
+  echo "FAIL cli_version_mismatch: accepted -> $out"; fail=1
+else
+  echo "ok   cli_version_mismatch: rejected"
+fi
 for c in valid_approve valid_block; do
   if out="$(run "$c")" && [ -n "$out" ]; then echo "ok   $c: accepted"; else echo "FAIL $c: rejected"; fail=1; fi
 done
