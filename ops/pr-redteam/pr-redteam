@@ -140,11 +140,39 @@ run_agent() { # review-dir tag sha work-dir
       --disallowedTools Bash Edit Write NotebookEdit WebFetch WebSearch Agent \
       --add-dir "$d" --setting-sources user --strict-mcp-config --no-session-persistence \
       </dev/null >"$out" 2>"$work/agent.err") || rc=$?
-  jq -ce '.structured_output | select(.verdict and .summary and (.findings | type == "array"))' "$out" 2>/dev/null || {
-    say "$tag: agent gave no usable verdict (exit $rc), NOT approving, retry next run: $(jq -r '.result // empty' "$out" 2>/dev/null | head -c 200)$(tail -c 200 "$work/agent.err")" >&2
+  # A review counts only if the process exited 0, the envelope reports success, and the verdict is
+  # complete, well-typed and self-consistent. Anything else posts nothing and is retried next run:
+  # a crash, a timeout after partial output, or a malformed verdict must never become an approval.
+  local why=""
+  if [ "$rc" != 0 ]; then
+    why="agent exited $rc"
+  elif ! jq -e '.is_error != true and .subtype == "success"' "$out" >/dev/null 2>&1; then
+    why="agent envelope is not a success"
+  elif ! jq -e "$verdict_valid" "$out" >/dev/null 2>&1; then
+    why="verdict failed schema/consistency validation"
+  fi
+  if [ -n "$why" ]; then
+    say "$tag: no usable verdict ($why), NOT approving, retry next run: $(jq -r '.result // empty' "$out" 2>/dev/null | head -c 200)$(tail -c 200 "$work/agent.err")" >&2
     return 1
-  }
+  fi
+  jq -c '.structured_output' "$out"
 }
+
+# The full verdict contract, checked before anything is published. `block` is valid exactly when a
+# `critical` finding exists: an approve that names a critical, or a block without one, is
+# inconsistent and posts nothing.
+verdict_valid='.structured_output as $v
+  | ($v | type) == "object"
+  and ($v.verdict == "approve" or $v.verdict == "block")
+  and ($v.summary | type) == "string" and ($v.summary | length) > 0
+  and ($v.findings | type) == "array"
+  and all($v.findings[];
+        (. | type) == "object"
+        and (.severity as $s | ["critical", "high", "medium", "low"] | index($s)) != null
+        and (.title | type) == "string" and (.file | type) == "string"
+        and (.detail | type) == "string" and (.evidence | type) == "string"
+        and ((.line == null) or ((.line | type) == "number")))
+  and (($v.verdict == "block") == any($v.findings[]; .severity == "critical"))'
 
 # --- one review ----------------------------------------------------------------------------------
 
@@ -249,10 +277,15 @@ review_one() { # owner/name number dry-run force include-drafts
   local verdict
   verdict="$(run_agent "$d" "$tag" "$sha" "$work")" || return 0
 
-  # Decision: approve unless a confirmed critical. A committed private key holds regardless.
-  local decision=approve
-  if jq -e '.verdict == "block" and any(.findings[]; .severity == "critical")' <<<"$verdict" >/dev/null \
-     || grep -qE '^\+.*-----BEGIN [A-Z ]*PRIVATE KEY-----' "$d/diff.patch"; then
+  # Decision: approve only on an explicit, validated `approve`; a validated `block` holds. Nothing
+  # falls through to approval. A committed private key holds regardless of the agent.
+  local decision
+  case "$(jq -r .verdict <<<"$verdict")" in
+    approve) decision=approve ;;
+    block) decision=hold ;;
+    *) say "$tag: unexpected verdict after validation, NOT approving"; return 0 ;;
+  esac
+  if grep -qE '^\+.*-----BEGIN [A-Z ]*PRIVATE KEY-----' "$d/diff.patch"; then
     decision=hold
   fi
   local body; body="$(render_body "$verdict" "$decision" "$sha")"

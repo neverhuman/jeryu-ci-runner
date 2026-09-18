@@ -221,9 +221,9 @@
       "purpose": "verify pre-push gates delegate to local CI lanes"
     },
     "ops/pr-redteam/": {
-      "command": "ops/pr-redteam/test/canary.sh",
+      "command": "ops/pr-redteam/test/verdict-validation.sh && ops/pr-redteam/test/canary.sh",
       "lane": "ci",
-      "purpose": "verify the PR red-team blocks a fabricated malicious PR (planted key, weakened required lane, prompt injection)"
+      "purpose": "verify a failed or malformed review never becomes an approval (offline), and that the red-team blocks a fabricated malicious PR (live canary)"
     },
     "policies/": {
       "command": "just check",
