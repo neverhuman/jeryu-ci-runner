@@ -178,6 +178,10 @@ pub struct GovernorConfig {
     pub load_high_ratio: f64,
     /// Swap-in-use above which the pool is clamped hard against thrash.
     pub swap_used_high_bytes: u64,
+    /// The swap clamp fires only while available memory is below this fraction
+    /// of total memory. Swap that is full of pages nobody touches, on a box
+    /// with most of its memory free, is history, not thrash.
+    pub swap_pressure_avail_fraction: f64,
 }
 
 impl Default for GovernorConfig {
@@ -189,11 +193,12 @@ impl Default for GovernorConfig {
             floor: 1,
             load_high_ratio: 0.7,
             swap_used_high_bytes: GIB,
+            swap_pressure_avail_fraction: 0.25,
         }
     }
 }
 
-/// The hard clamp imposed when swap is actively in use. Swap thrash was the
+/// The hard clamp imposed when swap is in use and memory is short. Swap thrash was the
 /// actual death of the wedged box, so this is deliberately aggressive.
 const SWAP_THRASH_CAP: u32 = 2;
 
@@ -241,9 +246,15 @@ pub fn decide_jobs(load: &SystemLoad, request: Option<u32>, cfg: &GovernorConfig
         binding = Bound::Load;
     }
 
-    // Swap clamp: any active swap means the box is already paging; squeeze the
-    // pool to a hard minimum. This is the guard that the wedged box lacked.
-    if load.swap_used_bytes > cfg.swap_used_high_bytes {
+    // Swap clamp: swap in use while memory is short means the box is paging;
+    // squeeze the pool to a hard minimum. This is the guard that the wedged box
+    // lacked. Swap in use with most memory available is not that: Linux leaves
+    // idle pages in swap indefinitely, and one long-lived process once held an
+    // 8 GiB swap file full on a box with 108 GiB available, which pinned every
+    // gate to 2 of 128 cores for no reason.
+    let memory_short = (load.available_mem_bytes as f64)
+        < (load.total_mem_bytes as f64) * cfg.swap_pressure_avail_fraction;
+    if load.swap_used_bytes > cfg.swap_used_high_bytes && memory_short {
         base = base.min(SWAP_THRASH_CAP);
         binding = Bound::Swap;
     }
@@ -311,7 +322,7 @@ fn cap_reason(
             load.load1, cfg.load_high_ratio
         ),
         Bound::Swap => format!(
-            "swap-bound: {cap}; swap in use {swap_gib:.1}GiB > {swap_high_gib:.1}GiB so the pool was clamped"
+            "swap-bound: {cap}; swap in use {swap_gib:.1}GiB > {swap_high_gib:.1}GiB and memory is short, so the pool was clamped"
         ),
         Bound::Floor => format!("floor-bound: {cap} = configured minimum"),
         // The resource budgets feed mem_cap; surface it when nothing else binds.
@@ -422,6 +433,7 @@ mod tests {
         // binding on swap — the guard the wedged box never had.
         let load = SystemLoad {
             swap_used_bytes: 8 * GIB,
+            available_mem_bytes: 20 * GIB,
             ..big_idle_box()
         };
         let d = decide_jobs(&load, None, &GovernorConfig::default());
@@ -430,10 +442,27 @@ mod tests {
     }
 
     #[test]
+    fn stale_swap_on_a_box_with_memory_to_spare_does_not_clamp() {
+        // xbabe2, 2026-09-19: an 8 GiB swap file full of one idle process's
+        // pages, 108 of 125 GiB available, no paging. Every gate compiled with
+        // 2 of 128 cores. Used swap alone is not pressure.
+        let load = SystemLoad {
+            swap_total_bytes: 8 * GIB,
+            swap_used_bytes: 8 * GIB,
+            available_mem_bytes: 108 * GIB,
+            ..big_idle_box()
+        };
+        let d = decide_jobs(&load, None, &GovernorConfig::default());
+        assert_ne!(d.binding, Bound::Swap);
+        assert_eq!(d.jobs, GovernorConfig::default().hard_ceiling);
+    }
+
+    #[test]
     fn swap_clamp_overrides_a_user_request() {
         // Even a user request cannot lift the pool above the swap clamp.
         let load = SystemLoad {
             swap_used_bytes: 8 * GIB,
+            available_mem_bytes: 20 * GIB,
             ..big_idle_box()
         };
         let d = decide_jobs(&load, Some(40), &GovernorConfig::default());
