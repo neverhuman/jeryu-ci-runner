@@ -469,8 +469,9 @@ beat_done() { # owner/name number sha conclusion started-epoch
 }
 
 # One beat. `current` is the review that has been running longest, so a pass reviewing several PRs at
-# once still reports a single truthful task. A forge that predates the route answers with the web
-# app's HTML, so only a JSON refusal is worth a log line.
+# once still reports a single truthful task. Every beat the forge does not accept gets a log line:
+# a JSON refusal, but also an HTML answer (a forge that predates the route, or a proxy error page)
+# and a curl failure, which used to be dropped silently and left a refused reviewer with a quiet log.
 heartbeat() {
   local current=null last=null f
   # A review killed mid-flight leaves its current file behind; forget one after two hours rather
@@ -486,8 +487,14 @@ heartbeat() {
   api POST "/api/v1/runners/heartbeat" "$(jq -nc --arg id "$runner_id" --arg host "$runner_host" \
     --argjson current "$current" --argjson last "$last" \
     '{runnerId: $id, host: $host, slot: 0, labels: ["redteam"], current: $current, last: $last}')"
-  if ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1 && jq -e . <<<"$body" >/dev/null 2>&1; then
-    say "heartbeat refused ($code): $(jq -c '.message // .' <<<"$body")"
+  if [ "$code" = 000 ]; then
+    say "heartbeat refused (no answer): $body"
+  elif ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1; then
+    if jq -e . <<<"$body" >/dev/null 2>&1; then
+      say "heartbeat refused ($code): $(jq -c '.message // .' <<<"$body")"
+    else
+      say "heartbeat refused ($code): non-JSON answer: $(tr -s '[:space:]' ' ' <<<"$body" | head -c 160)"
+    fi
   fi
   return 0
 }
