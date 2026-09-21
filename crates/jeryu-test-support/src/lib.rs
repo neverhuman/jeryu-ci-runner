@@ -26,7 +26,7 @@ pub fn unique_temp_path(prefix: &str) -> PathBuf {
 pub fn unique_temp_dir(prefix: &str) -> PathBuf {
     let dir = unique_temp_path(prefix);
     std::fs::create_dir_all(&dir)
-        .unwrap_or_else(|err| panic!("create temp dir {}: {err}", dir.display()));
+        .unwrap_or_else(|err| panic!("create per-test directory {}: {err}", dir.display()));
     dir
 }
 
