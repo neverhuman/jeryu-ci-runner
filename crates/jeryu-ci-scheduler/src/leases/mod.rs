@@ -12,6 +12,8 @@ mod types;
 
 #[cfg(test)]
 mod fencing_tests;
+#[cfg(test)]
+mod retry_tests;
 
 pub use book::LeaseBook;
 pub use error::LeaseError;
