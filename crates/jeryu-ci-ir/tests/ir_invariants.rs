@@ -422,8 +422,8 @@ fn self_dependency_is_rejected() {
 /// Independent Kahn's-algorithm topological sort over the IR's `(jobs, edges)`,
 /// treating `from -> to` as "from runs before to". Returns `Err(())` when the
 /// dependency graph contains a cycle. This lives in the test crate because the
-/// IR itself ships no DAG/cycle helper (see the documented gap in
-/// `validate_does_not_currently_reject_multi_node_cycles`).
+/// IR's own cycle check (`validate_rejects_multi_node_cycles`) is cross-checked
+/// against it.
 fn topological_order(p: &Pipeline) -> Result<Vec<String>, ()> {
     let ids: Vec<String> = p.jobs.iter().map(|j| j.id.clone()).collect();
     let mut indegree: BTreeMap<String, usize> =
@@ -508,26 +508,37 @@ fn topological_order_detects_three_node_cycle() {
     );
 }
 
-/// Documents a SOURCE GAP: `Pipeline::validate()` checks self-dependency and
-/// unknown endpoints, but does NOT detect multi-node cycles. A graph that an
-/// independent topological sort rejects still passes `validate()`. This test
-/// pins the *current* behavior so a future fix (adding cycle detection) makes
-/// the gap visible rather than silently changing semantics.
+/// Dependency edges must form a DAG: `validate()` rejects multi-node cycles
+/// that the independent topological sort above also rejects.
 #[test]
-fn validate_does_not_currently_reject_multi_node_cycles() {
+fn validate_rejects_multi_node_cycles() {
     let mut p = sample_pipeline();
     p.edges.push(Dependency {
         from: "test".to_string(),
         to: "fmt".to_string(),
     });
-    // Independent DAG check: this IS a cycle.
     assert!(topological_order(&p).is_err());
-    // Current crate behavior: validate() accepts it (no cycle detection yet).
     assert_eq!(
         p.validate(),
-        Ok(()),
-        "if this fails, validate() gained cycle detection -- update this gap test"
+        Err(ValidationError::DependencyCycle("fmt".to_string()))
     );
+    // A job hanging off the cycle does not hide it.
+    let mut three = p.clone();
+    three.edges.retain(|e| e.from != "test");
+    let mut lint = Job::new("lint", "lint", RunnerClass::NativeRustClean);
+    lint.steps.push(Step::run("l0", "lint", "echo"));
+    three.jobs.push(lint);
+    for (from, to) in [("test", "lint"), ("lint", "fmt")] {
+        three.edges.push(Dependency {
+            from: from.to_string(),
+            to: to.to_string(),
+        });
+    }
+    assert!(topological_order(&three).is_err());
+    assert!(matches!(
+        three.validate(),
+        Err(ValidationError::DependencyCycle(_))
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -535,64 +546,48 @@ fn validate_does_not_currently_reject_multi_node_cycles() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn trust_tiers_order_from_most_to_least_trusted() {
+fn trust_tier_orders_labels_and_round_trips() {
     use TrustTier::*;
-    // Derived Ord follows declaration order: ReleaseHermetic is the smallest.
-    let mut tiers = vec![
-        PublicUntrusted,
-        ForkPr,
-        AgentAuthored,
-        InternalBranch,
-        ProtectedInternal,
+    // Derived Ord follows declaration order: ReleaseHermetic is the most trusted.
+    let ordered = [
         ReleaseHermetic,
+        ProtectedInternal,
+        InternalBranch,
+        AgentAuthored,
+        ForkPr,
+        PublicUntrusted,
     ];
-    tiers.sort();
-    assert_eq!(
-        tiers,
-        vec![
-            ReleaseHermetic,
-            ProtectedInternal,
-            InternalBranch,
-            AgentAuthored,
-            ForkPr,
-            PublicUntrusted,
-        ]
-    );
-    // The most trusted tier is the minimum; the least trusted is the maximum.
-    assert_eq!(tiers.iter().min(), Some(&ReleaseHermetic));
-    assert_eq!(tiers.iter().max(), Some(&PublicUntrusted));
-    assert!(ReleaseHermetic < PublicUntrusted);
+    let mut shuffled = ordered.to_vec();
+    shuffled.reverse();
+    shuffled.sort();
+    assert_eq!(shuffled, ordered);
+    let labels = [
+        "T0-release-hermetic",
+        "T1-protected-internal",
+        "T2-internal-branch",
+        "T3-agent-authored",
+        "T4-fork-pr",
+        "T5-public-untrusted",
+    ];
+    for (tier, label) in ordered.iter().zip(labels) {
+        assert_eq!(tier.as_str(), label);
+        assert_eq!(label.parse::<TrustTier>().as_ref(), Ok(tier), "{label}");
+    }
 }
 
 #[test]
-fn trust_tier_as_str_maps_to_tiered_labels() {
-    assert_eq!(TrustTier::ReleaseHermetic.as_str(), "T0-release-hermetic");
-    assert_eq!(
-        TrustTier::ProtectedInternal.as_str(),
-        "T1-protected-internal"
-    );
-    assert_eq!(TrustTier::InternalBranch.as_str(), "T2-internal-branch");
-    assert_eq!(TrustTier::AgentAuthored.as_str(), "T3-agent-authored");
-    assert_eq!(TrustTier::ForkPr.as_str(), "T4-fork-pr");
-    assert_eq!(TrustTier::PublicUntrusted.as_str(), "T5-public-untrusted");
-}
-
-#[test]
-fn trust_tier_from_str_accepts_canonical_aliases_and_shorthands() {
+fn trust_tier_from_str_accepts_aliases_and_rejects_unknown() {
     let cases: &[(&str, TrustTier)] = &[
-        ("T0-release-hermetic", TrustTier::ReleaseHermetic),
         ("release", TrustTier::ReleaseHermetic),
-        ("T1-protected-internal", TrustTier::ProtectedInternal),
         ("protected", TrustTier::ProtectedInternal),
-        ("T2-internal-branch", TrustTier::InternalBranch),
         ("internal", TrustTier::InternalBranch),
-        ("T3-agent-authored", TrustTier::AgentAuthored),
         ("agent", TrustTier::AgentAuthored),
-        ("T4-fork-pr", TrustTier::ForkPr),
         ("fork", TrustTier::ForkPr),
-        ("T5-public-untrusted", TrustTier::PublicUntrusted),
         ("public", TrustTier::PublicUntrusted),
         ("untrusted", TrustTier::PublicUntrusted),
+        // Case and separator insensitive.
+        ("  T2 internal_branch  ", TrustTier::InternalBranch),
+        ("RELEASE-HERMETIC", TrustTier::ReleaseHermetic),
     ];
     for (input, expected) in cases {
         assert_eq!(
@@ -601,40 +596,8 @@ fn trust_tier_from_str_accepts_canonical_aliases_and_shorthands() {
             "parsing {input:?}"
         );
     }
-}
-
-#[test]
-fn trust_tier_from_str_is_case_and_separator_insensitive() {
-    assert_eq!(
-        "  T2 internal_branch  ".parse::<TrustTier>(),
-        Ok(TrustTier::InternalBranch)
-    );
-    assert_eq!(
-        "RELEASE-HERMETIC".parse::<TrustTier>(),
-        Ok(TrustTier::ReleaseHermetic)
-    );
-}
-
-#[test]
-fn trust_tier_from_str_rejects_unknown() {
     let err = "tier-9000".parse::<TrustTier>().unwrap_err();
     assert!(err.contains("unknown trust tier"), "err was: {err}");
-}
-
-#[test]
-fn trust_tier_as_str_round_trips_through_from_str() {
-    use TrustTier::*;
-    for tier in [
-        ReleaseHermetic,
-        ProtectedInternal,
-        InternalBranch,
-        AgentAuthored,
-        ForkPr,
-        PublicUntrusted,
-    ] {
-        let reparsed: TrustTier = tier.as_str().parse().expect("as_str must be parseable");
-        assert_eq!(reparsed, tier, "round trip for {}", tier.as_str());
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,96 +605,44 @@ fn trust_tier_as_str_round_trips_through_from_str() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn runner_class_default_is_native_rust_clean() {
-    assert_eq!(RunnerClass::default(), RunnerClass::NativeRustClean);
-}
-
-#[test]
-fn runner_class_as_str_maps_each_variant() {
-    assert_eq!(RunnerClass::NativeRustHot.as_str(), "native-rust-hot");
-    assert_eq!(RunnerClass::NativeRustClean.as_str(), "native-rust-clean");
-    assert_eq!(RunnerClass::CrategraphDelta.as_str(), "crategraph-delta");
-    assert_eq!(RunnerClass::NextestCapsule.as_str(), "nextest-capsule");
-    assert_eq!(RunnerClass::AgentGuard.as_str(), "agent-guard");
-    assert_eq!(RunnerClass::MergeSpec.as_str(), "merge-spec");
-    assert_eq!(RunnerClass::ReleaseHermetic.as_str(), "release-hermetic");
-    assert_eq!(RunnerClass::MicrovmRust.as_str(), "microvm-rust");
-    assert_eq!(RunnerClass::OciDocker.as_str(), "oci-docker");
-    assert_eq!(RunnerClass::K8sOci.as_str(), "k8s-oci");
-    assert_eq!(
-        RunnerClass::Custom("gpu-fleet".to_string()).as_str(),
-        "gpu-fleet"
-    );
-}
-
-#[test]
-fn runner_class_from_str_maps_canonical_names() {
-    let cases: &[(&str, RunnerClass)] = &[
-        ("native-rust-hot", RunnerClass::NativeRustHot),
-        ("native-rust-clean", RunnerClass::NativeRustClean),
-        ("crategraph-delta", RunnerClass::CrategraphDelta),
-        ("nextest-capsule", RunnerClass::NextestCapsule),
-        ("agent-guard", RunnerClass::AgentGuard),
-        ("merge-spec", RunnerClass::MergeSpec),
-        ("release-hermetic", RunnerClass::ReleaseHermetic),
-        ("microvm-rust", RunnerClass::MicrovmRust),
-        ("oci-docker", RunnerClass::OciDocker),
-        ("k8s-oci", RunnerClass::K8sOci),
+fn runner_class_maps_names_aliases_and_custom() {
+    use RunnerClass::*;
+    assert_eq!(RunnerClass::default(), NativeRustClean);
+    let canonical = [
+        (NativeRustHot, "native-rust-hot"),
+        (NativeRustClean, "native-rust-clean"),
+        (CrategraphDelta, "crategraph-delta"),
+        (NextestCapsule, "nextest-capsule"),
+        (AgentGuard, "agent-guard"),
+        (MergeSpec, "merge-spec"),
+        (ReleaseHermetic, "release-hermetic"),
+        (MicrovmRust, "microvm-rust"),
+        (OciDocker, "oci-docker"),
+        (K8sOci, "k8s-oci"),
     ];
-    for (input, expected) in cases {
-        assert_eq!(
-            input.parse::<RunnerClass>().as_ref(),
-            Ok(expected),
-            "{input}"
-        );
+    for (class, name) in canonical {
+        assert_eq!(class.as_str(), name);
+        assert_eq!(name.parse::<RunnerClass>(), Ok(class), "{name}");
     }
-}
-
-#[test]
-fn runner_class_from_str_maps_github_runner_aliases() {
-    // GitHub Actions-style runner labels map onto the native clean class.
-    assert_eq!(
-        "ubuntu-latest".parse::<RunnerClass>(),
-        Ok(RunnerClass::NativeRustClean)
-    );
-    assert_eq!(
-        "linux".parse::<RunnerClass>(),
-        Ok(RunnerClass::NativeRustClean)
-    );
-    assert_eq!("docker".parse::<RunnerClass>(), Ok(RunnerClass::OciDocker));
-    assert_eq!("kubernetes".parse::<RunnerClass>(), Ok(RunnerClass::K8sOci));
-    assert_eq!("k8s".parse::<RunnerClass>(), Ok(RunnerClass::K8sOci));
-    assert_eq!(
-        "microvm".parse::<RunnerClass>(),
-        Ok(RunnerClass::MicrovmRust)
-    );
-}
-
-#[test]
-fn runner_class_from_str_falls_back_to_custom() {
-    assert_eq!(
-        "gpu-fleet-a100".parse::<RunnerClass>(),
-        Ok(RunnerClass::Custom("gpu-fleet-a100".to_string()))
-    );
-}
-
-#[test]
-fn runner_class_from_str_strips_quotes_for_custom() {
-    assert_eq!(
-        "\"gpu fleet\"".parse::<RunnerClass>(),
-        Ok(RunnerClass::Custom("gpu fleet".to_string()))
-    );
-    assert_eq!(
-        "'self-hosted'".parse::<RunnerClass>(),
-        Ok(RunnerClass::Custom("self-hosted".to_string()))
-    );
-}
-
-#[test]
-fn runner_class_from_str_rejects_empty() {
-    assert!("".parse::<RunnerClass>().is_err());
-    assert!("   ".parse::<RunnerClass>().is_err());
-    assert!("\"\"".parse::<RunnerClass>().is_err());
+    // GitHub Actions-style labels, then custom fallback (quotes stripped).
+    let aliases = [
+        ("ubuntu-latest", NativeRustClean),
+        ("linux", NativeRustClean),
+        ("docker", OciDocker),
+        ("kubernetes", K8sOci),
+        ("k8s", K8sOci),
+        ("microvm", MicrovmRust),
+        ("gpu-fleet-a100", Custom("gpu-fleet-a100".to_string())),
+        ("\"gpu fleet\"", Custom("gpu fleet".to_string())),
+        ("'self-hosted'", Custom("self-hosted".to_string())),
+    ];
+    for (input, expected) in aliases {
+        assert_eq!(input.parse::<RunnerClass>(), Ok(expected), "{input}");
+    }
+    assert_eq!(Custom("gpu-fleet".to_string()).as_str(), "gpu-fleet");
+    for empty in ["", "   ", "\"\""] {
+        assert!(empty.parse::<RunnerClass>().is_err(), "{empty:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -842,7 +753,7 @@ fn canonical_newline_escaping_prevents_hash_collision() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn policy_defaults_are_fail_safe() {
+fn policy_and_job_defaults_are_fail_safe() {
     let cache = CachePolicy::default();
     assert!(cache.project_scoped);
     assert!(!cache.allow_cross_project_compiled);
@@ -873,10 +784,9 @@ fn policy_defaults_are_fail_safe() {
     let retry = RetryPolicy::default();
     assert_eq!(retry.max_attempts, 1);
     assert_eq!(retry.backoff_seconds, 0);
-}
 
-#[test]
-fn job_new_has_fail_closed_defaults() {
+    assert_eq!(NetworkPolicy::default(), NetworkPolicy::Deny);
+    assert_eq!(TokenScope::default(), TokenScope::ReadRepo);
     let job = Job::new("j", "J", RunnerClass::NativeRustClean);
     assert_eq!(job.network_policy, NetworkPolicy::Deny);
     assert_eq!(job.token_scope, TokenScope::ReadRepo);
@@ -886,69 +796,44 @@ fn job_new_has_fail_closed_defaults() {
 }
 
 #[test]
-fn network_policy_default_is_deny() {
-    assert_eq!(NetworkPolicy::default(), NetworkPolicy::Deny);
+fn enum_labels_map_each_variant() {
+    for (mode, label) in [
+        (CacheMode::ReadOnly, "read-only"),
+        (CacheMode::ReadWriteQuarantine, "read-write-quarantine"),
+        (CacheMode::ReadWriteTrusted, "read-write-trusted"),
+    ] {
+        assert_eq!(mode.as_str(), label);
+    }
+    for (when, label) in [
+        (ArtifactWhen::Always, "always"),
+        (ArtifactWhen::OnSuccess, "on-success"),
+        (ArtifactWhen::OnFailure, "on-failure"),
+    ] {
+        assert_eq!(when.as_str(), label);
+    }
 }
 
 #[test]
-fn token_scope_default_is_read_repo() {
-    assert_eq!(TokenScope::default(), TokenScope::ReadRepo);
-}
-
-#[test]
-fn cache_mode_as_str_maps_each_variant() {
-    assert_eq!(CacheMode::ReadOnly.as_str(), "read-only");
-    assert_eq!(
-        CacheMode::ReadWriteQuarantine.as_str(),
-        "read-write-quarantine"
-    );
-    assert_eq!(CacheMode::ReadWriteTrusted.as_str(), "read-write-trusted");
-}
-
-#[test]
-fn artifact_when_as_str_maps_each_variant() {
-    assert_eq!(ArtifactWhen::Always.as_str(), "always");
-    assert_eq!(ArtifactWhen::OnSuccess.as_str(), "on-success");
-    assert_eq!(ArtifactWhen::OnFailure.as_str(), "on-failure");
-}
-
-// ---------------------------------------------------------------------------
-// PipelineSource mapping
-// ---------------------------------------------------------------------------
-
-#[test]
-fn pipeline_source_as_str_maps_each_variant() {
-    assert_eq!(PipelineSource::GitHubActions.as_str(), "github-actions");
-    assert_eq!(PipelineSource::NativeToml.as_str(), "jit-native");
-    assert_eq!(PipelineSource::Api.as_str(), "api");
-    assert_eq!(PipelineSource::Agent.as_str(), "agent");
-    assert_eq!(PipelineSource::MergeQueue.as_str(), "merge-queue");
-    assert_eq!(PipelineSource::Hotfix.as_str(), "hotfix");
-    assert_eq!(PipelineSource::Release.as_str(), "release");
-    assert_eq!(PipelineSource::Scheduled.as_str(), "scheduled");
-    assert_eq!(
-        PipelineSource::Unknown("weird".to_string()).as_str(),
-        "weird"
-    );
-}
-
-#[test]
-fn pipeline_source_display_matches_as_str() {
-    assert_eq!(
-        PipelineSource::GitHubActions.to_string(),
-        PipelineSource::GitHubActions.as_str()
-    );
-    assert_eq!(PipelineSource::Unknown("x".to_string()).to_string(), "x");
-}
-
-#[test]
-fn pipeline_source_ordering_is_declaration_order() {
+fn pipeline_source_labels_display_and_order() {
+    for (source, label) in [
+        (PipelineSource::GitHubActions, "github-actions"),
+        (PipelineSource::NativeToml, "jit-native"),
+        (PipelineSource::Api, "api"),
+        (PipelineSource::Agent, "agent"),
+        (PipelineSource::MergeQueue, "merge-queue"),
+        (PipelineSource::Hotfix, "hotfix"),
+        (PipelineSource::Release, "release"),
+        (PipelineSource::Scheduled, "scheduled"),
+        (PipelineSource::Unknown("weird".to_string()), "weird"),
+    ] {
+        assert_eq!(source.as_str(), label);
+        assert_eq!(source.to_string(), label);
+    }
+    // PipelineSource ordering is declaration order.
     assert!(PipelineSource::GitHubActions < PipelineSource::NativeToml);
     assert!(PipelineSource::Api < PipelineSource::Agent);
 }
 
-// ---------------------------------------------------------------------------
-// id / sanitize / quote helpers
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1049,5 +934,9 @@ fn validation_error_display_is_human_readable() {
     assert_eq!(
         ValidationError::SelfDependency("loop".into()).to_string(),
         "job cannot depend on itself: loop"
+    );
+    assert_eq!(
+        ValidationError::DependencyCycle("a".into()).to_string(),
+        "dependency cycle through job: a"
     );
 }

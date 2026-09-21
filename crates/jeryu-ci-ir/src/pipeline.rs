@@ -1,7 +1,7 @@
 //! Top-level pipeline IR: assembly, canonical serialisation, content hashing,
 //! and structural validation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::enums::PipelineSource;
@@ -174,7 +174,38 @@ impl Pipeline {
                 return Err(ValidationError::SelfDependency(edge.from.clone()));
             }
         }
+        if let Some(job) = self.first_job_in_cycle() {
+            return Err(ValidationError::DependencyCycle(job));
+        }
         Ok(())
+    }
+
+    /// Kahn's algorithm over `(jobs, edges)`: returns the smallest job id left
+    /// unscheduled when the dependency graph contains a cycle.
+    fn first_job_in_cycle(&self) -> Option<String> {
+        let mut indegree: BTreeMap<&str, usize> =
+            self.jobs.iter().map(|j| (j.id.as_str(), 0)).collect();
+        for edge in &self.edges {
+            *indegree.entry(edge.to.as_str()).or_default() += 1;
+        }
+        let mut ready: Vec<&str> = indegree
+            .iter()
+            .filter(|&(_, &d)| d == 0)
+            .map(|(&id, _)| id)
+            .collect();
+        while let Some(node) = ready.pop() {
+            for edge in self.edges.iter().filter(|e| e.from == node) {
+                let d = indegree.get_mut(edge.to.as_str())?;
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(edge.to.as_str());
+                }
+            }
+        }
+        indegree
+            .into_iter()
+            .find(|&(_, d)| d > 0)
+            .map(|(id, _)| id.to_string())
     }
 }
 
@@ -187,6 +218,7 @@ pub enum ValidationError {
     JobHasNoSteps(String),
     UnknownEdgeEndpoint(String),
     SelfDependency(String),
+    DependencyCycle(String),
 }
 
 impl fmt::Display for ValidationError {
@@ -199,6 +231,7 @@ impl fmt::Display for ValidationError {
             Self::JobHasNoSteps(job) => write!(f, "job has no steps: {job}"),
             Self::UnknownEdgeEndpoint(job) => write!(f, "edge references unknown job: {job}"),
             Self::SelfDependency(job) => write!(f, "job cannot depend on itself: {job}"),
+            Self::DependencyCycle(job) => write!(f, "dependency cycle through job: {job}"),
         }
     }
 }
