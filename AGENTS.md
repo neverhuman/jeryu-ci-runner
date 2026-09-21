@@ -21,3 +21,22 @@ second crate identity.
 The public runner wire mirror is `schemas/jeryu.runner.v1.schema.json`. Rust
 serde plus `ValidateWire` remain authoritative; run `just contract-drift` whenever
 wire source or schema bytes change.
+
+## Test placement
+
+One rule for this repository: a test lives in the crate that owns the code it
+exercises, and in exactly one place.
+
+- Unit tests (private items, single module) go in that module's
+  `#[cfg(test)] mod tests`; move them to a sibling `src/<module>/tests.rs` via
+  `mod tests;` once the inline block outgrows the module. Never both.
+- Tests that drive only a crate's public API go in that crate's
+  `crates/<crate>/tests/*.rs` (or `bins/<bin>/tests/`).
+- The repository-level `tests/` holds only shared fixtures and shell matrices
+  (`tests/fixtures/`, `tests/sandbox_escape_matrix.sh`), never Rust tests.
+
+Before adding a test, search both the module and the crate's `tests/` for an
+existing case covering the same behavior; extend it rather than duplicating it.
+The jankurai pin lives only in the generated block of `ops/ci/ensure-jankurai.sh`
+(currently `jankurai 1.6.11`, matching jeryu-core); `just required` is the entry
+point for the protected required check.
