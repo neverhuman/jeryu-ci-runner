@@ -15,7 +15,7 @@ mod cgroup_probe;
 
 use cgroup_probe::probe_cgroup_subtree;
 #[cfg(test)]
-use cgroup_probe::{create_probe_directory, current_cgroup_rel, cgroup_subtree_is_enforceable};
+use cgroup_probe::{cgroup_subtree_is_enforceable, create_probe_directory, current_cgroup_rel};
 
 /// Snapshot of the kernel sandbox primitives available to the current,
 /// unprivileged process.

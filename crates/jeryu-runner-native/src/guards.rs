@@ -5,7 +5,7 @@ use jeryu_runner_core::fscheck::{
     DENIED_ENV_VARS, deny_dangerous_host_path, sanitize_env, validate_mount_sources,
 };
 use jeryu_runner_core::job::JobRequest;
-use jeryu_runner_core::sandbox::SandboxPlan;
+use jeryu_runner_core::sandbox::{SandboxPlan, toolchain_home};
 use jeryu_runner_core::trust::RunnerClass;
 use jeryu_sandbox_linux::capability::{EnforcementLevel, SandboxCapabilities};
 use jeryu_sandbox_linux::launch::EnforcementReport;
@@ -169,8 +169,10 @@ pub fn sanitized_native_env(job: &JobRequest, plan: &SandboxPlan) -> BTreeMap<St
         "HOME".to_string(),
         job.workspace.join(".home").display().to_string(),
     );
-    let cargo_home = match env.get("CARGO_HOME").map(String::as_str) {
-        Some("/home/ubuntu/.cargo") => "/home/ubuntu/.cargo".to_string(),
+    let tool_home = toolchain_home();
+    let host_cargo_home = tool_home.join(".cargo").display().to_string();
+    let cargo_home = match env.get("CARGO_HOME") {
+        Some(requested) if *requested == host_cargo_home => host_cargo_home.clone(),
         _ => job.workspace.join(".cargo-home").display().to_string(),
     };
     env.insert("CARGO_HOME".to_string(), cargo_home);
@@ -180,17 +182,21 @@ pub fn sanitized_native_env(job: &JobRequest, plan: &SandboxPlan) -> BTreeMap<St
     );
     env.insert(
         "RUSTUP_HOME".to_string(),
-        "/home/ubuntu/.rustup".to_string(),
+        tool_home.join(".rustup").display().to_string(),
     );
     env.insert(
         "JERYU_JANKURAI_BIN".to_string(),
-        "/home/ubuntu/.local/bin/jankurai".to_string(),
+        tool_home.join(".local/bin/jankurai").display().to_string(),
     );
     env.insert("TMPDIR".to_string(), "/tmp".to_string());
     env.insert("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string());
     env.insert(
         "PATH".to_string(),
-        "/home/ubuntu/.cargo/bin:/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin".to_string(),
+        format!(
+            "{}:{}:/usr/local/bin:/usr/bin:/bin",
+            tool_home.join(".cargo/bin").display(),
+            tool_home.join(".local/bin").display()
+        ),
     );
     if !plan.allow_secrets {
         env.insert("JERYU_SECRETS".to_string(), "disabled".to_string());
@@ -350,6 +356,7 @@ mod tests {
         let decision = select_runner(&job).unwrap_or_else(|err| panic!("{err}"));
         let plan = SandboxPlan::from_decision(&job.workspace, &decision);
         let env = sanitized_native_env(&job, &plan);
+        let tool_home = toolchain_home();
         for denied in DENIED_ENV_VARS {
             assert!(!env.contains_key(*denied), "{denied} must be scrubbed");
         }
@@ -371,35 +378,40 @@ mod tests {
         );
         assert_eq!(
             env.get("RUSTUP_HOME"),
-            Some(&"/home/ubuntu/.rustup".to_string())
+            Some(&tool_home.join(".rustup").display().to_string())
         );
         assert_eq!(
             env.get("JERYU_JANKURAI_BIN"),
-            Some(&"/home/ubuntu/.local/bin/jankurai".to_string())
+            Some(&tool_home.join(".local/bin/jankurai").display().to_string())
         );
         assert!(
             env.get("PATH")
                 .unwrap_or_else(|| panic!("PATH missing"))
-                .starts_with("/home/ubuntu/.cargo/bin:/home/ubuntu/.local/bin:"),
+                .starts_with(&format!(
+                    "{}:{}:",
+                    tool_home.join(".cargo/bin").display(),
+                    tool_home.join(".local/bin").display()
+                )),
             "PATH should expose controlled local tool shims first"
         );
     }
 
     #[test]
     fn sanitized_env_allows_only_host_cargo_source_cache_override() {
+        let tool_home = toolchain_home();
+        let host_cargo_home = tool_home.join(".cargo").display().to_string();
         let mut job = job();
         job.env
-            .insert("CARGO_HOME".to_string(), "/home/ubuntu/.cargo".to_string());
+            .insert("CARGO_HOME".to_string(), host_cargo_home.clone());
         let decision = select_runner(&job).unwrap_or_else(|err| panic!("{err}"));
         let plan = SandboxPlan::from_decision(&job.workspace, &decision);
         let env = sanitized_native_env(&job, &plan);
-        assert_eq!(
-            env.get("CARGO_HOME"),
-            Some(&"/home/ubuntu/.cargo".to_string())
-        );
+        assert_eq!(env.get("CARGO_HOME"), Some(&host_cargo_home));
 
-        job.env
-            .insert("CARGO_HOME".to_string(), "/home/ubuntu/.ssh".to_string());
+        job.env.insert(
+            "CARGO_HOME".to_string(),
+            tool_home.join(".ssh").display().to_string(),
+        );
         let env = sanitized_native_env(&job, &plan);
         assert_eq!(
             env.get("CARGO_HOME"),

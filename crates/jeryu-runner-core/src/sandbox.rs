@@ -3,7 +3,40 @@
 use crate::job::NetworkPolicy;
 use crate::policy::{CacheWritePolicy, PolicyDecision};
 use crate::trust::RunnerClass;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Environment variable naming the home directory whose Rust and local tool
+/// installs (`.cargo`, `.rustup`, `.local/bin`) are exposed read-only to jobs.
+pub const TOOLCHAIN_HOME_ENV: &str = "JERYU_TOOLCHAIN_HOME";
+
+/// Toolchain home used when [`TOOLCHAIN_HOME_ENV`] is unset or not absolute.
+pub const DEFAULT_TOOLCHAIN_HOME: &str = "/home/ubuntu";
+
+/// Resolve the host toolchain home from [`TOOLCHAIN_HOME_ENV`], falling back
+/// to [`DEFAULT_TOOLCHAIN_HOME`].
+pub fn toolchain_home() -> PathBuf {
+    std::env::var_os(TOOLCHAIN_HOME_ENV)
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_TOOLCHAIN_HOME))
+}
+
+/// Toolchain paths under `home` exposed read-only to jobs, paired with whether
+/// they need execute access.
+pub fn toolchain_paths(home: &Path) -> Vec<(PathBuf, bool)> {
+    [
+        (".cargo/bin", true),
+        (".cargo/config.toml", false),
+        (".cargo/git/db", false),
+        (".cargo/git/checkouts", false),
+        (".cargo/registry", false),
+        (".rustup", true),
+        (".local/bin", true),
+    ]
+    .into_iter()
+    .map(|(rel, execute)| (home.join(rel), execute))
+    .collect()
+}
 
 /// cgroups v2 resource limits.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,23 +270,19 @@ impl SandboxPlan {
 }
 
 fn local_toolchain_rules() -> Vec<LandlockRule> {
-    [
-        ("/home/ubuntu/.cargo/bin", true),
-        ("/home/ubuntu/.cargo/config.toml", false),
-        ("/home/ubuntu/.cargo/git/db", false),
-        ("/home/ubuntu/.cargo/git/checkouts", false),
-        ("/home/ubuntu/.cargo/registry", false),
-        ("/home/ubuntu/.rustup", true),
-        ("/home/ubuntu/.local/bin", true),
-    ]
-    .into_iter()
-    .map(|(path, execute)| LandlockRule {
-        path: PathBuf::from(path),
-        read: true,
-        write: false,
-        execute,
-    })
-    .collect()
+    toolchain_rules(&toolchain_home())
+}
+
+fn toolchain_rules(home: &Path) -> Vec<LandlockRule> {
+    toolchain_paths(home)
+        .into_iter()
+        .map(|(path, execute)| LandlockRule {
+            path,
+            read: true,
+            write: false,
+            execute,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -262,7 +291,6 @@ mod tests {
     use crate::job::NetworkPolicy;
     use crate::policy::{CacheWritePolicy, PolicyDecision};
     use crate::trust::RunnerClass;
-    use std::path::Path;
 
     fn decision(runner_class: RunnerClass) -> PolicyDecision {
         PolicyDecision {
@@ -317,6 +345,27 @@ mod tests {
     }
 
     #[test]
+    fn toolchain_rules_follow_the_given_home() {
+        let home = Path::new("/srv/toolchain-fixture");
+        let rules = toolchain_rules(home);
+        assert_eq!(rules.len(), 7);
+        for rule in &rules {
+            assert!(
+                rule.path.starts_with(home),
+                "{} escapes home",
+                rule.path.display()
+            );
+            assert!(rule.read);
+            assert!(!rule.write);
+        }
+        let rustup = rules
+            .iter()
+            .find(|rule| rule.path == home.join(".rustup"))
+            .unwrap_or_else(|| panic!("expected .rustup rule"));
+        assert!(rustup.execute);
+    }
+
+    #[test]
     fn default_plan_limits_writes_to_workspace() {
         let workspace = PathBuf::from("/tmp/jeryu-work");
         let plan = SandboxPlan::from_decision(&workspace, &decision(RunnerClass::NativeRustClean));
@@ -341,28 +390,20 @@ mod tests {
             assert!(rule.execute);
         }
 
-        for (tool_path, execute) in [
-            ("/home/ubuntu/.cargo/bin", true),
-            ("/home/ubuntu/.cargo/config.toml", false),
-            ("/home/ubuntu/.cargo/git/db", false),
-            ("/home/ubuntu/.cargo/git/checkouts", false),
-            ("/home/ubuntu/.cargo/registry", false),
-            ("/home/ubuntu/.rustup", true),
-            ("/home/ubuntu/.local/bin", true),
-        ] {
+        for (tool_path, execute) in toolchain_paths(&toolchain_home()) {
             let rule = plan
                 .landlock_rules
                 .iter()
-                .find(|rule| rule.path == Path::new(tool_path))
-                .unwrap_or_else(|| panic!("expected {tool_path} Landlock rule"));
+                .find(|rule| rule.path == tool_path)
+                .unwrap_or_else(|| panic!("expected {} Landlock rule", tool_path.display()));
             assert!(rule.read);
             assert!(!rule.write);
             assert_eq!(rule.execute, execute);
             let mount = plan
                 .mounts
                 .iter()
-                .find(|mount| mount.source == Path::new(tool_path))
-                .unwrap_or_else(|| panic!("expected {tool_path} mount"));
+                .find(|mount| mount.source == tool_path)
+                .unwrap_or_else(|| panic!("expected {} mount", tool_path.display()));
             assert!(mount.read_only);
         }
 
