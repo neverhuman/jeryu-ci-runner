@@ -16,13 +16,7 @@ fn editbot_src() -> PathBuf {
 }
 
 fn cell(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "jeryu-refute-{tag}-{}-{}",
-        std::process::id(),
-        jeryu_runner_core::receipt::now_ms()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    jeryu_test_support::unique_temp_dir(&format!("jeryu-refute-{tag}"))
 }
 
 /// PROOF 1: the SAME editbot env-driven write path that is DENIED outside the
@@ -67,11 +61,7 @@ fn same_write_path_succeeds_inside_and_is_blocked_outside() {
     // allow it (parent is writable), so a non-creation is Landlock, not perms.
     let ws_out = cell("outside");
     let bot_out = stage_editbot(&ws_out, &editbot_src()).unwrap();
-    let outside = std::env::temp_dir().join(format!(
-        "jeryu-refute-ESCAPE-{}-{}.txt",
-        std::process::id(),
-        jeryu_runner_core::receipt::now_ms()
-    ));
+    let outside = jeryu_test_support::unique_temp_path("jeryu-refute-ESCAPE").with_extension("txt");
     let _ = std::fs::remove_file(&outside);
     // Sanity: confirm DAC would permit this write from THIS (unsandboxed) process.
     std::fs::write(&outside, b"dac-ok").expect("DAC must allow the path unsandboxed");
@@ -111,11 +101,8 @@ fn same_write_path_succeeds_inside_and_is_blocked_outside() {
 fn unsandboxed_control_can_write_outside_proving_landlock_is_the_blocker() {
     let ws = cell("control");
     let bot = stage_editbot(&ws, &editbot_src()).unwrap();
-    let outside = std::env::temp_dir().join(format!(
-        "jeryu-refute-CONTROL-{}-{}.txt",
-        std::process::id(),
-        jeryu_runner_core::receipt::now_ms()
-    ));
+    let outside =
+        jeryu_test_support::unique_temp_path("jeryu-refute-CONTROL").with_extension("txt");
     let _ = std::fs::remove_file(&outside);
 
     // Retry on ETXTBSY: under parallel tests, another thread's fork() can

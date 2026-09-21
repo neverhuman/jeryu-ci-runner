@@ -26,13 +26,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 fn workspace(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "jeryu-cgconf-{tag}-{}-{}",
-        std::process::id(),
-        jeryu_runner_core::receipt::now_ms()
-    ));
-    std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("create ws: {e}"));
-    d
+    jeryu_test_support::unique_temp_dir(&format!("jeryu-cgconf-{tag}"))
 }
 
 fn sandbox_env() -> BTreeMap<String, String> {

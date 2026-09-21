@@ -31,6 +31,7 @@ surfaces and consume sibling crates from pinned public Git tags.
 - `crates/jeryu-egress/**`
 - `crates/jeryu-artifact-metadata/**`
 - `crates/jeryu-cache-policy/**`
+- `crates/jeryu-test-support/**`
 - `crates/jeryu-ci-governor/**`
 - `crates/jeryu-phase7-cli/**`
 - `bins/jeryu-ci-bin/**`

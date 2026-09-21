@@ -29,6 +29,7 @@
     "crates/jeryu-ci-scheduler/": "jeryu-ci-runner",
     "crates/jeryu-egress/": "jeryu-ci-runner",
     "crates/jeryu-phase7-cli/": "jeryu-ci-runner",
+    "crates/jeryu-test-support/": "jeryu-ci-runner",
     "crates/jeryu-runner-core/": "jeryu-ci-runner",
     "crates/jeryu-runner-microvm/": "jeryu-ci-runner",
     "crates/jeryu-runner-native/": "jeryu-ci-runner",

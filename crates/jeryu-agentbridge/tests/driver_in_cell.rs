@@ -29,13 +29,7 @@ fn editbot_src() -> PathBuf {
 
 /// Make a unique throwaway cell workspace directory.
 fn cell_workspace(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "jeryu-agentcell-{tag}-{}-{}",
-        std::process::id(),
-        jeryu_runner_core::receipt::now_ms()
-    ));
-    std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("create cell {}: {e}", dir.display()));
-    dir
+    jeryu_test_support::unique_temp_dir(&format!("jeryu-agentcell-{tag}"))
 }
 
 /// Run the driver, mapping a fail-closed `SandboxUnavailable` into an honest
@@ -118,11 +112,8 @@ fn editbot_writing_outside_the_cell_is_denied_by_landlock() {
     // A DAC-WRITABLE target OUTSIDE the cell: only Landlock can block this, so a
     // success here would be a true breach (not a DAC accident). We pre-create the
     // parent and assert the file never appears.
-    let outside = std::env::temp_dir().join(format!(
-        "jeryu-agentcell-escape-{}-{}.txt",
-        std::process::id(),
-        jeryu_runner_core::receipt::now_ms()
-    ));
+    let outside =
+        jeryu_test_support::unique_temp_path("jeryu-agentcell-escape").with_extension("txt");
     let _ = std::fs::remove_file(&outside);
 
     // HONESTY: without Landlock the workspace-only write confinement cannot be

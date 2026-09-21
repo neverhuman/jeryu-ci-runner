@@ -26,6 +26,7 @@ sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+jeryu-test-support = { path = "../jeryu-test-support" }
 
 [[example]]
 name = "jail_demo"

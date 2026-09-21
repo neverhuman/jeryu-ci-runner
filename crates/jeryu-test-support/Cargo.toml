@@ -1,15 +1,13 @@
 [package]
-name = "jeryu-runner-oci"
+name = "jeryu-test-support"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 rust-version.workspace = true
+publish = false
 
 [dependencies]
-jeryu-runner-core = { path = "../jeryu-runner-core" }
-
-[dev-dependencies]
-jeryu-test-support = { path = "../jeryu-test-support" }
 
 [lints]
 workspace = true

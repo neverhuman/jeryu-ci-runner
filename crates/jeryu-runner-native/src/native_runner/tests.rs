@@ -4,11 +4,7 @@ use jeryu_runner_core::policy::select_runner;
 use jeryu_runner_core::sandbox::SandboxPlan;
 use jeryu_runner_core::trust::TrustTier;
 use std::path::PathBuf;
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
-};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
 
 static EXECUTION_GUARD: Mutex<()> = Mutex::new(());
 
@@ -91,13 +87,7 @@ fn successful_exit_with_output_overflow_receipts_failure() {
 }
 
 fn temp_dir() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("jeryu-native-test-{stamp}-{unique}"))
+    jeryu_test_support::unique_temp_path("jeryu-native-test")
 }
 
 #[test]

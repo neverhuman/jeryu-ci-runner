@@ -41,8 +41,7 @@ fn sandbox_env() -> BTreeMap<String, String> {
 #[test]
 fn launch_runs_command_and_proves_enforcement() {
     let caps = SandboxCapabilities::probe();
-    let ws = std::env::temp_dir().join(format!("jeryu-launch-it-{}", std::process::id()));
-    std::fs::create_dir_all(&ws).unwrap_or_else(|e| panic!("workspace: {e}"));
+    let ws = jeryu_test_support::unique_temp_dir("jeryu-launch-it");
 
     let j = job(ws.clone(), "/bin/echo", vec!["sandbox-ok".into()]);
     let decision = select_runner(&j).unwrap_or_else(|e| panic!("{e}"));
@@ -85,8 +84,7 @@ fn launch_no_new_privs_is_observable_in_proc_status() {
         eprintln!("SKIP: no_new_privs unavailable on this host");
         return;
     }
-    let ws = std::env::temp_dir().join(format!("jeryu-launch-nnp-{}", std::process::id()));
-    std::fs::create_dir_all(&ws).unwrap_or_else(|e| panic!("workspace: {e}"));
+    let ws = jeryu_test_support::unique_temp_dir("jeryu-launch-nnp");
 
     let j = job(ws.clone(), "/bin/sleep", vec!["2".into()]);
     let decision = select_runner(&j).unwrap_or_else(|e| panic!("{e}"));
@@ -133,8 +131,7 @@ fn launch_no_new_privs_is_observable_in_proc_status() {
 #[test]
 fn watchdog_kills_runaway_under_sandbox() {
     let caps = SandboxCapabilities::probe();
-    let ws = std::env::temp_dir().join(format!("jeryu-launch-killer-{}", std::process::id()));
-    std::fs::create_dir_all(&ws).unwrap_or_else(|e| panic!("workspace: {e}"));
+    let ws = jeryu_test_support::unique_temp_dir("jeryu-launch-killer");
 
     // sleep 30 must be killed by a 300ms watchdog after sandbox application.
     let j = job(ws.clone(), "/bin/sleep", vec!["30".into()]);

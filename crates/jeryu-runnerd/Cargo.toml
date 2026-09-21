@@ -15,5 +15,8 @@ jeryu-runner-protocol = { path = "../jeryu-runner-protocol" }
 jeryu-runner-registry = { path = "../jeryu-runner-registry" }
 serde = { workspace = true }
 
+[dev-dependencies]
+jeryu-test-support = { path = "../jeryu-test-support" }
+
 [lints]
 workspace = true

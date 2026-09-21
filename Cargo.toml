@@ -20,6 +20,7 @@ members = [
   "crates/jeryu-cache-policy",
   "crates/jeryu-ci-governor",
   "crates/jeryu-phase7-cli",
+  "crates/jeryu-test-support",
   "bins/jeryu-ci-bin",
 ]
 exclude = [

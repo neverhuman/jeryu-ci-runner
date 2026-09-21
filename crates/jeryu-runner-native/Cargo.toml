@@ -11,5 +11,8 @@ jeryu-runner-core = { path = "../jeryu-runner-core" }
 # primitives to jeryu-sandbox-linux, the single unsafe island.
 jeryu-sandbox-linux = { path = "../jeryu-sandbox-linux" }
 
+[dev-dependencies]
+jeryu-test-support = { path = "../jeryu-test-support" }
+
 [lints]
 workspace = true

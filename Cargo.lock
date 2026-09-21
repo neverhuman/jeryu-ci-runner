@@ -421,6 +421,7 @@ dependencies = [
  "jeryu-proof",
  "jeryu-runner-core",
  "jeryu-sandbox-linux",
+ "jeryu-test-support",
  "tempfile",
 ]
 
@@ -536,6 +537,7 @@ version = "5.0.0"
 dependencies = [
  "jeryu-runner-core",
  "jeryu-sandbox-linux",
+ "jeryu-test-support",
 ]
 
 [[package]]
@@ -543,6 +545,7 @@ name = "jeryu-runner-oci"
 version = "5.0.0"
 dependencies = [
  "jeryu-runner-core",
+ "jeryu-test-support",
 ]
 
 [[package]]
@@ -577,6 +580,7 @@ dependencies = [
  "jeryu-runner-oci",
  "jeryu-runner-protocol",
  "jeryu-runner-registry",
+ "jeryu-test-support",
  "serde",
 ]
 
@@ -585,6 +589,7 @@ name = "jeryu-sandbox-linux"
 version = "5.0.0"
 dependencies = [
  "jeryu-runner-core",
+ "jeryu-test-support",
  "landlock",
  "libc",
  "nix",
@@ -592,6 +597,10 @@ dependencies = [
  "sha2",
  "tempfile",
 ]
+
+[[package]]
+name = "jeryu-test-support"
+version = "5.0.0"
 
 [[package]]
 name = "js-sys"

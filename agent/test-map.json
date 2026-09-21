@@ -110,6 +110,11 @@
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
+    "crates/jeryu-test-support/": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+    },
     "crates/jeryu-cache-policy/": {
       "command": "just check",
       "lane": "check",

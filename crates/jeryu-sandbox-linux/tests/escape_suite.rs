@@ -49,10 +49,8 @@ fn target_arch() -> TargetArch {
 // ---- Escape 1: write outside the workspace (Landlock) ---------------------
 
 fn escape_write_outside_workspace(caps: &SandboxCapabilities, workspace: &Path) -> EscapeResult {
-    let outside = std::env::temp_dir().join(format!(
-        "jeryu-escape-write-{}-outside.txt",
-        std::process::id()
-    ));
+    let outside =
+        jeryu_test_support::unique_temp_path("jeryu-escape-write-outside").with_extension("txt");
     let outside_for_child = outside.clone();
     let ws = workspace.to_path_buf();
 
@@ -129,10 +127,8 @@ fn escape_read_outside_workspace(caps: &SandboxCapabilities, workspace: &Path) -
     // workspace, so only Landlock can do the blocking. We seed it ourselves to
     // avoid depending on host files. We also attempt /etc/shadow as a secondary
     // assertion that the canonical secret stays unreadable.
-    let secret = std::env::temp_dir().join(format!(
-        "jeryu-escape-read-{}-secret.txt",
-        std::process::id()
-    ));
+    let secret =
+        jeryu_test_support::unique_temp_path("jeryu-escape-read-secret").with_extension("txt");
     if std::fs::write(&secret, b"top-secret-outside-workspace").is_err() {
         return EscapeResult {
             name: "read_outside_workspace",
@@ -344,8 +340,7 @@ fn escape_suite_blocks_or_honestly_skips() {
     let caps = SandboxCapabilities::probe();
 
     // Workspace the sandboxed children are confined to.
-    let workspace = std::env::temp_dir().join(format!("jeryu-escape-ws-{}", std::process::id()));
-    std::fs::create_dir_all(&workspace).unwrap_or_else(|e| panic!("create workspace: {e}"));
+    let workspace = jeryu_test_support::unique_temp_dir("jeryu-escape-ws");
 
     let results = vec![
         escape_write_outside_workspace(&caps, &workspace),

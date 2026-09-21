@@ -110,10 +110,7 @@ fn hardened_agent_container_runs_on_a_real_engine() {
     }
 
     // A real, isolated workspace directory the hardened spec mounts at /workspace.
-    let workspace: PathBuf =
-        std::env::temp_dir().join(format!("jeryu-real-docker-smoke-{}", std::process::id()));
-    std::fs::create_dir_all(&workspace)
-        .unwrap_or_else(|err| panic!("create workspace {}: {err}", workspace.display()));
+    let workspace: PathBuf = jeryu_test_support::unique_temp_dir("jeryu-real-docker-smoke");
     let _guard = WorkspaceGuard(workspace.clone());
 
     let job = agent_job(&workspace);

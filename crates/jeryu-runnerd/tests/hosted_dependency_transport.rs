@@ -3,7 +3,6 @@ use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 const SOURCE: &str = "https://github.com/neverhuman/jeryu-core.git";
 const HOSTED: &str = "https://git.neverhuman.org/git/jeryu/jeryu-core.git";
@@ -19,16 +18,9 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "jeryu-ci-runner-hosted-transport-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::create_dir(&path).expect("create unique scratch directory");
-        Self(path)
+        Self(jeryu_test_support::unique_temp_dir(
+            "jeryu-ci-runner-hosted-transport",
+        ))
     }
 }
 

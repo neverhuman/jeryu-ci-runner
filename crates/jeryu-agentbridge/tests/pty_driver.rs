@@ -13,9 +13,7 @@ use jeryu_agentbridge::driver::{
 use jeryu_agentbridge::pty_driver::{AgentControl, AgentControlSource, NoControl, PtyAgentDriver};
 
 fn cell_workspace(tag: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("jeryu-pty-drv-{tag}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).expect("create cell workspace");
-    dir
+    jeryu_test_support::unique_temp_dir(&format!("jeryu-pty-drv-{tag}"))
 }
 
 fn run_or_skip<C: AgentControlSource>(

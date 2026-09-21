@@ -4,22 +4,12 @@ use jeryu_runner_core::receipt::ReceiptStatus;
 use jeryu_runner_core::trust::{RunnerClass, TrustTier};
 use jeryu_runnerd::{DispatchEngine, DispatchMode};
 use std::path::PathBuf;
-use std::sync::{
-    Mutex,
-    atomic::{AtomicU64, Ordering},
-};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Mutex;
 
 static EXECUTION_GUARD: Mutex<()> = Mutex::new(());
 
 fn workspace() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("jeryu-phase4-gate-{stamp}-{unique}"))
+    jeryu_test_support::unique_temp_path("jeryu-phase4-gate")
 }
 
 fn job(tier: TrustTier) -> JobRequest {

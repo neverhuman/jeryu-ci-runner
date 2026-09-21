@@ -83,8 +83,7 @@ fn skip_if_unavailable(
 #[test]
 fn pty_child_output_reaches_master() {
     let caps = SandboxCapabilities::probe();
-    let ws = std::env::temp_dir().join(format!("jeryu-pty-out-{}", std::process::id()));
-    std::fs::create_dir_all(&ws).expect("workspace");
+    let ws = jeryu_test_support::unique_temp_dir("jeryu-pty-out");
 
     let j = job(
         ws.clone(),
@@ -126,8 +125,7 @@ fn pty_child_output_reaches_master() {
 #[test]
 fn pty_child_sees_stdout_as_a_terminal() {
     let caps = SandboxCapabilities::probe();
-    let ws = std::env::temp_dir().join(format!("jeryu-pty-istty-{}", std::process::id()));
-    std::fs::create_dir_all(&ws).expect("workspace");
+    let ws = jeryu_test_support::unique_temp_dir("jeryu-pty-istty");
 
     // `test -t 1` is true ONLY when stdout is a tty — proves the slave is a real
     // PTY, not a pipe. Under ChildIo::Piped this would print NOT_TTY.
