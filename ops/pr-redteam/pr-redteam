@@ -359,6 +359,10 @@ review_one() { # owner/name number dry-run force include-drafts
   fi
   git -C "$cache" cat-file -e "$sha^{commit}" 2>/dev/null \
     || { say "$tag: head ${sha:0:12} not on $head_ref (pushed mid-review?), retry next run"; return 0; }
+  # The forge's base_sha keys the receipt (skip_reason compares against it). The diff base may fall
+  # back to the fetched base branch; recording that fallback instead made every later pass miss the
+  # receipt, re-review the unchanged head and post the same approval again.
+  local forge_base_sha="$base_sha"
   git -C "$cache" cat-file -e "$base_sha^{commit}" 2>/dev/null || base_sha="$(git -C "$cache" rev-parse "refs/pr/$number/base")"
 
   local d="$work/review"
@@ -379,8 +383,8 @@ review_one() { # owner/name number dry-run force include-drafts
     say "$tag: diff is $diff_bytes bytes (> $max_diff_bytes), too large to red-team; NOT approving, needs a human"
     local big; big="$(receipt_path "$repo" "$number" "$sha")"; mkdir -p "$(dirname "$big")"
     jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" \
-      --argjson bytes "$diff_bytes" --arg identity "$review_identity" --arg base "$base_sha" \
-      '{repo:$repo, number:$number, head_sha:$sha, decision:"too_large", posted:false, diff_bytes:$bytes, reviewed_at:$at, review_identity:$identity, base_sha:$base}' | store_receipt "$big"
+      --argjson bytes "$diff_bytes" --arg identity "$review_identity" --arg base "$forge_base_sha" --arg diff_base "$base_sha" \
+      '{repo:$repo, number:$number, head_sha:$sha, decision:"too_large", posted:false, diff_bytes:$bytes, reviewed_at:$at, review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$big"
     return 0
   fi
   say "$tag: reviewing ${sha:0:12} ($(wc -l <"$d/files.txt") files, $(wc -c <"$d/diff.patch") bytes of diff)"
@@ -431,11 +435,11 @@ review_one() { # owner/name number dry-run force include-drafts
     else say "$tag: posting $decision answered $code, retry next run: $(jq -c '.error // .message // .' <<<"$body" 2>/dev/null | head -c 300)"
     fi
   fi
-  jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$base_sha" \
+  jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$forge_base_sha" --arg diff_base "$base_sha" \
     --arg decision "$decision" --argjson verdict "$verdict" --arg model "$model" --argjson cost "$cost" --arg identity "$review_identity" \
     --argjson posted "$posted" --arg code "$post_code" --argjson dry "$([ "$dry" = 1 ] && echo true || echo false)" \
     --arg at "$(date -u +%FT%TZ)" \
-    '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, decision:$decision, posted:$posted,
+    '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, diff_base_sha:$diff_base, decision:$decision, posted:$posted,
       post_http:$code, dry_run:$dry, model:$model, cost_usd:$cost, reviewed_at:$at, verdict:$verdict,review_identity:$identity}' | store_receipt "$receipt"
 }
 

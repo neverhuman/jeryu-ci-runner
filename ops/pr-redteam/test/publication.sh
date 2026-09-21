@@ -221,6 +221,17 @@ review
 jq -e --arg base "$(cat "$t/base")" '.base_sha == $base and .posted == true' "$(receipt)" > /dev/null
 echo 'ok changed base re-reviewed'
 
+# A forge base_sha that is not fetchable diffs against the base branch, but the receipt stays keyed
+# on the forge's value: the unchanged head is not reviewed or approved a second time.
+advance
+printf '%040d\n' 7 > "$t/base"
+model_calls="$(count "$t/model-calls")"; accepted_before="$(count "$t/accepted")"
+review
+jq -e --arg base "$(cat "$t/base")" '.base_sha == $base and .diff_base_sha != $base and .posted == true' "$(receipt)" > /dev/null
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" && "$(count "$t/accepted")" == "$((accepted_before + 1))" ]]
+echo 'ok unfetchable forge base approved once'
+
 # The normal review command has no merge pass or branch rewrite, even with a merger token present.
 "$here/pr-redteam" run --repo jeryu/fixture --pr 1 >> "$t/controller.log" 2>&1
 [[ ! -e "$t/danger" ]]
