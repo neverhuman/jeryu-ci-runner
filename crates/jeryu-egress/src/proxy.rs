@@ -74,6 +74,16 @@ impl Proxy {
     /// Returns an error if binding the listener fails.
     pub async fn serve(&self, bind: SocketAddr) -> io::Result<()> {
         let listener = TcpListener::bind(bind).await?;
+        self.serve_listener(listener).await
+    }
+
+    /// Serve forever on an already-bound listener, spawning a task per
+    /// connection. Callers that need the bound address before serving (tests
+    /// on an ephemeral port) bind first and hand the listener over.
+    ///
+    /// # Errors
+    /// Returns an error on a fatal accept error.
+    pub async fn serve_listener(&self, listener: TcpListener) -> io::Result<()> {
         let local = listener.local_addr()?;
         tracing::info!(addr = %local, "egress proxy listening");
         loop {

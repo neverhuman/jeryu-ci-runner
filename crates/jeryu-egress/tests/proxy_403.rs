@@ -13,16 +13,14 @@ use tokio::net::{TcpListener, TcpStream};
 
 /// Spawn the proxy on an ephemeral loopback port and return its bound address.
 ///
-/// We grab a free ephemeral port, drop the probe listener, then let the proxy's
-/// own public `serve` loop rebind it. The 100ms sleep lets that rebind settle.
+/// The listener is bound before the proxy task starts, so the address accepts
+/// connections immediately — no rebind race and no settling delay.
 async fn spawn_proxy(proxy: Proxy) -> SocketAddr {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let _ = proxy.serve(addr).await;
+        let _ = proxy.serve_listener(listener).await;
     });
-    tokio::time::sleep(Duration::from_millis(100)).await;
     addr
 }
 
