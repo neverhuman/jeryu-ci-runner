@@ -2,3 +2,8 @@
 path = ".jankurai/"
 generator = "just score"
 manual_edits = false
+
+[[zones]]
+path = "ops/ci/kit/"
+generator = "bash ops/ci-kit/bin/vendor.sh ."
+manual_edits = false

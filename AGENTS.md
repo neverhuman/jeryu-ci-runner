@@ -40,3 +40,7 @@ existing case covering the same behavior; extend it rather than duplicating it.
 The jankurai pin lives only in the generated block of `ops/ci/ensure-jankurai.sh`
 (currently `jankurai 1.6.11`, matching jeryu-core); `just required` is the entry
 point for the protected required check.
+Shared CI helpers live in the versioned `ops/ci-kit/` (see its README), which
+this repo and the rest of the family vendor as `ops/ci/kit/` pinned by
+`ops/ci/kit.pin`. Never edit a vendored copy: change the kit, bump its
+`VERSION`, run `ops/ci-kit/bin/seal.sh`, then `ops/ci-kit/bin/vendor.sh .`.

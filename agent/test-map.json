@@ -220,6 +220,11 @@
       "lane": "ci",
       "purpose": "verify host CI wrappers and fail-closed security gates"
     },
+    "ops/ci-kit/": {
+      "command": "just fast && just check && just security && just score",
+      "lane": "ci",
+      "purpose": "verify the canonical ci-kit is sealed, the vendored ops/ci/kit copy matches its pin, and the kit selftest passes"
+    },
     "ops/git-hooks/": {
       "command": "just fast && just check && just score",
       "lane": "ci",

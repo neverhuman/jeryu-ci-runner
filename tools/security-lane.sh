@@ -29,35 +29,14 @@ if ! actionlint --version 2>&1 | grep -Eq "^${ACTIONLINT_VERSION//./\\.}([[:spac
 fi
 
 mkdir -p target/security
-if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  {
-    git ls-files -z
-    git ls-files --others --exclude-standard -z
-  } | sort -zu | while IFS= read -r -d '' path; do
-    [[ -f "${path}" ]] || continue
-    case "${path}" in
-      target/*|node_modules/*|dist/*)
-        continue
-        ;;
-    esac
-    if LC_ALL=C grep -Iq . "${path}"; then
-      printf '\n===== %s =====\n' "${path}"
-      cat "${path}"
-    fi
-  done | gitleaks detect --pipe --redact --verbose
-else
-  gitleaks detect --no-git --redact --verbose
-fi
+ci_kit_secret_scan
 checks+=("gitleaks-${GITLEAKS_VERSION}")
 
 if [[ -d .github/workflows ]]; then
   actionlint .github/workflows/*.yml
   checks+=("actionlint-${ACTIONLINT_VERSION}")
 fi
-if find . -path './.git' -prune -o -name '.env' -type f -print | grep -q .; then
-  printf 'security check failed: committed .env file found\n' >&2
-  exit 1
-fi
+ci_kit_forbid_env_files
 checks+=("env-file-absence")
 if [[ -f Cargo.toml ]]; then
   cargo metadata --locked --format-version 1 --no-deps >/dev/null

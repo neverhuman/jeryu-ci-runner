@@ -41,15 +41,8 @@ require_jankurai
 source "${repo_root}/ops/ci/hosted-git-env.sh"
 
 # jeryu governs the worker count from live load; never default high.
-if [ -n "${JERYU_CI_JOBS:-}" ]; then
-  JOBS="${JERYU_CI_JOBS}"
-elif command -v jeryu-ci-governor >/dev/null 2>&1; then
-  JOBS="$(jeryu-ci-governor 2>/dev/null || echo 8)"
-else
-  JOBS=8
-fi
-export JERYU_CI_JOBS="$JOBS"
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$JOBS}"
+ci_kit_resolve_jobs
+JOBS="${JERYU_CI_JOBS}"
 
 # The pinned Jankurai 1.6.11 lives in ~/.cargo/bin. Other host installations
 # may appear earlier on PATH, so resolve the pinned auditor first; scripts that

@@ -41,7 +41,12 @@ if [[ -e repos.manifest.toml || -L repos.manifest.toml ]]; then
   printf 'jeryu-ci-runner may not own an authority repos.manifest.toml\n' >&2
   exit 1
 fi
-for script in scripts/*.sh ops/ci/*.sh tools/*.sh; do
+# The canonical ci-kit must be sealed, and this repo's vendored copy must match
+# both its pin and the canonical kit; any drift fails the gate.
+bash ops/ci-kit/bin/verify.sh --sealed ops/ci-kit
+bash ops/ci/kit/bin/verify.sh . --canonical ops/ci-kit
+bash ops/ci-kit/test/selftest.sh
+for script in scripts/*.sh ops/ci/*.sh tools/*.sh ops/ci-kit/*/*.sh ops/ci/kit/*/*.sh; do
   [[ -e "$script" ]] || continue
   bash -n "$script"
 done

@@ -45,6 +45,7 @@
     "ops/": "ops",
     "ops/agent-sandbox/": "jeryu-ci-runner",
     "ops/ci/": "ops",
+    "ops/ci-kit/": "ops",
     "ops/git-hooks/": "ops",
     "ops/pr-redteam/": "ops",
     "policies/": "jeryu-ci-runner",
