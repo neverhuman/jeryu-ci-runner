@@ -4,6 +4,47 @@ fn root() -> PathBuf {
     PathBuf::from("/workspace/core/web")
 }
 
+fn rebased_request(agent_id: &str) -> WorkcellClaimRequest {
+    WorkcellClaimRequest {
+        agent_id: agent_id.into(),
+        workspace_root: root(),
+        repo_roots: vec![root()],
+        branch_budget: 1,
+        runner_id: "xbabe0".into(),
+        runner_epoch: 7,
+        git_status_summary: "clean".into(),
+        ci_snapshot_age_ms: Some(0),
+        startup: StartupSync::Rebased {
+            main_ref: "origin/main".into(),
+            base_sha: "abc123".into(),
+            head_sha: "def456".into(),
+        },
+    }
+}
+
+#[test]
+fn claims_from_an_empty_pool_hand_out_distinct_cells() {
+    let mut manager = WorkcellManager::new();
+    assert_eq!(manager.ready_count(), 0);
+
+    let first = manager
+        .claim(rebased_request("agent-wrath-17"))
+        .expect("first claim succeeds");
+    let second = manager
+        .claim(rebased_request("agent-wrath-18"))
+        .expect("second claim succeeds");
+
+    assert_ne!(
+        first.workcell_id, second.workcell_id,
+        "each claim owns its own cell"
+    );
+    assert_eq!(
+        manager.ready_count(),
+        0,
+        "a claimed cell never stays in the ready queue"
+    );
+}
+
 #[test]
 fn claim_replaces_warm_cell_and_assigns_branch_budget() {
     let mut manager = WorkcellManager::with_warm_pool(1);

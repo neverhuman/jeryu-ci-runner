@@ -30,10 +30,11 @@ impl WorkcellManager {
     }
 
     pub fn claim(&mut self, request: WorkcellClaimRequest) -> WorkcellResult<WorkcellLease> {
-        let workcell_id = self
-            .ready_queue
-            .pop_front()
-            .unwrap_or_else(|| self.spawn_ready_cell());
+        let warm_hit = !self.ready_queue.is_empty();
+        let workcell_id = match self.ready_queue.pop_front() {
+            Some(workcell_id) => workcell_id,
+            None => self.mint_cell(),
+        };
         let outcome = {
             let lease = self
                 .cells
@@ -53,8 +54,11 @@ impl WorkcellManager {
         };
 
         // Keep the warm pool at a steady depth as soon as a warm cell is
-        // consumed.
-        self.spawn_ready_cell();
+        // consumed. A claim served by a freshly minted cell drew from an empty
+        // pool, so there is no depth to restore.
+        if warm_hit {
+            self.spawn_ready_cell();
+        }
 
         let lease = self
             .cells
@@ -283,12 +287,21 @@ impl WorkcellManager {
         ))
     }
 
-    fn spawn_ready_cell(&mut self) -> String {
+    /// Mint a ready cell into the lease table without queueing it. The caller
+    /// owns the new id: a claim hands it straight to one agent, so it must not
+    /// also sit in the ready queue where the next claim would take it.
+    fn mint_cell(&mut self) -> String {
         self.next_id = self.next_id.saturating_add(1);
         let workcell_id = format!("wc-{:04}", self.next_id);
         let lease = WorkcellLease::ready(workcell_id.clone());
-        self.ready_queue.push_back(workcell_id.clone());
         self.cells.insert(workcell_id.clone(), lease);
+        workcell_id
+    }
+
+    /// Mint a ready cell and queue it for the next claim.
+    fn spawn_ready_cell(&mut self) -> String {
+        let workcell_id = self.mint_cell();
+        self.ready_queue.push_back(workcell_id.clone());
         workcell_id
     }
 
