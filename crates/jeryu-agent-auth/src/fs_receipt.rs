@@ -127,7 +127,7 @@ fn create_pending_sibling(target: &Path) -> Result<(PathBuf, File), AgentAuthErr
     Err(fs_error(last.unwrap_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::AlreadyExists,
-            "no unused temporary name next to the credential",
+            "no free staging name next to the credential",
         )
     })))
 }
