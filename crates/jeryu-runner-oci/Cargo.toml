@@ -9,7 +9,10 @@ rust-version.workspace = true
 jeryu-runner-core = { path = "../jeryu-runner-core" }
 
 [dev-dependencies]
-jeryu-test-support = { path = "../jeryu-test-support" }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
