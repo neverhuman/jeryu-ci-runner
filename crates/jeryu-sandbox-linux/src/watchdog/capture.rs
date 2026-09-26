@@ -6,6 +6,17 @@ use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 
+/// Lowercase hex for a digest value.
+fn digest_hex(bytes: impl AsRef<[u8]>) -> String {
+    bytes
+        .as_ref()
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            out.push_str(&format!("{byte:02x}"));
+            out
+        })
+}
+
 pub const DEFAULT_OUTPUT_LIMIT: usize = 8 * 1024 * 1024;
 pub const MAX_OUTPUT_LIMIT: usize = 64 * 1024 * 1024;
 
@@ -207,7 +218,7 @@ impl Capture {
                 ));
             }
         }
-        Ok(format!("sha256:{digest:x}"))
+        Ok(format!("sha256:{}", digest_hex(digest)))
     }
 }
 
@@ -291,7 +302,7 @@ mod tests {
         options.validate().unwrap();
         alias.seek(SeekFrom::Start(100)).unwrap();
         let mut captured = capture(b"\xff\x00abc", 8, options.stdout_spool);
-        let expected = format!("sha256:{:x}", Sha256::digest(b"\xff\x00abc"));
+        let expected = format!("sha256:{}", digest_hex(Sha256::digest(b"\xff\x00abc")));
         assert_eq!(captured.finish().unwrap(), expected);
         assert_eq!(std::fs::read(spool.path()).unwrap(), b"\xff\x00abc");
     }
@@ -311,7 +322,7 @@ mod tests {
         assert_eq!(captured.bytes, b"12345678");
         assert_eq!(
             captured.finish().unwrap(),
-            format!("sha256:{:x}", Sha256::digest(b"12345678"))
+            format!("sha256:{}", digest_hex(Sha256::digest(b"12345678")))
         );
     }
 
