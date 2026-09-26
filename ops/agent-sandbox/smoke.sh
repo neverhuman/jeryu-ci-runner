@@ -10,9 +10,9 @@
 # Usage:  ops/agent-sandbox/smoke.sh [smoke|full]
 # Engine: ${JERYU_OCI_RUNTIME:-podman} (matches the runner's runtime selection).
 #
-# When no container engine is present the script prints a clear SKIP line and exits 0, so
-# it is safe to invoke from any lane; the assertions only run where an engine exists (a
-# dedicated runner). The daemonless CI never reaches the engine path.
+# A missing engine is a failure: this harness proves the lockdown on a live engine, so it
+# runs only where one exists (a dedicated runner) and refuses to report success otherwise.
+# Keep its real-engine execution separate from ordinary source regressions.
 set -euo pipefail
 
 # BEGIN GENERATED JANKURAI PIN — DO NOT EDIT
@@ -43,14 +43,18 @@ export JERYU_JANKURAI_BUILD_COMMAND="cargo install --locked --offline --path /op
 export JERYU_JANKURAI_BUILD_CONTEXT_SHA256="889d19f86fc390b0f0cf0bd6ecb4d451c51a2d6fb328e5520e4310e7ee5dedd6"
 # END GENERATED JANKURAI PIN
 
+if (( $# > 1 )) || [[ ${1:-smoke} != smoke && ${1:-smoke} != full ]]; then
+  printf 'usage: %s [smoke|full]\n' "$0" >&2
+  exit 2
+fi
 mode="${1:-smoke}"
 runtime="${JERYU_OCI_RUNTIME:-podman}"
 image="localhost/jeryu/agent-sandbox:smoke"
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if ! command -v "$runtime" >/dev/null 2>&1; then
-  echo "agent-sandbox smoke: SKIP (no container runtime: '$runtime' not on PATH)"
-  exit 0
+  echo "agent-sandbox smoke: FAILED (no container runtime: '$runtime' not on PATH)" >&2
+  exit 1
 fi
 
 # The seccomp profile the engine reads from the host. It is the same JSON the image ships
@@ -80,7 +84,7 @@ echo "agent-sandbox smoke: building $image with $runtime"
 # safe.directory so the mounted repo is trusted under the non-root uid).
 hard=(
   --read-only
-  --tmpfs /tmp:rw,nosuid,nodev,noexec
+  --tmpfs "/tmp:rw,nosuid,nodev,noexec"
   --cap-drop=ALL
   --security-opt no-new-privileges
   --security-opt "seccomp=$seccomp_profile"
@@ -196,9 +200,9 @@ if [[ "$mode" == "full" ]]; then
   echo "agent-sandbox smoke: full mode ran the complete lockdown battery on $runtime"
 fi
 
-if [[ "$fails" -eq 0 ]]; then
+if [[ "$fails" -eq 0 && "$passes" -eq 21 ]]; then
   echo "agent-sandbox smoke: PASSED"
   exit 0
 fi
-echo "agent-sandbox smoke: FAILED"
+echo "agent-sandbox smoke: FAILED (requires exactly 21 passing checks and zero failures)"
 exit 1

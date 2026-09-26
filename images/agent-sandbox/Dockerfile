@@ -27,13 +27,13 @@ FROM rust:1.95-slim-bookworm AS guard-build
 ENV CARGO_HOME=/opt/rust/cargo
 WORKDIR /src
 COPY . /src
-RUN cargo build --release -p jeryu-git-guard --bin jeryu-git \
+RUN cargo build --locked --release -p jeryu-git-guard --bin jeryu-git \
     && cp target/release/jeryu-git /jeryu-git
 # Warm this repo's cargo registry cache here, where the FULL workspace source exists, so
 # the runtime image can ship it for an offline (`--network none`) first build. Doing it
 # in this stage avoids copying every member crate into the runtime just to satisfy
 # `cargo fetch`'s workspace-manifest read.
-RUN cargo fetch --locked || cargo fetch || true
+RUN cargo fetch --locked
 
 # ---- jankurai build stage: compile the pinned auditor ---------------------------------
 # KEEP IN SYNC with ops/ci/ensure-jankurai.sh (the pin source of truth). The runtime
@@ -118,8 +118,8 @@ RUN curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - \
     && rm -rf /var/lib/apt/lists/* /root/.npm
 
 # Jekko (jeryu's own agent CLI) — installed from the internal registry/release.
-# Kept as a clearly-marked install hook so the image build stays reproducible.
-RUN npm install -g @jeryu/jekko-cli || echo "jekko: install from internal registry at build time"
+# A missing package is a build failure, not an image with a silently absent agent.
+RUN npm install -g @jeryu/jekko-cli
 
 # The git guard becomes the ONLY `git` on the agent PATH; a refusal wrapper is installed
 # as every tool a "just edit + build + commit code in this branch" agent does NOT need.
@@ -162,7 +162,7 @@ WORKDIR /opt/jeryu/repo
 COPY --from=guard-build /opt/rust/cargo/registry /opt/rust/cargo/registry
 COPY Cargo.toml Cargo.lock ./
 COPY apps/web/package.json apps/web/package-lock.json ./apps/web/
-RUN (cd apps/web && npm ci --no-audit --no-fund || true)
+RUN (cd apps/web && npm ci --no-audit --no-fund)
 
 # Non-root user (uid/gid 1000). The container runs `--read-only`, so the ONLY writable
 # spots are `--tmpfs /tmp` and the workspace bind-mount. The agent CLIs (codex/claude)
