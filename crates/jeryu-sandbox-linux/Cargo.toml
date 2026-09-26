@@ -31,3 +31,7 @@ jeryu-test-support = { path = "../jeryu-test-support" }
 [[example]]
 name = "jail_demo"
 path = "examples/jail_demo.rs"
+
+[[example]]
+name = "required_capabilities"
+path = "examples/required_capabilities.rs"
