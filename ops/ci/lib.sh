@@ -106,3 +106,11 @@ source "${ci_kit_dir}/lib/security.sh"
 # shellcheck source=ops/ci/kit/lib/jobs.sh
 source "${ci_kit_dir}/lib/jobs.sh"
 unset ci_kit_dir
+
+# jeryu-tool's pin renderer owns this wrapper in every ops/ci/lib.sh and
+# appends it when missing, so it stays here even though the kit defines the
+# same function.
+jankurai() {
+  require_jankurai || return 1
+  command "${JERYU_GOVERNED_JANKURAI_BIN}" "$@"
+}
