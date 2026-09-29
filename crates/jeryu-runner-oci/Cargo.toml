@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+jeryu-egress = { path = "../jeryu-egress" }
 jeryu-runner-core = { path = "../jeryu-runner-core" }
 
 [dev-dependencies]

@@ -1,6 +1,7 @@
 #![doc = "Container lifecycle seam for the warm pool: pre-warm detached cells and reap orphans without a real Docker/Podman daemon."]
 
 use crate::runtime::ContainerRuntime;
+use jeryu_egress::ContainerRoute;
 use jeryu_runner_core::error::RunnerResult;
 
 /// Label key that tags every warm/agent container with the workcell id it backs.
@@ -42,10 +43,14 @@ pub struct WarmContainerSpec {
     /// Image the warm container boots from (must match the agent image so a
     /// session can exec straight in).
     pub image: String,
-    /// Network mode; agents idle network-isolated, so this is `none`.
+    /// Network mode; with no model-egress route this is `none`.
     pub network: String,
     /// Workcell id stamped into the `jeryu.workcell=<id>` label.
     pub workcell_id: String,
+    /// Container environment, `-e KEY=VALUE`. A session execs into this warm
+    /// container, so the proxy environment must be set when it STARTS: an exec
+    /// inherits it, and there is no way to widen the network afterwards.
+    pub env: Vec<(String, String)>,
 }
 
 impl WarmContainerSpec {
@@ -61,23 +66,49 @@ impl WarmContainerSpec {
             image: image.into(),
             network: network.into(),
             workcell_id: workcell_id.into(),
+            env: Vec::new(),
+        }
+    }
+
+    /// Build a warm container spec that carries a model-egress route: the
+    /// container joins the dedicated egress bridge and its proxy environment
+    /// points at the allow-listing proxy. With `None` the container stays
+    /// network-isolated on `none`, unchanged.
+    pub fn with_route(
+        runtime: impl Into<String>,
+        image: impl Into<String>,
+        workcell_id: impl Into<String>,
+        route: Option<&ContainerRoute>,
+    ) -> Self {
+        let network = route.map_or_else(|| "none".to_string(), |r| r.network.clone());
+        Self {
+            runtime: runtime.into(),
+            image: image.into(),
+            network,
+            workcell_id: workcell_id.into(),
+            env: route.map(ContainerRoute::env).unwrap_or_default(),
         }
     }
 
     /// Runtime args without the executable: a detached, labeled, network-isolated
     /// container that idles on `sleep infinity`.
     pub fn args(&self) -> Vec<String> {
-        vec![
+        let mut args = vec![
             "run".to_string(),
             "--detach".to_string(),
             "--label".to_string(),
             format!("{WORKCELL_LABEL}={}", self.workcell_id),
-            "--network".to_string(),
-            self.network.clone(),
-            self.image.clone(),
-            "sleep".to_string(),
-            "infinity".to_string(),
-        ]
+        ];
+        for (key, value) in &self.env {
+            args.push("-e".to_string());
+            args.push(format!("{key}={value}"));
+        }
+        args.push("--network".to_string());
+        args.push(self.network.clone());
+        args.push(self.image.clone());
+        args.push("sleep".to_string());
+        args.push("infinity".to_string());
+        args
     }
 
     /// Full argv including the runtime executable, mirroring how the runtime is

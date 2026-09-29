@@ -15,6 +15,8 @@ name = "jeryu-egress"
 path = "src/bin/jeryu-egress.rs"
 
 [dependencies]
+serde = { workspace = true }
+toml = { workspace = true }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,32 @@
+# Model-egress policy for agent containers.
+#
+# Point JERYU_MODEL_EGRESS_CONFIG at this file on every host that runs agent
+# sessions. Both `jeryu-egress` (the proxy) and the OCI runner read it, so the
+# allow-list the proxy enforces and the route the container is given always
+# come from one place.
+#
+# With no file at all the defaults apply: only api.anthropic.com is allowed and
+# no bridge is configured, so agent containers stay on `--network none`.
+
+[model_egress]
+# Address the proxy listens on. Use the host's address ON the egress bridge so
+# only containers attached to that bridge can reach it.
+bind = "10.88.0.1:8889"
+
+# The dedicated, internal container network agent cells are attached to. Create
+# it with no gateway to the outside world, e.g.
+#   podman network create --internal jeryu-model-egress
+network = "jeryu-model-egress"
+
+# The proxy as the container sees it. The runner sets HTTPS_PROXY/HTTP_PROXY to
+# this value inside the agent container.
+proxy_endpoint = "http://10.88.0.1:8889"
+
+# Exact model API hosts the proxy forwards to. This list REPLACES the default
+# (api.anthropic.com); anything not named here is answered with 403 and no
+# upstream connection is ever opened.
+allow_hosts = ["api.anthropic.com"]
+
+# Optional DNS suffixes, matched on a dot boundary: ".example.test" allows
+# example.test and any subdomain, never notexample.test.
+allow_suffixes = []

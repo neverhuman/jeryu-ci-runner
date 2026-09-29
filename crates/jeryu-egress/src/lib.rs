@@ -14,9 +14,11 @@
 #![doc = "  ever opening an upstream socket."]
 
 pub mod allowlist;
+pub mod config;
 pub mod proxy;
 
 pub use allowlist::Allowlist;
+pub use config::{ContainerRoute, ModelEgressConfig};
 pub use proxy::{Proxy, ProxyConfig};
 
 use std::sync::Arc;

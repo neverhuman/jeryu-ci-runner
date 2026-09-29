@@ -10,6 +10,8 @@ pub use lifecycle::{
 pub use runtime::{CliContainerRuntime, ContainerRuntime, FakeContainerRuntime, RuntimeOutcome};
 pub use session::{AgentSessionPlan, plan_agent_session};
 
+pub use jeryu_egress::{ContainerRoute, ModelEgressConfig};
+
 use jeryu_runner_core::error::{RunnerError, RunnerResult};
 use jeryu_runner_core::fscheck::deny_dangerous_host_path;
 use jeryu_runner_core::job::{JobRequest, NetworkPolicy};
@@ -63,6 +65,13 @@ pub struct OciSpec {
     pub env: Vec<(String, String)>,
     /// Lock-down options for confined agent containers; `None` for the OCI-compat lane.
     pub hardening: Option<AgentHardening>,
+    /// The model-egress route this container gets, when the host configured one.
+    ///
+    /// `Some` attaches the container to the dedicated egress bridge and points
+    /// its proxy environment at the host proxy, which forwards ONLY to the
+    /// configured model API hosts. `None` keeps [`OciSpec::network`] at `none`,
+    /// i.e. no route off the container at all.
+    pub model_egress: Option<ContainerRoute>,
 }
 
 impl OciSpec {
@@ -91,6 +100,7 @@ impl OciSpec {
             },
             env: Vec::new(),
             hardening: None,
+            model_egress: None,
         })
     }
 
@@ -100,8 +110,34 @@ impl OciSpec {
     /// and ONLY the workspace mounted (the Rust/Vite/TS/React toolchain + repo deps +
     /// the agent CLIs live in the image, so no host paths are exposed). The image comes
     /// from `JERYU_AGENT_IMAGE`. Agents must be network-deny here; model egress is via
-    /// the separate proxy bridge, never the container.
+    /// the separate proxy bridge (see [`ModelEgressConfig`]), never open container
+    /// networking.
+    ///
+    /// # Errors
+    /// Returns `invalid_model_egress_config` when the configured model-egress
+    /// policy file cannot be read or parsed: a host that cannot read its own
+    /// egress policy must refuse to launch rather than guess at one.
     pub fn from_agent_job(job: &JobRequest, plan: &SandboxPlan) -> RunnerResult<Self> {
+        let config = ModelEgressConfig::load()
+            .map_err(|err| RunnerError::new("invalid_model_egress_config", err.to_string()))?;
+        Self::from_agent_job_with_route(job, plan, config.container_route())
+    }
+
+    /// Build the agent container spec with an explicitly supplied model-egress
+    /// route, bypassing config resolution.
+    ///
+    /// [`OciSpec::from_agent_job`] is this with the host's configured route.
+    /// Passing `None` here is the `--network none` shape: no bridge, no proxy
+    /// environment, nothing reachable from inside the container.
+    ///
+    /// # Errors
+    /// Returns `invalid_oci_runner`, `host_path_denied` or
+    /// `invalid_agent_network_policy` exactly as [`OciSpec::from_agent_job`].
+    pub fn from_agent_job_with_route(
+        job: &JobRequest,
+        plan: &SandboxPlan,
+        model_egress: Option<ContainerRoute>,
+    ) -> RunnerResult<Self> {
         if plan.runner_class != RunnerClass::OciDocker {
             return Err(RunnerError::new(
                 "invalid_oci_runner",
@@ -130,7 +166,12 @@ impl OciSpec {
             image,
             workspace: job.workspace.display().to_string(),
             command,
-            network: "none".to_string(),
+            // With no configured route the container has no network at all. With
+            // one it joins ONLY the dedicated egress bridge, whose single
+            // reachable service is the allow-listing proxy.
+            network: model_egress
+                .as_ref()
+                .map_or_else(|| "none".to_string(), |route| route.network.clone()),
             env: Vec::new(),
             hardening: Some(AgentHardening {
                 uid: 1000,
@@ -150,6 +191,7 @@ impl OciSpec {
                     plan.seccomp.name
                 ),
             }),
+            model_egress,
         })
     }
 
@@ -182,7 +224,15 @@ impl OciSpec {
             args.push("--cpu-shares".to_string());
             args.push(h.cpu_shares.to_string());
         }
-        for (key, value) in &self.env {
+        // The proxy environment is emitted from the route itself, not from
+        // `env`, so a caller that replaces `env` wholesale cannot drop the only
+        // path this container has to the model API.
+        let route_env = self
+            .model_egress
+            .as_ref()
+            .map(ContainerRoute::env)
+            .unwrap_or_default();
+        for (key, value) in route_env.iter().chain(self.env.iter()) {
             args.push("-e".to_string());
             args.push(format!("{key}={value}"));
         }
@@ -206,9 +256,10 @@ impl OciSpec {
     /// the full hardening + the in-image agent argv unchanged. The runtime
     /// executable itself (docker) is NOT included — the caller prepends it.
     ///
-    /// `--network none` is preserved: the agent still streams its banner / first
-    /// output (proving the pipeline) without egress. Model egress is a separate
-    /// later layer (the proxy bridge), never the container.
+    /// The network shape is preserved exactly as [`OciSpec::args`] builds it:
+    /// `--network none` with no configured model-egress route, or the dedicated
+    /// egress bridge plus the proxy environment with one. The live path never
+    /// widens the confinement it was handed.
     pub fn live_pty_args(&self, run_id: &str) -> Vec<String> {
         let mut args = self.args();
         // args[0] == "run", args[1] == "--rm"; splice the live-terminal flags in

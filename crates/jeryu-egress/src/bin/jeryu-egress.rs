@@ -1,13 +1,13 @@
 #![doc = "Thin entrypoint for the host-allowlist egress proxy."]
 #![doc = ""]
-#![doc = "All policy lives in the `jeryu_egress` library; this binary only parses a"]
-#![doc = "bind address from the environment and runs the proxy."]
+#![doc = "All policy lives in the `jeryu_egress` library; this binary only resolves"]
+#![doc = "the model-egress config (bind address + allow-list) and runs the proxy."]
+#![doc = "Point `JERYU_MODEL_EGRESS_CONFIG` at a TOML file to bind the proxy on the"]
+#![doc = "agent bridge and name the model API hosts it may forward to; with no file"]
+#![doc = "it listens on loopback and allows only the Anthropic API host."]
 
-use jeryu_egress::{Allowlist, Budget, Proxy};
+use jeryu_egress::{Budget, ModelEgressConfig, Proxy};
 use std::net::SocketAddr;
-
-/// The default bind address (loopback, the port the legacy Python proxy used).
-const DEFAULT_BIND: &str = "127.0.0.1:8889";
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -18,16 +18,25 @@ async fn main() -> std::io::Result<()> {
         )
         .init();
 
-    let bind: SocketAddr = std::env::var("JERYU_EGRESS_BIND")
-        .unwrap_or_else(|_| DEFAULT_BIND.to_string())
-        .parse()
-        .map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("bad bind addr: {e}"),
-            )
-        })?;
+    let config = ModelEgressConfig::load()
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string()))?;
+    // An explicit override still wins, so an operator can move the listener
+    // without editing the policy file.
+    let bind = std::env::var("JERYU_EGRESS_BIND").unwrap_or_else(|_| config.bind.clone());
+    let bind: SocketAddr = bind.parse().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("bad bind addr {bind:?}: {e}"),
+        )
+    })?;
 
-    let proxy = Proxy::new(Allowlist::default(), Budget::new());
+    let allowlist = config.allowlist();
+    tracing::info!(
+        hosts = ?allowlist.hosts(),
+        suffixes = ?allowlist.suffixes(),
+        network = %config.network,
+        "model egress allow-list"
+    );
+    let proxy = Proxy::new(allowlist, Budget::new());
     proxy.serve(bind).await
 }

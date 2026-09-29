@@ -308,3 +308,157 @@ fn rejected_agent_network_policies_never_reach_the_runtime() {
         }
     }
 }
+
+/// The route a host with a configured model-egress proxy hands the container.
+fn model_egress_route() -> ContainerRoute {
+    ContainerRoute {
+        network: "jeryu-model-egress".to_string(),
+        proxy_endpoint: "http://10.88.0.1:8889".to_string(),
+    }
+}
+
+/// Every `--network <value>` in an argv, in order.
+fn networks(argv: &[String]) -> Vec<&str> {
+    argv.windows(2)
+        .filter(|pair| pair[0] == "--network")
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+/// Every `-e KEY=VALUE` in an argv, in order.
+fn env_args(argv: &[String]) -> Vec<&str> {
+    argv.windows(2)
+        .filter(|pair| pair[0] == "-e")
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+#[test]
+fn a_configured_route_attaches_only_the_egress_bridge_and_the_proxy_env() {
+    let job = oci_agent_job();
+    let decision = select_runner(&job).unwrap_or_else(|err| panic!("{err}"));
+    let plan = SandboxPlan::from_decision(&job.workspace, &decision);
+    let spec = OciSpec::from_agent_job_with_route(&job, &plan, Some(model_egress_route()))
+        .unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(spec.network, "jeryu-model-egress");
+
+    for argv in [spec.args(), spec.live_pty_args("run-42")] {
+        // Exactly one network, and it is the dedicated egress bridge.
+        assert_eq!(networks(&argv), ["jeryu-model-egress"], "argv: {argv:?}");
+        let env = env_args(&argv);
+        assert!(
+            env.contains(&"HTTPS_PROXY=http://10.88.0.1:8889"),
+            "argv: {argv:?}"
+        );
+        assert!(
+            env.contains(&"NO_PROXY=localhost,127.0.0.1"),
+            "argv: {argv:?}"
+        );
+        // The lock-down is untouched: the bridge is the ONLY thing that widened.
+        assert!(argv.contains(&"--read-only".to_string()), "argv: {argv:?}");
+        assert!(argv.contains(&"--cap-drop=ALL".to_string()));
+        let binds: Vec<&String> = argv
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "-v")
+            .map(|(i, _)| &argv[i + 1])
+            .collect();
+        assert_eq!(binds.len(), 1, "still only the workspace mount: {binds:?}");
+    }
+}
+
+#[test]
+fn without_a_route_the_container_keeps_network_none_and_no_proxy_env() {
+    let job = oci_agent_job();
+    let decision = select_runner(&job).unwrap_or_else(|err| panic!("{err}"));
+    let plan = SandboxPlan::from_decision(&job.workspace, &decision);
+    let spec =
+        OciSpec::from_agent_job_with_route(&job, &plan, None).unwrap_or_else(|err| panic!("{err}"));
+    assert_eq!(spec.network, "none");
+    for argv in [spec.args(), spec.live_pty_args("run-42")] {
+        assert_eq!(networks(&argv), ["none"], "argv: {argv:?}");
+        assert!(
+            !argv.iter().any(|arg| arg.contains("PROXY")),
+            "no route means no proxy env: {argv:?}"
+        );
+    }
+}
+
+#[test]
+fn the_network_policy_check_still_applies_when_a_route_is_configured() {
+    // A bridge for the model proxy must not become a way to smuggle an open
+    // network policy past admission: the requested/effective deny check runs
+    // exactly as it does without a route.
+    let policies = [
+        NetworkPolicy::Deny,
+        NetworkPolicy::LoopbackOnly,
+        NetworkPolicy::EgressOnly,
+    ];
+    for requested in policies {
+        for effective in policies {
+            let mut job = oci_agent_job();
+            let decision = select_runner(&job).unwrap_or_else(|err| panic!("{err}"));
+            let mut plan = SandboxPlan::from_decision(&job.workspace, &decision);
+            job.network_policy = requested;
+            plan.network_policy = effective;
+            let result =
+                OciSpec::from_agent_job_with_route(&job, &plan, Some(model_egress_route()));
+            if requested == NetworkPolicy::Deny && effective == NetworkPolicy::Deny {
+                let spec = result.unwrap_or_else(|err| panic!("{err}"));
+                assert_eq!(spec.network, "jeryu-model-egress");
+            } else {
+                let err = result.expect_err("unsupported agent network policy must be rejected");
+                assert_eq!(err.code(), "invalid_agent_network_policy");
+            }
+        }
+    }
+}
+
+#[test]
+fn replacing_the_session_env_cannot_drop_the_proxy_route() {
+    // The session planner assigns `env` wholesale (branch pin, git guard). The
+    // proxy environment comes from the route, so it survives that assignment —
+    // otherwise the agent would sit on the bridge with no way to use it.
+    let job = oci_agent_job();
+    let decision = select_runner(&job).unwrap_or_else(|err| panic!("{err}"));
+    let plan = SandboxPlan::from_decision(&job.workspace, &decision);
+    let mut spec = OciSpec::from_agent_job_with_route(&job, &plan, Some(model_egress_route()))
+        .unwrap_or_else(|err| panic!("{err}"));
+    spec.env = vec![(
+        "JERYU_BRANCH".to_string(),
+        "agents/a/sessions/r".to_string(),
+    )];
+    let args = spec.args();
+    let env = env_args(&args);
+    assert!(
+        env.contains(&"HTTPS_PROXY=http://10.88.0.1:8889"),
+        "{env:?}"
+    );
+    assert!(env.contains(&"JERYU_BRANCH=agents/a/sessions/r"), "{env:?}");
+}
+
+#[test]
+fn a_warm_cell_starts_on_the_egress_bridge_with_the_proxy_env() {
+    // Sessions exec into a warm cell, so the cell itself must carry the route.
+    let route = model_egress_route();
+    let spec = WarmContainerSpec::with_route("podman", "agent:latest", "wc-1", Some(&route));
+    let args = spec.args();
+    assert_eq!(networks(&args), ["jeryu-model-egress"], "args: {args:?}");
+    assert!(
+        env_args(&args).contains(&"HTTPS_PROXY=http://10.88.0.1:8889"),
+        "args: {args:?}"
+    );
+    assert!(
+        args.windows(2)
+            .any(|w| w[0] == "--label" && w[1] == "jeryu.workcell=wc-1")
+    );
+
+    // With no configured route the warm cell idles with no network at all.
+    let isolated = WarmContainerSpec::with_route("podman", "agent:latest", "wc-1", None);
+    let args = isolated.args();
+    assert_eq!(networks(&args), ["none"], "args: {args:?}");
+    assert!(
+        !args.iter().any(|arg| arg.contains("PROXY")),
+        "args: {args:?}"
+    );
+}

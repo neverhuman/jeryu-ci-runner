@@ -12,6 +12,11 @@ The strict endpoint-neutral `jeryu.runner.v1` JSON contract is documented in
 [`docs/runner-wire-v1.md`](docs/runner-wire-v1.md). It is protocol-only; no AtomicSoul runner is
 installed or registered by this repository state.
 
+Agent containers run network-denied; the only route to a model API is the
+per-host allow-listing proxy described in
+[`docs/model-egress.md`](docs/model-egress.md), configured by
+[`configs/model-egress.toml`](configs/model-egress.toml).
+
 This repository was seeded from Jeryu source commit `cbecf7caa0e932c76a341b2521e66e911233860d` by
 `ops/split/materialize.py`. It is part of the seven-repo Jeryu split family and keeps source
 paths stable where practical so ownership remains auditable.

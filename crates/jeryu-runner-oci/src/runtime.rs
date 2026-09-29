@@ -49,6 +49,14 @@ impl CliContainerRuntime {
         std::env::var("JERYU_AGENT_IMAGE")
             .unwrap_or_else(|_| "localhost/jeryu/agent-sandbox:latest".to_string())
     }
+
+    /// The host's configured model-egress route, or `None` when the host has
+    /// not configured one (warm cells then idle with no network at all).
+    fn model_egress_route() -> RunnerResult<Option<jeryu_egress::ContainerRoute>> {
+        jeryu_egress::ModelEgressConfig::load()
+            .map(|config| config.container_route())
+            .map_err(|err| RunnerError::new("invalid_model_egress_config", err.to_string()))
+    }
 }
 
 impl ContainerRuntime for CliContainerRuntime {
@@ -77,11 +85,12 @@ impl ContainerRuntime for CliContainerRuntime {
 
 impl ContainerLifecycle for CliContainerRuntime {
     fn start_warm(&self, workcell_id: &str) -> RunnerResult<String> {
-        let spec = WarmContainerSpec::new(
+        let route = Self::model_egress_route()?;
+        let spec = WarmContainerSpec::with_route(
             Self::engine(),
             Self::agent_image(),
-            "none",
             workcell_id.to_string(),
+            route.as_ref(),
         );
         if !Self::gate_open() {
             return Ok(format!("planned-{workcell_id}"));
