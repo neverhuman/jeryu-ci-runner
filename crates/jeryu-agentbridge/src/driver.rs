@@ -30,7 +30,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::OnceLock;
-use std::sync::mpsc::{Receiver, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -204,6 +204,10 @@ impl std::error::Error for DriverError {}
 /// Default output budget: 64 KiB of captured stdout+stderr.
 pub const DEFAULT_OUTPUT_BUDGET_BYTES: usize = 64 * 1024;
 
+/// How long the supervisor waits, after the child is reaped, for each reader
+/// thread to forward its last bytes and an explicit EOF.
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// In-cell agent driver. Holds the supervision budgets; the host sandbox
 /// capabilities are probed once and cached process-wide.
 #[derive(Debug, Clone)]
@@ -253,6 +257,110 @@ enum Line {
     Bytes(Vec<u8>),
     /// The stream reached EOF.
     Eof,
+}
+
+/// Account one line against the shared budget, retaining and emitting only the
+/// bytes that still fit. Returns true once the budget has been exceeded.
+fn record_line<S: AgentEventSink>(
+    line: Vec<u8>,
+    buf: &mut Vec<u8>,
+    used: &mut usize,
+    is_stdout: bool,
+    output_budget_bytes: usize,
+    sink: &S,
+) -> bool {
+    let used_before = *used;
+    *used = used_before.saturating_add(line.len());
+
+    // Retain and emit only bytes inside the configured capture budget. Once a
+    // line crosses the limit, the remaining pipe contents are still drained to
+    // prove EOF but are discarded without creating unbounded buffers/events.
+    if used_before <= output_budget_bytes {
+        let keep = output_budget_bytes
+            .saturating_sub(used_before)
+            .min(line.len());
+        if keep > 0 {
+            let kept = &line[..keep];
+            buf.extend_from_slice(kept);
+            let text = String::from_utf8_lossy(kept).trim_end().to_string();
+            if is_stdout {
+                sink.emit(AgentEvent::Stdout(text));
+            } else {
+                sink.emit(AgentEvent::Stderr(text));
+            }
+        }
+        sink.emit(AgentEvent::Budget {
+            used: *used,
+            limit: output_budget_bytes,
+        });
+    }
+
+    *used > output_budget_bytes
+}
+
+/// Drain every line currently available without waiting. Returns true when the
+/// byte budget was exceeded.
+fn drain_ready<S: AgentEventSink>(
+    rx: Option<&Receiver<Line>>,
+    buf: &mut Vec<u8>,
+    used: &mut usize,
+    is_stdout: bool,
+    output_budget_bytes: usize,
+    sink: &S,
+) -> bool {
+    let Some(rx) = rx else { return false };
+    loop {
+        match rx.try_recv() {
+            Ok(Line::Bytes(line)) => {
+                if record_line(line, buf, used, is_stdout, output_budget_bytes, sink) {
+                    return true;
+                }
+            }
+            Ok(Line::Eof) | Err(TryRecvError::Disconnected) => return false,
+            Err(TryRecvError::Empty) => return false,
+        }
+    }
+}
+
+/// After the child exits, wait for its reader thread to forward all remaining
+/// bytes and an explicit EOF. Returns whether any of those late bytes exceeded
+/// the shared output budget. A bounded timeout rejects inherited pipe handles
+/// instead of silently returning an incomplete transcript.
+fn drain_to_eof<S: AgentEventSink>(
+    rx: Option<&Receiver<Line>>,
+    buf: &mut Vec<u8>,
+    used: &mut usize,
+    is_stdout: bool,
+    output_budget_bytes: usize,
+    timeout: Duration,
+    sink: &S,
+) -> Result<bool, DriverError> {
+    let Some(rx) = rx else { return Ok(false) };
+    let stream = if is_stdout { "stdout" } else { "stderr" };
+    let deadline = Instant::now() + timeout;
+    let mut budget_exceeded = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(DriverError::Supervision(format!(
+                "timed out waiting for agent {stream} pipe EOF"
+            )));
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Line::Bytes(line)) => {
+                budget_exceeded |=
+                    record_line(line, buf, used, is_stdout, output_budget_bytes, sink);
+            }
+            Ok(Line::Eof) | Err(RecvTimeoutError::Disconnected) => {
+                return Ok(budget_exceeded);
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(DriverError::Supervision(format!(
+                    "timed out waiting for agent {stream} pipe EOF"
+                )));
+            }
+        }
+    }
 }
 
 /// Read a child pipe line-by-line on a dedicated thread, forwarding each line to
@@ -367,6 +475,32 @@ pub fn stage_editbot(workspace: &Path, editbot_src: &Path) -> Result<PathBuf, Dr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Read};
+
+    /// A reader that stalls once before yielding its bytes, standing in for a
+    /// child whose last burst lands after the supervisor reaped it.
+    struct DelayedReader {
+        inner: Cursor<Vec<u8>>,
+        delay: Option<Duration>,
+    }
+
+    impl DelayedReader {
+        fn new(bytes: &[u8], delay: Duration) -> Self {
+            Self {
+                inner: Cursor::new(bytes.to_vec()),
+                delay: Some(delay),
+            }
+        }
+    }
+
+    impl Read for DelayedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if let Some(delay) = self.delay.take() {
+                thread::sleep(delay);
+            }
+            self.inner.read(buf)
+        }
+    }
 
     #[test]
     fn collecting_sink_records_events_in_order() {
@@ -383,6 +517,231 @@ mod tests {
         assert_eq!(events[0], AgentEvent::Started { pid: 7 });
         assert!(matches!(events[1], AgentEvent::Stdout(_)));
         assert!(matches!(events[2], AgentEvent::Finished { .. }));
+    }
+
+    #[test]
+    fn final_drain_waits_for_delayed_stdout_and_stderr_through_eof() {
+        let stdout_rx = spawn_line_reader(DelayedReader::new(
+            b"agent-out\n",
+            Duration::from_millis(20),
+        ));
+        let stderr_rx = spawn_line_reader(DelayedReader::new(
+            b"agent-err\n",
+            Duration::from_millis(40),
+        ));
+        let sink = CollectingSink::new();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut used = 0;
+
+        assert!(!drain_ready(
+            Some(&stderr_rx),
+            &mut stderr,
+            &mut used,
+            false,
+            4096,
+            &sink,
+        ));
+        assert!(stderr.is_empty(), "the delayed line must not be ready yet");
+
+        let stdout_budget_exceeded = drain_to_eof(
+            Some(&stdout_rx),
+            &mut stdout,
+            &mut used,
+            true,
+            4096,
+            Duration::from_secs(1),
+            &sink,
+        )
+        .expect("drain delayed stdout through EOF");
+        let stderr_budget_exceeded = drain_to_eof(
+            Some(&stderr_rx),
+            &mut stderr,
+            &mut used,
+            false,
+            4096,
+            Duration::from_secs(1),
+            &sink,
+        )
+        .expect("drain delayed stderr through EOF");
+
+        assert!(!stdout_budget_exceeded);
+        assert!(!stderr_budget_exceeded);
+        assert_eq!(stdout, b"agent-out\n");
+        assert_eq!(stderr, b"agent-err\n");
+        assert_eq!(used, stdout.len() + stderr.len());
+        sink.emit(AgentEvent::Finished {
+            exit_code: Some(0),
+            timed_out: false,
+            budget_exceeded: false,
+        });
+        let events = sink.events();
+        let stdout_index = events
+            .iter()
+            .position(|event| event == &AgentEvent::Stdout("agent-out".to_string()))
+            .expect("delayed stdout event");
+        let stderr_index = events
+            .iter()
+            .position(|event| event == &AgentEvent::Stderr("agent-err".to_string()))
+            .expect("delayed stderr event");
+        let finished_index = events
+            .iter()
+            .position(|event| matches!(event, AgentEvent::Finished { .. }))
+            .expect("finished event");
+        assert!(stdout_index < finished_index);
+        assert!(stderr_index < finished_index);
+    }
+
+    #[test]
+    fn final_drain_preserves_a_delayed_final_chunk_without_newline() {
+        let stdout_rx = spawn_line_reader(DelayedReader::new(
+            b"tail-without-newline",
+            Duration::from_millis(20),
+        ));
+        let sink = CollectingSink::new();
+        let mut stdout = Vec::new();
+        let mut used = 0;
+
+        let budget_exceeded = drain_to_eof(
+            Some(&stdout_rx),
+            &mut stdout,
+            &mut used,
+            true,
+            4096,
+            Duration::from_secs(1),
+            &sink,
+        )
+        .expect("drain the final non-newline chunk through EOF");
+
+        assert!(!budget_exceeded);
+        assert_eq!(stdout, b"tail-without-newline");
+        assert_eq!(used, stdout.len());
+        assert!(
+            sink.events()
+                .iter()
+                .any(|event| { event == &AgentEvent::Stdout("tail-without-newline".to_string()) })
+        );
+    }
+
+    #[test]
+    fn final_drain_reports_delayed_over_budget_output_in_both_pipe_orders() {
+        for stdout_first in [true, false] {
+            let stdout_rx =
+                spawn_line_reader(DelayedReader::new(b"stdout\n", Duration::from_millis(10)));
+            let stderr_rx =
+                spawn_line_reader(DelayedReader::new(b"stderr\n", Duration::from_millis(20)));
+            let sink = CollectingSink::new();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut used = 0;
+            let limit = 9;
+            let mut budget_exceeded = false;
+
+            if stdout_first {
+                budget_exceeded |= drain_to_eof(
+                    Some(&stdout_rx),
+                    &mut stdout,
+                    &mut used,
+                    true,
+                    limit,
+                    Duration::from_secs(1),
+                    &sink,
+                )
+                .expect("drain delayed stdout");
+                budget_exceeded |= drain_to_eof(
+                    Some(&stderr_rx),
+                    &mut stderr,
+                    &mut used,
+                    false,
+                    limit,
+                    Duration::from_secs(1),
+                    &sink,
+                )
+                .expect("drain delayed stderr");
+            } else {
+                budget_exceeded |= drain_to_eof(
+                    Some(&stderr_rx),
+                    &mut stderr,
+                    &mut used,
+                    false,
+                    limit,
+                    Duration::from_secs(1),
+                    &sink,
+                )
+                .expect("drain delayed stderr");
+                budget_exceeded |= drain_to_eof(
+                    Some(&stdout_rx),
+                    &mut stdout,
+                    &mut used,
+                    true,
+                    limit,
+                    Duration::from_secs(1),
+                    &sink,
+                )
+                .expect("drain delayed stdout");
+            }
+
+            let result = AgentRunResult {
+                exit_code: Some(0),
+                timed_out: false,
+                budget_exceeded,
+                stdout,
+                stderr,
+                captured_bytes: used,
+                enforcement_level: "enforced".to_string(),
+                elapsed: Duration::ZERO,
+            };
+            assert!(
+                result.budget_exceeded,
+                "late output must set the typed budget result"
+            );
+            assert!(
+                !result.succeeded(),
+                "an exit-zero child with late over-budget output must not succeed"
+            );
+            assert_eq!(
+                result.stdout.len() + result.stderr.len(),
+                limit,
+                "captured memory stays at the combined budget"
+            );
+            assert_eq!(
+                result.captured_bytes,
+                b"stdout\n".len() + b"stderr\n".len(),
+                "the outcome reports every observed byte"
+            );
+            let events = sink.events();
+            assert!(
+                events.iter().any(
+                    |event| matches!(event, AgentEvent::Budget { used, limit } if used > limit)
+                ),
+                "the event stream must record the late budget breach"
+            );
+        }
+    }
+
+    #[test]
+    fn final_drain_rejects_a_pipe_that_never_reaches_eof() {
+        let (_sender, receiver) = channel::<Line>();
+        let sink = CollectingSink::new();
+        let mut output = Vec::new();
+        let mut used = 0;
+        let error = drain_to_eof(
+            Some(&receiver),
+            &mut output,
+            &mut used,
+            false,
+            4096,
+            Duration::from_millis(10),
+            &sink,
+        )
+        .expect_err("an inherited stderr writer must fail bounded final drain");
+        assert!(
+            error
+                .to_string()
+                .contains("timed out waiting for agent stderr pipe EOF")
+        );
+        assert!(output.is_empty());
+        assert_eq!(used, 0);
     }
 
     #[test]

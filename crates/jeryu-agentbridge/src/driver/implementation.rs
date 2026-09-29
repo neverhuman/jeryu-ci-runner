@@ -201,45 +201,23 @@ impl AgentDriver {
         let mut timed_out = false;
         let mut budget_exceeded = false;
 
-        // Drain whatever lines are ready RIGHT NOW from one stream into its
-        // buffer, emit per-line events, and grow the running byte total. Returns
-        // true when the byte budget was tripped on this drain.
-        let drain = |rx: &Option<Receiver<Line>>,
-                     buf: &mut Vec<u8>,
-                     used: &mut usize,
-                     is_stdout: bool|
-         -> bool {
-            let Some(rx) = rx else { return false };
-            loop {
-                match rx.try_recv() {
-                    Ok(Line::Bytes(line)) => {
-                        *used += line.len();
-                        buf.extend_from_slice(&line);
-                        let text = String::from_utf8_lossy(&line).trim_end().to_string();
-                        if is_stdout {
-                            sink.emit(AgentEvent::Stdout(text));
-                        } else {
-                            sink.emit(AgentEvent::Stderr(text));
-                        }
-                        sink.emit(AgentEvent::Budget {
-                            used: *used,
-                            limit: self.output_budget_bytes,
-                        });
-                        if *used > self.output_budget_bytes {
-                            return true;
-                        }
-                    }
-                    Ok(Line::Eof) | Err(TryRecvError::Disconnected) => return false,
-                    Err(TryRecvError::Empty) => return false,
-                }
-            }
-        };
-
         let exit_code = loop {
             // Pull any pending output first so a budget breach is seen promptly.
-            if drain(&stdout_rx, &mut stdout, &mut used, true)
-                || drain(&stderr_rx, &mut stderr, &mut used, false)
-            {
+            if drain_ready(
+                stdout_rx.as_ref(),
+                &mut stdout,
+                &mut used,
+                true,
+                self.output_budget_bytes,
+                sink,
+            ) || drain_ready(
+                stderr_rx.as_ref(),
+                &mut stderr,
+                &mut used,
+                false,
+                self.output_budget_bytes,
+                sink,
+            ) {
                 budget_exceeded = true;
                 let _ = child.kill();
                 let status = child
@@ -267,11 +245,28 @@ impl AgentDriver {
             }
         };
 
-        // Final drain of any output produced between the last poll and exit. We
-        // ignore a late budget trip here (the child has already exited), but we
-        // still account the bytes so `captured_bytes` is honest.
-        drain(&stdout_rx, &mut stdout, &mut used, true);
-        drain(&stderr_rx, &mut stderr, &mut used, false);
+        // The child is reaped, but its reader threads may not have forwarded
+        // their last line yet. Wait through explicit EOF/disconnect instead of
+        // making one racy nonblocking read. A descendant that improperly keeps
+        // a pipe open fails supervision after a bounded wait.
+        budget_exceeded |= drain_to_eof(
+            stdout_rx.as_ref(),
+            &mut stdout,
+            &mut used,
+            true,
+            self.output_budget_bytes,
+            OUTPUT_DRAIN_TIMEOUT,
+            sink,
+        )?;
+        budget_exceeded |= drain_to_eof(
+            stderr_rx.as_ref(),
+            &mut stderr,
+            &mut used,
+            false,
+            self.output_budget_bytes,
+            OUTPUT_DRAIN_TIMEOUT,
+            sink,
+        )?;
 
         // Truncate the captured buffers to the budget so a final burst cannot
         // blow the cap retroactively.
