@@ -327,6 +327,25 @@ mod tests {
         assert_eq!(fake.recorded(), vec![expected]);
     }
 
+    /// Planning never runs anything: even an injected runtime, which is itself
+    /// an execution opt-in, must observe no invocation.
+    #[test]
+    fn plan_only_never_invokes_injected_runtime() {
+        let job = sample_job();
+        let decision = select_runner(&job).unwrap_or_else(|err| panic!("{err}"));
+        let plan = SandboxPlan::from_decision(&job.workspace, &decision);
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let runner = OciRunner::with_runtime(fake.clone());
+
+        let receipt = runner
+            .plan_only(&job, &decision, &plan)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(receipt.status, ReceiptStatus::Planned);
+        assert_eq!(receipt.exit_code, None);
+        assert!(fake.recorded().is_empty());
+    }
+
     /// An injected runtime is the opt-in: the fake-backed runner executes and
     /// reports `Passed` with exit 0 without needing `JERYU_RUN_OCI`.
     #[test]

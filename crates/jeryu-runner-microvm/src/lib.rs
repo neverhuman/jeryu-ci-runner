@@ -76,6 +76,31 @@ impl MicroVmRunner {
         Self
     }
 
+    /// Build a microVM plan receipt without consulting the execution gate or
+    /// invoking the configured launcher.
+    ///
+    /// Explain mode dispatches here so a plan request stays non-executing even
+    /// when the host has enabled real microVM execution for the run path.
+    pub fn plan_only(
+        &self,
+        job: &JobRequest,
+        decision: &PolicyDecision,
+        plan: &SandboxPlan,
+    ) -> RunnerResult<Receipt> {
+        let spec = MicroVmSpec::from_job(job, plan)?;
+        let timestamp = now_ms();
+        Ok(Receipt::new(
+            job,
+            decision,
+            plan,
+            ReceiptStatus::Planned,
+            None,
+            timestamp,
+            timestamp,
+            spec.explain(),
+        ))
+    }
+
     /// Plan or execute a microVM job.
     ///
     /// By default this returns a plan receipt. Set `JERYU_RUN_MICROVM=1` to
@@ -168,5 +193,34 @@ mod tests {
         let spec = MicroVmSpec::from_job(&job, &plan).unwrap_or_else(|err| panic!("{err}"));
         assert_eq!(spec.network, "deny");
         assert!(spec.explain().contains("microvm"));
+    }
+
+    #[test]
+    fn plan_only_returns_non_executing_receipt() {
+        let job = JobRequest {
+            job_id: "job".to_string(),
+            repo_id: "repo".to_string(),
+            commit_sha: "abc".to_string(),
+            workspace: PathBuf::from("/tmp/work"),
+            command: "/definitely/not/a/launcher".to_string(),
+            args: Vec::new(),
+            env: Default::default(),
+            trust_tier: TrustTier::T4ForkPr,
+            requested_runner: None,
+            network_policy: NetworkPolicy::Deny,
+            secret_policy: SecretPolicy::Default,
+            token_policy: TokenPolicy::ReadOnly,
+            timeout_ms: 1000,
+            fork: true,
+        };
+        let decision = select_runner(&job).unwrap_or_else(|err| panic!("{err}"));
+        let plan = SandboxPlan::from_decision(&job.workspace, &decision);
+
+        let receipt = MicroVmRunner::new()
+            .plan_only(&job, &decision, &plan)
+            .unwrap_or_else(|err| panic!("{err}"));
+
+        assert_eq!(receipt.status, ReceiptStatus::Planned);
+        assert_eq!(receipt.exit_code, None);
     }
 }

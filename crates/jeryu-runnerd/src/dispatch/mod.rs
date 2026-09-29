@@ -69,6 +69,18 @@ mod tests {
     }
 
     #[test]
+    fn explain_oci_returns_planned_receipt() {
+        let mut request = job(TrustTier::T4ForkPr);
+        request.requested_runner = Some(RunnerClass::OciDocker);
+
+        let receipt = DispatchEngine::new().dispatch(&request, DispatchMode::Explain);
+
+        assert_eq!(receipt.status, ReceiptStatus::Planned);
+        assert_eq!(receipt.runner_class, RunnerClass::OciDocker.as_str());
+        assert_eq!(receipt.exit_code, None);
+    }
+
+    #[test]
     fn denied_policy_still_receipts() {
         let mut request = job(TrustTier::T5PublicUntrusted);
         request.requested_runner = Some(RunnerClass::NativeRustHot);

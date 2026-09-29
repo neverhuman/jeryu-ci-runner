@@ -19,7 +19,8 @@ use super::adapter::protocol_to_core_job;
 /// Dispatch mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchMode {
-    /// Explain policy and sandbox plan without execution.
+    /// Explain policy and sandbox plan without consulting execution gates or
+    /// invoking a runner.
     Explain,
     /// Execute where enabled.
     Run,
@@ -94,10 +95,10 @@ impl DispatchEngine {
                 self.native.plan_only(job, &decision, &plan)
             }
             (DispatchMode::Explain, RunnerClass::MicroVmRust) => {
-                self.microvm.execute(job, &decision, &plan)
+                self.microvm.plan_only(job, &decision, &plan)
             }
             (DispatchMode::Explain, RunnerClass::OciDocker) => {
-                self.oci.execute(job, &decision, &plan)
+                self.oci.plan_only(job, &decision, &plan)
             }
             (DispatchMode::Run, RunnerClass::NativeRustHot)
             | (DispatchMode::Run, RunnerClass::NativeRustClean)

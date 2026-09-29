@@ -264,6 +264,33 @@ impl OciRunner {
         Self { runtime: rt }
     }
 
+    /// Build an OCI plan receipt without consulting the runtime execution gate
+    /// or calling the configured runtime.
+    ///
+    /// Explain mode dispatches here. Keeping it separate from
+    /// [`OciRunner::execute`] makes a plan request non-executing even when the
+    /// host enables OCI execution for the run path, and regardless of which
+    /// runtime is injected.
+    pub fn plan_only(
+        &self,
+        job: &JobRequest,
+        decision: &PolicyDecision,
+        plan: &SandboxPlan,
+    ) -> RunnerResult<Receipt> {
+        let spec = OciSpec::from_job(job, plan)?;
+        let timestamp = now_ms();
+        Ok(Receipt::new(
+            job,
+            decision,
+            plan,
+            ReceiptStatus::Planned,
+            None,
+            timestamp,
+            timestamp,
+            spec.explain(),
+        ))
+    }
+
     /// Launch a planned agent session's already-hardened container through the
     /// configured runtime.
     ///
