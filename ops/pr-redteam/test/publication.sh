@@ -58,6 +58,16 @@ case "$url" in
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"jeryu","name":"fixture"},"family":"jain","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
+  */pulls/1)
+    # The pull request detail: its merge passport says whether the base branch
+    # requires jankurai/proof on this head and whether it passes.
+    if [[ -e "$PUBLISH_FIXTURE/gate-blocked" ]]; then
+      printf '{"merge_passport":{"blockers":[{"code":"passport_blocked_checks","message":"Required context `jankurai/proof` is failing."}]}}\n200'
+    else printf '{"merge_passport":{"blockers":[]}}\n200'; fi ;;
+  */pulls/1/checks)
+    if [[ -e "$PUBLISH_FIXTURE/gate-blocked" ]]; then
+      printf '{"checks":[{"name":"jankurai/proof","required":true,"title":"score 47 < floor 85"}]}\n200'
+    else printf '{"checks":[]}\n200'; fi ;;
   */reviews)
     jq -c . <<< "$data" >> "$PUBLISH_FIXTURE/posts"
     if [[ -e "$PUBLISH_FIXTURE/reject" ]]; then printf '{"message":"publication refused"}\n403'
@@ -231,6 +241,25 @@ jq -e --arg base "$(cat "$t/base")" '.base_sha == $base and .diff_base_sha != $b
 review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" && "$(count "$t/accepted")" == "$((accepted_before + 1))" ]]
 echo 'ok unfetchable forge base approved once'
+
+# The quality gate: where the base branch requires jankurai/proof, a head whose
+# proof fails is held with that reason and no review budget is spent on it —
+# an approving agent could not have approved it anyway.
+advance
+printf '{"verdict":"approve","summary":"fixture review complete","findings":[]}\n' > "$t/verdict"
+touch "$t/gate-blocked"
+model_calls="$(count "$t/model-calls")"
+review
+jq -e '.posted == true and .decision == "hold"' "$(receipt)" > /dev/null
+[[ "$(count "$t/model-calls")" == "$model_calls" ]]
+tail -1 "$t/accepted" | jq -e '.verdict == "request_changes" and (.body_markdown | test("score 47 < floor 85"))' > /dev/null
+rm "$t/gate-blocked"
+# With the proof no longer in the way, the next head is reviewed and approved.
+advance
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
+echo 'ok failing required proof held without a review, cleared proof approved'
 
 # The normal review command has no merge pass or branch rewrite, even with a merger token present.
 "$here/pr-redteam" run --repo jeryu/fixture --pr 1 >> "$t/controller.log" 2>&1

@@ -69,6 +69,10 @@ bash ops/ci/fast.sh
 JERYU_SPLIT_FULL_CHECK=1 bash ops/ci/check.sh
 just contract-drift
 bash ops/ci/score.sh
+# The pre-approval gate: the verdict the hosted jankurai/proof will publish for
+# this head, before the PR exists. Refuses only where the rollout is on
+# (agent/jankurai-gate.toml); elsewhere it reports and passes.
+bash ops/ci/jankurai-gate.sh
 JERYU_SECURITY_NETWORK=1 bash ops/ci/security.sh
 bash ops/ci/artifact_support.sh
 

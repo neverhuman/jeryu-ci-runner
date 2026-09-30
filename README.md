@@ -25,6 +25,14 @@ the fleet score and hard-finding gates pass, and an independent review is bound
 to that same head. A `jankurai/proof` check is useful corroboration, but it does
 not substitute for the protected required context.
 
+`ops/ci/jankurai-gate.sh` (`just jankurai-gate`) is the pre-approval quality
+gate, run locally before a pull request exists: the same governed audit against
+the merge-base with `origin/main`, printing the verdict the hosted
+`jankurai/proof` will publish for that head and exiting non-zero when it would
+fail. It refuses only where the rollout is on (`agent/jankurai-gate.toml`), so a
+repository whose main does not clear the floor yet is not frozen. Where the gate
+is on, pr-redteam holds a head whose proof does not pass instead of reviewing it.
+
 ## Quick Start
 
 Use the pinned Rust toolchain and locked dependency graph from the repository

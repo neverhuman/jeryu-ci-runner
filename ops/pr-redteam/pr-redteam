@@ -10,6 +10,10 @@
 # security/correctness findings block, and every explicit block verdict is honored. Invalid or
 # contradictory output publishes nothing. Every finding is preserved in the review and receipt.
 #
+# The quality gate comes first: where the base branch requires `jankurai/proof`, a head whose proof
+# fails, has not run, or failed to score is held with that reason and no agent budget is spent on it.
+# Nothing here can approve such a head, and the forge refuses an approval on one anyway.
+#
 # The existing separate merger owns landing. This tool never merges, rebases or pushes branches,
 # and does not load a merger credential. Installation leaves its timers disabled.
 #
@@ -133,6 +137,37 @@ pr_row() { # owner/name number
 }
 
 receipt_path() { echo "$state/receipts/$1/$2-$3.json"; } # owner/name number sha
+
+# The quality gate, in the forge's own words. `jankurai/proof` is a required
+# context exactly in the repositories the gate has been rolled out to, so the
+# merge passport of the exact head answers both questions at once: is this
+# repository under the gate, and does this head pass it. A missing proof, a
+# failing one and a scorer failure all arrive here as a passport blocker.
+jankurai_gate_reason() { # pr-detail-json checks-json -> reason, or empty
+  jq -nr --argjson d "$1" --argjson c "$2" '
+    (($d.merge_passport.blockers // [])
+      | map(select((.message // "") | test("jankurai/proof"))) | first) as $blocker
+    | (($c.checks // []) | map(select(.name == "jankurai/proof")) | first) as $proof
+    | if $blocker == null then ""
+      else ($blocker.message
+            + (if ($proof.title // "") != "" then " jankurai/proof says: \($proof.title)" else "" end))
+      end'
+}
+
+# Why this head cannot be approved yet, or empty. A forge that will not answer is
+# not a pass: an unproven gate holds.
+jankurai_gate_hold() { # owner/name number
+  local detail
+  api GET "/api/v1/repos/${1/\//%2F}/pulls/$2"
+  if [ "$code" != 200 ]; then
+    echo "the forge answered $code for this pull request, so its quality gate is unproven"
+    return
+  fi
+  detail="$body"
+  api GET "/api/v1/repos/${1/\//%2F}/pulls/$2/checks"
+  [ "$code" = 200 ] || body='{"checks":[]}'
+  jankurai_gate_reason "$detail" "$body"
+}
 
 # Why a row would be skipped, or empty when it should be reviewed.
 skip_reason() { # row me include_drafts force
@@ -389,8 +424,26 @@ review_one() { # owner/name number dry-run force include-drafts
   fi
   say "$tag: reviewing ${sha:0:12} ($(wc -l <"$d/files.txt") files, $(wc -c <"$d/diff.patch") bytes of diff)"
 
-  local verdict
-  verdict="$(run_agent "$d" "$tag" "$sha" "$work")" || return 0
+  # The gate before the agent: a head the quality gate blocks cannot be approved
+  # whatever the review concludes, so it holds with the gate's reason and the
+  # per-PR agent budget is not spent on it.
+  local verdict gate_reason
+  gate_reason="$(jankurai_gate_hold "$repo" "$number")"
+  if [ -n "$gate_reason" ]; then
+    say "$tag: quality gate holds ${sha:0:12} — $gate_reason"
+    verdict="$(jq -nc --arg reason "$gate_reason" \
+      '{verdict: "block", summary: ("The quality gate blocks this head: " + $reason),
+        findings: [{severity: "critical",
+          title: "jankurai/proof does not pass on this head",
+          file: "(whole repository)",
+          detail: ("The base branch requires a passing jankurai/proof before a review can "
+                   + "approve this head. " + $reason
+                   + " Run `ops/ci/jankurai-gate.sh` locally for the same verdict, clear it, "
+                   + "and push again: the new head is scored and reviewed."),
+          evidence: $reason}]}')"
+  else
+    verdict="$(run_agent "$d" "$tag" "$sha" "$work")" || return 0
+  fi
 
   # Decision: approve only on an explicit, validated `approve`; a validated `block` holds. Nothing
   # falls through to approval. A committed private key holds regardless of the agent.
@@ -415,7 +468,8 @@ review_one() { # owner/name number dry-run force include-drafts
   fi
   local body; body="$(render_body "$verdict" "$decision" "$sha")"
   # The latest receipt was admitted before the worker started.
-  local cost; cost="$(jq -r '.total_cost_usd // null' "$work/agent.json" 2>/dev/null)"
+  local cost; cost="$(jq -r '.total_cost_usd // null' "$work/agent.json" 2>/dev/null || true)"
+  [ -n "$cost" ] || cost=null
 
   if [[ "$(review_input_identity)" != "$review_identity" ]]; then
     say "$tag: review inputs changed during execution; no review published; requalification required"
@@ -515,7 +569,7 @@ while [ $# -gt 0 ]; do
     --jobs) jobs="$2"; shift ;;
     --repo) only_repo="$2"; shift ;;
     --pr) only_pr="$2"; shift ;;
-    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _gate ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
   esac
   shift
 done
@@ -552,6 +606,8 @@ case "$cmd" in
     ;;
   heartbeat) # report liveness to jeryu's /runners page; safe to run from a short timer
     heartbeat ;;
+  _gate) # internal/testing: pr-detail.json checks.json -> gate reason (no forge calls)
+    jankurai_gate_reason "$(cat "$1")" "$(cat "$2")" ;;
   _blobs) # internal/testing: git-dir base head diff.patch -> unpinned binaries (no forge calls)
     unpinned_blobs "$1" "$2" "$3" "$4" ;;
   _agent) # internal/testing: review-dir tag sha -> verdict JSON (no forge calls)

@@ -5,6 +5,13 @@ critical security/correctness findings block. An explicit block verdict always
 holds; failed processes, incomplete output and contradictory approvals publish
 nothing. Findings and terminal attempt receipts remain available for review.
 
+Where the base branch requires `jankurai/proof`, the quality gate comes first: a
+head whose proof fails, has not run, or failed to score is held with that reason
+before any agent budget is spent, and nothing here can approve it. Repositories
+outside the gate's rollout are unaffected — their proof is reported, not
+required. `ops/ci/jankurai-gate.sh` is the same verdict, run locally before the
+pull request exists.
+
 The existing separate merger owns acceptance and landing. This controller never
 merges, rebases, pushes, tags, waives checks or posts required statuses. It does
 not read a merger credential. Installation stages inactive units; it does not
@@ -12,7 +19,7 @@ authorize or start automated review.
 
 ## Qualification
 
-`bash test/required.sh` runs offline verdict, binary-payload, credential-transport,
+`bash test/required.sh` runs offline quality-gate, verdict, binary-payload, credential-transport,
 publication/recovery and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
