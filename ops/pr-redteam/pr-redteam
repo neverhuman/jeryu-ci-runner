@@ -17,6 +17,9 @@
 # The existing separate merger owns landing. This tool never merges, rebases or pushes branches,
 # and does not load a merger credential. Installation leaves its timers disabled.
 #
+# A draft is never reviewed (unless --include-drafts): the skip is posted to the PR's timeline as
+# `pr.skipped` once per head, so a draft does not sit with no signal at all.
+#
 # What it never does: tag, waive, post statuses, or approve a PR whose author is the token's
 # own identity (the forge forbids self-approval). If the agent errors, times out or returns
 # something unparseable, the PR is left alone and retried on the next run — a failed review is never
@@ -167,6 +170,26 @@ jankurai_gate_hold() { # owner/name number
   api GET "/api/v1/repos/${1/\//%2F}/pulls/$2/checks"
   [ "$code" = 200 ] || body='{"checks":[]}'
   jankurai_gate_reason "$detail" "$body"
+}
+
+# A draft is skipped on every pass until somebody marks it ready, so saying so
+# only in this log leaves the draft with no signal where its author looks. Post
+# it to the pull request's own timeline instead, once per head: `event_id`
+# carries the head sha, and the forge keeps one line however many passes see the
+# same draft. Best-effort — a refused post is logged and nothing else.
+report_draft_skip() { # row
+  local row="$1" repo number sha
+  repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"
+  number="$(jq -r .number <<<"$row")"; sha="$(jq -r .head_sha <<<"$row")"
+  api POST /api/v1/events "$(jq -nc --arg repo "$repo" --argjson pr "$number" --arg sha "$sha" \
+    '{event_id: "pr-redteam:\($sha):skipped-draft", source: "pr-redteam", kind: "pr.skipped",
+      actor: "pr-redteam", repo: $repo, pr: $pr, sha: $sha, outcome: "skipped",
+      summary: "pr-redteam skipped \($repo)#\($pr): draft",
+      detail: {automation: "pr-redteam", skipped: "draft"}}')"
+  case "$code" in
+    200|201) ;;
+    *) say "could not report the draft skip of $repo#$number on its timeline ($code)" ;;
+  esac
 }
 
 # Why a row would be skipped, or empty when it should be reviewed.
@@ -585,7 +608,12 @@ case "$cmd" in
       [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
       reason="$(skip_reason "$row" "$me" "$drafts" "$force")"
       tier="$(jq -r 'if .priority then "priority" else "family \(.family // "" | if . == "" then "(none)" else . end)" end' <<<"$row")"
-      if [ -n "$reason" ]; then say "skip $repo#$number — $reason"
+      if [ -n "$reason" ]; then
+        say "skip $repo#$number — $reason"
+        # `list` and `--dry-run` answer what a run would do; neither writes.
+        if [ "$cmd" = run ] && [ "$dry" = 0 ] && [ "$reason" = draft ]; then
+          report_draft_skip "$row"
+        fi
       else
         say "queue [$tier] $repo#$number $(jq -r '"by \(.author): \(.title)"' <<<"$row")"
         if jq -e .priority <<<"$row" >/dev/null; then first+=("$repo $number"); else rest+=("$repo $number"); fi

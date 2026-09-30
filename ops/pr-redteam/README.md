@@ -19,8 +19,8 @@ authorize or start automated review.
 
 ## Qualification
 
-`bash test/required.sh` runs offline quality-gate, verdict, binary-payload, credential-transport,
-publication/recovery and installation checks. The actual repository required lane
+`bash test/required.sh` runs offline quality-gate, draft-skip, verdict, binary-payload,
+credential-transport, publication/recovery and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
 publication refusal, restart, duplicate dispatch, worker loss and changed heads.
@@ -45,6 +45,12 @@ successfully posted reviews at the current head with matching controller, prompt
 schema, model, CLI executable and version inputs. Each changed head needs a new
 review. The forge receives the exact expected head and can reject publication
 if it moved while the model was running. Rejected publication remains retryable.
+
+A skipped draft is reported to the forge as one `pr.skipped` pipeline event per
+head, so it appears on the pull request's own timeline instead of only in this
+log; `list` and `--dry-run` post nothing. Marking a draft ready for review is
+the author's or an admin's move:
+`POST /api/v1/repos/{id}/pulls/{number}/ready`.
 
 `JERYU_TOKEN_FILE` selects the existing approval credential by path. API calls
 require `https://git.neverhuman.org`, an owned mode0600 nonsymlink regular token
