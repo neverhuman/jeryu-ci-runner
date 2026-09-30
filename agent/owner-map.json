@@ -16,6 +16,7 @@
     "VERSION": "release",
     "agent/": "agent",
     "bins/jeryu-ci-bin/": "jeryu-ci-runner",
+    "configs/model-egress.toml": "jeryu-ci-runner",
     "configs/runnerd.toml": "jeryu-ci-runner",
     "contracts/": "contracts",
     "crates/jeryu-agent-auth/": "jeryu-ci-runner",

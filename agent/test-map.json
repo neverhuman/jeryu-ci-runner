@@ -80,6 +80,11 @@
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
+    "configs/model-egress.toml": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+    },
     "configs/runnerd.toml": {
       "command": "just check",
       "lane": "check",
