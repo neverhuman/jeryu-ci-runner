@@ -261,6 +261,24 @@ review
 jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
 echo 'ok failing required proof held without a review, cleared proof approved'
 
+# A base branch the forge does not have yet is recorded once and not retried: no model call, no
+# publication, and no second attempt for the same head however many passes run.
+advance
+g switch -q --detach HEAD
+g branch -D main
+model_calls="$(count "$t/model-calls")"; posts_before="$(count "$t/posts")"
+review
+jq -e '.decision == "base_missing" and .posted == false and .base_ref == "main"' "$(receipt)" > /dev/null
+grep -q 'base branch main does not exist yet' "$t/controller.log"
+attempts="$(find "$t/state/attempts" -type f | wc -l)"
+review
+[[ "$(find "$t/state/attempts" -type f | wc -l)" == "$attempts" ]]
+[[ "$(count "$t/model-calls")" == "$model_calls" && "$(count "$t/posts")" == "$posts_before" ]]
+grep -q 'skip — main does not exist yet' "$t/controller.log"
+! grep -q 'fetch failed' "$t/controller.log"
+g rev-parse HEAD > "$t/base"; g branch main "$(cat "$t/base")"; g switch -q topic
+echo 'ok missing base branch recorded once, never retried'
+
 # The normal review command has no merge pass or branch rewrite, even with a merger token present.
 "$here/pr-redteam" run --repo jeryu/fixture --pr 1 >> "$t/controller.log" 2>&1
 [[ ! -e "$t/danger" ]]

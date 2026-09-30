@@ -43,8 +43,11 @@ activation approval.
 The reviewer skips its own authored PRs, drafts unless explicitly included, and
 successfully posted reviews at the current head with matching controller, prompt,
 schema, model, CLI executable and version inputs. Each changed head needs a new
-review. The forge receives the exact expected head and can reject publication
-if it moved while the model was running. Rejected publication remains retryable.
+review. A PR whose base branch the forge does not have yet — the shape a new
+repository is bootstrapped with, since a first push to the default branch is
+refused — is recorded once per head as `base_missing` and left to a person,
+rather than failing its fetch again on every pass. The forge receives the exact
+expected head and can reject publication if it moved while the model was running. Rejected publication remains retryable.
 
 A skipped draft is reported to the forge as one `pr.skipped` pipeline event per
 head, so it appears on the pull request's own timeline instead of only in this

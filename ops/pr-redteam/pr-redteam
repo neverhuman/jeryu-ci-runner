@@ -201,9 +201,31 @@ skip_reason() { # row me include_drafts force
   [ "$(jq -r .author <<<"$row")" != "$me" ] || { echo "authored by $me (self-approval is forbidden)"; return; }
   receipt="$(receipt_path "$repo" "$number" "$sha")"
   if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" --arg identity "$review_identity" --arg base "$(jq -r .base_sha <<< "$row")" \
-      '.review_identity == $identity and .base_sha == $base and (.posted == true or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
-    echo "already reviewed at ${sha:0:12} ($(jq -r .decision "$receipt"))"; return
+      '.review_identity == $identity and .base_sha == $base
+       and (.posted == true or .decision == "base_missing" or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
+    case "$(jq -r .decision "$receipt")" in
+      base_missing) echo "$(jq -r '.base_ref // "the base branch"' "$receipt") does not exist yet; a person creates it" ;;
+      *) echo "already reviewed at ${sha:0:12} ($(jq -r .decision "$receipt"))" ;;
+    esac
+    return
   fi
+}
+
+# Branch names the forge has for one repository, one `refs/heads/...` per line.
+remote_branches() { # owner/name
+  local out
+  out="$(timeout 120 git ls-remote --heads --quiet "$base/git/$1.git" 2>/dev/null)" || return 1
+  [ -n "$out" ] || return 1
+  awk '{print $2}' <<<"$out"
+}
+
+# A bootstrap PR: its head branch is on the forge and its base branch is not. A new repository
+# starts this way, because the forge refuses a first push to the default branch and the branch is
+# created by merging such a PR. There is no base to diff against, and no later pass changes that.
+bootstrap_pr() { # owner/name base-ref head-ref
+  local refs; refs="$(remote_branches "$1")" || return 1
+  grep -qxF "refs/heads/$3" <<<"$refs" || return 1
+  ! grep -qxF "refs/heads/$2" <<<"$refs"
 }
 
 # Preserve only the CLI's declared authentication/runtime inputs. Forge and
@@ -413,6 +435,19 @@ review_one() { # owner/name number dry-run force include-drafts
         timeout 900 git -C "$cache" fetch -q --no-tags "$base/git/$repo.git" \
           "+refs/heads/$head_ref:refs/pr/$number/head" "+refs/heads/$base_ref:refs/pr/$number/base"
        ) 7>"$cache.lock" 2>"$work/fetch.err"; then
+    # A base branch the forge does not have is not a transient failure: retrying it every pass
+    # only repeated the same "review failed" for a head nothing will make reviewable. Record it
+    # once per head, keyed like any other terminal outcome, and leave the PR to a person.
+    if bootstrap_pr "$repo" "$base_ref" "$head_ref"; then
+      say "$tag: base branch $base_ref does not exist yet; a person creates it — not retried"
+      jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$base_sha" \
+        --arg base_ref "$base_ref" --arg head_ref "$head_ref" --arg at "$(date -u +%FT%TZ)" \
+        --arg identity "$review_identity" \
+        '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, base_ref:$base_ref, head_ref:$head_ref,
+          decision:"base_missing", posted:false, reviewed_at:$at, review_identity:$identity,
+          reason:"the base branch does not exist on the forge yet; a person creates it"}' | store_receipt "$receipt"
+      return 0
+    fi
     say "$tag: fetch failed, retry next run: $(tail -1 "$work/fetch.err")"; return 0
   fi
   git -C "$cache" cat-file -e "$sha^{commit}" 2>/dev/null \
