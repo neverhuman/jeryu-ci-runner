@@ -12,7 +12,7 @@ const SUPPORT_REF: &str = "refs/heads/preserve/hosted-cargo/jeryu-core-v5.0.0-sp
 const GOVERNED_JANKURAI: &str = "/home/ubuntu/.jeryu/bin/jankurai";
 const GOVERNED_JANKURAI_VERSION: &str = "jankurai 1.6.11";
 const GOVERNED_JANKURAI_SHA256: &str =
-    "9e6b8857a26f6004d4c74e510e13b06d880f2e2ae0c89502698889ed690c5d6c";
+    "b05c03bcb0fb2d004d3daa303ae236b8985b39e393567e8f8d274cd9f6f89103";
 
 struct Scratch(PathBuf);
 
