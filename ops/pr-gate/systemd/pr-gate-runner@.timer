@@ -1,0 +1,17 @@
+# One timer per slot. A busy slot does not tick, so the interval is only the pause between one tick
+# finishing and the next starting. At 1min, with systemd's default 1min AccuracySec and a 20s random
+# delay on top, a slot sat 60-140s between ticks: measured on a gate host (2026-09-18) at ~1.7 of 12
+# slot-hours, as much as all tree syncing. 20s with 1s accuracy keeps the pause short. An idle tick
+# lists open PRs on every gated repo (~65 API reads), so six idle slots cost ~15 reads/s at most.
+[Unit]
+Description=Poll open family PRs and gate the next unclaimed head (slot %i)
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=20s
+AccuracySec=1s
+RandomizedDelaySec=5
+Persistent=true
+
+[Install]
+WantedBy=timers.target

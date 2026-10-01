@@ -1,0 +1,11 @@
+# Every 5 minutes, so a gate's own advisory fetch is always a no-op.
+[Unit]
+Description=Refresh the RustSec advisory database every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

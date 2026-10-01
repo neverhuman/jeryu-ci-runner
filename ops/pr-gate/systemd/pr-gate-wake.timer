@@ -1,0 +1,12 @@
+# 5s after the last poll finished: one open-PR list per gated repo plus one merge-queue read, with no
+# per-PR reads -- less than a single idle slot tick. The slot timers remain the fallback if this stops.
+[Unit]
+Description=Poll gated heads and wake an idle PR gate slot
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

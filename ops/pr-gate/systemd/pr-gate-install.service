@@ -1,0 +1,10 @@
+# Keep the installed gate runner equal to its source branch; see bin/pr-gate-install.sh.
+[Unit]
+Description=Install the gate runner from its source branch (drains slots first)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GATE_RUNNER_HOME=%h/gate-runner
+ExecStart=%h/gate-runner/bin/pr-gate-install.sh
+TimeoutStartSec=1h

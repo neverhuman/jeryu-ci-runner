@@ -48,6 +48,7 @@
     "ops/ci/": "ops",
     "ops/ci-kit/": "ops",
     "ops/git-hooks/": "ops",
+    "ops/pr-gate/": "ops",
     "ops/pr-redteam/": "ops",
     "policies/": "jeryu-ci-runner",
     "repos.manifest.toml": "split",

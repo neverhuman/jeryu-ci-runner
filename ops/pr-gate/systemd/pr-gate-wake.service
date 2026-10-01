@@ -1,0 +1,11 @@
+# Start idle gate slots when a gated head appears or moves; see bin/pr-gate-wake.sh. Reads the
+# open-PR lists and the merge queue only; never takes a gate lock or posts a status.
+[Unit]
+Description=Wake idle PR gate runner slots on new or moved heads
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GATE_RUNNER_HOME=%h/gate-runner
+ExecStart=%h/gate-runner/bin/pr-gate-wake.sh
+TimeoutStartSec=2min

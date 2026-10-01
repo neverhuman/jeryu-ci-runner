@@ -1,0 +1,9 @@
+# Keep ~/.cargo/advisory-db current outside the gates; see bin/pr-gate-advisory-refresh.sh.
+[Unit]
+Description=Refresh the RustSec advisory database used by gate recipes
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/gate-runner/bin/pr-gate-advisory-refresh.sh
+TimeoutStartSec=15min

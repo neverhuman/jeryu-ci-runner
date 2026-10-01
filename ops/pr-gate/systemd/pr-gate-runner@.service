@@ -1,0 +1,25 @@
+# Gate open family PR heads and post <repo>/required, one slot per instance: pr-gate-runner@0 ..
+# pr-gate-runner@3. Installed on the gate host as --user units; see bin/pr-gate-runner.sh. It never
+# approves or merges. Site settings (forge, credential, identity, owners) come from
+# ~/.config/jeryu/pr-gate.env; an Environment= line here or in a drop-in overrides them for a slot.
+#
+# IDENTITY. The runner refuses to gate heads belonging to the identity whose token it holds, because
+# a proof is only worth the independence of whoever produced it. The gate identity
+# (GATE_RUNNER_IDENTITY) should author nothing; it posts commit statuses and check runs and reads PRs,
+# nothing else (role user, write on gated repos).
+[Unit]
+Description=Family PR gate runner slot %i (exact-head gate -> <repo>/required)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GATE_RUNNER_HOME=%h/gate-runner
+Environment=GATE_RUNNER_SLOT=%i
+ExecStart=%h/gate-runner/bin/pr-gate-runner.sh
+Nice=10
+# The recipe and its sccache server run under `ionice -c 3` (idle) from the runner itself. The runner's
+# own bookkeeping -- hashing inputs, the clean-tree git status, receipt fsyncs -- stays best-effort:
+# under idle it queued behind every slot's build I/O (sampled on a gate host 2026-09-18).
+TimeoutStartSec=4h

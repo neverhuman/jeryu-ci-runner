@@ -1,0 +1,11 @@
+# Every 10 minutes: merges within one interval become one install and one re-gate round.
+[Unit]
+Description=Install the gate runner from its source branch every 10 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

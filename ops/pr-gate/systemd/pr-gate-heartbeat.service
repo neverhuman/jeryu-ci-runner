@@ -1,0 +1,11 @@
+# Report every gate slot to the forge's /runners page; see bin/pr-gate-heartbeat.sh. Reads only
+# what pr-gate-runner leaves on disk; never takes a gate lock or posts a status.
+[Unit]
+Description=Report PR gate runner slots to the forge (/runners)
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GATE_RUNNER_HOME=%h/gate-runner
+ExecStart=%h/gate-runner/bin/pr-gate-heartbeat.sh
+TimeoutStartSec=2min

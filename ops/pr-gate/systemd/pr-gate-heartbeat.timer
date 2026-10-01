@@ -1,0 +1,11 @@
+# Every minute: the forge forgets a runner 180s after its last heartbeat.
+[Unit]
+Description=Report PR gate runner slots to the forge every minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

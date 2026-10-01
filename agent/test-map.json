@@ -235,6 +235,11 @@
       "lane": "ci",
       "purpose": "verify pre-push gates delegate to local CI lanes"
     },
+    "ops/pr-gate/": {
+      "command": "bash ops/pr-gate/tests/required.sh",
+      "lane": "ci",
+      "purpose": "offline gate runner regressions: site config reader, attempt journal and publication recovery, full runner against a fixture forge, namespace, locks, heartbeat/events, wake, retention, prefetch source allowlist, installer and database refreshers"
+    },
     "ops/pr-redteam/": {
       "command": "bash ops/pr-redteam/test/required.sh",
       "lane": "ci",

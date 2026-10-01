@@ -1,0 +1,11 @@
+# Every 6 hours, well inside grype's 5-day max database age.
+[Unit]
+Description=Refresh the grype vulnerability database every 6 hours
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=6h
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target
