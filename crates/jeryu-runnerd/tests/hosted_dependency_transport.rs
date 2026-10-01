@@ -10,9 +10,8 @@ const TAG: &str = "jeryu-core-v5.0.0-split.0";
 const COMMIT: &str = "0e29dc90673ffdf9959aaaa1f05482301f15fabe";
 const SUPPORT_REF: &str = "refs/heads/preserve/hosted-cargo/jeryu-core-v5.0.0-split.0";
 const GOVERNED_JANKURAI: &str = "/home/ubuntu/.jeryu/bin/jankurai";
-const GOVERNED_JANKURAI_VERSION: &str = "jankurai 1.6.11";
-const GOVERNED_JANKURAI_SHA256: &str =
-    "b05c03bcb0fb2d004d3daa303ae236b8985b39e393567e8f8d274cd9f6f89103";
+/// The host authority stamp names the Jankurai the installer last made current.
+const GOVERNED_JANKURAI_AUTHORITY: &str = "/home/ubuntu/.jeryu/authority/jankurai.json";
 
 struct Scratch(PathBuf);
 
@@ -172,6 +171,22 @@ fn run_library_jankurai(
     }
     scrub_git_config_env(&mut command);
     command.output().expect("run CI library in a login shell")
+}
+
+/// One string field of the host authority stamp; no pin is carried in this repo.
+fn governed_jankurai_authority(field: &str) -> String {
+    let stamp = fs::read_to_string(GOVERNED_JANKURAI_AUTHORITY)
+        .expect("read the host Jankurai authority stamp");
+    let key = format!("\"{field}\":");
+    let rest = stamp
+        .split_once(&key)
+        .unwrap_or_else(|| panic!("authority stamp has no {field}"))
+        .1
+        .trim_start();
+    let value = rest
+        .strip_prefix('"')
+        .expect("authority stamp field is a string");
+    value[..value.find('"').expect("terminated string")].to_owned()
 }
 
 fn sha256_file(path: &Path) -> String {
@@ -373,12 +388,13 @@ fn login_shell_proof_replay_uses_only_the_governed_jankurai_binary() {
     assert_eq!(
         String::from_utf8(output.stdout).expect("UTF-8 Jankurai version"),
         format!(
-            "command=jankurai\nfile={GOVERNED_JANKURAI}\nversion={GOVERNED_JANKURAI_VERSION}\n"
+            "command=jankurai\nfile={GOVERNED_JANKURAI}\nversion={}\n",
+            governed_jankurai_authority("version")
         )
     );
     assert_eq!(
         sha256_file(Path::new(GOVERNED_JANKURAI)),
-        GOVERNED_JANKURAI_SHA256
+        governed_jankurai_authority("binary_sha256")
     );
     assert!(
         !hostile_marker.exists(),
@@ -408,7 +424,7 @@ fn governed_jankurai_custody_identity_and_receipt_fail_closed() {
     let symlink_target = scratch.0.join("symlink-target");
     write_fake_jankurai(
         &symlink_target,
-        GOVERNED_JANKURAI_VERSION,
+        &governed_jankurai_authority("version"),
         &scratch.0.join("symlink-ran"),
         0o755,
     );
@@ -424,7 +440,7 @@ fn governed_jankurai_custody_identity_and_receipt_fail_closed() {
     let symlink_parent_target = scratch.0.join("symlink-parent-target");
     write_fake_jankurai(
         &symlink_parent_target.join("bin/jankurai"),
-        GOVERNED_JANKURAI_VERSION,
+        &governed_jankurai_authority("version"),
         &scratch.0.join("symlink-parent-ran"),
         0o755,
     );
@@ -463,7 +479,7 @@ fn governed_jankurai_custody_identity_and_receipt_fail_closed() {
     let non_executable = scratch.0.join("non-executable-jankurai");
     write_fake_jankurai(
         &non_executable,
-        GOVERNED_JANKURAI_VERSION,
+        &governed_jankurai_authority("version"),
         &scratch.0.join("non-executable-ran"),
         0o644,
     );
@@ -486,16 +502,20 @@ fn governed_jankurai_custody_identity_and_receipt_fail_closed() {
         !wrong_version.status.success(),
         "wrong governed version was accepted"
     );
+    // No pin is carried: a binary nothing vouches for is refused for its missing
+    // receipt before any identity comparison; one with a receipt fails the match.
     let wrong_version_stderr = String::from_utf8_lossy(&wrong_version.stderr);
     assert!(
-        wrong_version_stderr.contains("governed jankurai identity mismatch"),
+        wrong_version_stderr.contains("governed jankurai identity mismatch")
+            || wrong_version_stderr
+                .contains("non-governed jankurai requires an explicit installation receipt"),
         "unexpected wrong-version failure: {wrong_version_stderr}"
     );
 
     let wrong_digest_path = scratch.0.join("wrong-digest/jankurai");
     write_fake_jankurai(
         &wrong_digest_path,
-        GOVERNED_JANKURAI_VERSION,
+        &governed_jankurai_authority("version"),
         &scratch.0.join("wrong-digest-ran"),
         0o755,
     );
