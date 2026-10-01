@@ -48,6 +48,35 @@ gate_detach_strays() { # tree detached-dir name...
   done
 }
 
+# Evidence repositories are read by exact tag/commit/tree from outside a gate's family (a docs
+# repository reading another owner's release evidence, say). Keep a bare <name>.git of each beside
+# the family checkouts: it has no .git subdirectory, so gate_detach_strays leaves it alone. A refresh
+# that fails is reported, never fatal: only the repository that reads the evidence needs it, and it
+# fails closed on its own with a precise message.
+gate_mirror_evidence() { # tree base owner/name...
+  local tree=$1 base=$2 e dest; shift 2
+  for e in "$@"; do
+    [[ "$e" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || { printf 'evidence %s: not owner/name\n' "$e"; continue; }
+    dest="$tree/${e#*/}.git"
+    if [[ ! -d "$dest" ]] && ! git clone --quiet --bare "$base/git/$e.git" "$dest" 2>/dev/null; then
+      rm -rf -- "$dest"; printf 'evidence %s: cannot mirror\n' "$e"; continue
+    fi
+    git -C "$dest" fetch --quiet --prune "$base/git/$e.git" \
+      '+refs/heads/main:refs/heads/main' '+refs/tags/*:refs/tags/*' 2>/dev/null ||
+      printf 'evidence %s: cannot refresh\n' "$e"
+  done
+}
+
+# The evidence repositories configured for one tree owner: PR_GATE_EVIDENCE_REPOS lists
+# <tree-owner>=<owner>/<name> entries.
+gate_evidence_for() { # tree-owner
+  local entry
+  for entry in ${PR_GATE_EVIDENCE_REPOS:-}; do
+    [[ "${entry%%=*}" == "$1" && "$entry" == *=* ]] && printf '%s\n' "${entry#*=}"
+  done
+  return 0
+}
+
 # True when the newest status of this gate's required context on a status snapshot is a success this
 # runner posted ($MARKER). A re-verification of such a head does not post `pending` over it.
 gate_newest_is_own_success() { # status-snapshot

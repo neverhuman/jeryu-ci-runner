@@ -302,6 +302,30 @@ moved=$(gate_detach_strays "$strays/tree" "$strays/detached" keep-a keep-b | sor
 [[ ! -e "$strays/tree/stray-x" && -d "$strays/detached/stray-x/.git" && ! -e "$strays/detached/stray-x/old-copy" ]]
 printf 'PASS exact tree: strays move out (replacing an older copy), family and non-checkouts stay\n'
 
+# Evidence mirrors: a bare <name>.git beside the family, refreshed with main and tags, left alone by
+# the stray detach; an unreachable or malformed source is reported and never fatal.
+ev="$scratch/evidence"
+mkdir -p "$ev/forge/git/labs" "$ev/tree" "$ev/work"
+git init --quiet --bare "$ev/forge/git/labs/proof.git"
+git -C "$ev/work" init --quiet -b main
+git -C "$ev/work" -c user.name=t -c user.email=t@t commit --quiet --allow-empty -m one
+git -C "$ev/work" tag release-1
+git -C "$ev/work" push --quiet "$ev/forge/git/labs/proof.git" main release-1
+out=$(gate_mirror_evidence "$ev/tree" "$ev/forge" labs/proof)
+[[ -z "$out" && -d "$ev/tree/proof.git" && ! -e "$ev/tree/proof.git/.git" ]]
+git -C "$ev/work" -c user.name=t -c user.email=t@t commit --quiet --allow-empty -m two
+git -C "$ev/work" tag release-2
+git -C "$ev/work" push --quiet "$ev/forge/git/labs/proof.git" main release-2
+gate_mirror_evidence "$ev/tree" "$ev/forge" labs/proof >/dev/null
+[[ "$(git -C "$ev/tree/proof.git" rev-parse main)" == "$(git -C "$ev/work" rev-parse HEAD)" ]]
+git -C "$ev/tree/proof.git" rev-parse --verify --quiet refs/tags/release-2 >/dev/null
+[[ -z "$(gate_detach_strays "$ev/tree" "$ev/detached")" && -d "$ev/tree/proof.git" ]]
+out=$(gate_mirror_evidence "$ev/tree" "$ev/forge" labs/missing 'bad name')
+[[ "$out" == *"labs/missing: cannot mirror"* && "$out" == *"bad name: not owner/name"* && ! -e "$ev/tree/missing.git" ]]
+[[ "$(PR_GATE_EVIDENCE_REPOS='acme=labs/proof other=labs/x acme=labs/y' gate_evidence_for acme | tr '\n' ' ')" == 'labs/proof labs/y ' ]]
+[[ -z "$(PR_GATE_EVIDENCE_REPOS='other=labs/x' gate_evidence_for acme)" && -z "$(gate_evidence_for acme)" ]]
+printf 'PASS evidence mirrors: per tree owner, bare beside the family, refreshed with tags, kept by the detach, never fatal\n'
+
 # Re-verifying a head keeps this runner's own newest success instead of posting `pending` over it.
 owner=jeryu repo=jeryu-web MARKER=pr-gate-runner@test
 snap="$scratch/snap.json"

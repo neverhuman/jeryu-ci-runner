@@ -533,6 +533,10 @@ done
 for n in $(gate_detach_strays "$run" "$HOME_DIR/detached/slot$SLOT" $family $repo); do
   say "moved $owner/$n out of the slot tree: not in this gate's family"
 done
+mapfile -t evidence < <(gate_evidence_for "$owner")
+if ((${#evidence[@]})); then
+  while read -r line; do say "$line"; done < <(gate_mirror_evidence "$run" "$BASE" "${evidence[@]}")
+fi
 if [[ "$qref" == - ]]; then
   git -C "$run/$repo" fetch --quiet "$BASE/git/$owner/$repo.git" "$sha"
 else
