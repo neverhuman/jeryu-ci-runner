@@ -1,9 +1,9 @@
 # Jeryu runner wire v1
 
 `jeryu-runner-protocol::wire` defines the endpoint-neutral JSON contract for a future
-AtomicSoul-native runner. It is a pure protocol leaf: this repository does not yet contain an
-AtomicSoul HTTP route, network client, credential loader, durable runner registry, service unit,
-or live xbabe3 registration.
+forge-native runner. It is a pure protocol leaf: this repository does not yet contain a
+forge HTTP route, network client, credential loader, durable runner registry, service unit,
+or live runner-host registration.
 
 The checked draft 2020-12 structural mirror is
 [`schemas/jeryu.runner.v1.schema.json`](../schemas/jeryu.runner.v1.schema.json),
@@ -85,7 +85,7 @@ artifact digests, ordered cache receipts, and log digest. Repeating an identical
 the same ID. Changing any bound context produces a different ID. A result or acknowledgement with
 a stale context or mismatched receipt fails before it can be handed to scheduler mutation logic.
 
-## Work still required before xbabe3 can register
+## Work still required before a runner host can register
 
 1. Jeryu Core must add authenticated, durable runner enrollment, epoch fencing, heartbeat,
    lease, and idempotent result application around these messages, with repository/check
@@ -95,11 +95,11 @@ a stale context or mismatched receipt fails before it can be handed to scheduler
    read-only-mirror mode.
 3. `jeryu-runnerd` needs a separate reviewed client tranche for TLS-pinned calls, bounded polling,
    drain/fence behavior, local credential-descriptor handling, and crash-safe result replay.
-4. A signed immutable release must be deployed to AtomicSoul and independently verified before
-   an xbabe3 service unit or registration credential is created.
-5. xbabe3 registration, capacity allocation, cgroup limits, end-to-end lease execution, required
+4. A signed immutable release must be deployed to the forge host and independently verified before
+   a runner-host service unit or registration credential is created.
+5. Runner-host registration, capacity allocation, cgroup limits, end-to-end lease execution, required
    check publication, reboot/linger behavior, credential renewal, and revocation tests remain host
    operations. The retired GitHub Actions units must remain disabled and must not be reused.
 
 Until those steps land through protected releases, this module is a tested contract only and must
-not be reported as a running or registered AtomicSoul runner.
+not be reported as a running or registered forge runner.

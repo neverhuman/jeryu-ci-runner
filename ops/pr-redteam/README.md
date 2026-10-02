@@ -34,9 +34,9 @@ activation approval.
 
 ```sh
 ./pr-redteam list
-./pr-redteam run --dry-run --repo veox/jain-web --pr 16
-./pr-redteam run --repo veox/jain-web --pr 16
-./pr-redteam show veox/jain-web 16
+./pr-redteam run --dry-run --repo acme/widget-web --pr 16
+./pr-redteam run --repo acme/widget-web --pr 16
+./pr-redteam show acme/widget-web 16
 ./pr-redteam heartbeat
 ```
 

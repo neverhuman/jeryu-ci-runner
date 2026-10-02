@@ -9,7 +9,7 @@ source or running a release lane. It defines the hosted dependency identity,
 required evidence, and generated-file boundaries that this README summarizes.
 
 The strict endpoint-neutral `jeryu.runner.v1` JSON contract is documented in
-[`docs/runner-wire-v1.md`](docs/runner-wire-v1.md). It is protocol-only; no AtomicSoul runner is
+[`docs/runner-wire-v1.md`](docs/runner-wire-v1.md). It is protocol-only; no forge runner is
 installed or registered by this repository state.
 
 Agent containers run network-denied; the only route to a model API is the
