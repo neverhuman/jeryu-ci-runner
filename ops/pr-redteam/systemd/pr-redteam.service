@@ -1,8 +1,8 @@
-# Publish exact-head security/correctness reviews. The separate merger owns landing.
+# Publish exact-head security/correctness reviews and land the PRs it approved.
 # install.sh stages this unit inactive; its service owner qualifies and activates it.
 # @REDTEAM_DIR@ is the custodied source directory.
 [Unit]
-Description=pr-redteam: suspicious agent review + approval of open forge PRs
+Description=pr-redteam: agent review, approval and landing of open forge PRs
 After=network-online.target
 Wants=network-online.target
 
@@ -14,6 +14,10 @@ Environment=REDTEAM_FAMILIES=all
 Environment=REDTEAM_JOBS=4
 Environment=REDTEAM_MODEL=claude-opus-5
 Environment=JERYU_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat
+# The merger credential path is site configuration, not source: set
+# REDTEAM_MERGE_TOKEN_FILE in this file to the merger's mode-0600 credential.
+# Without it pr-redteam reviews and publishes, and lands nothing.
+EnvironmentFile=-%h/.config/pr-redteam/merge.env
 ExecStart=@REDTEAM_DIR@/pr-redteam run
 Nice=10
 TimeoutStartSec=6h

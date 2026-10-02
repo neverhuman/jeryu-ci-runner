@@ -12,18 +12,43 @@ outside the gate's rollout are unaffected — their proof is reported, not
 required. `ops/ci/jankurai-gate.sh` is the same verdict, run locally before the
 pull request exists.
 
-The existing separate merger owns acceptance and landing. This controller never
-merges, rebases, pushes, tags, waives checks or posts required statuses. It does
-not read a merger credential. Installation stages inactive units; it does not
-authorize or start automated review.
+pr-redteam also lands what it approved. After the review pass, every open PR
+this controller approved at its current head is merged as the merger identity,
+once the forge itself says it can merge: approval, required contexts green, no
+changes requested. The merge is pinned to the exact reviewed head and the
+forge's merge passport, so a PR pushed after approval is never landed — it is
+reviewed again at its new head.
+
+Merge eligibility is recomputed on every pass from this controller's own
+receipts, independently of the "already reviewed" skip. That skip covers the
+review only. A required context that fails on its first attempt and succeeds on
+the gate runner's retry is therefore landed on the next pass, with no second
+review; the same holds for a head that was behind its base and became
+mergeable.
+
+Branches are never rewritten. An approved PR behind a linear-history base is
+handed to the forge's merge queue (`REDTEAM_QUEUE=1`, the default), which
+replays and gates it without touching anybody's branch. With `REDTEAM_QUEUE=0
+REDTEAM_REBASE=1` the controller will instead rebase and force-push such a
+branch, leased to the reviewed head; this is off by default because the family's
+no-force rule does not permit it, and an empty rebase is never pushed.
+
+The controller never tags, waives checks or posts required statuses.
+`REDTEAM_MERGE_TOKEN_FILE` selects the merger credential by path and has no
+default: this source is public, so the path is site configuration. Unset or
+unreadable, the review pass still runs and nothing is landed. Installation
+stages inactive units; it does not authorize or start automated review or
+landing.
 
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, verdict, binary-payload,
-credential-transport, publication/recovery and installation checks. The actual repository required lane
+credential-transport, publication/recovery, merge-pass and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
-publication refusal, restart, duplicate dispatch, worker loss and changed heads.
+publication refusal, restart, duplicate dispatch, worker loss and changed heads,
+and the landing path: approve, a failing required context, that context going
+green on a retry, and the merge that follows without a second review.
 
 `test/canary.sh` is a separate paid live-model qualification for the service owner.
 It requires the exact pinned CLI and selected model. Offline source qualification
@@ -55,7 +80,8 @@ log; `list` and `--dry-run` post nothing. Marking a draft ready for review is
 the author's or an admin's move:
 `POST /api/v1/repos/{id}/pulls/{number}/ready`.
 
-`JERYU_TOKEN_FILE` selects the existing approval credential by path. API calls
+`JERYU_TOKEN_FILE` selects the approval credential by path and
+`REDTEAM_MERGE_TOKEN_FILE` the merger credential. API calls
 require `https://git.neverhuman.org`, an owned mode0600 nonsymlink regular token
 file and a valid bearer value. The bearer travels through curl configuration
 stdin, with curlrc disabled, and is absent from curl argv. This transport guard
@@ -78,8 +104,9 @@ separately authorize activation. The script never starts or enables a timer.
 
 The units reference this source directory by absolute path. Treat any later
 source update as a service change requiring its owner's custody and qualification.
-The reviewer timer invokes only review publication; the separate merger remains
-outside this controller. Heartbeats report liveness through Jeryu's existing
+The timer invokes a review pass and then a merge pass. The merger credential's
+path comes from the site's `~/.config/pr-redteam/merge.env`, read by the unit;
+`install.sh` writes no credential and no credential path. Heartbeats report liveness through Jeryu's existing
 runner-reporting allowlist. An authorization refusal is logged, not bypassed.
 
 ## Review isolation
@@ -90,11 +117,12 @@ mode confines file tools to the empty working directory and exact PR review
 archive. The model process receives only declared CLI authentication/runtime
 variables; reviewer/merger paths and arbitrary service secrets are removed.
 OAuth/provider authentication remains the existing service owner's responsibility.
-The shipped unit contains no merger credential path.
+The shipped unit contains no credential and no merger credential path: it only
+reads the site's environment file.
 
 Before a verdict can be printed, stored as a review receipt, or published, the
-controller decodes its JSON strings and refuses the current reviewer bearer and
-common encoded forms. Unsafe raw output is removed without echoing it. This is
+controller decodes its JSON strings and refuses the current reviewer bearer, the
+configured merger bearer, and common encoded forms. Unsafe raw output is removed without echoing it. This is
 an additional publication guard, not proof against every possible encoding or a
 claim of OS-level isolation. Exact CLI behavior is owner-qualified before service
 activation. A source merge does not establish sealed execution.

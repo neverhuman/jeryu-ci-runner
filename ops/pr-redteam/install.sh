@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Stage pr-redteam user units; activation belongs to the existing service owner.
+# No credential is written here: the unit reads the merger credential's path from
+# ~/.config/pr-redteam/merge.env, which the service owner creates.
 # Run from the custodied source directory. Every later source change requires
 # the service owner's stopped handoff, qualification and separate activation.
 set -euo pipefail

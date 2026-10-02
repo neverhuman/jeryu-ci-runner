@@ -68,6 +68,9 @@ case "$url" in
     if [[ -e "$PUBLISH_FIXTURE/gate-blocked" ]]; then
       printf '{"checks":[{"name":"jankurai/proof","required":true,"title":"score 47 < floor 85"}]}\n200'
     else printf '{"checks":[]}\n200'; fi ;;
+  */pulls/1/merge)
+    # Nothing in this suite ends at an approved receipt, so any landing attempt here is a bug.
+    printf 'merged a head without an approving receipt\n' >> "$PUBLISH_FIXTURE/danger"; exit 99 ;;
   */reviews)
     jq -c . <<< "$data" >> "$PUBLISH_FIXTURE/posts"
     if [[ -e "$PUBLISH_FIXTURE/reject" ]]; then printf '{"message":"publication refused"}\n403'
@@ -279,7 +282,8 @@ grep -q 'skip — main does not exist yet' "$t/controller.log"
 g rev-parse HEAD > "$t/base"; g branch main "$(cat "$t/base")"; g switch -q topic
 echo 'ok missing base branch recorded once, never retried'
 
-# The normal review command has no merge pass or branch rewrite, even with a merger token present.
+# A full pass over a head this tool did not approve lands nothing and rewrites no branch, even with
+# a merger credential present. Landing an approved head is test/merge-pass.sh.
 "$here/pr-redteam" run --repo jeryu/fixture --pr 1 >> "$t/controller.log" 2>&1
 [[ ! -e "$t/danger" ]]
 jq -es 'all(.[]; .decision != "reviewing")' "$t/state/attempts/jeryu/fixture/"*.json > /dev/null

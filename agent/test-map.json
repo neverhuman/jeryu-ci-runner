@@ -243,7 +243,7 @@
     "ops/pr-redteam/": {
       "command": "bash ops/pr-redteam/test/required.sh",
       "lane": "ci",
-      "purpose": "offline verdict, credential transport, publication/retry, history preservation and inactive installation regressions; paid live-model canary is separately owner-qualified"
+      "purpose": "offline verdict, credential transport, publication/retry, history preservation, merge pass (an approved head whose required context recovers on a retry lands with no second review) and inactive installation regressions; paid live-model canary is separately owner-qualified"
     },
     "policies/": {
       "command": "just check",

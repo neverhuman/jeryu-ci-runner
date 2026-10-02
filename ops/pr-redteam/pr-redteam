@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pr-redteam — exact-head security and correctness review on git.neverhuman.org.
+# pr-redteam — exact-head security and correctness review, and landing, on git.neverhuman.org.
 #
 #   pr-redteam run [--dry-run] [--jobs N] [--repo owner/name] [--pr N] [--include-drafts] [--force]
 #   pr-redteam list                        what `run` would review right now, and why others skip
@@ -14,8 +14,14 @@
 # fails, has not run, or failed to score is held with that reason and no agent budget is spent on it.
 # Nothing here can approve such a head, and the forge refuses an approval on one anyway.
 #
-# The existing separate merger owns landing. This tool never merges, rebases or pushes branches,
-# and does not load a merger credential. Installation leaves its timers disabled.
+# pr-redteam also lands what it approved. After the review pass, every open PR this tool approved
+# at its current head is merged as the merger identity, once the forge itself says it can merge
+# (approval + required contexts green + no changes requested). The merge is pinned to that exact
+# head and the forge's passport, so a PR pushed after approval is never merged; it is re-reviewed.
+# Merge eligibility is re-read on every pass from this tool's own receipts, independently of the
+# "already reviewed" skip, so a required context that fails on its first attempt and succeeds on a
+# retry is merged on the next pass. Branches are never rewritten: an approved PR behind a
+# linear-history base goes to the forge's merge queue. Installation leaves its timers disabled.
 #
 # A draft is never reviewed (unless --include-drafts): the skip is posted to the PR's timeline as
 # `pr.skipped` once per head, so a draft does not sit with no signal at all.
@@ -34,6 +40,15 @@
 #   JERYU_BASE             https://git.neverhuman.org
 #   JERYU_TOKEN_FILE       ~/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat  (the approver;
 #                          the forge forbids self-approval, so PRs this identity wrote are skipped)
+#   REDTEAM_MERGE_TOKEN_FILE  (no default)        the merger credential, a path to a mode-0600 file
+#                          owned by this user. Unset or unreadable: reviews still run and nothing is
+#                          landed. The secret never reaches argv, a model process or a log.
+#   REDTEAM_QUEUE          1                    an approved PR behind a linear-history base is handed
+#                          to the forge's merge queue, which replays and lands it without rewriting
+#                          anybody's branch
+#   REDTEAM_REBASE         0                    with REDTEAM_QUEUE=0, set to 1 to rebase such a
+#                          branch and force-push it (leased to the reviewed head) instead. Off by
+#                          default: the family's no-force rule forbids rewriting an author's branch.
 #   REDTEAM_PRIORITY_FAMILIES "jain jeryu-split"  reviewed first; other families wait until these
 #                          have nothing left to review in a pass
 #   REDTEAM_FAMILIES       all                  forge `family` values to cover ("all" includes repos
@@ -57,6 +72,9 @@ here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 self="$here/$(basename "$(readlink -f "$0")")"
 base="${JERYU_BASE:-https://git.neverhuman.org}"
 token_file="${JERYU_TOKEN_FILE:-$HOME/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat}"
+# No site-specific default: this source is public, and the merger credential path is site
+# configuration. Without it the review pass runs and nothing is landed.
+merge_token_file="${REDTEAM_MERGE_TOKEN_FILE:-}"
 families="${REDTEAM_FAMILIES:-all}"
 priority_families="${REDTEAM_PRIORITY_FAMILIES:-jain jeryu-split}"
 jobs="${REDTEAM_JOBS:-4}"
@@ -94,7 +112,10 @@ api() { # method path [json-body] -> sets $code and $body
   # Check the destination before opening the reviewer credential.
   [[ "$base" == https://git.neverhuman.org ]] || die "credential-bearing API requires the canonical hosted HTTPS origin"
   [[ "$path" == /api/v1/* || "$path" == /api/v3/* ]] || die "unexpected hosted API path"
-  credential="$token_file"
+  # `as_token` selects the merger credential for the calls that land a PR; every
+  # other call uses the reviewer's. Either way the secret is validated here and
+  # travels through stdin only.
+  credential="${as_token:-$token_file}"
   [[ -f "$credential" && ! -L "$credential" ]] || die "token must be a regular non-symlink file"
   [[ "$(stat -c '%a:%u' -- "$credential")" == "600:$(id -u)" ]] || die "token must be owned by this user with mode0600"
   secret="$(cat -- "$credential")" || die "cannot read token file"
@@ -248,19 +269,30 @@ model_process() (
 # public review receipt. Decode JSON strings first, including escaped content;
 # check the raw bearer plus common encodings without putting them in argv.
 review_output_safe() { # private model output file
-  local secret strings encoded hex
-  [[ -f "$token_file" && ! -L "$token_file" ]] || return 1
-  [[ "$(stat -c '%a:%u' -- "$token_file")" == "600:$(id -u)" ]] || return 1
-  secret="$(cat -- "$token_file")" || return 1
-  [[ "$secret" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] || return 1
+  local secret strings squeezed encoded hex credential
+  local credentials=("$token_file")
+  # The merger credential is optional; when the site has a usable one, model output
+  # that carries it is just as unpublishable as output carrying the reviewer's. One
+  # that fails its own custody checks is never loaded by `api`, so it is not a
+  # bearer this process can leak, and a misconfigured path does not stop reviews.
+  if [[ -n "$merge_token_file" && -f "$merge_token_file" && ! -L "$merge_token_file" ]] \
+     && [[ "$(stat -c '%a:%u' -- "$merge_token_file")" == "600:$(id -u)" ]]; then
+    credentials+=("$merge_token_file")
+  fi
   strings="$(jq -er '.. | strings' "$1")" || return 1
-  encoded="$(printf '%s' "$secret" | base64 -w0)"
-  hex="$(printf '%s' "$secret" | od -An -tx1 | tr -d ' \n')"
-  [[ "$strings" != *"$secret"* && "$strings" != *"$encoded"* && "$strings" != *"$hex"* ]] || return 1
-  # Token fragments spread across JSON fields or whitespace cannot hide the
-  # current bearer from this additional check.
-  strings="$(printf '%s' "$strings" | tr -d '[:space:]')"
-  [[ "$strings" != *"$secret"* ]]
+  # Token fragments spread across JSON fields or whitespace cannot hide a
+  # current bearer from the second comparison.
+  squeezed="$(printf '%s' "$strings" | tr -d '[:space:]')"
+  for credential in "${credentials[@]}"; do
+    [[ -f "$credential" && ! -L "$credential" ]] || return 1
+    [[ "$(stat -c '%a:%u' -- "$credential")" == "600:$(id -u)" ]] || return 1
+    secret="$(cat -- "$credential")" || return 1
+    [[ "$secret" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] || return 1
+    encoded="$(printf '%s' "$secret" | base64 -w0)"
+    hex="$(printf '%s' "$secret" | od -An -tx1 | tr -d ' \n')"
+    [[ "$strings" != *"$secret"* && "$strings" != *"$encoded"* && "$strings" != *"$hex"* ]] || return 1
+    [[ "$squeezed" != *"$secret"* ]] || return 1
+  done
 }
 
 # The agent: empty cwd, review dir attached read-only, structured verdict on stdout.
@@ -615,6 +647,168 @@ heartbeat() {
   return 0
 }
 
+# --- merge pass ----------------------------------------------------------------------------------
+
+# This tool's own receipt for an open head that it approved and has not landed yet, or nothing.
+# Deliberately independent of skip_reason: the receipt that makes a head "already reviewed" is also
+# what keeps it merge-eligible. Tying the merge to the review skip left an approved PR whose required
+# context failed on its first attempt and succeeded on a retry unlanded forever, because every later
+# pass only skipped the review and never looked at the gate again.
+merge_receipt() { # owner/name number sha
+  local receipt; receipt="$(receipt_path "$1" "$2" "$3")"
+  [ -s "$receipt" ] || return 1
+  jq -e --arg sha "$3" '.head_sha == $sha and .decision == "approve" and .posted == true
+     and .dry_run != true and (.merged_at // null) == null' "$receipt" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$receipt"
+}
+
+# Why this approved head cannot be landed yet, in the forge's own words, or empty. Read fresh on
+# every pass: the PR list row is a snapshot of one moment, and a required context that recovers on
+# a second attempt only becomes visible by asking again.
+merge_hold_reason() { # owner/name number
+  local detail
+  api GET "/api/v1/repos/${1/\//%2F}/pulls/$2"
+  if [ "$code" != 200 ]; then
+    echo "the forge answered $code for this pull request, so it is not known to be mergeable"
+    return
+  fi
+  detail="$body"
+  api GET "/api/v1/repos/${1/\//%2F}/pulls/$2/checks"
+  [ "$code" = 200 ] || body='{"checks":[]}'
+  jq -nr --argjson d "$detail" --argjson c "$body" '
+    (($c.checks // []) | map(select((.required // false)
+        and ((.conclusion // .state // "pending") != "success")))) as $waiting
+    | if (($d.review.changes_requested // 0) > 0) then "changes are requested on this head"
+      elif ($waiting | length) > 0 then
+        ($waiting | map("required context \(.name) is \(.conclusion // .state // "pending")")
+         | join(", "))
+      elif (($d.mergeable.can_merge // false) | not) then
+        ($d.mergeable.reason // $d.mergeable.level // "the forge says it cannot merge yet")
+      else "" end'
+}
+
+# Merge every open PR this tool approved at its current head, once the forge says it can merge.
+merge_pass() { # dry
+  local dry="$1" merger row repo number sha receipt reason passport
+  if [ -z "$merge_token_file" ]; then
+    say "merge pass skipped: set REDTEAM_MERGE_TOKEN_FILE to the merger credential"; return 0
+  fi
+  if [ ! -r "$merge_token_file" ]; then
+    say "merge pass skipped: $merge_token_file is not readable"; return 0
+  fi
+  merger="$(as_token="$merge_token_file"; api GET /api/v3/user; [ "$code" = 200 ] && jq -r .login <<<"$body")" \
+    || { say "merge pass skipped: the merger credential was rejected"; return 0; }
+  while IFS= read -r row; do
+    repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
+    sha="$(jq -r .head_sha <<<"$row")"
+    [ -z "$only_repo" ] || [ "$repo" = "$only_repo" ] || continue
+    [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
+    [ "$(jq -r .draft <<<"$row")" != true ] || continue
+    receipt="$(merge_receipt "$repo" "$number" "$sha")" || continue
+    # Already handed to the forge's merge queue at this head: the queue replays, gates and lands it.
+    if jq -e --arg sha "$sha" '.queued_sha == $sha or .queue_refused_sha == $sha' "$receipt" >/dev/null 2>&1; then
+      continue
+    fi
+    reason="$(merge_hold_reason "$repo" "$number")"
+    if [ -n "$reason" ]; then
+      say "$repo#$number: approved, waiting to merge: $reason"; continue
+    fi
+    if [ "$dry" = 1 ]; then say "$repo#$number: DRY RUN would merge ${sha:0:12} as $merger"; continue; fi
+    passport="$(jq -r .passport_hash <<<"$row")"
+    as_token="$merge_token_file" api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/merge" \
+      "$(jq -n --arg sha "$sha" --arg p "$passport" \
+        '{expected_head_sha: $sha, passport_hash: $p, expected_passport_hash: $p}')"
+    if [[ "$code" == 2* ]]; then
+      say "$repo#$number: MERGED ${sha:0:12} as $merger"
+      jq --arg at "$(date -u +%FT%TZ)" --arg by "$merger" '.merged_at = $at | .merged_by = $by' \
+        "$receipt" | store_receipt "$receipt"
+    elif [ "$code" = 409 ] && jq -e '(.error // .).message // "" | test("linear history")' <<<"$body" >/dev/null 2>&1; then
+      # Rewriting an author's branch is off by default: the family's no-force rule forbids it (even
+      # with a lease), and an author still pushing to that branch collides with the rewrite.
+      if [ "${REDTEAM_QUEUE:-1}" = 1 ]; then
+        enqueue_pr "$repo" "$number" "$sha" "$receipt" "$merger"
+      elif [ "${REDTEAM_REBASE:-0}" = 1 ]; then
+        rebase_pr "$repo" "$number" "$sha" "$(jq -r .head_ref <<<"$row")" "$(jq -r .base_ref <<<"$row")" "$receipt" "$merger" "$dry"
+      else
+        say "$repo#$number: approved but behind $(jq -r .base_ref <<<"$row") (linear history); needs the author to rebase — not force-pushing"
+      fi
+    else
+      say "$repo#$number: merge answered $code, retry next run: $(jq -c '(.error // .) | {code, message, details}' <<<"$body" 2>/dev/null | head -c 400)"
+    fi
+  done < <(open_prs)
+}
+
+# An approved PR behind its linear-history base goes to the forge's merge queue: the forge replays it
+# onto the base tip into refs/queue/<base>/<n>, the gate runner gates that exact commit, and the forge
+# lands it by fast-forward. Nobody's branch is rewritten. The head is recorded once in the receipt, so
+# a queue entry that later fails or conflicts is reported, never re-queued in a loop; a new push is a
+# new head, reviewed and queued afresh.
+enqueue_pr() { # owner/name number reviewed-sha receipt merger
+  local repo="$1" number="$2" sha="$3" receipt="$4" merger="$5" state_now
+  as_token="$merge_token_file" api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/queue"
+  if [[ "$code" == 2* ]]; then
+    state_now="$(jq -r '.state // "?"' <<<"$body")"
+    say "$repo#$number: approved but behind; QUEUED ${sha:0:12} as $merger → $(jq -r '.queue_ref // "?"' <<<"$body") @ $(jq -r '.queue_sha // "?" | .[0:12]' <<<"$body") ($state_now)"
+    jq --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" --arg q "$(jq -r '.queue_sha // ""' <<<"$body")" \
+      '.queued_sha = $sha | .queued_at = $at | .queue_commit = $q' "$receipt" | store_receipt "$receipt"
+  elif [ "$code" = 409 ]; then
+    say "$repo#$number: approved but behind, and the merge queue refused it: $(jq -r '(.error // .) | "\(.code): \(.message)"' <<<"$body" 2>/dev/null | head -c 300) — needs the author to rebase"
+    jq --arg sha "$sha" '.queue_refused_sha = $sha' "$receipt" | store_receipt "$receipt"
+  else
+    say "$repo#$number: approved but behind; queueing answered $code, retry next run: $(head -c 300 <<<"$body")"
+  fi
+}
+
+# Only with REDTEAM_QUEUE=0 REDTEAM_REBASE=1, which the family's no-force rule does not permit by
+# default: rebase the PR branch onto its base and force-push it as the merger identity, leased to the
+# exact head that was reviewed, so an author's newer push is never overwritten. The new head has no
+# receipt, so the next pass reviews it again and lands it once its required contexts pass. Conflicts,
+# and a rebase that would leave the PR empty, are left alone.
+rebase_pr() { # owner/name number reviewed-sha head_ref base_ref receipt merger dry
+  local repo="$1" number="$2" sha="$3" head_ref="$4" base_ref="$5" receipt="$6" merger="$7" dry="$8"
+  local tag="$repo#$number" cache="$state/cache/$repo.git" url="$base/git/$repo.git"
+  local work; work="$(mktemp -d "$state/work/rebase.XXXXXX")"
+  # The credential reaches git as a file path read by the helper, never as an argument or a URL.
+  local helper="!f() { echo username=$merger; echo \"password=\$(cat '$merge_token_file')\"; }; f"
+  local g=(git -c credential.helper= -c "credential.$base.helper=" -c "credential.helper=$helper"
+    -c "user.name=$merger" -c "user.email=$merger@git.neverhuman.org" -c commit.gpgsign=false)
+
+  if [ "$dry" = 1 ]; then say "$tag: DRY RUN would rebase $head_ref onto $base_ref and force-push"; rm -rf "$work"; return 0; fi
+  [ -d "$cache" ] || git init -q --bare "$cache"
+  if ! timeout 900 "${g[@]}" -C "$cache" fetch -q --no-tags "$url" \
+      "+refs/heads/$head_ref:refs/pr/$number/head" "+refs/heads/$base_ref:refs/pr/$number/base" 2>"$work/err"; then
+    say "$tag: rebase skipped, fetch failed: $(tail -1 "$work/err")"; rm -rf "$work"; return 0
+  fi
+  if [ "$(git -C "$cache" rev-parse "refs/pr/$number/head")" != "$sha" ]; then
+    say "$tag: rebase skipped, $head_ref moved past the reviewed ${sha:0:12}; it will be re-reviewed"; rm -rf "$work"; return 0
+  fi
+  git clone -q --shared --no-checkout "$cache" "$work/tree" 2>"$work/err" \
+    && git -C "$work/tree" checkout -q --detach "$sha" 2>>"$work/err" || {
+    say "$tag: rebase skipped, local checkout failed: $(tail -1 "$work/err")"; rm -rf "$work"; return 0; }
+  local onto; onto="$(git -C "$cache" rev-parse "refs/pr/$number/base")"
+  if ! "${g[@]}" -C "$work/tree" rebase -q "$onto" >"$work/err" 2>&1; then
+    git -C "$work/tree" rebase --abort >/dev/null 2>&1 || true
+    say "$tag: rebase onto $base_ref ${onto:0:12} CONFLICTS, needs a manual rebase by the author"; rm -rf "$work"; return 0
+  fi
+  local new; new="$(git -C "$work/tree" rev-parse HEAD)"
+  # Every commit was already upstream: rewriting the branch to the base tip would leave an empty PR
+  # and hide the author's commits. Leave the branch alone and say the PR can be closed.
+  if [ "$new" = "$onto" ]; then
+    say "$tag: every commit on $head_ref is already in $base_ref ${onto:0:12}; NOT pushing — close the PR"
+    jq --arg onto "$onto" --arg at "$(date -u +%FT%TZ)" '.already_in_base = $onto | .checked_at = $at' \
+      "$receipt" | store_receipt "$receipt"
+    rm -rf "$work"; return 0
+  fi
+  if ! timeout 900 "${g[@]}" -C "$work/tree" push -q --force-with-lease="refs/heads/$head_ref:$sha" \
+      "$url" "HEAD:refs/heads/$head_ref" >"$work/err" 2>&1; then
+    say "$tag: rebased but force-push to $head_ref refused: $(grep -v '^$' "$work/err" | tail -1)"; rm -rf "$work"; return 0
+  fi
+  say "$tag: REBASED $head_ref ${sha:0:12} -> ${new:0:12} onto $base_ref ${onto:0:12} as $merger; re-review next pass"
+  jq --arg to "$new" --arg onto "$onto" --arg at "$(date -u +%FT%TZ)" \
+    '.rebased_to = $to | .rebased_onto = $onto | .rebased_at = $at' "$receipt" | store_receipt "$receipt"
+  rm -rf "$work"
+}
+
 # --- commands ------------------------------------------------------------------------------------
 
 cmd="${1:-}"; shift || true
@@ -627,7 +821,7 @@ while [ $# -gt 0 ]; do
     --jobs) jobs="$2"; shift ;;
     --repo) only_repo="$2"; shift ;;
     --pr) only_pr="$2"; shift ;;
-    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _gate ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
   esac
   shift
 done
@@ -665,10 +859,14 @@ case "$cmd" in
     fi
     [ "$cmd" = run ] || exit 0
     [ ${#queue[@]} -eq 0 ] || printf '%s\n' "${queue[@]}" | xargs -P "$jobs" -L 1 "$self" _review "$dry" "$force" "$drafts" || true
-    # Publication ends at a review. The existing separate merger owns landing.
+    # Then land what this tool approved, whether or not this pass reviewed anything: an approved head
+    # whose required contexts only went green after the review is merged here, not re-reviewed.
+    merge_pass "$dry"
     ;;
   heartbeat) # report liveness to jeryu's /runners page; safe to run from a short timer
     heartbeat ;;
+  _merge) # internal/testing: the merge pass alone, with no review pass before it
+    merge_pass "$dry" ;;
   _gate) # internal/testing: pr-detail.json checks.json -> gate reason (no forge calls)
     jankurai_gate_reason "$(cat "$1")" "$(cat "$2")" ;;
   _blobs) # internal/testing: git-dir base head diff.patch -> unpinned binaries (no forge calls)
