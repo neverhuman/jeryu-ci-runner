@@ -59,6 +59,7 @@
     "tests/fixtures/github/": "jeryu-ci-runner",
     "tests/fixtures/native/": "jeryu-ci-runner",
     "tests/sandbox_escape_matrix.sh": "jeryu-ci-runner",
+    "tests/sandbox_image_pin.sh": "jeryu-ci-runner",
     "tools/": "ops",
     "agent/tool-adoption.toml": "agent",
     "db/": "jeryu-ci-runner"

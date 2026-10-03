@@ -290,6 +290,11 @@
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
+    "tests/sandbox_image_pin.sh": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "prove the escape matrix base image stays pinned by digest and pulls only when it is not cached"
+    },
     "tools/": {
       "command": "just security",
       "lane": "security",

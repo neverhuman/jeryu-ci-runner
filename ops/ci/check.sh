@@ -46,6 +46,9 @@ fi
 bash ops/ci-kit/bin/verify.sh --sealed ops/ci-kit
 bash ops/ci/kit/bin/verify.sh . --canonical ops/ci-kit
 bash ops/ci-kit/test/selftest.sh
+# The live escape matrix needs docker, but its image pin does not: prove the
+# pin and the cache-first pull here, offline.
+bash tests/sandbox_image_pin.sh
 for script in scripts/*.sh ops/ci/*.sh tools/*.sh ops/ci-kit/*/*.sh ops/ci/kit/*/*.sh; do
   [[ -e "$script" ]] || continue
   bash -n "$script"

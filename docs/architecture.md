@@ -38,6 +38,7 @@ surfaces and consume sibling crates from pinned public Git tags.
 - `tests/fixtures/github/**`
 - `tests/fixtures/native/**`
 - `tests/sandbox_escape_matrix.sh`
+- `tests/sandbox_image_pin.sh`
 - `examples/jobs/**`
 - `ops/agent-sandbox/**`
 - `images/agent-sandbox/**`

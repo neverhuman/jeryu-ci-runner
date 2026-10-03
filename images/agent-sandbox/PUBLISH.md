@@ -35,12 +35,13 @@ Do NOT publish a build the smoke did not pass.
 
 ## 3. Tag + push to the internal registry
 
-The internal registry lives at `registry.jeryu.internal`. Tag the proven build with an
+The internal registry lives at `image.neverhuman.org`: pulls authenticate with a
+registry token, pushes are owner-gated. Tag the proven build with an
 immutable, content-addressed tag (a short commit sha or build date) plus a moving tag the
 fleet tracks:
 
 ```
-REG=registry.jeryu.internal/jeryu/agent-sandbox
+REG=image.neverhuman.org/jeryu/agent-sandbox
 REV="$(git rev-parse --short HEAD)"
 podman tag localhost/jeryu/agent-sandbox:latest "$REG:$REV"
 podman tag localhost/jeryu/agent-sandbox:latest "$REG:latest"
@@ -57,7 +58,7 @@ The runner consumes the image through `JERYU_AGENT_IMAGE`. Set it to the pushed 
 so every confined session launches from the proven build:
 
 ```
-JERYU_AGENT_IMAGE=registry.jeryu.internal/jeryu/agent-sandbox:<rev>
+JERYU_AGENT_IMAGE=image.neverhuman.org/jeryu/agent-sandbox:<rev>
 ```
 
 Leave it unset and the runner uses the local `localhost/jeryu/agent-sandbox:latest` build,

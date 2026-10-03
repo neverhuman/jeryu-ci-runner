@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/ops/ci/common.sh"
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/ops/ci/sandbox-image.sh"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
@@ -24,10 +25,8 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-IMAGE="${JERYU_SANDBOX_IMAGE:-alpine:3.20}"
-if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-  docker pull "${IMAGE}"
-fi
+IMAGE="$(jeryu_sandbox_image_resolve)"
+jeryu_sandbox_image_ensure "${IMAGE}"
 
 ARTIFACT_DIR="${ROOT}/target/jankurai/runner-sandbox"
 mkdir -p "${ARTIFACT_DIR}"
