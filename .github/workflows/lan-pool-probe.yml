@@ -1,0 +1,53 @@
+name: LAN pool qualification
+
+on:
+  push:
+    branches: [ci/shared-lan-runners]
+    paths:
+      - .github/workflows/lan-pool-probe.yml
+      - ops/ci/lan-pool-probe.sh
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lan-pool-probe-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualification:
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4, 5, 6]
+    runs-on:
+      group: neverhuman-lan
+      labels: [self-hosted, Linux, X64, lan-ci, ubuntu24]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          persist-credentials: false
+      - name: Qualify the actual GitHub job guest
+        env:
+          PROBE_PHASE: qualification
+        run: bash ops/ci/lan-pool-probe.sh
+  replacement:
+    needs: qualification
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3]
+    runs-on:
+      group: neverhuman-lan
+      labels: [self-hosted, Linux, X64, lan-ci, ubuntu24]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955
+        with:
+          persist-credentials: false
+      - name: Qualify a fresh replacement guest
+        env:
+          PROBE_PHASE: replacement
+        run: bash ops/ci/lan-pool-probe.sh
