@@ -1,0 +1,26 @@
+[Unit]
+Description=Shared neverhuman ephemeral GitHub runner lane %i
+After=network-online.target neverhuman-actions-egress.service
+Wants=network-online.target
+Requires=neverhuman-actions-egress.service
+ConditionPathExists=/etc/neverhuman-actions/app-key.pem
+ConditionPathExists=/var/lib/neverhuman-actions/images/runner-ubuntu24-x64.qcow2
+
+[Service]
+Type=exec
+ExecStart=/bin/bash /opt/neverhuman-actions/launch.sh %i
+Restart=always
+RestartSec=60
+TimeoutStopSec=90
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/neverhuman-actions
+PrivateTmp=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

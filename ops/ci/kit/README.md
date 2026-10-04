@@ -7,6 +7,10 @@ repository as a pinned copy (the same model as the Jankurai pin).
   exports its generated `JERYU_JANKURAI_*` pin block first.
 - `lib/security.sh`: `ci_kit_secret_scan [skip-glob...]`, `ci_kit_forbid_env_files`.
 - `lib/jobs.sh`: `ci_kit_resolve_jobs` (governor-driven `JERYU_CI_JOBS`).
+- `github-actions/`: owner-operated Ubuntu/KVM preparation, live network
+  qualification and shared ephemeral GitHub runner controllers. This is a
+  deployment candidate; see `docs/runbooks/github-actions-lan.md` in the source
+  repository for its qualification and activation requirements.
 
 Repository-specific lanes (fleet score floor, extra security tools, the lanes
 a `pr-ci.sh` runs) stay in each repository's `ops/ci/`.
