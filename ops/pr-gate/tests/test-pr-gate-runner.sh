@@ -88,6 +88,10 @@ case "$method $url" in
   'GET '*'/branches/main/protection')
     jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'
     printf '\n200';;
+  'GET '*'/gate-regate'*)
+    if [[ -f "$FAKE_FORGE/refuse-regate" ]]; then printf '{"message":"re-gate list denied"}\n403'; exit; fi
+    if [[ -f "$FAKE_FORGE/regate.json" ]]; then cat "$FAKE_FORGE/regate.json"; else printf '{"requests":[]}'; fi
+    printf '\n200';;
   'GET '*'/merge-queue?state=building')
     if [[ -f "$FAKE_FORGE/queue.json" ]]; then cat "$FAKE_FORGE/queue.json"; else printf '{"entries":[]}'; fi
     printf '\n200';;
@@ -498,6 +502,70 @@ GATE_RUNNER_REGATE_SETTLE=3600 invoke
 grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
   || { printf 'a settled head was not re-gated\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 printf 'PASS re-gate on a moved main: a burst is coalesced, explicit retry is not deferred, a settled head re-gates\n'
+
+# A re-gate asked for on the forge (jeryu-deploy: POST /api/v1/repos/:id/pulls/:n/regate) gates a
+# head again although a terminal result for it exists, and is listed as claimable even while a merge
+# burst defers the automatic re-gates. It is honoured exactly once per request.
+head=$(cat "$fixture/head")
+regate() { # requested_at
+  jq -nc --arg s "$head" --arg at "$1" \
+    '{requests:[{repo:"acme/fixture",number:1,head_sha:$s,requested_at:$at,requested_by:"dana"}]}' \
+    >"$fixture/regate.json"
+}
+regate 2026-10-04T09:00:00Z
+touch "$mains"   # the family's mains just moved: an automatic re-gate would wait for the burst
+listed=$(GATE_RUNNER_REGATE_SETTLE=3600 bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
+grep -qx "acme fixture 1 $head -" <<<"$listed" \
+  || { printf 'a requested re-gate was not claimable:\n%s\n' "$listed" >&2; exit 1; }
+before_count=$(count)
+GATE_RUNNER_REGATE_SETTLE=3600 invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+grep -q "re-gate requested for acme/fixture#1 at $head" "$fixture/runner.log" \
+  || { printf 'the re-gate was not named\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+[[ "$(cat "$fixture/runner/regate/acme-fixture-$head")" == 2026-10-04T09:00:00Z ]] \
+  || { printf 'the honoured request was not recorded\n' >&2; exit 1; }
+jq -se 'last.state=="success"' "$fixture/statuses.jsonl" >/dev/null
+# The same request is not a second re-gate: the head goes back to waiting for the burst.
+GATE_RUNNER_REGATE_SETTLE=3600 invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+grep -q 'deferring re-gate of acme/fixture#1' "$fixture/runner.log" \
+  || { printf 'a honoured request was replayed\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+# Asking again is a newer request, and a newer request is another re-gate.
+regate 2026-10-04T09:05:00Z
+GATE_RUNNER_REGATE_SETTLE=3600 invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 2))"
+# An explicit --repo/--pr reads no requests at all: it is already a retry.
+regate 2026-10-04T09:10:00Z
+GATE_RUNNER_REGATE_SETTLE=3600 invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 3))"
+! grep -q 're-gate requested' "$fixture/runner.log"
+[[ "$(cat "$fixture/runner/regate/acme-fixture-$head")" == 2026-10-04T09:05:00Z ]] \
+  || { printf 'an explicit retry consumed a request it never read\n' >&2; exit 1; }
+rm -f "$fixture/regate.json"
+printf 'PASS a requested re-gate is claimable while a burst defers, runs once per request, and is never read by an explicit retry\n'
+
+# A request the runner cannot trust is named and ignored, and a forge that refuses the list says so
+# instead of silently ignoring every re-gate asked for.
+jq -nc '{requests:[{repo:"acme/fixture","number":1,head_sha:"not-a-sha",requested_at:"2026-10-04T09:00:00Z"}]}' \
+  >"$fixture/regate.json"
+before_count=$(count)
+GATE_RUNNER_REGATE_SETTLE=3600 invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$before_count"
+grep -q 'ignoring a malformed re-gate request: acme/fixture#1' "$fixture/runner.log" \
+  || { printf 'a malformed request was not named\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/regate.json"
+touch "$fixture/refuse-regate"
+GATE_RUNNER_REGATE_SETTLE=3600 invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q 're-gate requests answered 403; gating this tick without them' "$fixture/runner.log" \
+  || { printf 'a refused re-gate list was silent\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/refuse-regate"
+printf 'PASS a malformed re-gate request is named and ignored, and a refused list is reported\n'
 
 # A missing sccache must be visible without being fatal: the gate says so once, still runs, and its
 # receipt records what it actually compiled with. An explicit GATE_RUNNER_SCCACHE="" is a configured

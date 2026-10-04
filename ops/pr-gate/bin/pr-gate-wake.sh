@@ -5,10 +5,11 @@
 # A slot only looks for work when its timer fires (pr-gate-runner@.timer, 20s after its last tick),
 # so a push waited up to ~25s for an idle slot to notice it. This runs from its own short timer
 # (pr-gate-wake.timer), polls the cheapest view of "what could be gated" -- the open-PR list of every
-# gated repo plus the building merge-queue entries -- and, when that view gained a head since the
-# last poll, starts pr-gate-runner@N.service on idle slots: one per new or moved head, at most every
-# idle slot. The runner then ticks exactly as it would from its timer: it chooses, claims and gates
-# heads itself, so this decides only WHEN a tick starts. The slot timers stay the fallback.
+# gated repo, the building merge-queue entries and the pending re-gate requests -- and, when that
+# view gained a line since the last poll, starts pr-gate-runner@N.service on idle slots: one per new
+# or moved head and one per fresh re-gate request, at most every idle slot. The runner then ticks
+# exactly as it would from its timer: it chooses, claims and gates heads itself, so this decides only
+# WHEN a tick starts. The slot timers stay the fallback.
 #
 # It is a separate file for the same reason as pr-gate-heartbeat.sh: the runner and pr-gate-state.sh
 # are gate inputs, and waking is not part of any gate's proof. It never takes a gate lock, never
@@ -65,8 +66,8 @@ get() { # path -> $body, $code
 }
 
 # The current view: one "repo number sha" line per open PR head, "repo number sha queue" per building
-# queue entry. A source that cannot be read keeps its previous lines, so a forge hiccup neither wakes
-# nor forgets anything.
+# queue entry, "repo number sha regate <requested_at>" per pending re-gate request. A source that
+# cannot be read keeps its previous lines, so a forge hiccup neither wakes nor forgets anything.
 for q in $repos; do
   if [[ "$q" != */* ]]; then [[ -n "$PRIMARY_OWNER" ]] || continue; q="$PRIMARY_OWNER/$q"; fi
   get "/api/v1/repos/${q%%/*}%2F${q#*/}/pulls?state=open"
@@ -81,6 +82,15 @@ if [[ "$code" == 200 ]] && jq -e . <<<"$body" >/dev/null 2>&1; then
   jq -r '.entries[]? | "\(.repo) \(.number) \(.queue_sha) queue"' <<<"$body" >>"$now"
 else
   { grep ' queue$' "$STATE" 2>/dev/null || true; } >>"$now"
+fi
+# A re-gate asked for on the forge is a head that could be gated now, so it wakes a slot like a new
+# one. Its requested_at is part of the line: asking again for the same head is a new ask, and the
+# runner decides whether it still owes it.
+get "/api/v1/gate-regate?state=pending"
+if [[ "$code" == 200 ]] && jq -e . <<<"$body" >/dev/null 2>&1; then
+  jq -r '.requests[]? | "\(.repo) \(.number) \(.head_sha) regate \(.requested_at)"' <<<"$body" >>"$now"
+else
+  { grep ' regate ' "$STATE" 2>/dev/null || true; } >>"$now"
 fi
 sort -u -o "$now" "$now"
 

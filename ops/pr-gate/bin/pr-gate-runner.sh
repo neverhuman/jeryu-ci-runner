@@ -152,7 +152,7 @@ if [[ ! -x "$HOOKS/pre-push" ]]; then
   printf '#!/bin/sh\nprintf "pr-gate-runner: a gate never pushes\\n" >&2\nexit 1\n' >"$HOOKS/pre-push"
   chmod 0755 "$HOOKS/pre-push"
 fi
-mkdir -p "$HOME_DIR/mirror" "$HOME_DIR/runs" "$HOME_DIR/logs" "$HOME_DIR/claims" "$HOME_DIR/cache" "$HOME_DIR/targets"
+mkdir -p "$HOME_DIR/mirror" "$HOME_DIR/runs" "$HOME_DIR/logs" "$HOME_DIR/claims" "$HOME_DIR/cache" "$HOME_DIR/targets" "$HOME_DIR/regate"
 # Slot 0 keeps the original lock name, so an older single-slot install and slot 0 exclude each other.
 lock_name=".lock"; ((SLOT == 0)) || lock_name=".lock-slot$SLOT"
 exec 9>"$HOME_DIR/$lock_name"
@@ -346,6 +346,42 @@ if [[ -z "$only_pr" ]]; then
     say "merge queue answered $code; gating PR heads only this tick"
   fi
 fi
+# Re-gate requests from the forge (jeryu-deploy: POST /api/v1/repos/:id/pulls/:n/regate, read here as
+# GET /api/v1/gate-regate?state=pending). A gate result is reused while its inputs are identical and
+# a failure is held, which is right for a head that failed on its own sources and wrong for one that
+# failed on something else: a dependency fetch that timed out, a gate host that lost its cache. A
+# request names the head it was asked for, and honouring it gates exactly that head again although a
+# result for it exists. One request is one re-gate: the requested_at this runner honoured is recorded
+# under regate/<owner>-<repo>-<sha> when the attempt begins, and the forge keeps one request per PR,
+# so a request is never replayed and asking again records a newer time. --repo/--pr already retries,
+# so it reads nothing. A request never admits a head the rules above refused (the runner's own work,
+# a closed PR, a moved head): it only decides whether an admitted head is gated again.
+declare -A regate_at=()
+if [[ -z "$only_pr" ]]; then
+  api GET "/api/v1/gate-regate?state=pending"
+  if [[ "$code" == 200 ]]; then
+    while IFS=$'\t' read -r rrepo rnumber rsha rat; do
+      if ! [[ "$rrepo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$rnumber" =~ ^[0-9]+$ \
+          && "$rsha" =~ ^[0-9a-f]{40}$ && "$rat" =~ ^[0-9A-Za-z:.+-]{1,64}$ ]]; then
+        say "ignoring a malformed re-gate request: $rrepo#$rnumber"; continue
+      fi
+      regate_at["$rrepo#$rnumber $rsha"]="$rat"
+    done < <(jq -r '.requests[]? | [.repo, (.number|tostring), .head_sha, .requested_at] | @tsv' <<<"$body")
+  elif [[ "$code" != 404 ]]; then
+    # 404 is a forge without the route; anything else is a forge this identity cannot read it from,
+    # which would silently ignore every re-gate asked for, so say it.
+    say "re-gate requests answered $code; gating this tick without them"
+  fi
+fi
+
+# The requested_at of a re-gate this tick owes one head, or nothing: a request for that exact head
+# whose time is not the one already recorded for it.
+gate_regate_wanted() { # owner repo number sha
+  local at="${regate_at["$1/$2#$3 $4"]:-}"
+  [[ -n "$at" ]] || return 1
+  [[ "$at" != "$(cat "$HOME_DIR/regate/$1-$2-$4" 2>/dev/null || true)" ]]
+}
+
 # Heads never gated go first after the queue. A sibling's main moving invalidates every open result in
 # the family, and re-proving those in PR order put each new head behind all of them, one tree
 # preparation at a time. Only the order changes; every head is still decided exactly as before.
@@ -356,6 +392,12 @@ fresh=() seen_before=()
 for candidate in "${candidates[@]}"; do
   read -r owner repo number sha qref <<<"$candidate"
   if [[ ! -d "$HOME_DIR/attempts/$owner-$repo-$sha" ]]; then fresh+=("$candidate"); continue; fi
+  # Somebody asked for this head: it is as urgent as a new one, and coalescing a burst of merges is
+  # not a reason to make them wait for it.
+  if gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
+    say "re-gate requested for $owner/$repo#$number at $sha"
+    fresh+=("$candidate"); continue
+  fi
   if [[ -z "$only_pr" ]] && gate_regate_settling "$HOME_DIR/cache/mains-$owner" "$REGATE_SETTLE"; then
     say "deferring re-gate of $owner/$repo#$number: $owner mains moved within ${REGATE_SETTLE}s"; continue
   fi
@@ -637,6 +679,13 @@ api GET "/repos/$owner/$repo/commits/$sha/status"
 [[ "$code" == 200 ]] || die "cannot verify current status for $owner/$repo@$sha ($code)"
 printf '%s\n' "$body" >"$status_snapshot"
 retry=0; [[ -z "$only_pr" ]] || retry=1
+# A requested re-gate is a retry of this head: gate_decision must neither reuse its success nor hold
+# its failure.
+regate_now=""
+if gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
+  regate_now="${regate_at["$owner/$repo#$number $sha"]}"
+  retry=1
+fi
 gate_decision "$identity" "$retry" "$status_snapshot"
 case "${gate_action:?}" in
   reuse|hold)
@@ -675,6 +724,11 @@ if ((admitted == 0)); then
 fi
 gate_begin "$identity"
 : "${gate_attempt_dir:?}"
+# The request is discharged by the attempt it started, not by the attempt's outcome: a gate that
+# dies leaves recovery to finish, and reading the request as still owed would gate the same head on
+# every tick until it moved.
+[[ -z "$regate_now" ]] || printf '%s\n' "$regate_now" | gate_atomic "$HOME_DIR/regate/$owner-$repo-$sha" \
+  || say "could not record the honoured re-gate of $owner/$repo@$sha"
 # Re-verifying a head whose newest required status is this runner's own success does not post
 # `pending` over it: merge readiness reads the newest status, so each re-verification made a passing PR
 # unmergeable until it finished (jeryu-web#23: 12 passes in an hour, ~15s green windows). The success

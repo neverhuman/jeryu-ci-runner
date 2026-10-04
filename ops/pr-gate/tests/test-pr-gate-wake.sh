@@ -21,6 +21,7 @@ case "\$url" in
   */repos/acme%2Facme-a/pulls*) f=a;;
   */repos/gate-a%2Fgate-b/pulls*) f=b;;
   */merge-queue*) f=queue;;
+  */gate-regate*) f=regate;;
   *) f=none;;
 esac
 if [[ -e "$fx/forge/\$f.json" ]]; then printf '%s\n200' "\$(cat "$fx/forge/\$f.json")"; else printf 'oops\n500'; fi
@@ -65,6 +66,24 @@ run
 must 'two new heads wake two idle slots' test "$(started)" == 2
 must 'busy slot skipped' test "$(grep -c 'runner@0' "$fx/started.log" || true)" == 0
 printf 'PASS new PR and queue entry wake one idle slot each, skipping busy ones\n'
+
+# A re-gate asked for on the forge is work an idle slot can start now, and asking again for the same
+# head is a new ask, because the runner decides whether it still owes it.
+printf '{"requests":[{"repo":"acme/acme-a","number":1,"head_sha":"%s","requested_at":"2026-10-04T09:00:00Z"}]}' "$A2" \
+  >"$fx/forge/regate.json"
+run
+must 'a pending re-gate wakes one idle slot' test "$(started)" == 1
+must 'the request is in the view' grep -qx "acme/acme-a 1 $A2 regate 2026-10-04T09:00:00Z" "$fx/home/cache/wake-heads"
+run
+must 'the same request wakes nothing again' test "$(started)" == 0
+printf '{"requests":[{"repo":"acme/acme-a","number":1,"head_sha":"%s","requested_at":"2026-10-04T09:05:00Z"}]}' "$A2" \
+  >"$fx/forge/regate.json"
+run
+must 'asking again wakes a slot again' test "$(started)" == 1
+rm -f "$fx/forge/regate.json"
+run
+must 'a withdrawn request wakes nothing' test "$(started)" == 0
+printf 'PASS a pending re-gate request wakes an idle slot, once per ask\n'
 
 touch "$fx/busy-1" "$fx/busy-2"
 pulls a "$(pr 1 "$A1")"

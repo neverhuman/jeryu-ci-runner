@@ -15,6 +15,13 @@
   setting reappears.
 
 ## Unreleased
+- The PR gate honours a re-gate asked for on the forge (jeryu-deploy: `POST
+  /api/v1/repos/:id/pulls/:n/regate`, read as `GET /api/v1/gate-regate?state=pending`): a request
+  naming an admitted head gates that head again although a terminal result exists for it, and is
+  claimable at once even while a merge burst defers the automatic re-gates. The honoured
+  `requested_at` is recorded in `regate/<owner>-<repo>-<sha>` when the attempt begins, so one
+  request is one re-gate and asking again is a new one; `pr-gate-wake.sh` starts an idle slot for a
+  fresh request. pr-gate 1.2.0.
 - Fence scheduler transitions by the complete lease, runner epoch and current
   scheduler time. Expiration consumes retry attempts, cancellation is terminal,
   and an idempotent expiry sweep emits retry or failure receipts. Direct

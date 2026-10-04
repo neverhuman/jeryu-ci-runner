@@ -18,7 +18,7 @@ identity authored.
 | `bin/pr-gate-state.sh` | the durable attempt journal, input identity, publication and recovery |
 | `bin/pr-gate-config.sh` | the site configuration reader every script uses |
 | `bin/pr-gate-heartbeat.sh` | reports every slot to the forge's `/runners` page and finished attempts as events |
-| `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears or moves |
+| `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears, moves, or is asked for again |
 | `bin/pr-gate-install.sh` | keeps the installed copy equal to the source branch (drains slots first) |
 | `bin/pr-gate-advisory-refresh.sh`, `bin/pr-gate-grype-db-refresh.sh` | keep security databases fresh outside the gates |
 | `systemd/` | the `--user` units and timers; `pr-gate-runner@N` is one slot |
@@ -27,8 +27,28 @@ identity authored.
 | `pr-gate.env.example` | every site setting, with invented values |
 
 On a gate host the scripts live in `~/gate-runner/bin`, the units in `~/.config/systemd/user`, and
-the state under `~/gate-runner` (`installed-main.json`, `tools.json`, `attempts/`, `cache/`, mirrors
-and trees). The units run `%h/gate-runner/bin/<script>`.
+the state under `~/gate-runner` (`installed-main.json`, `tools.json`, `attempts/`, `cache/`,
+`regate/`, mirrors and trees). The units run `%h/gate-runner/bin/<script>`.
+
+## Re-gating a head on request
+
+A result is reused while its inputs are identical and a failure is held, so a head that failed on
+something other than its own sources -- a dependency fetch that timed out, a host that lost its
+compile cache -- needs somebody to ask for it again. The forge takes that ask (jeryu-deploy: `POST
+/api/v1/repos/:id/pulls/:n/regate`) and the runner reads it each tick from
+`GET /api/v1/gate-regate?state=pending`, as
+
+    {"requests":[{"repo":"acme/widgets","number":7,"head_sha":"<40 hex>",
+                  "requested_at":"2026-10-04T09:00:00Z","requested_by":"dana"}]}
+
+A request for an admitted head it has not honoured makes the runner gate that head again although a
+result exists for it, and lifts the coalescing deferral, so the head is claimable at once. What was
+honoured is recorded in `regate/<owner>-<repo>-<sha>` when the attempt begins, which is what makes
+one request one re-gate: the request is discharged by the attempt it started, not by its outcome,
+and asking again records a newer `requested_at`. A request admits nothing the ordinary rules
+refused -- this runner's own work, a closed pull request, a head that moved -- and `--repo/--pr`
+reads no requests, being a retry already. A forge without the route (404) is silent; any other
+answer is reported, because it would otherwise ignore every re-gate asked for without a word.
 
 ## Site configuration
 
@@ -81,8 +101,8 @@ and `systemd/*` to `~/.config/systemd/user`, `systemctl --user daemon-reload`, t
 ## Qualification
 
 `bash tests/required.sh` runs the whole suite offline: the config reader, the attempt journal and
-publication recovery, the complete runner against a fixture forge and real Git, the mount-namespace
-selection, lock inheritance, heartbeat and event projection, waking, retention, the locked-crate
-prefetch's source allowlist, the installer and the database refreshers. Every fixture uses invented
-names (`acme`, `gate-a`, `example.test`); none reads the host's own site file. The repository's
-`ops/ci/pr-ci.sh` runs it.
+publication recovery, the complete runner against a fixture forge and real Git (including re-gate
+requests), the mount-namespace selection, lock inheritance, heartbeat and event projection, waking,
+retention, the locked-crate prefetch's source allowlist, the installer and the database refreshers.
+Every fixture uses invented names (`acme`, `gate-a`, `example.test`); none reads the host's own site
+file. The repository's `ops/ci/pr-ci.sh` runs it.
