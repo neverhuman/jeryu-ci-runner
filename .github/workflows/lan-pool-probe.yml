@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Consume the three bootstrap listeners and three newly created JIT listeners.
   qualification:
     strategy:
       fail-fast: false
@@ -33,6 +34,7 @@ jobs:
         env:
           PROBE_PHASE: qualification
         run: bash ops/ci/lan-pool-probe.sh
+  # Fresh JIT listeners must replace the consumed listeners before this can run.
   replacement:
     needs: qualification
     strategy:
