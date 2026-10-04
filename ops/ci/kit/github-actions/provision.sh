@@ -15,8 +15,18 @@ install -d -m 0755 /opt/neverhuman-actions "$NH_STATE/images"
 install -d -m 0700 "$NH_CONFIG" "$NH_STATE/receipts"
 install -d -m 0750 -o neverhuman-vm -g neverhuman-vm "$NH_STATE/jobs"
 source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-for file in common.sh egress.sh prepare-image.sh prepare-browser-image.sh qualify.sh api.sh launch.sh pilot-register.sh; do
-  [[ $source_dir/$file == /opt/neverhuman-actions/$file ]] || install -o root -g root -m 0644 "$source_dir/$file" "/opt/neverhuman-actions/$file"
+target_tmp=''
+trap '[[ -z $target_tmp ]] || rm -f -- "$target_tmp"' EXIT
+for file in common.sh egress.sh prepare-image.sh prepare-browser-image.sh prepare-ubuntu26-image.sh qualify.sh api.sh launch.sh pilot-register.sh; do
+  if [[ $source_dir/$file != /opt/neverhuman-actions/$file ]]; then
+    # Bash may still read a running script after a long guest job returns.
+    # Replacing its inode lets that process finish against its original bytes.
+    target_tmp=$(mktemp "/opt/neverhuman-actions/.$file.XXXXXX")
+    install -o root -g root -m 0644 "$source_dir/$file" "$target_tmp"
+    bash -n "$target_tmp"
+    mv -f -- "$target_tmp" "/opt/neverhuman-actions/$file"
+    target_tmp=''
+  fi
   chown root:root "/opt/neverhuman-actions/$file"
   chmod 0644 "/opt/neverhuman-actions/$file"
 done

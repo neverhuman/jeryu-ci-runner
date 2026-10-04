@@ -11,6 +11,12 @@ NH_CLOUD_IMAGE=$NH_STATE/images/noble-20260926-amd64.img
 NH_GOLD_IMAGE=${NH_GOLD_IMAGE:-$NH_STATE/images/runner-ubuntu24-x64.qcow2}
 NH_IMAGE_RECEIPT=${NH_IMAGE_RECEIPT:-$NH_STATE/receipts/image-prepared.json}
 NH_QUALIFICATION_RECEIPT=${NH_QUALIFICATION_RECEIPT:-$NH_STATE/receipts/vm-qualified.json}
+NH_OS_LABEL=${NH_OS_LABEL:-ubuntu24}
+case "$NH_OS_LABEL" in
+  ubuntu24) NH_UBUNTU_VERSION=24.04 ;;
+  ubuntu26) NH_UBUNTU_VERSION=26.04 ;;
+  *) echo "Unapproved Ubuntu capability label" >&2; exit 2 ;;
+esac
 NH_HOST=$(hostname -s)
 case "$NH_HOST" in xbabe1|xbabe2|xbabe3) ;; *) echo "Unapproved physical host: $NH_HOST" >&2; exit 2 ;; esac
 

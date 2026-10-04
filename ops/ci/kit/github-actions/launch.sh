@@ -11,6 +11,7 @@ flock -n 9 || { echo 'Lane already owned' >&2; exit 2; }
 [[ -f $NH_GOLD_IMAGE && -f $NH_IMAGE_RECEIPT && -f $NH_QUALIFICATION_RECEIPT ]] || exit 2
 expected=$(jq -er '.image_sha256' "$NH_IMAGE_RECEIPT")
 [[ $(jq -er '.image_sha256' "$NH_QUALIFICATION_RECEIPT") == "$expected" ]] || { echo 'Qualified image binding absent' >&2; exit 2; }
+[[ $(jq -er '.ubuntu_version' "$NH_QUALIFICATION_RECEIPT") == "$NH_UBUNTU_VERSION" ]] || { echo 'Qualified OS capability mismatch' >&2; exit 2; }
 printf '%s  %s\n' "$expected" "$NH_GOLD_IMAGE" | sha256sum -c - >/dev/null
 [[ $(df --output=avail -BG "$NH_STATE" | tail -n1 | tr -dc '0-9') -ge 100 ]] || { echo 'Disk admission refused' >&2; exit 2; }
 available=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
@@ -41,7 +42,7 @@ until nh_guest_ssh true >/dev/null 2>&1; do
 done
 nh_guest_ssh 'sudo cloud-init status --wait >/dev/null'
 browser=$(jq -r '.browser158 // false' "$NH_QUALIFICATION_RECEIPT")
-body=$(jq -nc --arg name "$NH_INSTANCE" --argjson browser "$browser" '{name:$name,runner_group_id:3,labels:(["self-hosted","linux","x64","lan-ci","ubuntu24"] + (if $browser then ["browser158"] else [] end)),work_folder:"_work"}')
+body=$(jq -nc --arg name "$NH_INSTANCE" --argjson browser "$browser" --arg os_label "$NH_OS_LABEL" '{name:$name,runner_group_id:3,labels:(["self-hosted","linux","x64","lan-ci",$os_label] + (if $browser then ["browser158"] else [] end)),work_folder:"_work"}')
 response=$(printf '%s' "$body" | bash "$(dirname "${BASH_SOURCE[0]}")/api.sh" POST /orgs/neverhuman/actions/runners/generate-jitconfig)
 runner_id=$(jq -er '.runner.id' <<< "$response")
 jit=$(jq -er '.encoded_jit_config' <<< "$response")

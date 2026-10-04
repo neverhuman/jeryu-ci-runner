@@ -21,8 +21,10 @@ forge HTTPS, LAN/metadata/public SSH denial and credential-absence checks in
 Owner authentication is complete. Private org App
 `neverhuman-lan-runner-controller` (App 5190166, installation 167953338) has only
 organization Self-hosted runners read/write, no repository access and no webhook.
-One boot-enabled `neverhuman-runner@1.service` per host automatically creates and
-destroys single-job VMs. Lane 2 remains disabled. App credentials are root-only;
+Two boot-enabled controller lanes per host automatically create and destroy
+single-job VMs. Five lanes serve Ubuntu 24.04/browser158; lane 2 on xbabe3
+serves Ubuntu 26.04. Measured memory/disk admission allowed lane 2 on xbabe1/2
+without stopping existing work. Each guest uses 8 vCPUs/8 GiB and a bounded overlay. App credentials are root-only;
 the downloaded local key copy was removed and both unusable keys were revoked.
 
 Infrastructure probe run 37237247647, attempt 1, exact source
@@ -46,19 +48,42 @@ Dope PR 108 https://github.com/neverhuman/dope/pull/108 passed CPU/security
 37239693821 and Full Jankurai 37239693742 at exact head
 `7f75ba398d7076be4051bcacb1970b21a34d70e2`. It merged as
 `55995d00ffd7f9d4435b549e32350dde508577bd`. Post-merge CPU/security
-37241411624 passed; Full Jankurai 37241411579 is pending final completion.
+37241411624 and Full Jankurai 37241411579 both passed.
 Dope's GPU workflow still uses its existing local dedicated capability.
 The credential-free local `just check` VM also passed and was destroyed.
 
-Application draft https://github.com/neverhuman/ai-veox-app/pull/250 starts from
-`rc/auto`, head `f9415f6bdd992e243840f99149e26c20b2478f6f`. Required run
-37241735053 is running on qualified browser158 runner 278 on xbabe2.
-Earlier run 37238732343 timed out downloading Chromium; it is cancelled,
-not a product pass. Group admission now contains demo-repository, ai-veox-app
-and dope (numeric IDs 1388268629, 1336448620 and 1394151792), all workflows,
+Application PR 250 https://github.com/neverhuman/ai-veox-app/pull/250 landed
+through the unmodified `just land` recipe onto `rc/auto` at 23:24 UTC, exact head
+`550f9db55a73bb2356bd41a5fa60311910612ca1`. Full `just required` passed in an
+owned credential-free LAN VM; actual PostgreSQL/browser CI 37242647163 passed
+on runner 284 on xbabe1. Both are necessary proof; the local lane without a DB
+is not a replacement for database CI. Its first full local gate discovered that
+the convoy lacked published v0.8.10/v0.8.11 release notes; those exact entries
+were restored from tag v0.8.11 (`fa808afec43e547e823016090fac17f95ad91fc2`). CI
+now fetches tags to enforce the same check. Earlier cancelled/superseded runs
+are not passes. Main promotion PR 251 contains only the already-landed CI files,
+head `d816c2bd489b477173bf2fa93638dffb4adeb22e`; its own final-head run
+37243774021 remains pending. Post-convoy run 37243633840 is also pending.
+
+Jailgun draft https://github.com/neverhuman/jailgun/pull/20, head
+`5a2f7e9ce3ec1f7f27ac7c4fe5350fe6c8a33af2`, preserves both actual Ubuntu
+24.04 and 26.04 matrix children. Current runs are 37244692686 (CI),
+37244692616 (Jankurai) and 37244692613 (Security), still being qualified.
+The first head failed because Playwright 1.60 has no Ubuntu 26 dependency
+installer entry and zizmor flagged all 15 self-hosted jobs. The repair installs
+the pinned Chromium native library list from the real Ubuntu guest repositories,
+then requires an actual sandboxed browser launch. Per-job zizmor exceptions cover
+only the self-hosted-runner rule and document the disposable KVM boundary; no
+scanner command or other rule is disabled. Old failed/cancelled runs are retained. Source setup installs distro
+just/rustup. `ops/ci/lan-browser.sh` extracts the digest-pinned public Playwright
+1.60 artifact, installs dependencies and requires a real sandboxed browser launch;
+it refuses non-VM hosts and changes user-namespace policy only in that guest.
+No scanner/auditor floor, native acceptance proof or timeout was removed.
+Group admission contains demo-repository, ai-veox-app, dope and jailgun
+(numeric IDs 1388268629, 1336448620, 1394151792 and 1254916854), all workflows,
 with public-repository access enabled under the verified VM boundary.
 
-CI-kit 1.3.0 adds an immutable Playwright 1.58 browser profile. All three
+CI-kit 1.4.0 adds immutable browser and Ubuntu OS capabilities. All three
 `runner-ubuntu24-x64-browser158.qcow2` images passed full browser launch,
 credential-absence and network-isolation checks. Factory builds use a fresh,
 unregistered guest from the pinned base, never an Actions job disk. xbabe1/2
@@ -77,6 +102,17 @@ mirrors. Keep their local-forge source authority and disabled GitHub Actions;
 do not enable duplicate CI to inflate migration counts. Demo and Dope Linux migrations have landed; full platform
 migration remains incomplete. Old hosted-label jobs are queued behind the disabled
 policy. Existing local product runners remain until their replacements qualify.
+
+Ubuntu 26.04 source is the official 20260927 cloud image, SHA256
+`8800651811af9a85465ad1d552add729947bb16488dddb4a9b5305a3d97332b2`.
+The immutable xbabe3 guest image is
+`60f15a2489649258c7b177ff6a1a99131c7bc4f3884a73d6ec5c173eb3dca7e7`.
+Its OS, runner, Docker, network and credential boundary qualification passed
+and the qualification guest was destroyed. All three browser158 qualifications
+now also bind the actual Ubuntu 24.04 version. Admission refused both a
+mismatched image receipt and a wrong OS label before VM/JIT creation. A separate
+`neverhuman-runner@2.service.d/ubuntu26.conf` selects this capability in the same
+general group; it does not dedicate a runner to Jailgun.
 
 ## Assumptions, dependencies and non-goals
 
@@ -163,7 +199,7 @@ repository, Redline's hot CI file and shared kit version changes conflict.
    `launch.sh 1` creates a fresh VM, generates one JIT config in group 3, starts
    one job, stops the VM and removes only its generated disk/seed. The root
    receipt binds runner ID, actual physical host, image hash and timestamps.
-   Add lane 2 only after measured memory/disk/CPU admission. A successful runner
+   Add further lanes only after measured memory/disk/CPU admission. A successful runner
    process exit does not prove the GitHub job itself succeeded.
 7. Review the live isolation receipts before each admission expansion. Grant shared
    repository access and keep all-external-contributor approval enabled. Restrict
@@ -275,7 +311,7 @@ LAN guest, retain logs and stop/delete only that guest's generated overlay/seed.
    `work/github-sources/jeryu-ci-runner`, draft PR 1. Reconcile current protected
    forge head; never overwrite an older canonical checkout with the GitHub
    mirror. Edit only `ops/ci-kit/github-actions/{common,prepare-image,prepare-browser-image,
-   qualify,launch,api,egress,provision}.sh`, units and this runbook as needed. `api.sh`
+   prepare-ubuntu26-image,qualify,launch,api,egress,provision}.sh`, units and this runbook as needed. `api.sh`
    must keep its endpoint allowlist; do not turn it into an arbitrary privileged
    transport. Preserve private-credential FD/stdin handling. Publish kit changes
    through `bin/{manifest,seal,vendor}.sh`; do not edit `ops/ci/kit` manually.
@@ -328,8 +364,7 @@ LAN guest, retain logs and stop/delete only that guest's generated overlay/seed.
 
 5. **Jailgun.** Refresh/read its current instruction maps and ops guidance;
    edits are `.github/workflows/{ci,jankurai,security}.yml` and runner-label lint
-   configuration. Keep the Ubuntu 24.04 and 26.04 runtime matrix. Qualify a
-   separately pinned Ubuntu 26 guest before admitting that label; an Ubuntu 24
+   configuration. Keep the Ubuntu 24.04 and 26.04 runtime matrix. The separately pinned Ubuntu 26 guest is now qualified; an Ubuntu 24
    guest cannot claim that OS. Preserve Xvfb/X11/user-systemd tests, artifact
    producers/consumers and aggregate dependencies. Required commands include
    `bash ops/ci/scan.sh` and `bash ops/ci/jankurai.sh`, with actual guest tool
@@ -358,7 +393,8 @@ LAN guest, retain logs and stop/delete only that guest's generated overlay/seed.
    attestations and official-evidence acceptance. Run `just fast` then
    `REDLINE_TESTING_POSTGRES_URL=<isolated-service-url> just pr-ci`. Required
    `RedlineDB/required`, exact-head independent approval, claim release proof and
-   clean canonical source are mandatory. The operator cannot self-review.
+   clean canonical source are mandatory. The operator cannot self-review. Independent required review is a source gate,
+   not a missing implementation-choice permission from the user.
 
 8. **JopeDime.** Single writer in `/home/ubuntu/JopeDime`; use its AGENT_CHAT flock
    protocol and read the current PR queue before edits. Edit the six workflows
@@ -416,8 +452,39 @@ pilot destruction. `neverhuman-active-ci-snapshot-2026-10-04.json` captures
 active/queued jobs separately. `neverhuman-ci-rollout-receipt-2026-10-04.json`
 must be refreshed after each admission/merge, with `objective_complete=false`
 until every completion criterion holds. The final handoff includes a fresh
-billing/policy/budget readback; billing at 22:13 UTC showed $0 Actions billed,
-$108.82 consumed fully offset, 0/3,000 private minutes and 0.5/2 GB storage.
+billing/policy/budget readback; billing at 23:00 UTC showed $0 Actions billed,
+$108.83 consumed fully offset, 0/3,000 private minutes and 0.5/2 GB storage.
 Repeat storage/billing verification after GitHub's reporting delay following
 the last migration. The recurring $12 Team subscription is outside extra
 processing charges and has not been changed.
+
+## Atomic deployment and cleanup recovery
+
+Never truncate or overwrite a controller script that a running Bash process is
+reading. Stage each changed script under `/opt/neverhuman-actions/`, set root
+ownership/mode, run `bash -n`, then atomically rename it over the final path.
+`provision.sh` follows the same rule. Existing jobs retain their original inode;
+new controllers read the new version. Do not restart a busy controller to apply
+a source update. A source refresh does not justify killing unrelated CI.
+
+An earlier in-place operator deployment interrupted cleanup after runners 284
+(xbabe1, successful application job) and 286 (xbabe3, successful Dope job)
+completed. Their original root receipts/logs remain unchanged. Exact GitHub job
+runner IDs, completed job conclusions, stopped per-VM units, consumed registry
+IDs and owned non-symlink overlay/seed paths were checked before manual cleanup.
+Separate root recovery receipts record `controller_exit=2`,
+`automatic_cleanup=false`, and actual workspace destruction. Do not rewrite these
+as automatic exit-0 lifecycle successes. Runner 285 on xbabe2 started under the
+same overwritten version and remains under observation until its unrelated Dope
+job completes; do not stop it. Root runner 287 on Ubuntu 26 stopped/destroyed its
+VM automatically with controller exit 0 after a failed product job, which proves
+cleanup only and does not turn that product failure into a pass.
+
+Public recovery evidence is
+`outputs/neverhuman-controller-cleanup-recovery-proof-2026-10-04.json`. Keep
+automatic lifecycle proofs and manual recovery proofs distinguishable. Validate
+new jobs under the atomically installed source and bind replacement runner IDs
+to root receipts. Final source kit 1.4.0 hash is
+`eb8e27a3bcf54514db7b00b9b9eff5b8bd7957e3ee03e63cc0ed8a3e7a2cb703`;
+Linux seal/vendor/verify and all 20 kit self-tests passed. This is not the
+governed product-required qualification or independent authoritative review.

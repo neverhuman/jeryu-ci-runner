@@ -21,6 +21,11 @@ until nh_guest_ssh true >/dev/null 2>&1; do
   sleep 3
 done
 nh_guest_ssh 'sudo cloud-init status --wait >/dev/null; /opt/actions-runner/bin/Runner.Listener --version; docker info --format "{{.ServerVersion}}"; curl -fsSI --max-time 15 https://api.github.com >/dev/null' > "$NH_JOB/qualification.log"
+# The label must describe the actual guest, never merely its filename.
+# shellcheck disable=SC2016 # The guest expands its own OS metadata.
+ubuntu_version=$(nh_guest_ssh 'source /etc/os-release; printf "%s" "$VERSION_ID"')
+[[ $ubuntu_version == "$NH_UBUNTU_VERSION" ]] || { echo "Guest OS capability mismatch" >&2; exit 2; }
+printf 'Ubuntu version qualified: %s\n' "$ubuntu_version" >> "$NH_JOB/qualification.log"
 browser=false
 if [[ $(jq -r '.playwright_version // empty' "$NH_IMAGE_RECEIPT") == 1.58.0 ]]; then
   nh_guest_ssh '/home/runner/.browser-image-build/bin/python -c '\''from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(); print(b.version); b.close(); p.stop()'\''' >> "$NH_JOB/qualification.log"
@@ -53,7 +58,7 @@ nh_vm_stop
 systemctl is-active --quiet "$NH_UNIT" && exit 1
 rm -- "$NH_JOB/disk.qcow2" "$NH_JOB/seed.img"
 sha=$(sha256sum "$NH_JOB/qualification.log" | cut -d' ' -f1)
-jq -n --arg host "$NH_HOST" --arg image_sha256 "$expected" --argjson browser "$browser" --arg time "$(date -u +%FT%TZ)" --arg log_sha256 "$sha" \
-  '{phase:"vm-qualified",host:$host,image_sha256:$image_sha256,browser158:$browser,time:$time,log_sha256:$log_sha256,runner_registered:false,workspace_destroyed:true,checks:(["runner-version","docker","github-https","forge-https","lan-denied","metadata-denied","host-ssh-denied","controller-credentials-absent"] + (if $browser then ["browser158-launch"] else [] end))}' \
+jq -n --arg host "$NH_HOST" --arg image_sha256 "$expected" --argjson browser "$browser" --arg ubuntu_version "$ubuntu_version" --arg time "$(date -u +%FT%TZ)" --arg log_sha256 "$sha" \
+  '{phase:"vm-qualified",host:$host,image_sha256:$image_sha256,browser158:$browser,ubuntu_version:$ubuntu_version,time:$time,log_sha256:$log_sha256,runner_registered:false,workspace_destroyed:true,checks:(["ubuntu-version","runner-version","docker","github-https","forge-https","lan-denied","metadata-denied","host-ssh-denied","controller-credentials-absent"] + (if $browser then ["browser158-launch"] else [] end))}' \
   > "$NH_QUALIFICATION_RECEIPT"
 echo "VM boundary qualified on $NH_HOST"
