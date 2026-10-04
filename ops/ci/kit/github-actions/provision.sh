@@ -15,8 +15,10 @@ install -d -m 0755 /opt/neverhuman-actions "$NH_STATE/images"
 install -d -m 0700 "$NH_CONFIG" "$NH_STATE/receipts"
 install -d -m 0750 -o neverhuman-vm -g neverhuman-vm "$NH_STATE/jobs"
 source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-for file in common.sh egress.sh prepare-image.sh qualify.sh api.sh launch.sh pilot-register.sh; do
-  [[ $source_dir/$file == /opt/neverhuman-actions/$file ]] || install -m 0644 "$source_dir/$file" "/opt/neverhuman-actions/$file"
+for file in common.sh egress.sh prepare-image.sh prepare-browser-image.sh qualify.sh api.sh launch.sh pilot-register.sh; do
+  [[ $source_dir/$file == /opt/neverhuman-actions/$file ]] || install -o root -g root -m 0644 "$source_dir/$file" "/opt/neverhuman-actions/$file"
+  chown root:root "/opt/neverhuman-actions/$file"
+  chmod 0644 "/opt/neverhuman-actions/$file"
 done
 install -m 0644 "$source_dir/systemd/neverhuman-actions-egress.service" /etc/systemd/system/
 install -m 0644 "$source_dir/systemd/neverhuman-runner@.service" /etc/systemd/system/

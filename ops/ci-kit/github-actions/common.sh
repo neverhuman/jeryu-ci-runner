@@ -8,7 +8,9 @@ NH_RUNNER_VERSION=2.337.0
 NH_RUNNER_SHA256=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613
 NH_CLOUD_SHA256=6a81c37564db9b1ee84e141922625e1d7c5b389b99bb3c572e0243607d5bb4d2
 NH_CLOUD_IMAGE=$NH_STATE/images/noble-20260926-amd64.img
-NH_GOLD_IMAGE=$NH_STATE/images/runner-ubuntu24-x64.qcow2
+NH_GOLD_IMAGE=${NH_GOLD_IMAGE:-$NH_STATE/images/runner-ubuntu24-x64.qcow2}
+NH_IMAGE_RECEIPT=${NH_IMAGE_RECEIPT:-$NH_STATE/receipts/image-prepared.json}
+NH_QUALIFICATION_RECEIPT=${NH_QUALIFICATION_RECEIPT:-$NH_STATE/receipts/vm-qualified.json}
 NH_HOST=$(hostname -s)
 case "$NH_HOST" in xbabe1|xbabe2|xbabe3) ;; *) echo "Unapproved physical host: $NH_HOST" >&2; exit 2 ;; esac
 

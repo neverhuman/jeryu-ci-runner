@@ -4,6 +4,8 @@ set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 nh_require_root
+expected=$(jq -er '.image_sha256' "$NH_IMAGE_RECEIPT")
+printf '%s  %s\n' "$expected" "$NH_GOLD_IMAGE" | sha256sum -c - >/dev/null
 NH_INSTANCE="qualify-$NH_HOST-$(date -u +%Y%m%d%H%M%S)"
 NH_UNIT="neverhuman-$NH_INSTANCE"
 NH_PORT=22610
@@ -19,6 +21,11 @@ until nh_guest_ssh true >/dev/null 2>&1; do
   sleep 3
 done
 nh_guest_ssh 'sudo cloud-init status --wait >/dev/null; /opt/actions-runner/bin/Runner.Listener --version; docker info --format "{{.ServerVersion}}"; curl -fsSI --max-time 15 https://api.github.com >/dev/null' > "$NH_JOB/qualification.log"
+browser=false
+if [[ $(jq -r '.playwright_version // empty' "$NH_IMAGE_RECEIPT") == 1.58.0 ]]; then
+  nh_guest_ssh '/home/runner/.browser-image-build/bin/python -c '\''from playwright.sync_api import sync_playwright; p=sync_playwright().start(); b=p.chromium.launch(); print(b.version); b.close(); p.stop()'\''' >> "$NH_JOB/qualification.log"
+  browser=true
+fi
 nh_guest_ssh "bash -s" >> "$NH_JOB/qualification.log" <<'GUEST'
 set -euo pipefail
 for target in 192.168.68.86 192.168.68.87 192.168.68.54 169.254.169.254 10.0.2.2; do
@@ -35,6 +42,7 @@ for port in 696 6969 6970; do
 done
 curl -fsSI --max-time 15 https://git.neverhuman.org >/dev/null
 test ! -e /etc/neverhuman-actions/app-key.pem
+test ! -e /etc/neverhuman-actions/app.json
 test ! -e /etc/jope-runner/github-pat
 test ! -S /run/host/docker.sock
 echo 'Runner binary, Docker, GitHub HTTPS, forge HTTPS and credential boundary qualified'
@@ -42,8 +50,10 @@ GUEST
 nft -j list table inet neverhuman_actions > "$NH_JOB/egress-evidence.json"
 jq -e '[..|objects|select(has("counter"))|.counter.packets] | add > 0' "$NH_JOB/egress-evidence.json" >/dev/null
 nh_vm_stop
+systemctl is-active --quiet "$NH_UNIT" && exit 1
+rm -- "$NH_JOB/disk.qcow2" "$NH_JOB/seed.img"
 sha=$(sha256sum "$NH_JOB/qualification.log" | cut -d' ' -f1)
-jq -n --arg host "$NH_HOST" --arg time "$(date -u +%FT%TZ)" --arg log_sha256 "$sha" \
-  '{phase:"vm-qualified",host:$host,time:$time,log_sha256:$log_sha256,runner_registered:false,checks:["runner-version","docker","github-https","forge-https","lan-denied","metadata-denied","host-ssh-denied","controller-credentials-absent"]}' \
-  > "$NH_STATE/receipts/vm-qualified.json"
+jq -n --arg host "$NH_HOST" --arg image_sha256 "$expected" --argjson browser "$browser" --arg time "$(date -u +%FT%TZ)" --arg log_sha256 "$sha" \
+  '{phase:"vm-qualified",host:$host,image_sha256:$image_sha256,browser158:$browser,time:$time,log_sha256:$log_sha256,runner_registered:false,workspace_destroyed:true,checks:(["runner-version","docker","github-https","forge-https","lan-denied","metadata-denied","host-ssh-denied","controller-credentials-absent"] + (if $browser then ["browser158-launch"] else [] end))}' \
+  > "$NH_QUALIFICATION_RECEIPT"
 echo "VM boundary qualified on $NH_HOST"
