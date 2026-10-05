@@ -4,7 +4,10 @@
 #   pr-redteam run [--dry-run] [--jobs N] [--repo owner/name] [--pr N] [--include-drafts] [--force]
 #   pr-redteam list                        what `run` would review right now, and why others skip
 #   pr-redteam show owner/name N           the latest local receipt for one PR
-#   pr-redteam heartbeat                   report liveness to jeryu's /runners page (one-minute timer)
+#   pr-redteam heartbeat                   report liveness to jeryu's /runners page (one-minute timer),
+#                                          one row per reviewer slot (REDTEAM_JOBS rows)
+#   pr-redteam poke [--dry-run]            start a pass now if a new head needs review or an approval
+#                                          became landable (30-second timer; never reviews or merges)
 #
 # Each open PR is reviewed at its exact head by a read-only agent. Confirmed high or critical
 # security/correctness findings block, and every explicit block verdict is honored. Invalid or
@@ -598,12 +601,31 @@ runner_host="$(hostname -s)"
 runner_id="${REDTEAM_RUNNER_ID:-$runner_host/redteam}"
 beats="$state/beats"
 
+# Reviews run $jobs at a time, and each one holds a numbered slot for as long as it runs, so /runners
+# shows one row per reviewer instead of one row for the whole pass. A slot is a file created with
+# noclobber: two reviews starting in the same instant cannot take the same number. A review that
+# finds every slot taken (a slot file left by a killed run) still reviews; it just has no row.
+beat_slot() { # key -> prints the slot taken, or nothing
+  local i
+  mkdir -p "$beats/slots"
+  find "$beats/slots" -type f -mmin +120 -delete 2>/dev/null || true
+  for ((i = 0; i < jobs; i++)); do
+    if (set -o noclobber; printf '%s\n' "$1" >"$beats/slots/$i") 2>/dev/null; then
+      printf '%s' "$i"; return 0
+    fi
+  done
+  return 0
+}
+
 beat_start() { # owner/name number sha
+  local key="${1/\//_}-$2" slot
   mkdir -p "$beats/current"
+  slot="$(beat_slot "$key")"
   jq -nc --arg repo "$1" --argjson pr "$2" --arg sha "$3" --arg recipe redteam-review \
-    --arg at "$(date -u +%FT%TZ)" \
-    '{repo:$repo, pr:$pr, sha:$sha, recipe:$recipe, started_at:$at}' \
-    >"$beats/current/${1/\//_}-$2.json" 2>/dev/null || true
+    --arg at "$(date -u +%FT%TZ)" --arg slot "$slot" \
+    '{repo:$repo, pr:$pr, sha:$sha, recipe:$recipe, started_at:$at}
+     + (if $slot == "" then {} else {slot: ($slot | tonumber)} end)' \
+    >"$beats/current/$key.json" 2>/dev/null || true
 }
 
 beat_done() { # owner/name number sha conclusion started-epoch
@@ -613,37 +635,49 @@ beat_done() { # owner/name number sha conclusion started-epoch
     --arg at "$(date -u +%FT%TZ)" \
     '{repo:$repo, pr:$pr, sha:$sha, recipe:$recipe, conclusion:$conclusion, seconds:$seconds, finished_at:$at}' \
     >"$beats/last.json" 2>/dev/null || true
-  rm -f "$beats/current/${1/\//_}-$2.json"
+  # The slot's own last review, so each row says what that reviewer did, and the slot is free again.
+  local key="${1/\//_}-$2" slot
+  slot="$(jq -r '.slot // empty' "$beats/current/$key.json" 2>/dev/null || true)"
+  if [ -n "$slot" ]; then
+    cp -f "$beats/last.json" "$beats/last-$slot.json" 2>/dev/null || true
+    if [ "$(cat "$beats/slots/$slot" 2>/dev/null)" = "$key" ]; then rm -f "$beats/slots/$slot"; fi
+  fi
+  rm -f "$beats/current/$key.json"
 }
 
-# One beat. `current` is the review that has been running longest, so a pass reviewing several PRs at
-# once still reports a single truthful task. Every beat the forge does not accept gets a log line:
-# a JSON refusal, but also an HTML answer (a forge that predates the route, or a proxy error page)
-# and a curl failure, which used to be dropped silently and left a refused reviewer with a quiet log.
+# One beat per reviewer slot. The first keeps the old runner id so its history carries on; the
+# others are <id>-2 .. <id>-N. A slot's `current` is the review holding that slot, never "the oldest
+# one", so a review does not hop between rows while its neighbours finish. Every beat the forge does
+# not accept gets a log line: a JSON refusal, but also an HTML answer (a forge that predates the
+# route, or a proxy error page) and a curl failure.
 heartbeat() {
-  local current=null last=null f
+  local current last f i id key
   # A review killed mid-flight leaves its current file behind; forget one after two hours rather
   # than reporting a task that is never going to finish.
   find "$beats/current" -name '*.json' -mmin +120 -delete 2>/dev/null || true
-  # Oldest in-flight review wins. `ls` exits non-zero when the directory is empty, which under
-  # `set -e -o pipefail` would abort the beat, so the whole assignment tolerates failure.
-  f="$(ls -t "$beats/current"/*.json 2>/dev/null | tail -1 || true)"
-  if [ -n "$f" ] && jq -e . "$f" >/dev/null 2>&1; then current="$(cat "$f")"; fi
-  if [ -s "$beats/last.json" ] && jq -e . "$beats/last.json" >/dev/null 2>&1; then
-    last="$(cat "$beats/last.json")"
-  fi
-  api POST "/api/v1/runners/heartbeat" "$(jq -nc --arg id "$runner_id" --arg host "$runner_host" \
-    --argjson current "$current" --argjson last "$last" \
-    '{runnerId: $id, host: $host, slot: 0, labels: ["redteam"], current: $current, last: $last}')"
-  if [ "$code" = 000 ]; then
-    say "heartbeat refused (no answer): $body"
-  elif ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1; then
-    if jq -e . <<<"$body" >/dev/null 2>&1; then
-      say "heartbeat refused ($code): $(jq -c '.message // .' <<<"$body")"
-    else
-      say "heartbeat refused ($code): non-JSON answer: $(tr -s '[:space:]' ' ' <<<"$body" | head -c 160)"
+  for ((i = 0; i < jobs; i++)); do
+    current=null; last=null
+    key="$(cat "$beats/slots/$i" 2>/dev/null || true)"
+    f="$beats/current/$key.json"
+    if [ -n "$key" ] && jq -e . "$f" >/dev/null 2>&1; then current="$(cat "$f")"; fi
+    f="$beats/last-$i.json"
+    # Before the first review on a slot, the first row still shows the pass's last review.
+    if [ "$i" -eq 0 ] && [ ! -s "$f" ]; then f="$beats/last.json"; fi
+    if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then last="$(cat "$f")"; fi
+    id="$runner_id"; if [ "$i" -gt 0 ]; then id="$runner_id-$((i + 1))"; fi
+    api POST "/api/v1/runners/heartbeat" "$(jq -nc --arg id "$id" --arg host "$runner_host" \
+      --argjson slot "$i" --argjson current "$current" --argjson last "$last" \
+      '{runnerId: $id, host: $host, slot: $slot, labels: ["redteam"], current: $current, last: $last}')"
+    if [ "$code" = 000 ]; then
+      say "heartbeat refused for $id (no answer): $body"
+    elif ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1; then
+      if jq -e . <<<"$body" >/dev/null 2>&1; then
+        say "heartbeat refused for $id ($code): $(jq -c '.message // .' <<<"$body")"
+      else
+        say "heartbeat refused for $id ($code): non-JSON answer: $(tr -s '[:space:]' ' ' <<<"$body" | head -c 160)"
+      fi
     fi
-  fi
+  done
   return 0
 }
 
@@ -809,6 +843,43 @@ rebase_pr() { # owner/name number reviewed-sha head_ref base_ref receipt merger 
   rm -rf "$work"
 }
 
+# --- poke ----------------------------------------------------------------------------------------
+
+# Cheap event trigger (every ~30s from pr-redteam-poke.timer): start a full pass now if the queue has
+# something new — a PR head no pass has reviewed yet, or an approved head that the forge would now
+# land. Each head triggers at most once (state/poke-seen), so a review that keeps failing cannot turn
+# this into a pass every 30 seconds; the five-minute timer still retries it. It never reviews or
+# merges by itself.
+poke() { # dry
+  local dry="$1" me row repo number sha key why="" seen="$state/poke-seen"
+  touch "$seen"
+  me="$(whoami_login)"
+  while IFS= read -r row; do
+    repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
+    sha="$(jq -r .head_sha <<<"$row")"
+    [ -z "$only_repo" ] || [ "$repo" = "$only_repo" ] || continue
+    [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
+    if [ -z "$(skip_reason "$row" "$me" 0 0)" ]; then
+      key="review $repo#$number $sha"
+    elif merge_receipt "$repo" "$number" "$sha" >/dev/null && [ -z "$(merge_hold_reason "$repo" "$number")" ]; then
+      key="merge $repo#$number $sha"
+    else
+      continue
+    fi
+    grep -qxF "$key" "$seen" && continue
+    echo "$key" >>"$seen"
+    why="$key"; break
+  done < <(open_prs)
+  [ -n "$why" ] || return 0
+  if [ "$dry" = 1 ]; then say "poke: would start a pass ($why)"; return 0; fi
+  if systemctl --user is-active --quiet pr-redteam.service; then
+    say "poke: pass already running ($why)"
+  else
+    say "poke: starting a pass now ($why)"
+    systemctl --user start --no-block pr-redteam.service
+  fi
+}
+
 # --- commands ------------------------------------------------------------------------------------
 
 cmd="${1:-}"; shift || true
@@ -865,6 +936,8 @@ case "$cmd" in
     ;;
   heartbeat) # report liveness to jeryu's /runners page; safe to run from a short timer
     heartbeat ;;
+  poke) # start a pass now if there is a new head to review or a newly landable approval
+    poke "$dry" ;;
   _merge) # internal/testing: the merge pass alone, with no review pass before it
     merge_pass "$dry" ;;
   _gate) # internal/testing: pr-detail.json checks.json -> gate reason (no forge calls)

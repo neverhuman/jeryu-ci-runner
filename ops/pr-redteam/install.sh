@@ -12,7 +12,8 @@ command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ] || { echo "clau
 units="$HOME/.config/systemd/user"
 # Replacing an active or enabled unit would change its next execution. Require the
 # service owner to stop/disable it explicitly before staging replacement source.
-for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-redteam-heartbeat.timer; do
+for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-redteam-heartbeat.timer \
+  pr-redteam-poke.service pr-redteam-poke.timer; do
   if systemctl --user is-active --quiet "$unit" || systemctl --user is-enabled --quiet "$unit"; then
     echo "$unit is active or enabled; its service owner must stop/disable it before installation" >&2
     exit 1
@@ -27,6 +28,9 @@ cp "$here/systemd/pr-redteam.timer" "$units/pr-redteam.timer"
 rm -f "$units/pr-redteam-heartbeat.service" "$units/pr-redteam-heartbeat.timer"
 sed "s#@REDTEAM_DIR@#$here#g" "$here/systemd/pr-redteam-heartbeat.service" >"$units/pr-redteam-heartbeat.service"
 cp "$here/systemd/pr-redteam-heartbeat.timer" "$units/pr-redteam-heartbeat.timer"
+rm -f "$units/pr-redteam-poke.service" "$units/pr-redteam-poke.timer"
+sed "s#@REDTEAM_DIR@#$here#g" "$here/systemd/pr-redteam-poke.service" >"$units/pr-redteam-poke.service"
+cp "$here/systemd/pr-redteam-poke.timer" "$units/pr-redteam-poke.timer"
 systemctl --user daemon-reload
-echo "units staged from $here; no review or heartbeat was started"
+echo "units staged from $here; no review, heartbeat or poke was started"
 echo "the existing service owner must independently qualify and authorize activation"

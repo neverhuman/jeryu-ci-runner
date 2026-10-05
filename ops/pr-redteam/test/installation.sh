@@ -25,7 +25,9 @@ unit="$t/home/.config/systemd/user/pr-redteam.service"
 grep -q '^EnvironmentFile=-%h/.config/pr-redteam/merge.env$' "$unit"
 if grep -Eq '^Environment=.*REDTEAM_MERGE_TOKEN_FILE' "$unit"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 if grep -E 'credentials/|\.pat' "$unit" | grep -qv '^Environment=JERYU_TOKEN_FILE='; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
-[[ "$(find "$t/home/.config/systemd/user" -type f | wc -l)" == 4 ]]
+[[ "$(find "$t/home/.config/systemd/user" -type f | wc -l)" == 6 ]]
+# The poke unit runs this directory's script, like the review and heartbeat units.
+grep -q "^ExecStart=$here/pr-redteam poke\$" "$t/home/.config/systemd/user/pr-redteam-poke.service"
 if grep -Eq 'enable --now|start --no-block|disable|stop ' "$t/calls"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 sha256sum "$t/home/.config/systemd/user/"* > "$t/before"
 if run 1; then echo 'active installation was accepted' >&2; exit 1; fi

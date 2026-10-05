@@ -1,0 +1,15 @@
+# React to events instead of waiting for the five-minute pass: every ~30s, if a PR head nobody has
+# reviewed yet appeared, or an approved head became landable, start pr-redteam.service now. Each
+# head triggers at most once. It never reviews or merges by itself.
+[Unit]
+Description=pr-redteam: start a pass early when a PR needs it
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=JERYU_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat
+ExecStart=@REDTEAM_DIR@/pr-redteam poke
+Nice=15
+TimeoutStartSec=2min

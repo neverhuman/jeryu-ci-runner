@@ -63,7 +63,15 @@ activation approval.
 ./pr-redteam run --repo acme/widget-web --pr 16
 ./pr-redteam show acme/widget-web 16
 ./pr-redteam heartbeat
+./pr-redteam poke --dry-run
 ```
+
+`heartbeat` sends one beat per reviewer slot: a review takes a numbered slot for
+as long as it runs, so `/runners` shows `REDTEAM_JOBS` rows (`<id>`, `<id>-2` …)
+instead of one row for the whole pass. `poke` runs every 30 seconds from
+`pr-redteam-poke.timer` and starts `pr-redteam.service` early when a head nobody
+has reviewed appears or an approval becomes landable, once per head; it never
+reviews or merges itself, and the five-minute timer stays as the fallback.
 
 The reviewer skips its own authored PRs, drafts unless explicitly included, and
 successfully posted reviews at the current head with matching controller, prompt,
@@ -104,7 +112,8 @@ separately authorize activation. The script never starts or enables a timer.
 
 The units reference this source directory by absolute path. Treat any later
 source update as a service change requiring its owner's custody and qualification.
-The timer invokes a review pass and then a merge pass. The merger credential's
+The timer invokes a review pass and then a merge pass. `install.sh` stages all
+six units (review, heartbeat and poke, each a service and a timer) and enables none. The merger credential's
 path comes from the site's `~/.config/pr-redteam/merge.env`, read by the unit;
 `install.sh` writes no credential and no credential path. Heartbeats report liveness through Jeryu's existing
 runner-reporting allowlist. An authorization refusal is logged, not bypassed.

@@ -1,0 +1,11 @@
+[Unit]
+Description=pr-redteam poke every 30 seconds (the five-minute pr-redteam.timer stays as the fallback)
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=30s
+AccuracySec=5s
+Unit=pr-redteam-poke.service
+
+[Install]
+WantedBy=timers.target
