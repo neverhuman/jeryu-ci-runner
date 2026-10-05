@@ -61,18 +61,49 @@ is not a replacement for database CI. Its first full local gate discovered that
 the convoy lacked published v0.8.10/v0.8.11 release notes; those exact entries
 were restored from tag v0.8.11 (`fa808afec43e547e823016090fac17f95ad91fc2`). CI
 now fetches tags to enforce the same check. Earlier cancelled/superseded runs
-are not passes. Main promotion PR 251 contains only the already-landed CI files,
+are not passes. Main promotion PR 251 initially contained only the already-landed CI files,
 head `d816c2bd489b477173bf2fa93638dffb4adeb22e`; its own final-head run
-37243774021 attempt 1 failed an existing UTC-midnight test assumption at observability.rs:492 (two day rows instead of one). The unchanged head is running attempt 2; retain both outcomes. Post-convoy run 37243633840 passed.
+37243774021 failed both attempts: observability.rs:492 assumed one day across
+UTC midnight; load.rs:226 backdated fixtures into the preceding UTC day.
+Retain both failures. Post-convoy run 37243633840 passed. Fixture-only repair
+convoy PR 252 initially at `ce5e78f0e204644b7cc99a8ca0d7e9f9e0a8ed30` deliberately crosses
+midnight and asserts both observation days, while the count fixtures remain on
+their intended UTC day. Full local `just required` and both actual PostgreSQL
+cases passed in an owned disposable LAN VM; that VM was destroyed. Actual full
+PostgreSQL/browser CI 37248250631 also passed both fixture cases, then timed out
+at the unchanged 30-minute quota; browser integration was skipped and the
+unmodified `just land` refused to advance the convoy. Current head
+`ecf35a8a6e172b8963a0e8ce37a1473bed775dc6` adds a bounded 2 GiB tmpfs for the
+disposable PostgreSQL 16 data. Default fsync, synchronous commit and full page
+writes remain enabled. Full CI 37250577186 and a fresh exact-head local gate
+passed; the unmodified `just land` advanced `rc/auto`. Post-convoy 37251057764
+passed. Main PR 251 promoted both repairs at exact head
+`9644855b355526cd84b22f5b4ac2d4458292d066`. Run 37251123099 attempt 1 failed
+an upstream Cargo HTTP/2 download before tests; the unchanged attempt 2 passed.
+Ordinary merge produced `5c6ec7ed1dee8a864ee32bd6da503bba7da0da27` at 01:41 UTC
+on October 5. Post-main 37252384703 passed with actual PostgreSQL and browser
+coverage. No production release tag was created.
 
 Jailgun draft https://github.com/neverhuman/jailgun/pull/20, head
-`52771c691e6ed41377341127801f97e1751ce3e2`, preserves both actual Ubuntu
-24.04 and 26.04 matrix children. Current runs are 37246162494 (CI),
-37246162414 (Jankurai) and 37246162486 (Security), still being qualified.
+`607f408e90adda98b57a43eb4285ab19ab176ee7`, preserves both actual Ubuntu
+24.04 and 26.04 matrix children. Current runs are 37252875495 (CI),
+37252875560 (Jankurai) and 37252875459 (Security), still being qualified.
+The preceding d833 head passed both native package children, Security and
+Jankurai (95, zero findings/caps), but standalone e2e failed because its
+synthetic cancellation victim could finish while waiting for a separate main
+run. The dependent aggregate was skipped. The CI-owned
+`scripts/check-concept-workflows.mjs` now holds only that victim in the existing
+partial mode before conversation publication and requires every held victim
+to be stopped. Rust ownership, double-cancellation, capacity release and
+partial-artifact assertions remain intact. No product implementation changed.
+Do not transfer the previous head's audit or native verdict to this new head.
+Full CI still requires both platform children, end-to-end and the aggregate.
 At the preceding head, Security passed and both real OS guests launched sandboxed
 Chromium. Copy-code and Jankurai failed because cargo-installed binaries were not
-on the next step's PATH; common setup now appends Cargo's bin directory to
-GITHUB_PATH. All final-head gates must pass again.
+on the next step's PATH. A dynamic GITHUB_PATH write then correctly failed the
+security scanner; common setup now writes the verified guest's literal
+`/home/runner/.cargo/bin`. Actual pinned Security passed without a github-env
+exception. All final-head gates must pass again.
 The first head failed because Playwright 1.60 has no Ubuntu 26 dependency
 installer entry and zizmor flagged all 15 self-hosted jobs. The repair installs
 the pinned Chromium native library list from the real Ubuntu guest repositories,
@@ -82,12 +113,18 @@ scanner command or other rule is disabled. Old failed/cancelled runs are retaine
 just/rustup. `ops/ci/lan-browser.sh` extracts the digest-pinned public Playwright
 1.60 artifact, installs dependencies and requires a real sandboxed browser launch;
 it refuses non-VM hosts and changes user-namespace policy only in that guest.
+The unchanged package doctor uses standard absolute browser locations. The
+preceding Ubuntu 26 package gate failed to discover the extracted executable;
+guest preparation now exposes that same qualified browser at `/usr/bin/chromium`
+and verifies its target/version, refusing to replace any different browser.
+Installed-package, actual user-systemd and browser-absent clean-container
+acceptance remain required; no package assertion is changed.
 No scanner/auditor floor, native acceptance proof or timeout was removed.
 Group admission contains demo-repository, ai-veox-app, dope and jailgun
 (numeric IDs 1388268629, 1336448620, 1394151792 and 1254916854), all workflows,
 with public-repository access enabled under the verified VM boundary.
 
-CI-kit 1.4.0 adds immutable browser and Ubuntu OS capabilities. All three
+CI-kit 1.4.1 includes immutable browser/Ubuntu capabilities and lanes 1–4. All three
 `runner-ubuntu24-x64-browser158.qcow2` images passed full browser launch,
 credential-absence and network-isolation checks. Factory builds use a fresh,
 unregistered guest from the pinned base, never an Actions job disk. xbabe1/2
@@ -103,7 +140,8 @@ The fresh Actions-policy audit found 24 live workflow files in seven active
 repositories: jailgun, ai-veox-app, bullet-kernel, JopeDime, demo-repository,
 redline and dope. The initial 46 definitions also include GitHub-disabled static
 mirrors. Keep their local-forge source authority and disabled GitHub Actions;
-do not enable duplicate CI to inflate migration counts. Demo and Dope Linux migrations have landed; full platform
+do not enable duplicate CI to inflate migration counts. Demo, Dope Linux and
+application main migrations have landed with post-merge proof; full platform
 migration remains incomplete. Old hosted-label jobs are queued behind the disabled
 policy. Existing local product runners remain until their replacements qualify.
 
@@ -117,6 +155,13 @@ now also bind the actual Ubuntu 24.04 version. Admission refused both a
 mismatched image receipt and a wrong OS label before VM/JIT creation. A separate
 `neverhuman-runner@2.service.d/ubuntu26.conf` selects this capability in the same
 general group; it does not dedicate a runner to Jailgun.
+
+Cache audit `neverhuman-cache-limit-audit-2026-10-04.json` read all 41 repository
+storage limits successfully: each is 10 GB. The org eviction setting is also
+10 GB. Eviction is not a spending guarantee; the $0 Actions stop-usage budget
+is the billing control. The 01:52 UTC October 5 browser readback still reports $0 Actions
+billable, 0 private hosted minutes and 0.5 GB of the included 2 GB storage.
+Billing storage reporting lags; a later post-rollout readback is still required.
 
 ## Assumptions, dependencies and non-goals
 
@@ -352,6 +397,14 @@ LAN guest, retain logs and stop/delete only that guest's generated overlay/seed.
    LAN cache keys use `cargo-lan-ubuntu24-x64-v1-`; old hosted caches are not a trusted base. Land
    through `just land`, not a shortcut merge into main or a production deploy.
    Any new diagnosis becomes an attended finding under the repo's own rules.
+   Fixture repairs are restricted to
+   `crates/veox-app-api/tests/integration/{observability,load}.rs` and
+   `docs/ci-utc-fixtures.md`. Preserve exact two-day history and count assertions.
+   The existing SQL suite must run with `VEOX_TEST_DATABASE_URL` set. Disposable
+   PostgreSQL data uses bounded tmpfs; do not disable fsync or change the quota.
+   After the convoy lands, use the owned `work/ai-veox-lan-main` promotion
+   branch, cherry-pick the attended fixture and CI-storage commits, retain the
+   already-promoted CI files, push PR 251 and bind every gate to its new SHA.
 
 4. **Dope.** Read `AGENTS.md`, `docs/{architecture,testing,release,audit}.md`,
    `agent/{owner-map.json,test-map.json,generated-zones.toml,cost-budget.toml}`.
@@ -588,8 +641,9 @@ after canonical reconciliation, not a mutation of the retired or sibling tree.
 ### Jope: source queue before another implementation lane
 
 Canonical xbabe2:/home/ubuntu/JopeDime has dirty main behind origin, modified
-AGENT_CHAT.md/MASTER_CLEAN_UP and an unrelated untracked .mcp file. Eight PRs
-were open: 184, 182, 180, 178, 177, 148, 147, 137. Five registered worktrees
+AGENT_CHAT.md/MASTER_CLEAN_UP and an unrelated untracked .mcp file. At 02:01 UTC
+October 5, main was 239 commits behind origin. Nine PRs were open:
+187, 186, 185, 180, 178, 177, 148, 147, 137. Seven registered worktrees
 already exceed its four-lane ceiling. Read AGENTS.md, MASTER_CLEAN_UP, AGENT_CHAT
 and six workflows. No migration claim, branch change or source write exists.
 Preserve those owners' work; do not reset/stash/force-push, create another
@@ -644,4 +698,6 @@ neverhuman-pool-scale-proof-2026-10-04.json. Existing controllers/jobs were not
 restarted. Images, App credentials and egress rules are unchanged. All scripts
 passed ShellCheck; GNU seal/vendor/verify and all 20 kit tests passed again.
 Bind actual new-lane jobs to root stop/destruction receipts before calling the
-expansion live-qualified.
+expansion live-qualified. Both added lanes have now completed actual jobs with
+root exit 0, stopped VM and destroyed disk/seed bindings; the expansion is
+live-qualified, while remaining product workflow qualification stays separate.
