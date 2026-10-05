@@ -49,7 +49,7 @@ Dope PR 108 https://github.com/neverhuman/dope/pull/108 passed CPU/security
 `7f75ba398d7076be4051bcacb1970b21a34d70e2`. It merged as
 `55995d00ffd7f9d4435b549e32350dde508577bd`. Post-merge CPU/security
 37241411624 and Full Jankurai 37241411579 both passed.
-Dope's GPU workflow still uses its existing local dedicated capability.
+Dope's GPU workflow still requests a local GPU capability. Fresh repository runner enumeration found zero registered dedicated GPU runners; shared GPU execution remains unqualified.
 The credential-free local `just check` VM also passed and was destroyed.
 
 Application PR 250 https://github.com/neverhuman/ai-veox-app/pull/250 landed
@@ -63,12 +63,16 @@ were restored from tag v0.8.11 (`fa808afec43e547e823016090fac17f95ad91fc2`). CI
 now fetches tags to enforce the same check. Earlier cancelled/superseded runs
 are not passes. Main promotion PR 251 contains only the already-landed CI files,
 head `d816c2bd489b477173bf2fa93638dffb4adeb22e`; its own final-head run
-37243774021 remains pending. Post-convoy run 37243633840 is also pending.
+37243774021 attempt 1 failed an existing UTC-midnight test assumption at observability.rs:492 (two day rows instead of one). The unchanged head is running attempt 2; retain both outcomes. Post-convoy run 37243633840 passed.
 
 Jailgun draft https://github.com/neverhuman/jailgun/pull/20, head
-`5a2f7e9ce3ec1f7f27ac7c4fe5350fe6c8a33af2`, preserves both actual Ubuntu
-24.04 and 26.04 matrix children. Current runs are 37244692686 (CI),
-37244692616 (Jankurai) and 37244692613 (Security), still being qualified.
+`52771c691e6ed41377341127801f97e1751ce3e2`, preserves both actual Ubuntu
+24.04 and 26.04 matrix children. Current runs are 37246162494 (CI),
+37246162414 (Jankurai) and 37246162486 (Security), still being qualified.
+At the preceding head, Security passed and both real OS guests launched sandboxed
+Chromium. Copy-code and Jankurai failed because cargo-installed binaries were not
+on the next step's PATH; common setup now appends Cargo's bin directory to
+GITHUB_PATH. All final-head gates must pass again.
 The first head failed because Playwright 1.60 has no Ubuntu 26 dependency
 installer entry and zizmor flagged all 15 self-hosted jobs. The repair installs
 the pinned Chromium native library list from the real Ubuntu guest repositories,
@@ -452,8 +456,8 @@ pilot destruction. `neverhuman-active-ci-snapshot-2026-10-04.json` captures
 active/queued jobs separately. `neverhuman-ci-rollout-receipt-2026-10-04.json`
 must be refreshed after each admission/merge, with `objective_complete=false`
 until every completion criterion holds. The final handoff includes a fresh
-billing/policy/budget readback; billing at 23:00 UTC showed $0 Actions billed,
-$108.83 consumed fully offset, 0/3,000 private minutes and 0.5/2 GB storage.
+billing/policy/budget readback; billing at 00:08 UTC October 5 showed $0 Actions billed,
+$108.84 consumed fully offset, 0/3,000 private minutes and 0.5/2 GB storage.
 Repeat storage/billing verification after GitHub's reporting delay following
 the last migration. The recurring $12 Team subscription is outside extra
 processing charges and has not been changed.
@@ -474,9 +478,11 @@ runner IDs, completed job conclusions, stopped per-VM units, consumed registry
 IDs and owned non-symlink overlay/seed paths were checked before manual cleanup.
 Separate root recovery receipts record `controller_exit=2`,
 `automatic_cleanup=false`, and actual workspace destruction. Do not rewrite these
-as automatic exit-0 lifecycle successes. Runner 285 on xbabe2 started under the
-same overwritten version and remains under observation until its unrelated Dope
-job completes; do not stop it. Root runner 287 on Ubuntu 26 stopped/destroyed its
+as automatic exit-0 lifecycle successes. Runner 285 on xbabe2 completed its cancelled unrelated Dope audit job and was
+reconciled using the same exact-ID, stopped-unit and owned-path checks. Its
+controller exit 2 is retained and cancellation is not a pass. All three affected
+instances are now reconciled; no affected busy instance remains. Replacement
+controllers are completing automatic stop/destruction with exit 0. Root runner 287 on Ubuntu 26 stopped/destroyed its
 VM automatically with controller exit 0 after a failed product job, which proves
 cleanup only and does not turn that product failure into a pass.
 
@@ -488,3 +494,138 @@ to root receipts. Final source kit 1.4.0 hash is
 `eb8e27a3bcf54514db7b00b9b9eff5b8bd7957e3ee03e63cc0ed8a3e7a2cb703`;
 Linux seal/vendor/verify and all 20 kit self-tests passed. This is not the
 governed product-required qualification or independent authoritative review.
+
+
+## Remaining exact source and acceptance constraints
+
+These packets are prepared, not implemented or qualified. The operator retains
+execution ownership. No user implementation choice is pending. The following
+source gates and physical capabilities prevent a truthful complete rollout.
+
+### Redline: canonical xbabe2:/home/ubuntu/redlineDB
+
+Read first in order: AGENTS.md, .jankurai/JANKURAI_STANDARD.md,
+agent/{owner-map.json,test-map.json,generated-zones.toml,boundaries.toml},
+.jankurai/{owner-map.json,test-map.json,proof-lanes.toml,tool-adoption.toml},
+ops/AGENTS.md, docs/{agent-native-standard,testing,ci-trust-boundary}.md,
+crates/bench/tests/{ci_workflow_routing,ci_trust_boundary}.rs, then all seven
+.github/workflows files. Clean canonical main and origin/main observed at
+9277455d5ad008252053a81d18add39b8cdc8f7b. Read the board again before claiming.
+No claim, branch change or source write has been made by this migration operator.
+
+From the canonical checkout, with every shell invocation prefixed rtk:
+
+    /home/ubuntu/.local/bin/bf board
+    /home/ubuntu/.local/bin/bf board --to me
+    pwd; git rev-parse --show-toplevel; git status --short --branch
+    /home/ubuntu/.local/bin/bf claim .github/ crates/bench/tests/ci_workflow_routing.rs crates/bench/tests/ci_trust_boundary.rs docs/ci-trust-boundary.md -m 'Shared isolated LAN CI capabilities with native and fork proof preserved'
+
+Only after a successful claim and clean freshly fetched main may the sole
+integrator create a branch. Existing docs PR 32 is unrelated: exact-head review
+is approved, but 13 hosted jobs remain blocked. Do not merge, amend, cancel or
+absorb it to manufacture a migration gate. Four-open-PR limit still applies.
+
+Edit seven workflows, add .github/actionlint.yaml for declared shared labels,
+update the two routing/trust tests and trust-boundary document. Register new
+paths in both live map copies as their schemas require. Generated audit scores,
+official reports, assets and benchmark evidence remain read-only.
+
+Current tests intentionally require hosted light jobs, forbid dtolnay in an old
+persistent self-hosted lane and assert fork-hosted fallback. Replace those
+assertions with the actual isolation contract rather than removing tests:
+
+- Linux compute jobs name group neverhuman-lan, self-hosted/Linux/X64 and the
+  true OS label. Dynamic forks must never select a GitHub-hosted label.
+- Forks retain external approval, nonpersistent checkout credentials, temporary
+  download caches, no trusted cache publication, parity refusal and aggregate
+  failure rules. Update the old fork-routing expression oracle to the verified
+  disposable guest route; preserve all token/cache assertions.
+- Aggregate needs retain every required child. Keep nextest digest, curl retries,
+  artifact warning/failure semantics and official evidence checks.
+- packages.yml needs actual Ubuntu 22 x64, Ubuntu 22 ARM, macOS 15 Intel and
+  macOS 15 ARM builds AND native installer/runtime proofs. Published installer
+  and quickstart consumers remain required. A cross-build is insufficient.
+- Release/write-token jobs need a separately admitted trusted-ref shared profile
+  with deliberate PR/fork refusal proof. No host key or writer PAT enters guests.
+
+The new acceptance command must fail on parent and pass on head. Use:
+
+    cargo test -p redlinedb-bench --test ci_workflow_routing --test ci_trust_boundary
+    actionlint
+    git diff --check
+    just fast
+    REDLINE_TESTING_POSTGRES_URL=<isolated-pinned-PG-service> just pr-ci
+
+The oracle is PostgreSQL 16.15 at the declared digest and settings 160015|C|C|UTC.
+Preserve failing names, skips and raw hashes. Missing native profiles leave the
+required package gate queued, never successful. PR body must carry bf claim ID
+and acceptance command. An eligible reviewer who neither opened nor authored/
+committed the PR must approve the exact head; RedlineDB/required must pass at
+that same head before merge. Heartbeat claims every 30 minutes and release with
+an actual proof command/recorded exit code. Do not self-review or relax protection.
+
+### Bullet: reconcile source authority before writes
+
+Declared family root /home/ubuntu/bullet on xbabe2 is absent. Preserved
+/home/ubuntu/bullet.retired-20260921 contains manifest/history;
+ /home/ubuntu/bullet-asap-family/bullet-kernel is a dangling symlink to that absent
+canonical root. Clean /home/ubuntu/src/bullet-stranger-console/bullet-kernel is a
+diagnostic sibling at bd2d7b70e76eaecbfd1e783b36d73a212969fc44, not a claimed
+canonical source. GitHub default head observed:
+f399d850acf62bc59332d162a7684df23e21e16e. Do not revive, overwrite, relink or
+mutate these roots solely to unblock CI. Reconcile current family manifest
+GitHub authority with the older SPLIT.md local-forge declaration first.
+
+Read family repos.manifest/owner log, SPLIT.md, AGENTS.md,
+agent/JANKURAI_STANDARD.md and maps; claim under the family lock before writes.
+Edit .github/workflows/{ci,scheduled}.yml in that claimed member, with a label
+lint config if permitted. Preserve all six Linux proof lanes and aggregate,
+scripts/ci-local.sh required, and scheduled actual macOS 15/Windows 2025
+portable-refusal proof. Native absence is a stop for qualification. Preserve
+publication semantics/tool hashes. Deliver an exact-head draft/review packet
+after canonical reconciliation, not a mutation of the retired or sibling tree.
+
+### Jope: source queue before another implementation lane
+
+Canonical xbabe2:/home/ubuntu/JopeDime has dirty main behind origin, modified
+AGENT_CHAT.md/MASTER_CLEAN_UP and an unrelated untracked .mcp file. Eight PRs
+were open: 184, 182, 180, 178, 177, 148, 147, 137. Five registered worktrees
+already exceed its four-lane ceiling. Read AGENTS.md, MASTER_CLEAN_UP, AGENT_CHAT
+and six workflows. No migration claim, branch change or source write exists.
+Preserve those owners' work; do not reset/stash/force-push, create another
+worktree or merge unrelated product PRs as a queue-clearing shortcut.
+
+When the governed queue permits a new lane, acquire flock/AGENT_CHAT claim,
+use permitted .agent work area and gh-role writer/reviewer helpers. Edit
+.github/workflows/{ci,full-main,main-guard,release,runner-admission-probe,weekly}.yml
+and declared admission action/scripts as one unit. Reanchor repository labels
+and host CPU/image expectations to a shared exclusive resource lease bound to
+root provenance. Deliberately test wrong host, image, CPU and unowned-lease
+refusals. Preserve eight manual proof lanes, aggregate, exact-head independent
+reviewer identity and post-merge main guard. Existing repo JIT runs on LAN;
+leave active jobs/credentials until shared equivalents pass. Preserve sealed
+GPU/corpus inputs; do not inspect holdout data during infrastructure work.
+
+### Drain and final evidence
+
+Legacy assessment found 27 original listeners, most resolving to neverhumanbot
+or unavailable repositories. One idle neverhuman/jankurai-audit listener with
+no workflows/jobs was stopped/disabled and its registration deleted after
+numeric-ID/busy/Worker checks. Twenty-six original services remain; do not
+blanket-retire other owners' listeners. Redline's two current dedicated listeners
+remain until shared required evidence qualifies. Dope has zero repo runners
+observed; its GPU workflow is an unqualified capability.
+
+Use neverhuman-legacy-runner-assessment-2026-10-04.json for exact unit/host/owner
+bindings. Before each retirement require current repo ID/ownership, completed
+replacement run/head and idle/no-Worker proof. Then stop/disable only that unit
+and delete only its exact repo runner ID. Preserve source/recovery files.
+Disable repo-runner creation only after Jope's active JIT controller is replaced
+and relevant lanes drained.
+
+Refresh seven repositories with work/refresh-ci-snapshot.py; collect successful
+jobs with work/collect-product-lan-proofs.py. Preserve original failed attempts
+and manual-cleanup distinctions. Saved policy/billing/budget browser readbacks
+prove account state at their timestamps. Repeat storage billing after reporting
+delay. Keep objective_complete=false until native/GPU/resource/source review,
+all real required gates and final drain criteria hold.
