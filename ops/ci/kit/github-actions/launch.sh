@@ -4,8 +4,8 @@ set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 nh_require_root
-lane=${1:?lane must be 1 or 2}
-case "$lane" in 1|2) ;; *) exit 2 ;; esac
+lane=${1:?lane must be 1 through 4}
+case "$lane" in 1|2|3|4) ;; *) exit 2 ;; esac
 exec 9>"$NH_STATE/lane-$lane.lock"
 flock -n 9 || { echo 'Lane already owned' >&2; exit 2; }
 [[ -f $NH_GOLD_IMAGE && -f $NH_IMAGE_RECEIPT && -f $NH_QUALIFICATION_RECEIPT ]] || exit 2

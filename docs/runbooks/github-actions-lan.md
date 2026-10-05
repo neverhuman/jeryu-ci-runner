@@ -21,9 +21,9 @@ forge HTTPS, LAN/metadata/public SSH denial and credential-absence checks in
 Owner authentication is complete. Private org App
 `neverhuman-lan-runner-controller` (App 5190166, installation 167953338) has only
 organization Self-hosted runners read/write, no repository access and no webhook.
-Two boot-enabled controller lanes per host automatically create and destroy
-single-job VMs. Five lanes serve Ubuntu 24.04/browser158; lane 2 on xbabe3
-serves Ubuntu 26.04. Measured memory/disk admission allowed lane 2 on xbabe1/2
+Two boot-enabled lanes on xbabe1/2 and four on xbabe3 automatically create and
+destroy single-job VMs. Seven lanes serve Ubuntu 24.04/browser158; lane 2 on
+xbabe3 serves Ubuntu 26.04. Measured memory/disk admission allowed lane 2 on xbabe1/2
 without stopping existing work. Each guest uses 8 vCPUs/8 GiB and a bounded overlay. App credentials are root-only;
 the downloaded local key copy was removed and both unusable keys were revoked.
 
@@ -490,8 +490,8 @@ Public recovery evidence is
 `outputs/neverhuman-controller-cleanup-recovery-proof-2026-10-04.json`. Keep
 automatic lifecycle proofs and manual recovery proofs distinguishable. Validate
 new jobs under the atomically installed source and bind replacement runner IDs
-to root receipts. Final source kit 1.4.0 hash is
-`eb8e27a3bcf54514db7b00b9b9eff5b8bd7957e3ee03e63cc0ed8a3e7a2cb703`;
+to root receipts. Final source kit 1.4.1 hash is
+`ca8d8fa2153fac2ebdb1e771b56f19d7e2b704d849ee1bb22b852c4ae8aa0d68`;
 Linux seal/vendor/verify and all 20 kit self-tests passed. This is not the
 governed product-required qualification or independent authoritative review.
 
@@ -629,3 +629,19 @@ and manual-cleanup distinctions. Saved policy/billing/budget browser readbacks
 prove account state at their timestamps. Repeat storage billing after reporting
 delay. Keep objective_complete=false until native/GPU/resource/source review,
 all real required gates and final drain criteria hold.
+
+
+## Measured pool expansion
+
+CI-kit 1.4.1 permits lanes 1 through 4 while rejecting lane 5 before VM/JIT
+creation. xbabe1/2 remain at two enabled lanes each. xbabe3 lanes 3/4 add two
+general Ubuntu 24/browser158 guests. These are shared capability slots, not
+repository reservations. Admission required at least 32 GiB MemAvailable and
+300 GiB free disk for this two-lane expansion; each normal launch still requires
+12 GiB available memory and 100 GiB free disk. Actual admission measurements,
+atomic source hashes and unit enable/active states are in
+neverhuman-pool-scale-proof-2026-10-04.json. Existing controllers/jobs were not
+restarted. Images, App credentials and egress rules are unchanged. All scripts
+passed ShellCheck; GNU seal/vendor/verify and all 20 kit tests passed again.
+Bind actual new-lane jobs to root stop/destruction receipts before calling the
+expansion live-qualified.

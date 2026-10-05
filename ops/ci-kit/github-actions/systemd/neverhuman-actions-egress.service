@@ -1,7 +1,7 @@
 [Unit]
 Description=Dedicated QEMU uid network policy for neverhuman CI
 After=network-pre.target
-Before=neverhuman-runner@1.service neverhuman-runner@2.service
+Before=neverhuman-runner@1.service neverhuman-runner@2.service neverhuman-runner@3.service neverhuman-runner@4.service
 
 [Service]
 Type=oneshot
