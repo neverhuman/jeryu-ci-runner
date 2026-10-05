@@ -11,7 +11,16 @@ cancelled run, skipped lane or local-only success as a green required check.
 
 The owner browser currently confirms standard hosted runners disabled, zero
 configured larger runners, $0 Actions billed, and $0 stop-usage budgets for
-Actions, Packages, Codespaces and Git LFS. The Team subscription is separate.
+Actions, Packages, Codespaces, Git LFS, Sandbox and all AI Credit SKUs. The latter
+organization-scope budget caps additional AI usage while the UI distinguishes
+included allowances from additional usage. Its saved $0/Stop usage Yes row was
+verified at 03:24 UTC October 5. Sandbox also has a saved $0 hard stop.
+Models budget creation reports paid usage disabled; no paid usage was enabled.
+The Models policy link returned 404, so it is not a policy-page verification.
+Spark budget creation remains disabled after a zero input; no budget or paid
+service was enabled. Advanced Security is license-based and its UI explicitly
+does not support Stop usage; an alert-only budget would not enforce this goal.
+The Team subscription is separate.
 External fork workflows require approval from all outside collaborators. Shared
 group `neverhuman-lan` is ID 3. Admission is staged by repository; this is one
 shared pool, with no repository-owned VM/controller. Each VM passed the runner/Docker, GitHub and
@@ -84,10 +93,21 @@ Ordinary merge produced `5c6ec7ed1dee8a864ee32bd6da503bba7da0da27` at 01:41 UTC
 on October 5. Post-main 37252384703 passed with actual PostgreSQL and browser
 coverage. No production release tag was created.
 
-Jailgun draft https://github.com/neverhuman/jailgun/pull/20, head
+Jailgun PR 20 https://github.com/neverhuman/jailgun/pull/20, final head
 `607f408e90adda98b57a43eb4285ab19ab176ee7`, preserves both actual Ubuntu
 24.04 and 26.04 matrix children. Current runs are 37252875495 (CI),
-37252875560 (Jankurai) and 37252875459 (Security), still being qualified.
+37252875560 (Jankurai) and 37252875459 (Security). All 16 jobs passed,
+including both real native package children, standalone e2e and the dependent
+aggregate. Both audit reports are 95 with zero findings/caps. Exact runner IDs
+bind all 16 successful jobs to root exit-0, stopped/destroyed guest receipts.
+The verified tree was squash-merged as
+`042f1e10f1b32c43da82482fe0b70e839c02d162` at 03:00:44 UTC on October 5.
+Post-merge runs 37257660321 (CI), 37257660201 (Jankurai) and 37257660161
+(Security) are being verified. The first main CI attempt exceeded the unchanged
+180-second database subprocess bound and did not emit the captured child log;
+retain that failure. Finish the active lanes before one unchanged retry.
+The pre-merge database lane ran all 34 tests successfully with SQLite 3.53.2.
+Do not describe the post-main full run as green until its complete real gate passes.
 The preceding d833 head passed both native package children, Security and
 Jankurai (95, zero findings/caps), but standalone e2e failed because its
 synthetic cancellation victim could finish while waiting for a separate main
@@ -96,14 +116,15 @@ run. The dependent aggregate was skipped. The CI-owned
 partial mode before conversation publication and requires every held victim
 to be stopped. Rust ownership, double-cancellation, capacity release and
 partial-artifact assertions remain intact. No product implementation changed.
-Do not transfer the previous head's audit or native verdict to this new head.
+The new head has its own complete audit, native and end-to-end receipts;
+the previous head's failures remain historical evidence.
 Full CI still requires both platform children, end-to-end and the aggregate.
 At the preceding head, Security passed and both real OS guests launched sandboxed
 Chromium. Copy-code and Jankurai failed because cargo-installed binaries were not
 on the next step's PATH. A dynamic GITHUB_PATH write then correctly failed the
 security scanner; common setup now writes the verified guest's literal
 `/home/runner/.cargo/bin`. Actual pinned Security passed without a github-env
-exception. All final-head gates must pass again.
+exception. All final-head gates subsequently passed with the original thresholds.
 The first head failed because Playwright 1.60 has no Ubuntu 26 dependency
 installer entry and zizmor flagged all 15 self-hosted jobs. The repair installs
 the pinned Chromium native library list from the real Ubuntu guest repositories,
@@ -141,7 +162,8 @@ repositories: jailgun, ai-veox-app, bullet-kernel, JopeDime, demo-repository,
 redline and dope. The initial 46 definitions also include GitHub-disabled static
 mirrors. Keep their local-forge source authority and disabled GitHub Actions;
 do not enable duplicate CI to inflate migration counts. Demo, Dope Linux and
-application main migrations have landed with post-merge proof; full platform
+application main migrations have landed with post-merge proof; Jailgun merged
+after all exact-head gates and post-main verification is in progress. Full platform
 migration remains incomplete. Old hosted-label jobs are queued behind the disabled
 policy. Existing local product runners remain until their replacements qualify.
 
@@ -159,9 +181,12 @@ general group; it does not dedicate a runner to Jailgun.
 Cache audit `neverhuman-cache-limit-audit-2026-10-04.json` read all 41 repository
 storage limits successfully: each is 10 GB. The org eviction setting is also
 10 GB. Eviction is not a spending guarantee; the $0 Actions stop-usage budget
-is the billing control. The 01:52 UTC October 5 browser readback still reports $0 Actions
+is the billing control. The 03:12 UTC October 5 browser readback still reports $0 Actions
 billable, 0 private hosted minutes and 0.5 GB of the included 2 GB storage.
 Billing storage reporting lags; a later post-rollout readback is still required.
+Gross Actions usage is now $108.86 and is fully offset by $108.86 discounts.
+Every observed compute/storage SKU has $0 billed; the historical public compute
+usage and a small continuing storage amount must not be mistaken for a charge.
 
 ## Assumptions, dependencies and non-goals
 
@@ -641,9 +666,9 @@ after canonical reconciliation, not a mutation of the retired or sibling tree.
 ### Jope: source queue before another implementation lane
 
 Canonical xbabe2:/home/ubuntu/JopeDime has dirty main behind origin, modified
-AGENT_CHAT.md/MASTER_CLEAN_UP and an unrelated untracked .mcp file. At 02:01 UTC
-October 5, main was 239 commits behind origin. Nine PRs were open:
-187, 186, 185, 180, 178, 177, 148, 147, 137. Seven registered worktrees
+AGENT_CHAT.md/MASTER_CLEAN_UP and an unrelated untracked .mcp file. At 03:16 UTC
+October 5, main was 240 commits behind origin. Nine PRs were open:
+188, 186, 185, 180, 178, 177, 148, 147, 137. Seven registered worktrees
 already exceed its four-lane ceiling. Read AGENTS.md, MASTER_CLEAN_UP, AGENT_CHAT
 and six workflows. No migration claim, branch change or source write exists.
 Preserve those owners' work; do not reset/stash/force-push, create another
@@ -701,3 +726,48 @@ Bind actual new-lane jobs to root stop/destruction receipts before calling the
 expansion live-qualified. Both added lanes have now completed actual jobs with
 root exit 0, stopped VM and destroyed disk/seed bindings; the expansion is
 live-qualified, while remaining product workflow qualification stays separate.
+
+
+## Dependabot generated jobs and the strict LAN-only boundary
+
+At 03:09 UTC October 5, main Jailgun also exposed generated `Dependabot Updates`
+runs 37257753790 and 37257752422. These are separate from the three product gate
+workflows. They are not files under .github/workflows/, so a YAML inventory alone
+is insufficient. Preserve their IDs/status in the run inventory.
+
+GitHub documents that these jobs bypass Actions policy disablement and that
+public repositories cannot select self-hosted Dependabot runners. Standard
+Dependabot execution is free; larger runners are billable. Zero configured larger
+runners plus the $0 stop-usage budget remains mandatory. Primary documentation:
+https://docs.github.com/en/code-security/concepts/supply-chain-security/dependabot-on-actions
+https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/manage-your-dependency-security/configure-on-self-hosted-runners
+
+Decision: preserve dependency/security update functionality while identifying it
+as an exception to all-processing-on-LAN. Do not disable updates without a
+working LAN replacement or claim the hosted-runner switch blocks these generated
+jobs. This does not add a paid hosted compute allowance.
+
+Read first: each authoritative repository's AGENTS/maps, .github/dependabot.yml
+if present, active bot PR metadata (not private credentials), and organization
+Advanced Security Dependabot runner settings through the owner browser. Then
+classify public/private repos. Private repos may use a separately qualified
+Linux x64/Docker shared Dependabot capability and label/group setting. Public
+repos need a LAN dependency updater with equivalent ecosystem, cadence,
+lockfile, vulnerability and PR behavior; changing a runner label cannot solve it.
+
+Keep updater credential provisioning separate from the runner-controller App,
+which has no repository access. Scope any updater credential to admitted repos
+and dependency-PR operations; keep it outside ordinary PR guests. Define a
+reviewable implementation/configuration before enabling it. Do not expand the
+controller App's privileges or let dependency PRs self-approve or bypass product
+gates. Serialize updater writes per repo and honor local claim/PR limits.
+
+Before replacing managed updates: dry-run the actual supported ecosystems in
+owned disposable LAN guests, produce dependency/lockfile diffs, open ordinary
+draft update PRs only where repository rules allow, and require real product
+checks and independent review. Compare generated updates to the existing bot
+configuration, verify private credential absence in logs, bind jobs to root
+runner receipts, and test failure/queue recovery. Disable the managed updater
+only after that replacement proves equivalent behavior. Generated update jobs
+remain an explicitly recorded exception until then. No replacement updater or
+new updater credential has been created during this rollout.
