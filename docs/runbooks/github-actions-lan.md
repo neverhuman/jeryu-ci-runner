@@ -15,6 +15,8 @@ Actions, Packages, Codespaces, Git LFS, Sandbox and all AI Credit SKUs. The latt
 organization-scope budget caps additional AI usage while the UI distinguishes
 included allowances from additional usage. Its saved $0/Stop usage Yes row was
 verified at 03:24 UTC October 5. Sandbox also has a saved $0 hard stop.
+All six organization rows were re-read at 03:55 UTC with $0 budgets and
+Stop usage Yes. The standard hosted disable policy was re-read at 03:56 UTC.
 Models budget creation reports paid usage disabled; no paid usage was enabled.
 The Models policy link returned 404, so it is not a policy-page verification.
 Spark budget creation remains disabled after a zero input; no budget or paid
@@ -95,7 +97,7 @@ coverage. No production release tag was created.
 
 Jailgun PR 20 https://github.com/neverhuman/jailgun/pull/20, final head
 `607f408e90adda98b57a43eb4285ab19ab176ee7`, preserves both actual Ubuntu
-24.04 and 26.04 matrix children. Current runs are 37252875495 (CI),
+24.04 and 26.04 matrix children. Pre-merge runs were 37252875495 (CI),
 37252875560 (Jankurai) and 37252875459 (Security). All 16 jobs passed,
 including both real native package children, standalone e2e and the dependent
 aggregate. Both audit reports are 95 with zero findings/caps. Exact runner IDs
@@ -103,11 +105,18 @@ bind all 16 successful jobs to root exit-0, stopped/destroyed guest receipts.
 The verified tree was squash-merged as
 `042f1e10f1b32c43da82482fe0b70e839c02d162` at 03:00:44 UTC on October 5.
 Post-merge runs 37257660321 (CI), 37257660201 (Jankurai) and 37257660161
-(Security) are being verified. The first main CI attempt exceeded the unchanged
-180-second database subprocess bound and did not emit the captured child log;
-retain that failure. Finish the active lanes before one unchanged retry.
-The pre-merge database lane ran all 34 tests successfully with SQLite 3.53.2.
-Do not describe the post-main full run as green until its complete real gate passes.
+(Security) passed all 16 jobs. Both native package/runtime children and all three
+cancellation barriers bind the actual main commit and matching driver hash;
+both audit reports score 95 with zero findings/caps. The first main CI attempt
+exceeded the unchanged 180-second database subprocess bound and did not emit
+the captured child log. That failure remains retained; its cause is not proven.
+One failed-job-only retry on the same commit passed all 34 database tests with
+SQLite 3.53.2 (36.81 seconds compilation, 6.33 seconds tests), then passed the
+dependent aggregate. CI attempt 2 retains 12 successful executions from attempt
+1; only database and aggregate executed again. API history binds retained jobs
+to their original execution IDs/times rather than counting them as new work.
+The complete post-main run and root exit-0/destroyed-workspace receipts passed
+verification at 04:06 UTC. No test, timeout or source changed for the retry.
 The preceding d833 head passed both native package children, Security and
 Jankurai (95, zero findings/caps), but standalone e2e failed because its
 synthetic cancellation victim could finish while waiting for a separate main
@@ -161,11 +170,21 @@ The fresh Actions-policy audit found 24 live workflow files in seven active
 repositories: jailgun, ai-veox-app, bullet-kernel, JopeDime, demo-repository,
 redline and dope. The initial 46 definitions also include GitHub-disabled static
 mirrors. Keep their local-forge source authority and disabled GitHub Actions;
-do not enable duplicate CI to inflate migration counts. Demo, Dope Linux and
-application main migrations have landed with post-merge proof; Jailgun merged
-after all exact-head gates and post-main verification is in progress. Full platform
+do not enable duplicate CI to inflate migration counts. Demo, Dope Linux,
+application main and Jailgun migrations have landed with post-merge proof. Full platform
 migration remains incomplete. Old hosted-label jobs are queued behind the disabled
 policy. Existing local product runners remain until their replacements qualify.
+
+Selected product receipts now cover 49 successful executions in 21 successful
+workflow runs across all three physical hosts. Live root verification found all
+49 exact per-job VM units stopped, their main/control PIDs zero, and generated
+disk/seed files absent. Two earlier manual cleanup recoveries still retain the
+original controller exit 2; they are not relabeled automatic cleanup passes.
+The 04:02 UTC current-main routing readback covers nine workflow files and 21
+shared-group job selectors, with no hosted fallback in migrated files. Dope's
+later main `66131fd8a42f771c7c26ca98c2ca23c8e115e4a4` retains the routing;
+inspection alone does not qualify that later product head. Its GPU workflow
+remains a local capability exception pending shared GPU isolation/corpus proof.
 
 Ubuntu 26.04 source is the official 20260927 cloud image, SHA256
 `8800651811af9a85465ad1d552add729947bb16488dddb4a9b5305a3d97332b2`.
@@ -181,8 +200,11 @@ general group; it does not dedicate a runner to Jailgun.
 Cache audit `neverhuman-cache-limit-audit-2026-10-04.json` read all 41 repository
 storage limits successfully: each is 10 GB. The org eviction setting is also
 10 GB. Eviction is not a spending guarantee; the $0 Actions stop-usage budget
-is the billing control. The 03:12 UTC October 5 browser readback still reports $0 Actions
-billable, 0 private hosted minutes and 0.5 GB of the included 2 GB storage.
+is the billing control. The 03:55 UTC October 5 owner-browser readback reports
+$0 Actions billable, $108.87 gross usage fully offset by $108.87 discounts,
+0 private hosted minutes and 0.5 GB of the included 2 GB storage. The existing
+three-seat GitHub Team subscription remains $12/month. Delayed storage billing
+after the final migration window has not yet been verified.
 Billing storage reporting lags; a later post-rollout readback is still required.
 Gross Actions usage is now $108.86 and is fully offset by $108.86 discounts.
 Every observed compute/storage SKU has $0 billed; the historical public compute
@@ -666,7 +688,7 @@ after canonical reconciliation, not a mutation of the retired or sibling tree.
 ### Jope: source queue before another implementation lane
 
 Canonical xbabe2:/home/ubuntu/JopeDime has dirty main behind origin, modified
-AGENT_CHAT.md/MASTER_CLEAN_UP and an unrelated untracked .mcp file. At 03:16 UTC
+AGENT_CHAT.md/MASTER_CLEAN_UP and an unrelated untracked .mcp file. At 04:01 UTC
 October 5, main was 240 commits behind origin. Nine PRs were open:
 188, 186, 185, 180, 178, 177, 148, 147, 137. Seven registered worktrees
 already exceed its four-lane ceiling. Read AGENTS.md, MASTER_CLEAN_UP, AGENT_CHAT
