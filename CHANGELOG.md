@@ -15,6 +15,11 @@
   setting reappears.
 
 ## Unreleased
+- ci-kit 1.5.0: opt-in ed25519-signed lan-ci guest receipt. With
+  `NH_RECEIPT_SIGNING=required`, `launch.sh` seeds each guest with a receipt
+  bound to its runner name, image and qualification hashes and issue time;
+  `verify-receipt.sh` checks it against a published host key. A missing key
+  fails closed; the default `off` keeps existing pool behaviour.
 - Fence scheduler transitions by the complete lease, runner epoch and current
   scheduler time. Expiration consumes retry attempts, cancellation is terminal,
   and an idempotent expiry sweep emits retry or failure receipts. Direct

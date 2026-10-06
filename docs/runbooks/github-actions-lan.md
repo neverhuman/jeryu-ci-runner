@@ -793,3 +793,34 @@ runner receipts, and test failure/queue recovery. Disable the managed updater
 only after that replacement proves equivalent behavior. Generated update jobs
 remain an explicitly recorded exception until then. No replacement updater or
 new updater credential has been created during this rollout.
+
+## Signed guest receipts for lan-ci jobs (opt-in, not deployed)
+
+Problem: a lan-ci guest gets only `/etc/profile.d/neverhuman-ci.sh` from its
+seed. The image and qualification receipts stay root-only on the host
+(`/var/lib/neverhuman-actions/receipts/`, unsigned) and the guest cannot reach
+the host, so a job cannot tell a pool VM from any other runner carrying the same
+labels. Consumers that bind provenance, such as JopeDime main-guard, therefore
+cannot use the general pool.
+
+Design (kit 1.5.0): with `NH_RECEIPT_SIGNING=required`, `launch.sh` signs a
+receipt with a host-local, root-only ed25519 key and writes it into the
+read-only cloud-init seed as `/etc/neverhuman-ci/receipt.json` and `.sig`. It
+binds the JIT runner name (`$RUNNER_NAME`), physical host, lane, image hash,
+image and qualification receipt hashes, qualification log hash, issue time and
+a nonce. `verify-receipt.sh` checks it against a published, pinned public key
+(`ops/ci-kit/github-actions/receipt-keys/<host>.pub`), the runner name, its age
+and the guest's boot time. The default `off` writes exactly what earlier kits
+wrote.
+
+Limits: the receipt attests what the controller launched, not what the job did
+afterwards. A job owns its guest, so it can copy or alter files there; replaying
+a copied receipt elsewhere still needs the same runner name, a guest booted
+within the window and a fresh issue time. It is not a hardware attestation.
+
+Rollout (owner decision through ENG:watcher; nothing here deploys it): on each
+host run `receipt-keygen.sh`, publish `<host>.pub` by PR, install the kit with
+`provision.sh --prepare` using the atomic procedure above, add the
+`NH_RECEIPT_SIGNING=required` drop-in and `daemon-reload` (new controller starts pick it up;
+never restart a busy controller), then prove a
+real job verifies its receipt before any consumer requires it.
