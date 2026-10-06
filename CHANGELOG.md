@@ -15,6 +15,13 @@
   setting reappears.
 
 ## Unreleased
+- ci-kit 1.5.2: a pinned receipt key must be byte-for-byte OpenSSL's canonical
+  public PEM of one ed25519 key, and anything `openssl pkey -in` loads as a
+  private key is refused, in the verifier and in the `receipt-keys/` check
+  (new `verify-receipt.sh --check-key`). Closes a private key relabelled
+  `PUBLIC KEY` (accepted on OpenSSL 3.5.7), an appended tab-header private
+  block and appended header-less private base64. `--max-age` is capped at
+  604800 s. Receipt selftest: 65 checks.
 - ci-kit 1.5.1: harden the signed lan-ci guest receipt after review. The
   verifier refuses any pinned key file holding `PRIVATE KEY` material (OpenSSL
   3.5 accepts one under `-pubin`) or anything but one ed25519 PEM public key,

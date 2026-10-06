@@ -47,21 +47,27 @@ until a host sets `NH_RECEIPT_SIGNING=required` (for example a
       bash verify-receipt.sh --pubkey-dir <pinned copy of receipt-keys/>
 
   It reads the receipt, signature and pinned key once each into a private
-  0600 temp copy (removed by a trap) and interprets only the copies. It
-  refuses a pinned file that holds any `PRIVATE KEY` material or is not
-  exactly one ed25519 PEM public key (OpenSSL 3.5 would otherwise accept a
-  private key under `-pubin`), a signature that is not 64 bytes and a receipt
-  over 64 KiB. It then checks the signature against the pinned key, the schema
+  0600 temp copy (removed by a trap) and interprets only the copies. A
+  pinned file must be byte-for-byte OpenSSL's canonical re-encoding of one
+  ed25519 public key (`openssl pkey -pubin -in F -pubout`, compared with
+  `cmp`), and anything `openssl pkey -in F` (without `-pubin`) loads as a
+  private key is refused. That covers private keys relabelled `PUBLIC KEY`
+  (which OpenSSL 3.5 would otherwise accept under `-pubin`), appended private
+  blocks with odd headers and header-less private base64. It also refuses a
+  signature that is not 64 bytes and a receipt over 64 KiB. It then checks the signature against the pinned key, the schema
   and `key_id`, `runner_name == instance == $RUNNER_NAME`, freshness
   (`--max-age`, default 86400 s; at most 60 s in the future) and that the guest
   booted within `--boot-window` (default 900 s) after issue. Numeric options
-  must be canonical integers (no sign, no leading zero, at most 12 digits). It
+  must be canonical integers (no sign, no leading zero, at most 12 digits), and
+  `--max-age` may not exceed 604800 s (7 days).
+  `verify-receipt.sh --check-key FILE` applies the pinned-key rule alone. It
   prints the verified receipt.
   Equivalent recipe without the script: `openssl pkeyutl -verify -pubin -inkey
   <host>.pub -rawin -in receipt.json -sigfile receipt.json.sig`, then compare
   the fields above with `jq`.
 - `receipt-keys/` may hold only `README.md` and public `<host>.pub` files; the
-  selftest fails on any `*.key` file or `PRIVATE KEY` material there.
+  selftest runs `verify-receipt.sh --check-key` on each `*.pub` and fails on
+  any other file, any `*.key` file or any `PRIVATE KEY` material there.
 - `test/receipt-selftest.sh` (run by `test/selftest.sh`) covers signing,
   fail-closed key checks, the test-only override, seed encoding, pinned-key
   hygiene and every verifier refusal offline.

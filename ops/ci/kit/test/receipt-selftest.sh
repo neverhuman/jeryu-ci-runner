@@ -168,14 +168,13 @@ TMPDIR="${work}/tmp" expect_fail "refusal still verifies only the copy" pv --pub
 if [[ -z "$(ls -A "${work}/tmp")" ]]; then pass "private snapshot is removed"; else flunk "private snapshot is removed"; fi
 
 # The published key directory may hold only README.md and public *.pub keys.
-keys_clean() { # [dir]
+keys_clean() { # [dir]: only README.md and canonical ed25519 public <host>.pub files
   local f dir=${1:-${ga}/receipt-keys}
   for f in "${dir}"/* "${dir}"/.[!.]*; do
     [[ -e $f || -L $f ]] || continue
     case ${f##*/} in
       README.md) ;;
-      *.pub) [[ -f $f && ! -L $f ]] && ! grep -q 'PRIVATE KEY' "$f" &&
-               [[ $(head -n1 "$f") == '-----BEGIN PUBLIC KEY-----' ]] || return 1 ;;
+      *.pub) bash "${ga}/verify-receipt.sh" --check-key "$f" >/dev/null 2>&1 || return 1 ;;
       *) return 1 ;;
     esac
   done
@@ -189,6 +188,31 @@ cp "${work}/signing.key" "${work}/badkeys/xbabe3.key"
 expect_fail "a *.key file under receipt-keys is caught" keys_clean "${work}/badkeys"
 rm -- "${work}/badkeys/xbabe3.key"; cp "${work}/signing.key" "${work}/badkeys/xbabe3.pub"
 expect_fail "a private key named *.pub under receipt-keys is caught" keys_clean "${work}/badkeys"
+
+# Review 5424329879: private material disguised past text checks. The pinned file must be
+# OpenSSL's canonical public PEM byte for byte, and must not load as a private key.
+b64body() { sed '/^-----/d' "$1"; }
+{ echo '-----BEGIN PUBLIC KEY-----'; b64body "${work}/signing.key"; echo '-----END PUBLIC KEY-----'; } > "${work}/relabelled.pub"
+{ cat "${work}/signing.pub"; printf -- '-----BEGIN\tPRIVATE\tKEY-----\n'; b64body "${work}/signing.key"; printf -- '-----END\tPRIVATE\tKEY-----\n'; } > "${work}/tabblock.pub"
+{ cat "${work}/signing.pub"; b64body "${work}/signing.key"; } > "${work}/rawtail.pub"
+{ cat "${work}/signing.pub"; printf '   \n'; } > "${work}/padded.pub"
+mkdir -p "${work}/relabeldir"; cp "${work}/relabelled.pub" "${work}/relabeldir/xbabe2.pub"
+expect_fail "(a) a private key relabelled PUBLIC KEY is refused (--pubkey)" pv --pubkey "${work}/relabelled.pub"
+expect_fail "(a) a private key relabelled PUBLIC KEY is refused (--pubkey-dir)" pv --pubkey-dir "${work}/relabeldir"
+expect_fail "(a) a relabelled private key fails the receipt-keys check" keys_clean "${work}/relabeldir"
+expect_fail "(b) a public key plus a tab-header private block is refused" pv --pubkey "${work}/tabblock.pub"
+expect_fail "(c) a public key plus header-less private base64 is refused" pv --pubkey "${work}/rawtail.pub"
+expect_fail "trailing whitespace after the public key is refused" pv --pubkey "${work}/padded.pub"
+for bad in tabblock rawtail padded; do
+  rm -rf "${work}/kc"; mkdir -p "${work}/kc"; cp "${work}/${bad}.pub" "${work}/kc/xbabe2.pub"
+  expect_fail "receipt-keys check refuses ${bad}" keys_clean "${work}/kc"
+done
+pv --pubkey "${work}/relabelled.pub" > /dev/null 2> "${work}/err" || true
+if grep -q 'loads as a private key\|not the canonical PEM' "${work}/err"; then pass "(a) refused as private or non-canonical"; else flunk "(a) refused as private or non-canonical"; fi
+expect_ok "--check-key accepts a canonical ed25519 public key" bash "${ga}/verify-receipt.sh" --check-key "${work}/signing.pub"
+expect_fail "--check-key refuses a relabelled private key" bash "${ga}/verify-receipt.sh" --check-key "${work}/relabelled.pub"
+expect_ok "--max-age at the 7-day cap is accepted" pv --pubkey "${work}/signing.pub" --max-age 604800
+expect_usage "--max-age above the 7-day cap is a usage error" --max-age 604801
 
 if (( failures > 0 )); then
   printf 'receipt selftest: %d failure(s)\n' "${failures}" >&2
