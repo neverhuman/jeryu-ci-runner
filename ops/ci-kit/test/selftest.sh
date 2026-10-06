@@ -104,6 +104,82 @@ else
   flunk "secret scan streams files and skips excluded paths"
 fi
 
+# Installation receipts. require_jankurai accepts a governed v3 receipt (a
+# key-signed public release) and, for the transition, a v2 one (a hermetic
+# source build); anything else binds nothing. The binary is a private stub, so
+# its receipt is passed explicitly and named by its own digest.
+mkdir -p "${work}/jk/bin" "${work}/jk/receipts"
+printf '#!/bin/sh\necho "jankurai 1.7.2"\n' > "${work}/jk/bin/jankurai"
+chmod 0755 "${work}/jk/bin/jankurai"
+jk_sha="$(sha256sum "${work}/jk/bin/jankurai" | awk '{print $1}')"
+jq -n --arg sha "${jk_sha}" --arg path "${work}/jk/bin/jankurai" '{
+  schema:"jeryu.jankurai-installation/v3",
+  source:{remote:"https://example.invalid/jankurai-audit",tag:"v1.7.2",
+    commit:("1"*40),tree:("2"*40),asset:"jankurai-1.7.2-x86_64-unknown-linux-gnu.tar.gz",
+    archive_sha256:("3"*64),provenance_sha256:("4"*64),family_lock_sha256:("5"*64),
+    cargo_lock_sha256:("6"*64),verification:"release-key-signed"},
+  signature:{scheme:"cosign-key-offline",verified:true,signer_sha256:("7"*64),
+    cosign_sha256:("8"*64),transparency_log:false},
+  build:{mode:"public-release-key-signed-v1",rustc:"rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    cargo:"cargo 1.97.1 (c980f4866 2026-06-30)",target_triple:"x86_64-unknown-linux-gnu"},
+  governance:{status:"governed",
+    manifest_repo:"https://git.neverhuman.org/git/jeryu/jeryu-tool.git",
+    manifest_commit:("a"*40),manifest_tree:("b"*40),manifest_sha256:("c"*64),
+    protected_main:true,protection_policy:"immutable-main-v1"},
+  binary:{sha256:$sha,version_output:"jankurai 1.7.2"},
+  installation:{path:$path,atomic:true},test_mode:false,conclusion:"success"}' \
+  > "${work}/jk/v3.json"
+jq '.schema = "jeryu.jankurai-installation/v2"
+  | .source = {remote:"https://example.invalid/jankurai.git",commit:("1"*40),
+      tag:"v1.6.11-split",tree:("2"*40),archive_sha256:("3"*64),
+      cargo_lock_sha256:("4"*64),verification:"release-authoritative"}
+  | del(.signature)
+  | .build = {rustc:"rustc 1.95.0 (59807616e 2026-04-14)",
+      cargo:"cargo 1.95.0 (f2d3ce0bd 2026-03-21)",target_triple:"x86_64-unknown-linux-gnu",
+      mode:"oci-vendor-locked-offline-workspace-member-v2",
+      builder_image:("rust@sha256:"+("5"*64)),context_sha256:("8"*64),
+      cargo_net_offline:true,closed_vendor:true,network_none:true,read_only_root:true,
+      non_root:true,capabilities_dropped:true,no_new_privileges:true,
+      container_engine_path:"/usr/bin/docker",git_global_config_disabled:true,
+      git_system_config_disabled:true,git_http_follow_redirects:false,
+      git_terminal_prompt:false,jankurai_update_check:false,
+      network_scope:"local-forge-source-plus-closed-vendor-network-none"}' \
+  "${work}/jk/v3.json" > "${work}/jk/v2.json"
+# receipt_case <base> <jq mutation> [expected verification]: verify the stub
+# against a self-named receipt made from <base> with one change.
+receipt_case() {
+  local base="$1" mutation="$2" verification="${3:-}" staged digest
+  staged="${work}/jk/staged.json"
+  jq "${mutation}" "${work}/jk/${base}.json" > "${staged}"
+  digest="$(sha256sum "${staged}" | awk '{print $1}')"
+  rm -f -- "${work}"/jk/receipts/*.json
+  mv -- "${staged}" "${work}/jk/receipts/${digest}.json"
+  env -u JERYU_JANKURAI_ALLOW_TEST_RECEIPT -u JAIN_RELEASE_CI \
+    JERYU_GOVERNED_JANKURAI_BIN="${work}/jk/bin/jankurai" \
+    JERYU_JANKURAI_RECEIPT="${work}/jk/receipts/${digest}.json" \
+    bash -c 'source "$0/lib/jankurai.sh" && require_jankurai &&
+      [[ -z "$1" || "${JERYU_JANKURAI_VERIFICATION}" == "$1" ]]' "${kit_dir}" "${verification}"
+}
+expect_ok "governed v3 receipt verifies" receipt_case v3 . release-key-signed
+expect_ok "transitional v2 receipt verifies" receipt_case v2 . release-authoritative
+for mutation in '.signature.verified = false' 'del(.signature)' \
+  '.signature.scheme = "cosign-keyless"' '.signature.signer_sha256 = "release.pub"' \
+  '.source.verification = "release-authoritative"' \
+  '.build.mode = "oci-vendor-locked-offline-workspace-member-v2"' \
+  '.source.tag = "v1.6.11-split"' '.schema = "jeryu.jankurai-installation/v4"' \
+  '.schema = "jeryu.jankurai-installation/v2"' '.binary.sha256 = ("0"*64)' \
+  '.installation.path = "/elsewhere/jankurai"' '.governance.protected_main = false' \
+  '.test_mode = true'; do
+  expect_fail "v3 receipt refused: ${mutation}" receipt_case v3 "${mutation}"
+done
+for mutation in '.build.closed_vendor = false' '.source.verification = "release-key-signed"' \
+  '.schema = "jeryu.jankurai-installation/v3"' '.binary.sha256 = ("0"*64)'; do
+  expect_fail "v2 receipt refused: ${mutation}" receipt_case v2 "${mutation}"
+done
+expect_fail "receipt not named by its digest is refused" env \
+  JERYU_GOVERNED_JANKURAI_BIN="${work}/jk/bin/jankurai" JERYU_JANKURAI_RECEIPT="${work}/jk/v3.json" \
+  bash -c 'source "$0/lib/jankurai.sh" && require_jankurai' "${kit_dir}"
+
 if (( failures > 0 )); then
   printf 'ci-kit selftest: %d failure(s)\n' "${failures}" >&2
   exit 1
