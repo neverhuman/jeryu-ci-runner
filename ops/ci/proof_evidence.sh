@@ -199,10 +199,12 @@ baseline_sha256="$(sha256sum target/jankurai/accepted-baseline.json | \
 trap - EXIT HUP INT TERM
 cleanup_baseline
 
+# Jankurai 1.6.11 writes git.head as a 7-character prefix; 1.7 writes the full
+# commit id. Either names exactly this commit.
 short_base="${base_commit:0:7}"
-jq -e --arg base "${short_base}" \
+jq -e --arg base "${short_base}" --arg base_full "${base_commit}" \
   --argjson floor "${effective_floor}" \
-  '.git.head == $base and .git.dirty_worktree == false and
+  '(.git.head == $base or .git.head == $base_full) and .git.dirty_worktree == false and
    (.score | type == "number") and .decision.minimum_score == $floor and
    .decision.hard_findings == 0 and (.caps_applied | length) == 0 and
    .decision.passed == true' \
@@ -238,10 +240,12 @@ jq -e --arg head "${current_head}" \
      "hosted-dependency-sources", "syft-1.40.0-cyclonedx"] - .checks |
      length) == 0' \
   target/security/evidence.json >/dev/null
-jq -e --arg root "${ROOT}" \
+# copy-code stamps the version of the binary that ran it; bind it to the
+# receipt-verified auditor require_jankurai selected (1.6.11 or 1.7.x).
+jq -e --arg root "${ROOT}" --arg auditor "${JERYU_JANKURAI_SEMVER:?require_jankurai did not export JERYU_JANKURAI_SEMVER}" \
   '.schema_version == "1.1.0" and
    .generated_by == "jankurai copy-code" and
-   .auditor_version == "1.6.10" and .repo == $root and
+   .auditor_version == $auditor and .repo == $root and
    (.status == "pass" or .status == "review") and
    (.classes | type == "array") and
    .summary.hard_classes == 0 and .summary.hard_instances == 0 and
@@ -268,10 +272,10 @@ jq -e --arg root "${ROOT}" \
 # Bind and revalidate the protected-main ratchet output at the repository's
 # fleet-wide merge floor.
 jq -e \
-  --arg head "${short_head}" \
+  --arg head "${short_head}" --arg head_full "${current_head}" \
   --argjson baseline_score "${baseline_score}" \
   --argjson floor "${effective_floor}" \
-  '.git.head == $head and .git.dirty_worktree == false and
+  '(.git.head == $head or .git.head == $head_full) and .git.dirty_worktree == false and
    .score >= $floor and .decision.minimum_score == $floor and
    (.caps_applied | length) == 0 and
    .decision.hard_findings == 0 and .decision.passed == true and
