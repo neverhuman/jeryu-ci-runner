@@ -46,8 +46,13 @@ until a host sets `NH_RECEIPT_SIGNING=required` (for example a
 
       bash verify-receipt.sh --pubkey-dir <pinned copy of receipt-keys/>
 
-  It reads the receipt, signature and pinned key once each into a private
-  0600 temp copy (removed by a trap) and interprets only the copies. A
+  It opens the receipt, signature and pinned key once each and reads them
+  through that descriptor into a private 0600 temp copy (removed by a trap),
+  then interprets only the copies. Symlinks are never followed: the opened
+  file must be the regular file the path names (same device, inode and type,
+  fstat of the open descriptor against lstat of the path after the open), so a
+  symlink or a file swapped in after a check is refused; a FIFO cannot hang it
+  (bounded by `timeout`). A
   pinned file must be byte-for-byte OpenSSL's canonical re-encoding of one
   ed25519 public key (`openssl pkey -pubin -in F -pubout`, compared with
   `cmp`), and anything `openssl pkey -in F` (without `-pubin`) loads as a
@@ -67,7 +72,8 @@ until a host sets `NH_RECEIPT_SIGNING=required` (for example a
   the fields above with `jq`.
 - `receipt-keys/` may hold only `README.md` and public `<host>.pub` files; the
   selftest runs `verify-receipt.sh --check-key` on each `*.pub` and fails on
-  any other file, any `*.key` file or any `PRIVATE KEY` material there.
+  any symlink, any other file, any `*.key` file or any `PRIVATE KEY` material
+  there.
 - `test/receipt-selftest.sh` (run by `test/selftest.sh`) covers signing,
   fail-closed key checks, the test-only override, seed encoding, pinned-key
   hygiene and every verifier refusal offline.

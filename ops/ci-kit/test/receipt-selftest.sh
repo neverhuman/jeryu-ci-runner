@@ -145,6 +145,37 @@ expect_fail "a symlinked pinned key is refused" pv --pubkey "${work}/link.pub"
 pv --pubkey "${work}/signing.key" > /dev/null 2> "${work}/err" || true
 if grep -q 'private key material' "${work}/err"; then pass "private pinned key is refused by name"; else flunk "private pinned key is refused by name"; fi
 
+# Every input is opened once without following a symlink (1.5.3): the opened file must be the
+# regular file the path names, so neither a symlink nor a file swapped in after a check is read.
+ln -s "$r" "${work}/link-receipt.json"
+cp "$r" "${work}/plain-receipt.json"; ln -s "$r.sig" "${work}/plain-receipt.json.sig"
+mkfifo "${work}/fifo.pub"
+mkdir -p "${work}/linkkeys"; ln -s "${work}/signing.pub" "${work}/linkkeys/xbabe2.pub"
+expect_fail "a symlinked receipt is refused" pv --receipt "${work}/link-receipt.json" --sig "$r.sig" --pubkey "${work}/signing.pub"
+expect_fail "a symlinked signature is refused" pv --receipt "${work}/plain-receipt.json" --pubkey "${work}/signing.pub"
+expect_fail "a FIFO pinned key is refused without blocking" timeout 20 bash "${ga}/verify-receipt.sh" --check-key "${work}/fifo.pub"
+expect_fail "--check-key refuses a symlink to a real public key" bash "${ga}/verify-receipt.sh" --check-key "${work}/link.pub"
+expect_fail "receipt-keys check refuses a symlinked <host>.pub" keys_clean "${work}/linkkeys"
+# Swap race (ENG:watcher review 5424405493): race.pub flips between a symlink to the key that
+# signed the receipt and a regular file holding another key, so any verified run means the
+# symlink was followed. 1.5.2 lost about 25% of runs; this must be zero.
+race_runs=${NH_RECEIPT_RACE_RUNS:-200}
+cp "${work}/other.pub" "${work}/race.pub"
+( cd "${work}" && while :; do ln -sfn signing.pub race.tl && mv -fT race.tl race.pub; cp other.pub race.tr && mv -f race.tr race.pub; done ) &
+swapper=$!
+race_wins=0 race_seen=0
+for ((i = 0; i < race_runs; i++)); do
+  if pv --pubkey "${work}/race.pub" > /dev/null 2> "${work}/race.err"; then
+    race_wins=$((race_wins + 1))
+  elif grep -q 'symlink\|changed while being opened' "${work}/race.err"; then
+    race_seen=$((race_seen + 1))
+  fi
+done
+kill "$swapper" 2>/dev/null; wait "$swapper" 2>/dev/null || true
+echo "     swap race: ${race_runs} runs, ${race_wins} verified through the symlink, ${race_seen} refused as symlink/changed"
+if (( race_wins == 0 )); then pass "swap race never verifies through a symlink (${race_runs} runs)"; else flunk "swap race verified through a symlink ${race_wins}/${race_runs} times"; fi
+if (( race_seen > 0 )); then pass "swap race was exercised (symlink seen ${race_seen} times)"; else flunk "swap race was exercised"; fi
+
 # Strict numeric options and bounded inputs.
 pvu() { pv --pubkey "${work}/signing.pub" "$@" >/dev/null 2>&1; }
 expect_usage() { # <name> <args...>: the verifier must exit 2 (usage), not 0 or 1
@@ -172,6 +203,7 @@ keys_clean() { # [dir]: only README.md and canonical ed25519 public <host>.pub f
   local f dir=${1:-${ga}/receipt-keys}
   for f in "${dir}"/* "${dir}"/.[!.]*; do
     [[ -e $f || -L $f ]] || continue
+    [[ ! -L $f ]] || return 1
     case ${f##*/} in
       README.md) ;;
       *.pub) bash "${ga}/verify-receipt.sh" --check-key "$f" >/dev/null 2>&1 || return 1 ;;

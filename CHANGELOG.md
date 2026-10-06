@@ -15,6 +15,14 @@
   setting reappears.
 
 ## Unreleased
+- ci-kit 1.5.3: `verify-receipt.sh` opens the receipt, signature and pinned
+  key once each and reads only through that descriptor, after checking that
+  the opened file is the regular file the path names (fstat vs lstat of
+  device, inode and type). The separate symlink pre-check, which a swap could
+  race about 25% of the time, is gone; `--check-key` and the `receipt-keys/`
+  check use the same path. New tests: symlinked receipt, signature and
+  `--check-key` input, a FIFO key, and a symlink swap-race loop that must show
+  zero symlink wins. Receipt selftest: 72 checks.
 - ci-kit 1.5.2: a pinned receipt key must be byte-for-byte OpenSSL's canonical
   public PEM of one ed25519 key, and anything `openssl pkey -in` loads as a
   private key is refused, in the verifier and in the `receipt-keys/` check

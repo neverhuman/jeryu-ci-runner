@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Guest-side verifier for the signed lan-ci receipt written by launch.sh (receipt.sh).
-# Standalone: needs bash, jq, openssl, sha256sum and cmp; never sources the host controller.
+# Standalone: needs bash, jq, openssl and coreutils; never sources the host controller.
 #   verify-receipt.sh (--pubkey FILE | --pubkey-dir DIR) [--receipt FILE] [--sig FILE]
 #                     [--runner-name NAME] [--max-age SECONDS] [--boot-window SECONDS]
 #                     [--now EPOCH] [--boot-time EPOCH]
@@ -10,8 +10,8 @@
 # byte-for-byte OpenSSL's own canonical re-encoding of one ed25519 public key
 # (`openssl pkey -pubin -in F -pubout`), and anything `openssl pkey -in F` (no -pubin) loads
 # as a private key is refused; relabelled, appended or header-less private material fails on
-# every OpenSSL version. The receipt, signature and key are each read once into a private
-# 0600 copy and only the copies are interpreted. Checks: ed25519 signature, schema, key_id,
+# every OpenSSL version. The receipt, signature and key are each opened once, without
+# following a symlink, and read into a private 0600 copy; only the copies are interpreted. Checks: ed25519 signature, schema, key_id,
 # runner_name == instance == $RUNNER_NAME, issued no later than now+60s and no older than
 # --max-age (default 86400, at most 604800), and that this guest booted within --boot-window
 # seconds after issue (default 900; 0 disables). Prints the verified receipt JSON on
@@ -43,22 +43,41 @@ while [[ $# -gt 0 ]]; do
 done
 for value in "$max_age" "$boot_window" "${now:-0}" "${boot_time:-0}"; do is_uint "$value" || usage; done
 (( max_age <= max_age_limit )) || usage
-for tool in jq openssl sha256sum mktemp cmp; do command -v "$tool" >/dev/null || refuse "missing tool $tool"; done
+for tool in jq openssl sha256sum mktemp cmp stat head timeout; do command -v "$tool" >/dev/null || refuse "missing tool $tool"; done
 
 work=$(mktemp -d)
 trap 'rm -rf -- "$work"' EXIT
 chmod 0700 "$work"
 umask 077
 # One bounded read of each input into the private directory; nothing re-reads the originals.
+# The input is opened once and read only through that descriptor. The opened file (fstat via
+# /proc/self/fd) must be the same regular file (dev:inode:type) that the path names when
+# lstat'ed after the open, so a symlink, or a file swapped in after a check, is never read.
+# The child runs under timeout so a FIFO raced in after the type check cannot hang us.
+# shellcheck disable=SC2016 # Expanded by the child bash, not here.
+snapshot_child='set -u
+exec {fd}<"$1" || exit 1
+opened=$(stat -L -c "%d:%i:%F" -- "/proc/self/fd/${fd}") || exit 3
+named=$(stat -c "%d:%i:%F" -- "$1") || exit 3
+[[ $opened == "$named" && ${named#*:*:} == regular* ]] || exit 3
+head -c "$(( $3 + 1 ))" <&"$fd" > "$2" || exit 1'
 snapshot() { # <source> <dest> <max bytes>
-  [[ -f $1 ]] || refuse "absent: $1"
-  head -c "$(( $3 + 1 ))" -- "$1" > "$2" || refuse "unreadable: $1"
-  (( $(stat -c %s -- "$2") <= $3 )) || refuse "larger than $3 bytes: $1"
+  local src=$1 dest=$2 max=$3 kind rc=0
+  kind=$(stat -c %F -- "$src" 2>/dev/null) || refuse "absent: $src"
+  [[ $kind != 'symbolic link' ]] || refuse "is a symlink: $src"
+  [[ $kind == regular* ]] || refuse "not a regular file: $src"
+  timeout 10 bash -c "$snapshot_child" snapshot "$src" "$dest" "$max" || rc=$?
+  case $rc in
+    0) ;;
+    3) refuse "changed while being opened (symlink or replaced file): $src" ;;
+    124) refuse "timed out reading: $src" ;;
+    *) refuse "unreadable: $src" ;;
+  esac
+  (( $(stat -c %s -- "$dest") <= max )) || refuse "larger than $max bytes: $src"
 }
 # A pinned key file must be exactly OpenSSL's canonical PEM of one ed25519 public key.
 pin_key() { # <path>: snapshot to $work/pinned.pub and validate, or refuse
   local path=$1 public_text
-  [[ ! -L $path ]] || refuse "pinned key is a symlink: $path"
   snapshot "$path" "$work/pinned.pub" 4096
   if grep -q 'PRIVATE KEY' "$work/pinned.pub"; then refuse "pinned key file holds private key material: $path"; fi
   # Without -pubin OpenSSL loads only private keys (3.0 and 3.5 alike); empty passphrase and
