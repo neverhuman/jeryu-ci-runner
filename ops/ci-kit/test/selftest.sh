@@ -104,6 +104,9 @@ else
   flunk "secret scan streams files and skips excluded paths"
 fi
 
+# Signed lan-ci guest receipt (github-actions/receipt.sh, verify-receipt.sh).
+expect_ok "signed guest receipt suite" bash "${kit_dir}/test/receipt-selftest.sh"
+
 if (( failures > 0 )); then
   printf 'ci-kit selftest: %d failure(s)\n' "${failures}" >&2
   exit 1

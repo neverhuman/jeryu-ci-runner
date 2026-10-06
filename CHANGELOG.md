@@ -15,6 +15,35 @@
   setting reappears.
 
 ## Unreleased
+- ci-kit 1.5.3: `verify-receipt.sh` opens the receipt, signature and pinned
+  key once each and reads only through that descriptor, after checking that
+  the opened file is the regular file the path names (fstat vs lstat of
+  device, inode and type). The separate symlink pre-check, which a swap could
+  race about 25% of the time, is gone; `--check-key` and the `receipt-keys/`
+  check use the same path. New tests: symlinked receipt, signature and
+  `--check-key` input, a FIFO key, and a symlink swap-race loop that must show
+  zero symlink wins. Receipt selftest: 72 checks.
+- ci-kit 1.5.2: a pinned receipt key must be byte-for-byte OpenSSL's canonical
+  public PEM of one ed25519 key, and anything `openssl pkey -in` loads as a
+  private key is refused, in the verifier and in the `receipt-keys/` check
+  (new `verify-receipt.sh --check-key`). Closes a private key relabelled
+  `PUBLIC KEY` (accepted on OpenSSL 3.5.7), an appended tab-header private
+  block and appended header-less private base64. `--max-age` is capped at
+  604800 s. Receipt selftest: 65 checks.
+- ci-kit 1.5.1: harden the signed lan-ci guest receipt after review. The
+  verifier refuses any pinned key file holding `PRIVATE KEY` material (OpenSSL
+  3.5 accepts one under `-pubin`) or anything but one ed25519 PEM public key,
+  verifies only a single private 0600 snapshot of the receipt, signature and
+  key, bounds their sizes, and accepts only canonical integers. The signing key
+  path and owner are fixed; `NH_RECEIPT_ALLOW_TEST_KEY=1` is test-only and the
+  controllers reject it. The key-type check reads only `-text_pub`. The selftest
+  rejects private material under `receipt-keys/`; the runbook adds the JopeDime
+  drain and swap-pin check before any reload, and the stale-receipt remedy.
+- ci-kit 1.5.0: opt-in ed25519-signed lan-ci guest receipt. With
+  `NH_RECEIPT_SIGNING=required`, `launch.sh` seeds each guest with a receipt
+  bound to its runner name, image and qualification hashes and issue time;
+  `verify-receipt.sh` checks it against a published host key. A missing key
+  fails closed; the default `off` keeps existing pool behaviour.
 - Fence scheduler transitions by the complete lease, runner epoch and current
   scheduler time. Expiration consumes retry attempts, cancellation is terminal,
   and an idempotent expiry sweep emits retry or failure receipts. Direct

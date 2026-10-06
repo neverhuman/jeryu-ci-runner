@@ -793,3 +793,57 @@ runner receipts, and test failure/queue recovery. Disable the managed updater
 only after that replacement proves equivalent behavior. Generated update jobs
 remain an explicitly recorded exception until then. No replacement updater or
 new updater credential has been created during this rollout.
+
+## Signed guest receipts for lan-ci jobs (opt-in, not deployed)
+
+Problem: a lan-ci guest gets only `/etc/profile.d/neverhuman-ci.sh` from its
+seed. The image and qualification receipts stay root-only on the host
+(`/var/lib/neverhuman-actions/receipts/`, unsigned) and the guest cannot reach
+the host, so a job cannot tell a pool VM from any other runner carrying the same
+labels. Consumers that bind provenance, such as JopeDime main-guard, therefore
+cannot use the general pool.
+
+Design (kit 1.5.0): with `NH_RECEIPT_SIGNING=required`, `launch.sh` signs a
+receipt with a host-local, root-only ed25519 key and writes it into the
+read-only cloud-init seed as `/etc/neverhuman-ci/receipt.json` and `.sig`. It
+binds the JIT runner name (`$RUNNER_NAME`), physical host, lane, image hash,
+image and qualification receipt hashes, qualification log hash, issue time and
+a nonce. `verify-receipt.sh` checks it against a published, pinned public key
+(`ops/ci-kit/github-actions/receipt-keys/<host>.pub`), the runner name, its age
+and the guest's boot time. The default `off` writes exactly what earlier kits
+wrote.
+
+Stale receipts: the default `--max-age` is 86400 s and a JIT listener can idle
+indefinitely. A lane whose VM waited more than 24 h for a job hands that job a
+receipt the verifier refuses as stale, and a consumer that requires the receipt
+fails closed. Remedy: confirm the lane is idle (GitHub runner `busy=false`, no
+Worker), then `systemctl restart neverhuman-runner@<lane>`; the replacement VM
+gets a fresh receipt. Never restart a busy controller. A consumer may instead
+pass a larger `--max-age`; it must not disable the check.
+
+Limits: the receipt attests what the controller launched, not what the job did
+afterwards. A job owns its guest, so it can copy or alter files there; replaying
+a copied receipt elsewhere still needs the same runner name, a guest booted
+within the window and a fresh issue time. It is not a hardware attestation.
+
+Rollout (owner decision through ENG:watcher; nothing here deploys it):
+
+1. JopeDime freeze first, on xbabe1 and xbabe2, BEFORE any `provision.sh
+   --prepare`, drop-in change or anything else that runs `systemctl
+   daemon-reload`. A daemon-reload resets every live docker scope to unlimited
+   swap (runc registers `MemorySwapMax=infinity`), so a JopeDime listener that
+   started before the reload fails its next job's swap check. Post a FREEZE in
+   JopeDime AGENT_CHAT.md, `systemctl stop` (never disable) every
+   `jope-runner@*.timer`, wait for busy `jope-runner@*` jobs to finish on
+   their own (never kill one), then stop the idle listeners.
+2. On each host run `receipt-keygen.sh` and publish `<host>.pub` by PR.
+3. Install the kit with `provision.sh --prepare` using the atomic procedure
+   above, and add the `NH_RECEIPT_SIGNING=required` drop-in. Both reload
+   systemd; new controller starts pick the drop-in up. Never restart a busy
+   neverhuman controller.
+4. `systemctl start` (not enable) the JopeDime timers again, keeping each
+   unit's enabled state, and verify that a freshly started listener's
+   `docker-<id>.scope` shows `MemorySwapMax=0` and `memory.swap.max` 0 (the
+   JopeDime #205 swap pin, logged as `swap pin: ... MemorySwapMax=0`). Then
+   post UNFREEZE.
+5. Prove a real lan-ci job verifies its receipt before any consumer requires it.

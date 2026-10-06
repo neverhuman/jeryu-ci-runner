@@ -3,6 +3,9 @@
 set -euo pipefail
 # shellcheck source=common.sh
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
+# shellcheck source=receipt.sh
+source "$(dirname "${BASH_SOURCE[0]}")/receipt.sh"
+nh_receipt_refuse_test_override
 nh_require_root
 lane=${1:?lane must be 1 through 4}
 case "$lane" in 1|2|3|4) ;; *) exit 2 ;; esac
@@ -17,6 +20,8 @@ printf '%s  %s\n' "$expected" "$NH_GOLD_IMAGE" | sha256sum -c - >/dev/null
 available=$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)
 [[ $available -ge 12582912 ]] || { echo 'Memory admission refused' >&2; exit 2; }
 nft list table inet neverhuman_actions >/dev/null || { echo 'Egress policy unavailable' >&2; exit 2; }
+# Opt-in signed guest receipt (receipt.sh): refuse before any VM or JIT config exists.
+if nh_receipt_enabled; then nh_receipt_check_key; fi
 NH_INSTANCE="$NH_HOST-lan-$lane-$(date -u +%Y%m%d%H%M%S)-$RANDOM"
 NH_UNIT="neverhuman-$NH_INSTANCE"
 NH_PORT=$((22600 + lane))
@@ -33,6 +38,12 @@ write_files:
       export AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache
       export RUNNER_TOOL_CACHE=/opt/hostedtoolcache
 CLOUD
+guest_receipt_sha256=''
+if nh_receipt_enabled; then
+  nh_receipt_issue "$lane" "$expected"
+  nh_receipt_cloud_files >> "$NH_JOB/user-data"
+  guest_receipt_sha256=$(sha256sum "$NH_JOB/guest-receipt.json" | cut -d' ' -f1)
+fi
 nh_seed "$NH_JOB/user-data"
 nh_vm_start "$NH_JOB/disk.qcow2" "$NH_JOB/seed.img" 8 8192
 deadline=$((SECONDS + 300))
@@ -48,8 +59,8 @@ runner_id=$(jq -er '.runner.id' <<< "$response")
 jit=$(jq -er '.encoded_jit_config' <<< "$response")
 receipt=$NH_STATE/receipts/$NH_INSTANCE.json
 jq -n --arg host "$NH_HOST" --arg instance "$NH_INSTANCE" --arg image_sha256 "$expected" \
-  --argjson runner_id "$runner_id" --arg time "$(date -u +%FT%TZ)" \
-  '{phase:"runner-started",host:$host,instance:$instance,runner_id:$runner_id,image_sha256:$image_sha256,time:$time,ephemeral:true,group:"neverhuman-lan"}' > "$receipt"
+  --argjson runner_id "$runner_id" --arg time "$(date -u +%FT%TZ)" --arg guest_receipt_sha256 "$guest_receipt_sha256" \
+  '{phase:"runner-started",host:$host,instance:$instance,runner_id:$runner_id,image_sha256:$image_sha256,time:$time,ephemeral:true,group:"neverhuman-lan"} + (if $guest_receipt_sha256 == "" then {} else {guest_receipt_sha256:$guest_receipt_sha256} end)' > "$receipt"
 echo "Runner $runner_id started on physical host $NH_HOST instance=$NH_INSTANCE"
 set +e
 # shellcheck disable=SC2016 # The guest shell expands the single-use JIT config.

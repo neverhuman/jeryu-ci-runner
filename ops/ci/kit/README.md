@@ -15,6 +15,69 @@ repository as a pinned copy (the same model as the Jankurai pin).
 Repository-specific lanes (fleet score floor, extra security tools, the lanes
 a `pr-ci.sh` runs) stay in each repository's `ops/ci/`.
 
+### Signed guest receipts (opt-in)
+
+`github-actions/launch.sh` can hand each lan-ci guest an ed25519-signed receipt
+through its cloud-init seed, so a job can prove it runs in a VM that this pool
+controller launched from a qualified image. Off by default; nothing changes
+until a host sets `NH_RECEIPT_SIGNING=required` (for example a
+`neverhuman-runner@.service.d/` drop-in with `Environment=NH_RECEIPT_SIGNING=required`).
+
+- Key: `receipt-keygen.sh` (root, once per host) creates
+  `/etc/neverhuman-actions/receipt-signing.key` (root, 0600) and the public key
+  beside it. Publish the public key as `github-actions/receipt-keys/<host>.pub`.
+- Receipt: `/etc/neverhuman-ci/receipt.json` plus the raw signature
+  `/etc/neverhuman-ci/receipt.json.sig` in the guest (schema
+  `neverhuman.lan-runner-receipt.v1`): `host`, `lane`, `instance` and
+  `runner_name` (both equal the JIT runner name, i.e. the job's `$RUNNER_NAME`),
+  `os_label`, `ubuntu_version`, `image_sha256`, `image_receipt_sha256`,
+  `qualification_receipt_sha256`, `qualification_log_sha256`,
+  `qualification_ref`, `issued_at`, `issued_at_epoch`, `nonce`, `key_id`. The
+  host keeps the same bytes as `jobs/<instance>/guest-receipt.json{,.sig}` and
+  records `guest_receipt_sha256` in its runner receipt.
+- Fail closed: with `required`, a missing, symlinked, non-root, loosely
+  permissioned or non-ed25519 key refuses the lane before any VM or JIT config
+  exists. The key path and owner are fixed; the environment cannot redirect
+  them. Only the offline selftest may, via `NH_RECEIPT_ALLOW_TEST_KEY=1`
+  (the `JERYU_JANKURAI_ALLOW_TEST_RECEIPT` pattern), and `launch.sh` and
+  `receipt-keygen.sh` reject that flag. The key-type check reads only the
+  public half (`openssl pkey -noout -text_pub`).
+- Verify (inside the job):
+
+      bash verify-receipt.sh --pubkey-dir <pinned copy of receipt-keys/>
+
+  It opens the receipt, signature and pinned key once each and reads them
+  through that descriptor into a private 0600 temp copy (removed by a trap),
+  then interprets only the copies. Symlinks are never followed: the opened
+  file must be the regular file the path names (same device, inode and type,
+  fstat of the open descriptor against lstat of the path after the open), so a
+  symlink or a file swapped in after a check is refused; a FIFO cannot hang it
+  (bounded by `timeout`). A
+  pinned file must be byte-for-byte OpenSSL's canonical re-encoding of one
+  ed25519 public key (`openssl pkey -pubin -in F -pubout`, compared with
+  `cmp`), and anything `openssl pkey -in F` (without `-pubin`) loads as a
+  private key is refused. That covers private keys relabelled `PUBLIC KEY`
+  (which OpenSSL 3.5 would otherwise accept under `-pubin`), appended private
+  blocks with odd headers and header-less private base64. It also refuses a
+  signature that is not 64 bytes and a receipt over 64 KiB. It then checks the signature against the pinned key, the schema
+  and `key_id`, `runner_name == instance == $RUNNER_NAME`, freshness
+  (`--max-age`, default 86400 s; at most 60 s in the future) and that the guest
+  booted within `--boot-window` (default 900 s) after issue. Numeric options
+  must be canonical integers (no sign, no leading zero, at most 12 digits), and
+  `--max-age` may not exceed 604800 s (7 days).
+  `verify-receipt.sh --check-key FILE` applies the pinned-key rule alone. It
+  prints the verified receipt.
+  Equivalent recipe without the script: `openssl pkeyutl -verify -pubin -inkey
+  <host>.pub -rawin -in receipt.json -sigfile receipt.json.sig`, then compare
+  the fields above with `jq`.
+- `receipt-keys/` may hold only `README.md` and public `<host>.pub` files; the
+  selftest runs `verify-receipt.sh --check-key` on each `*.pub` and fails on
+  any symlink, any other file, any `*.key` file or any `PRIVATE KEY` material
+  there.
+- `test/receipt-selftest.sh` (run by `test/selftest.sh`) covers signing,
+  fail-closed key checks, the test-only override, seed encoding, pinned-key
+  hygiene and every verifier refusal offline.
+
 ## Versioning
 
 `VERSION` is the kit version; the content hash is the sha256 of

@@ -17,7 +17,7 @@ install -d -m 0750 -o neverhuman-vm -g neverhuman-vm "$NH_STATE/jobs"
 source_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 target_tmp=''
 trap '[[ -z $target_tmp ]] || rm -f -- "$target_tmp"' EXIT
-for file in common.sh egress.sh prepare-image.sh prepare-browser-image.sh prepare-ubuntu26-image.sh qualify.sh api.sh launch.sh pilot-register.sh; do
+for file in common.sh egress.sh prepare-image.sh prepare-browser-image.sh prepare-ubuntu26-image.sh qualify.sh api.sh receipt.sh receipt-keygen.sh verify-receipt.sh launch.sh pilot-register.sh; do
   if [[ $source_dir/$file != /opt/neverhuman-actions/$file ]]; then
     # Bash may still read a running script after a long guest job returns.
     # Replacing its inode lets that process finish against its original bytes.
