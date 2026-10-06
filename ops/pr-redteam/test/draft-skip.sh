@@ -25,7 +25,7 @@ case "$url" in
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"acme","name":"widget-shop"},"family":"widgets","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open')
-    printf '{"items":[{"repo":{"owner":"acme","name":"widget-shop"},"number":7,"head_sha":"dddddddddddddddddddddddddddddddddddddddd","base_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","head_ref":"cart-totals","base_ref":"rc/auto","draft":true,"author":"dana","title":"cart totals","state":"open"}]}\n200' ;;
+    printf '{"items":[{"repo":{"owner":"acme","name":"widget-shop"},"number":7,"head_sha":"dddddddddddddddddddddddddddddddddddddddd","base_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","head_ref":"cart-totals","base_ref":"rc/auto","draft":true,"author":"dana","title":"cart totals","state":"open","labels":["origin:internal"]}]}\n200' ;;
   */api/v1/events) printf '%s\n' "$data" >> "$DRAFT_FIXTURE/posted"; printf '{"ok":true,"seqs":[1],"duplicates":0}\n201' ;;
   *) printf '{"message":"unexpected %s %s"}\n404' "$method" "$url" ;;
 esac
