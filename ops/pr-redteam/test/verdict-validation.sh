@@ -53,7 +53,7 @@ run() {
   printf '%s\n' "${FAKE_VERSION:-9.9.9}" > "$t/version"
   REDTEAM_CLAUDE_VERSION=9.9.9 \
     REDTEAM_CLAUDE="$t/fake-claude" REDTEAM_TIMEOUT=1 REDTEAM_STATE="$t/state" \
-    JERYU_TOKEN_FILE="$t/token" "$here/pr-redteam" _agent "$t/review" "x/y#1" 0000000000000000000000000000000000000000 2>/dev/null
+    JERYU_BASE="${JERYU_BASE:-https://forge.invalid}" JERYU_TOKEN_FILE="$t/token" "$here/pr-redteam" _agent "$t/review" "x/y#1" 0000000000000000000000000000000000000000 2>/dev/null
 }
 fail=0
 for c in approve_then_exit42 approve_then_timeout invalid_verdict_enum approve_with_critical \

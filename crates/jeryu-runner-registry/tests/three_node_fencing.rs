@@ -35,13 +35,13 @@ fn three_node_fencing_and_reassignment() {
     let mut reg = NodeRegistry::new(heartbeat_ttl);
 
     // --- register three nodes in the same pool ("rust") at t=0 ---------------
-    let ack0 = reg.register(&hello("xbabe0", 4, &["rust"]), 0);
-    let ack1 = reg.register(&hello("xbabe1", 4, &["rust"]), 0);
-    let ack2 = reg.register(&hello("xbabe2", 4, &["rust"]), 0);
+    let ack0 = reg.register(&hello("node-0", 4, &["rust"]), 0);
+    let ack1 = reg.register(&hello("node-1", 4, &["rust"]), 0);
+    let ack2 = reg.register(&hello("node-2", 4, &["rust"]), 0);
     assert_eq!(ack0.epoch, 1);
     assert_eq!(ack1.epoch, 1);
     assert_eq!(ack2.epoch, 1);
-    for id in ["xbabe0", "xbabe1", "xbabe2"] {
+    for id in ["node-0", "node-1", "node-2"] {
         assert_eq!(reg.nodes[id].state, NodeState::Active);
     }
 
@@ -53,7 +53,7 @@ fn three_node_fencing_and_reassignment() {
     let dead_node = first.node_id.clone();
     let dead_epoch = first.epoch;
     assert!(
-        ["xbabe0", "xbabe1", "xbabe2"].contains(&dead_node.as_str()),
+        ["node-0", "node-1", "node-2"].contains(&dead_node.as_str()),
         "assignment landed on an unexpected node: {dead_node}"
     );
     assert!(reg.nodes[&dead_node].is_assignable() || reg.nodes[&dead_node].in_flight == 1);
@@ -69,7 +69,7 @@ fn three_node_fencing_and_reassignment() {
     // Advance the clock past heartbeat_ttl for the assigned node by heartbeating
     // the survivors at t=20 and never heartbeating `dead_node`.
     let now = 20; // > 0 + heartbeat_ttl(10)
-    for id in ["xbabe0", "xbabe1", "xbabe2"] {
+    for id in ["node-0", "node-1", "node-2"] {
         if id != dead_node {
             let ack = reg.heartbeat(&heartbeat(id), now);
             assert!(ack.still_owner, "survivor {id} must remain owner");
@@ -101,7 +101,7 @@ fn three_node_fencing_and_reassignment() {
         "reassignment must avoid the dead node"
     );
     assert!(
-        ["xbabe0", "xbabe1", "xbabe2"].contains(&second.node_id.as_str()),
+        ["node-0", "node-1", "node-2"].contains(&second.node_id.as_str()),
         "reassignment landed on an unexpected node: {}",
         second.node_id
     );
@@ -134,21 +134,21 @@ fn three_node_fencing_and_reassignment() {
     // And the new owner's completion IS accepted under the right epoch.
     assert!(reg.is_current_owner(&second.node_id, second.epoch));
 
-    // --- drain(xbabe1): subsequent assigns never pick xbabe1 -----------------
-    // Free up capacity everywhere so xbabe1 would otherwise be a candidate,
+    // --- drain(node-1): subsequent assigns never pick node-1 -----------------
+    // Free up capacity everywhere so node-1 would otherwise be a candidate,
     // then prove draining excludes it permanently.
-    reg.drain("xbabe1");
-    assert_eq!(reg.nodes["xbabe1"].state, NodeState::Draining);
+    reg.drain("node-1");
+    assert_eq!(reg.nodes["node-1"].state, NodeState::Draining);
 
-    // Run several assignments; none may land on xbabe1.
+    // Run several assignments; none may land on node-1.
     for i in 0..6 {
         if let Some(a) = reg.assign(
             &AssignSpec::new(format!("lease-{i}"), RunnerClass::NativeRustClean)
                 .with_tags(vec!["rust".to_string()]),
         ) {
             assert_ne!(
-                a.node_id, "xbabe1",
-                "drained node xbabe1 must never receive an assignment"
+                a.node_id, "node-1",
+                "drained node node-1 must never receive an assignment"
             );
             assert_ne!(
                 a.node_id, dead_node,
@@ -156,17 +156,17 @@ fn three_node_fencing_and_reassignment() {
             );
         }
     }
-    // xbabe1 stayed at whatever in_flight it had; draining never increases it.
+    // node-1 stayed at whatever in_flight it had; draining never increases it.
     // (It had at most 1 from the very first assignment if it was the winner,
     //  but it was excluded from every assign after drain.)
-    assert_eq!(reg.nodes["xbabe1"].state, NodeState::Draining);
+    assert_eq!(reg.nodes["node-1"].state, NodeState::Draining);
 }
 
 #[test]
 fn snapshot_persists_fencing_state() {
     let mut reg = NodeRegistry::new(10);
-    reg.register(&hello("xbabe0", 2, &["rust"]), 0);
-    reg.register(&hello("xbabe1", 2, &["rust"]), 0);
+    reg.register(&hello("node-0", 2, &["rust"]), 0);
+    reg.register(&hello("node-1", 2, &["rust"]), 0);
     let spec =
         AssignSpec::new("L", RunnerClass::NativeRustClean).with_tags(vec!["rust".to_string()]);
     let a = reg.assign(&spec).unwrap();

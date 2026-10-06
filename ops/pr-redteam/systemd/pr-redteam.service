@@ -9,11 +9,14 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-Environment="REDTEAM_PRIORITY_FAMILIES=jain jeryu-split"
 Environment=REDTEAM_FAMILIES=all
 Environment=REDTEAM_JOBS=4
 Environment=REDTEAM_MODEL=claude-opus-5
-Environment=JERYU_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat
+# The forge origin, the approver credential path and which forge families are
+# reviewed first are site configuration, not source: set JERYU_BASE,
+# JERYU_TOKEN_FILE and REDTEAM_PRIORITY_FAMILIES in this file. Without it the
+# unit refuses to run rather than guessing one installation's forge.
+EnvironmentFile=%h/.config/pr-redteam/site.env
 # The merger credential path is site configuration, not source: set
 # REDTEAM_MERGE_TOKEN_FILE in this file to the merger's mode-0600 credential.
 # Without it pr-redteam reviews and publishes, and lands nothing.

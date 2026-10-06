@@ -23,7 +23,7 @@ chmod +x "$t/bin/curl"
 printf 'fixture-bearer\n' > "$t/token"
 beat() { # fixture jobs
   : > "$t/sent"
-  HEARTBEAT_FIXTURE="$1" HEARTBEAT_SENT="$t/sent" PATH="$t/bin:$PATH" JERYU_TOKEN_FILE="$t/token" \
+  HEARTBEAT_FIXTURE="$1" HEARTBEAT_SENT="$t/sent" PATH="$t/bin:$PATH" JERYU_BASE="${JERYU_BASE:-https://forge.invalid}" JERYU_TOKEN_FILE="$t/token" \
     REDTEAM_STATE="$t/state" REDTEAM_RUNNER_ID=fixture/redteam REDTEAM_JOBS="$2" \
     "$here/pr-redteam" heartbeat > "$t/out" 2>&1
 }

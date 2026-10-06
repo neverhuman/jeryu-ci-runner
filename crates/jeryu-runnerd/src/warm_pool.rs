@@ -246,7 +246,7 @@ mod tests {
                 workspace_root: job.workspace.clone(),
                 repo_roots: vec![job.workspace.clone()],
                 branch_budget: 1,
-                runner_id: "xbabe0".to_string(),
+                runner_id: "node-0".to_string(),
                 runner_epoch: epoch,
                 git_status_summary: "clean".to_string(),
                 ci_snapshot_age_ms: Some(0),

@@ -33,7 +33,7 @@ FIXTURE
 chmod +x "$t/bin/curl"
 
 run() { # command extra-args…
-  DRAFT_FIXTURE="$t" PATH="$t/bin:$PATH" JERYU_TOKEN_FILE="$t/token" \
+  DRAFT_FIXTURE="$t" PATH="$t/bin:$PATH" JERYU_BASE="${JERYU_BASE:-https://forge.invalid}" JERYU_TOKEN_FILE="$t/token" \
     REDTEAM_STATE="$t/state" REDTEAM_FAMILIES=all "$here/pr-redteam" "$@" > "$t/out" 2>&1
 }
 

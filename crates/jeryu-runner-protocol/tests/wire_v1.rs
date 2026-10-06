@@ -16,20 +16,20 @@ fn digest(byte: char) -> String {
 
 fn hello() -> RunnerHello {
     let mut hello = RunnerHello::new(
-        "xbabe3-runner-01",
+        "node-3-runner-01",
         vec![
             RunnerClass::NativeRustClean,
             RunnerClass::Custom("cuda-12".to_string()),
         ],
     );
-    hello.labels = vec!["linux".to_string(), "xbabe3".to_string()];
+    hello.labels = vec!["linux".to_string(), "node-3".to_string()];
     hello.capacity = 128;
     hello
 }
 
 fn context_for(job: &WireJobRequest) -> ExecutionContext {
     ExecutionContext {
-        runner_id: "xbabe3-runner-01".to_string(),
+        runner_id: "node-3-runner-01".to_string(),
         runner_epoch: 7,
         run_id: "run-01".to_string(),
         lease_id: "lease-01".to_string(),
@@ -59,7 +59,7 @@ fn job() -> WireJobRequest {
         "job-01",
         RunnerClass::NativeRustClean,
     );
-    job.assign_runner("xbabe3-runner-01", 7);
+    job.assign_runner("node-3-runner-01", 7);
     let mut check = Step::run("check-01", "check", "cargo test --locked");
     check.env.insert("RUST_LOG".to_string(), "info".to_string());
     check.working_directory = Some("crates/jeryu-runner-protocol".to_string());
@@ -92,7 +92,7 @@ fn grant() -> LeaseGrant {
 
 fn result() -> WireJobResult {
     WireJobResult::try_from(&JobResult {
-        runner_id: "xbabe3-runner-01".to_string(),
+        runner_id: "node-3-runner-01".to_string(),
         runner_epoch: 7,
         run_id: "run-01".to_string(),
         lease_id: "lease-01".to_string(),
@@ -342,7 +342,7 @@ fn every_job_field_is_bound_to_the_lease_digest() {
         ("/run_id", json!("run-02")),
         ("/lease_id", json!("lease-02")),
         ("/job_id", json!("job-02")),
-        ("/runner_id", json!("xbabe3-runner-02")),
+        ("/runner_id", json!("node-3-runner-02")),
         ("/runner_epoch", json!(8)),
         ("/runner_class", json!("native-rust-hot")),
         ("/steps/0/id", json!("check-02")),

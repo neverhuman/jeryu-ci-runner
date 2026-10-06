@@ -9,7 +9,10 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
-Environment=JERYU_TOKEN_FILE=%h/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat
+# The forge origin and the approver credential path are site configuration, not
+# source: set JERYU_BASE and JERYU_TOKEN_FILE in this file. Without it the unit
+# refuses to run rather than guessing one installation's forge.
+EnvironmentFile=%h/.config/pr-redteam/site.env
 ExecStart=@REDTEAM_DIR@/pr-redteam heartbeat
 Nice=15
 TimeoutStartSec=2min

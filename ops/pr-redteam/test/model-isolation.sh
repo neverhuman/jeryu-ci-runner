@@ -29,7 +29,7 @@ FIXTURE
 chmod +x "$t/model"
 run() {
   printf '%s\n' "$1" > "$t/case"
-  JERYU_TOKEN_FILE="$t/token" REDTEAM_MERGE_TOKEN_FILE="$t/merger-token" ARBITRARY_SERVICE_SECRET=fixture-only \
+  JERYU_BASE="${JERYU_BASE:-https://forge.invalid}" JERYU_TOKEN_FILE="$t/token" REDTEAM_MERGE_TOKEN_FILE="$t/merger-token" ARBITRARY_SERVICE_SECRET=fixture-only \
     REDTEAM_STATE="$t/state" REDTEAM_CLAUDE="$t/model" REDTEAM_CLAUDE_VERSION=9.9.9 \
     "$here/pr-redteam" _agent "$t/review" 'x/y#1' 0000000000000000000000000000000000000000 > "$t/output" 2> "$t/errors"
 }

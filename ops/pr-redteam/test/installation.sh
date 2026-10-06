@@ -23,8 +23,15 @@ unit="$t/home/.config/systemd/user/pr-redteam.service"
 # The merger credential path is site configuration: the unit may only point at the
 # site's environment file, never assign REDTEAM_MERGE_TOKEN_FILE itself.
 grep -q '^EnvironmentFile=-%h/.config/pr-redteam/merge.env$' "$unit"
-if grep -Eq '^Environment=.*REDTEAM_MERGE_TOKEN_FILE' "$unit"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
-if grep -E 'credentials/|\.pat' "$unit" | grep -qv '^Environment=JERYU_TOKEN_FILE='; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
+# The forge origin and the approver credential path are site configuration too:
+# every unit may only point at the site's environment file.
+for staged in "$t/home/.config/systemd/user/pr-redteam"*.service; do
+  grep -q '^EnvironmentFile=%h/.config/pr-redteam/site.env$' "$staged"
+  if grep -Eq '^Environment=.*(JERYU_BASE|JERYU_TOKEN_FILE|REDTEAM_MERGE_TOKEN_FILE|REDTEAM_PRIORITY_FAMILIES)' "$staged"; then
+    echo 'forbidden credential or site setting in a unit' >&2; exit 1
+  fi
+  if grep -Eq 'credentials/|\.pat' "$staged"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
+done
 [[ "$(find "$t/home/.config/systemd/user" -type f | wc -l)" == 6 ]]
 # The poke unit runs this directory's script, like the review and heartbeat units.
 grep -q "^ExecStart=$here/pr-redteam poke\$" "$t/home/.config/systemd/user/pr-redteam-poke.service"

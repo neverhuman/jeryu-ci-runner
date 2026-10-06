@@ -20,7 +20,7 @@ checks() { # proof title (empty for no proof row)
 }
 gate() { # detail-json checks-json -> "hold|wait<TAB>reason" on stdout
   printf '%s\n' "$1" >"$t/detail.json"; printf '%s\n' "$2" >"$t/checks.json"
-  REDTEAM_STATE="$t/state" JERYU_TOKEN_FILE="$t/token" \
+  REDTEAM_STATE="$t/state" JERYU_BASE="${JERYU_BASE:-https://forge.invalid}" JERYU_TOKEN_FILE="$t/token" \
     "$here/pr-redteam" _gate "$t/detail.json" "$t/checks.json"
 }
 

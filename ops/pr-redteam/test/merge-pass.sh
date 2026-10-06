@@ -26,7 +26,7 @@ args=()
 for arg in "$@"; do
   case "$arg" in
     push|rebase|--force-with-lease*) echo forbidden-history-write >> "$MERGE_FIXTURE/danger"; exit 97 ;;
-    https://git.neverhuman.org/git/jeryu/fixture.git) args+=("$MERGE_FIXTURE/repo") ;;
+    https://forge.invalid/git/jeryu/fixture.git) args+=("$MERGE_FIXTURE/repo") ;;
     *) args+=("$arg") ;;
   esac
 done
@@ -107,7 +107,7 @@ chmod +x "$t/bin/"*
 export MERGE_FIXTURE="$t" FIXTURE_REAL_GIT="$real_git"
 export PATH="$t/bin:$PATH" JERYU_TOKEN_FILE="$t/token" REDTEAM_MERGE_TOKEN_FILE="$t/merge-token"
 export REDTEAM_STATE="$t/state" REDTEAM_CLAUDE="$t/bin/model" REDTEAM_CLAUDE_VERSION=9.9.9 REDTEAM_TIMEOUT=10
-export JERYU_BASE=https://git.neverhuman.org
+export JERYU_BASE=https://forge.invalid
 pass() { "$here/pr-redteam" run --repo jeryu/fixture --pr 107 >> "$t/controller.log" 2>&1; }
 receipt() { printf '%s/state/receipts/jeryu/fixture/107-%s.json\n' "$t" "$(cat "$t/head")"; }
 count() { if [[ -f "$1" ]]; then wc -l < "$1"; else echo 0; fi; }

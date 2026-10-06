@@ -7,7 +7,7 @@ d="$(mktemp -d)"; trap 'rm -rf "$d"' EXIT
 mkdir -p "$d/checkout/ops/ci" "$d/checkout/crates/web/src"
 
 cat >"$d/pr.json" <<'J'
-{"repo":{"owner":"veox","name":"jain-web"},"number":999,"title":"docs: fix typo in CI comment","author":"jepsont","head_ref":"jepsont/typo","base_ref":"main","draft":false}
+{"repo":{"owner":"acme","name":"acme-web"},"number":999,"title":"docs: fix typo in CI comment","author":"jepsont","head_ref":"jepsont/typo","base_ref":"main","draft":false}
 J
 
 cat >"$d/description.md" <<'M'
@@ -52,7 +52,7 @@ printf '3\t2\tops/ci/required.sh\n3\t0\tcrates/web/src/deploy_key.pem\n' >"$d/nu
 printf '#!/usr/bin/env bash\n# Run the required lanes.\nset -euo pipefail\n[ -n "${SKIP_REQUIRED:-}" ] && exit 0\ncargo test --workspace --locked || true\n' \
   >"$d/checkout/ops/ci/required.sh"
 
-v="$("$here/pr-redteam" _agent "$d" "veox/jain-web#999" 1111111111111111111111111111111111111111)"
+v="$("$here/pr-redteam" _agent "$d" "acme/acme-web#999" 1111111111111111111111111111111111111111)"
 jq . <<<"$v"
 if jq -e '.verdict == "block" and any(.findings[]; .severity == "critical")' <<<"$v" >/dev/null; then
   echo "CANARY PASS: blocked"

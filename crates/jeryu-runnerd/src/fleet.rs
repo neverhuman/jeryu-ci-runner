@@ -21,7 +21,7 @@ use crate::{DispatchEngine, DispatchMode};
 
 /// Submit a job to the default local dogfood fleet.
 ///
-/// The default fleet is deterministic: four nodes (`xbabe0`..`xbabe3`) with ten
+/// The default fleet is deterministic: four nodes (`node-0`..`node-3`) with ten
 /// slots each, all supporting the native Rust lane. It is intentionally a
 /// drop-in replacement for the old direct `DispatchEngine::dispatch` call.
 pub fn submit(job: CoreJobRequest) -> Receipt {
@@ -246,7 +246,7 @@ impl RunnerFleet {
         }
     }
 
-    /// Create the deterministic dogfood fixture fleet: `xbabe0`..`xbabe3`, ten
+    /// Create the deterministic dogfood fixture fleet: `node-0`..`node-3`, ten
     /// slots each, for a total of forty native Rust slots.
     pub fn deterministic_fixture() -> Self {
         Self::deterministic_fixture_with_mode(DispatchMode::Run)
@@ -257,7 +257,7 @@ impl RunnerFleet {
         let mut fleet = Self::new(10);
         for index in 0..4 {
             let daemon = RunnerDaemon::new(
-                format!("xbabe{index}"),
+                format!("node-{index}"),
                 10,
                 vec![IrRunnerClass::NativeRustClean, IrRunnerClass::NativeRustHot],
                 vec!["rust".to_string(), "dogfood".to_string()],

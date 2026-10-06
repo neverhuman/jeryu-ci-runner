@@ -1,6 +1,6 @@
 # pr-redteam
 
-Review pull requests on `git.neverhuman.org` at their exact head. Confirmed high or
+Review pull requests on the forge named by `JERYU_BASE` at their exact head. Confirmed high or
 critical security/correctness findings block. An explicit block verdict always
 holds; failed processes, incomplete output and contradictory approvals publish
 nothing. Findings and terminal attempt receipts remain available for review.
@@ -91,10 +91,12 @@ log; `list` and `--dry-run` post nothing. Marking a draft ready for review is
 the author's or an admin's move:
 `POST /api/v1/repos/{id}/pulls/{number}/ready`.
 
-`JERYU_TOKEN_FILE` selects the approval credential by path and
-`REDTEAM_MERGE_TOKEN_FILE` the merger credential. API calls
-require `https://git.neverhuman.org`, an owned mode0600 nonsymlink regular token
-file and a valid bearer value. The bearer travels through curl configuration
+`JERYU_BASE` names the forge origin and `JERYU_TOKEN_FILE` selects the approval
+credential by path; both are required site settings with no default, since this
+source is public. `REDTEAM_MERGE_TOKEN_FILE` selects the merger credential. API
+calls require a bare `https://host` origin with no port, path, credentials or
+query, an owned mode0600 nonsymlink regular token file and a valid bearer
+value. The bearer travels through curl configuration
 stdin, with curlrc disabled, and is absent from curl argv. This transport guard
 is separate from model/process credential confinement.
 

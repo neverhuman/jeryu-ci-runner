@@ -34,7 +34,7 @@ fn deterministic_fixture_registers_four_nodes_and_forty_slots() {
             .iter()
             .map(|node| node.runner_id.as_str())
             .collect::<Vec<_>>(),
-        vec!["xbabe0", "xbabe1", "xbabe2", "xbabe3"]
+        vec!["node-0", "node-1", "node-2", "node-3"]
     );
 }
 
@@ -46,31 +46,31 @@ fn forty_job_fanout_uses_all_four_nodes_at_ten_slots_each() {
         let reserved = fleet.reserve_job(job(id)).expect("reserve");
         *counts.entry(reserved.runner_id).or_default() += 1;
     }
-    assert_eq!(counts["xbabe0"], 10);
-    assert_eq!(counts["xbabe1"], 10);
-    assert_eq!(counts["xbabe2"], 10);
-    assert_eq!(counts["xbabe3"], 10);
+    assert_eq!(counts["node-0"], 10);
+    assert_eq!(counts["node-1"], 10);
+    assert_eq!(counts["node-2"], 10);
+    assert_eq!(counts["node-3"], 10);
 }
 
 #[test]
 fn reaped_node_stale_completion_is_fenced_and_work_reassigns() {
     let mut fleet = RunnerFleet::deterministic_fixture_with_mode(DispatchMode::Explain);
     let stale = fleet.reserve_job(job(1)).expect("first reserve");
-    assert_eq!(stale.runner_id, "xbabe0");
-    for survivor in ["xbabe1", "xbabe2", "xbabe3"] {
+    assert_eq!(stale.runner_id, "node-0");
+    for survivor in ["node-1", "node-2", "node-3"] {
         assert!(fleet.heartbeat(survivor, 20).still_owner);
     }
     let reaped = fleet.reap(20);
     assert_eq!(reaped.len(), 1);
-    assert_eq!(reaped[0].node_id, "xbabe0");
+    assert_eq!(reaped[0].node_id, "node-0");
 
     let err = fleet
         .run_reserved(stale.clone())
         .expect_err("stale completion must be fenced");
-    assert!(matches!(err, FleetError::FencedOut { runner_id, .. } if runner_id == "xbabe0"));
+    assert!(matches!(err, FleetError::FencedOut { runner_id, .. } if runner_id == "node-0"));
 
     let replacement = fleet.reserve_job(stale.job).expect("reassign");
-    assert_ne!(replacement.runner_id, "xbabe0");
+    assert_ne!(replacement.runner_id, "node-0");
     let completed = fleet.run_reserved(replacement).expect("run reassigned");
     assert_eq!(completed.receipt.status, ReceiptStatus::Planned);
 }
@@ -79,12 +79,12 @@ fn reaped_node_stale_completion_is_fenced_and_work_reassigns() {
 fn drain_blocks_new_assignments_but_inflight_work_finishes() {
     let mut fleet = RunnerFleet::deterministic_fixture_with_mode(DispatchMode::Explain);
     let inflight = fleet.reserve_job(job(1)).expect("reserve");
-    assert_eq!(inflight.runner_id, "xbabe0");
-    assert!(fleet.drain("xbabe0"));
+    assert_eq!(inflight.runner_id, "node-0");
+    assert!(fleet.drain("node-0"));
 
     for id in 2..12 {
         let reserved = fleet.reserve_job(job(id)).expect("reserve after drain");
-        assert_ne!(reserved.runner_id, "xbabe0");
+        assert_ne!(reserved.runner_id, "node-0");
     }
 
     let completed = fleet

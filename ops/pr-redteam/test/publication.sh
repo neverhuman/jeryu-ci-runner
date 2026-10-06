@@ -30,7 +30,7 @@ args=()
 for arg in "$@"; do
   case "$arg" in
     push|rebase|--force-with-lease*) echo forbidden-history-write >> "$PUBLISH_FIXTURE/danger"; exit 97 ;;
-    https://git.neverhuman.org/git/jeryu/fixture.git) args+=("$PUBLISH_FIXTURE/repo") ;;
+    https://forge.invalid/git/jeryu/fixture.git) args+=("$PUBLISH_FIXTURE/repo") ;;
     *) args+=("$arg") ;;
   esac
 done
@@ -103,7 +103,7 @@ printf '{"verdict":"approve","summary":"fixture review complete","findings":[]}\
 export PUBLISH_FIXTURE="$t" FIXTURE_REAL_GIT="$real_git"
 export PATH="$t/bin:$PATH" JERYU_TOKEN_FILE="$t/token" REDTEAM_MERGE_TOKEN_FILE="$t/token"
 export REDTEAM_STATE="$t/state" REDTEAM_CLAUDE="$t/bin/model" REDTEAM_CLAUDE_VERSION=9.9.9 REDTEAM_TIMEOUT=10
-export JERYU_BASE=https://git.neverhuman.org
+export JERYU_BASE=https://forge.invalid
 review() { "$here/pr-redteam" _review 0 0 0 jeryu/fixture 1 >> "$t/controller.log" 2>&1; }
 receipt() { printf '%s/state/receipts/jeryu/fixture/1-%s.json\n' "$t" "$(cat "$t/head")"; }
 count() { if [[ -f "$1" ]]; then wc -l < "$1"; else echo 0; fi; }

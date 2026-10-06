@@ -443,9 +443,9 @@ mod tests {
 
     #[test]
     fn stale_swap_on_a_box_with_memory_to_spare_does_not_clamp() {
-        // xbabe2, 2026-09-19: an 8 GiB swap file full of one idle process's
-        // pages, 108 of 125 GiB available, no paging. Every gate compiled with
-        // 2 of 128 cores. Used swap alone is not pressure.
+        // Measured on a gate host, 2026-09-19: an 8 GiB swap file full of one
+        // idle process's pages, 108 of 125 GiB available, no paging. Every gate
+        // compiled with 2 of 128 cores. Used swap alone is not pressure.
         let load = SystemLoad {
             swap_total_bytes: 8 * GIB,
             swap_used_bytes: 8 * GIB,

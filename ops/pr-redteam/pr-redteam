@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# pr-redteam — exact-head security and correctness review, and landing, on git.neverhuman.org.
+# pr-redteam — exact-head security and correctness review, and landing, on a jeryu forge.
 #
 #   pr-redteam run [--dry-run] [--jobs N] [--repo owner/name] [--pr N] [--include-drafts] [--force]
 #   pr-redteam list                        what `run` would review right now, and why others skip
@@ -41,10 +41,14 @@
 # hooks) and attached with --add-dir, so nothing in the PR can run code in the agent or change its
 # settings or tools. PR text is still read by the agent; the prompt treats it as untrusted data.
 #
-# Environment (all optional):
-#   JERYU_BASE             https://git.neverhuman.org
-#   JERYU_TOKEN_FILE       ~/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat  (the approver;
-#                          the forge forbids self-approval, so PRs this identity wrote are skipped)
+# Environment. The first two are required site settings with no default: this source is public
+# and a forge origin and a credential path are one installation's data.
+#   JERYU_BASE             (no default)          the forge origin, a bare `https://host` with no
+#                          path, port, credentials or query
+#   JERYU_TOKEN_FILE       (no default)          the approver credential, a path to a mode-0600
+#                          file owned by this user (the forge forbids self-approval, so PRs this
+#                          identity wrote are skipped)
+# Everything below is optional:
 #   REDTEAM_MERGE_TOKEN_FILE  (no default)        the merger credential, a path to a mode-0600 file
 #                          owned by this user. Unset or unreadable: reviews still run and nothing is
 #                          landed. The secret never reaches argv, a model process or a log.
@@ -54,8 +58,8 @@
 #   REDTEAM_REBASE         0                    with REDTEAM_QUEUE=0, set to 1 to rebase such a
 #                          branch and force-push it (leased to the reviewed head) instead. Off by
 #                          default: the family's no-force rule forbids rewriting an author's branch.
-#   REDTEAM_PRIORITY_FAMILIES "jain jeryu-split"  reviewed first; other families wait until these
-#                          have nothing left to review in a pass
+#   REDTEAM_PRIORITY_FAMILIES (none)         forge `family` values reviewed first; other families
+#                          wait until these have nothing left to review in a pass
 #   REDTEAM_FAMILIES       all                  forge `family` values to cover ("all" includes repos
 #                          with no family)
 #   REDTEAM_JOBS           4                    PRs reviewed in parallel
@@ -75,13 +79,14 @@ umask 077
 
 here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 self="$here/$(basename "$(readlink -f "$0")")"
-base="${JERYU_BASE:-https://git.neverhuman.org}"
-token_file="${JERYU_TOKEN_FILE:-$HOME/.config/jeryu/credentials/git-neverhuman-org-PRagent.pat}"
-# No site-specific default: this source is public, and the merger credential path is site
-# configuration. Without it the review pass runs and nothing is landed.
+# No site-specific defaults: this source is public, so the forge origin, the approver credential
+# path and the merger credential path are all site configuration. Without the merger credential the
+# review pass runs and nothing is landed; without the other two nothing runs at all.
+base="${JERYU_BASE:-}"
+token_file="${JERYU_TOKEN_FILE:-}"
 merge_token_file="${REDTEAM_MERGE_TOKEN_FILE:-}"
 families="${REDTEAM_FAMILIES:-all}"
-priority_families="${REDTEAM_PRIORITY_FAMILIES:-jain jeryu-split}"
+priority_families="${REDTEAM_PRIORITY_FAMILIES:-}"
 jobs="${REDTEAM_JOBS:-4}"
 model="${REDTEAM_MODEL:-claude-opus-5}"
 claude_version_pin="${REDTEAM_CLAUDE_VERSION:-$(tr -d '[:space:]' <"$(dirname "$(readlink -f "$0")")/claude-cli.version" 2>/dev/null)}"
@@ -95,6 +100,12 @@ claude_bin="${REDTEAM_CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/clau
 die() { echo "pr-redteam: $*" >&2; exit 1; }
 say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
+[ -n "$base" ] || die "JERYU_BASE is unset. The forge origin is site configuration, not source: set it to this installation's forge, for example https://forge.example.org"
+# A bare HTTPS origin only: a port, path, credentials or query would send the bearer somewhere the
+# transport checks below cannot reason about.
+[[ "$base" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+  || die "JERYU_BASE must be a bare https://host origin with no port, path, credentials or query"
+[ -n "$token_file" ] || die "JERYU_TOKEN_FILE is unset. The approver credential path is site configuration, not source: set it to a mode-0600 file this user owns"
 [ -r "$token_file" ] || die "token file $token_file is not readable (set JERYU_TOKEN_FILE)"
 for tool in curl jq git tar timeout flock sync sha256sum base64 od; do command -v "$tool" >/dev/null || die "$tool is required"; done
 mkdir -p "$state"/{receipts,cache,locks,work}
@@ -115,7 +126,7 @@ review_identity="$(review_input_identity)"
 api() { # method path [json-body] -> sets $code and $body
   local method="$1" path="$2" data="${3:-}" out credential secret
   # Check the destination before opening the reviewer credential.
-  [[ "$base" == https://git.neverhuman.org ]] || die "credential-bearing API requires the canonical hosted HTTPS origin"
+  [[ "$base" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "credential-bearing API requires a bare hosted HTTPS origin"
   [[ "$path" == /api/v1/* || "$path" == /api/v3/* ]] || die "unexpected hosted API path"
   # `as_token` selects the merger credential for the calls that land a PR; every
   # other call uses the reviewer's. Either way the secret is validated here and
@@ -846,7 +857,7 @@ rebase_pr() { # owner/name number reviewed-sha head_ref base_ref receipt merger 
   # The credential reaches git as a file path read by the helper, never as an argument or a URL.
   local helper="!f() { echo username=$merger; echo \"password=\$(cat '$merge_token_file')\"; }; f"
   local g=(git -c credential.helper= -c "credential.$base.helper=" -c "credential.helper=$helper"
-    -c "user.name=$merger" -c "user.email=$merger@git.neverhuman.org" -c commit.gpgsign=false)
+    -c "user.name=$merger" -c "user.email=$merger@${base#https://}" -c commit.gpgsign=false)
 
   if [ "$dry" = 1 ]; then say "$tag: DRY RUN would rebase $head_ref onto $base_ref and force-push"; rm -rf "$work"; return 0; fi
   [ -d "$cache" ] || git init -q --bare "$cache"

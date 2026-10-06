@@ -11,7 +11,7 @@ echo base >"$t/r/README"; g add -A; g commit -qm base; base="$(g rev-parse HEAD)
 
 blobs() { # head -> _blobs output for base..head
   g diff "$base...$1" >"$t/diff.patch"
-  REDTEAM_MAX_BLOB_BYTES=1000000 REDTEAM_STATE="$t/state" JERYU_TOKEN_FILE="$t/token" \
+  REDTEAM_MAX_BLOB_BYTES=1000000 REDTEAM_STATE="$t/state" JERYU_BASE="${JERYU_BASE:-https://forge.invalid}" JERYU_TOKEN_FILE="$t/token" \
     "$here/pr-redteam" _blobs "$t/r/.git" "$base" "$1" "$t/diff.patch"
 }
 fail=0
