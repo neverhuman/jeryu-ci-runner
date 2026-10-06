@@ -15,6 +15,12 @@
   setting reappears.
 
 ## Unreleased
+- `gate.log` events name the whole log and the slot that ran the gate. The tail is cut at a line
+  boundary, so it no longer starts mid-token, and `detail.runner` carries `<host>/slot<N>` instead of
+  leaving the runner readable only inside `summary`. Where a host's attempt logs are served,
+  `PR_GATE_LOG_URL_TEMPLATE` (`{attempt}`, `{host}`, `{slot}`, `{repo}`, `{sha}`) becomes the event's
+  `log_url`, so Activity's "Full log" link opens `build.log`; unset, no link is sent rather than one
+  that 404s. pr-gate 1.6.0.
 - The PR gate holds a contributed pull request until a maintainer allows it, and then runs it in a
   sandbox. A PR marked `PR_GATE_CONTRIBUTED_LABEL` (default `origin:contributed`, read from
   jeryu's own pull request row, as jeryu-deploy's importer marks it) executes nothing -- no recipe, no prefetch, no

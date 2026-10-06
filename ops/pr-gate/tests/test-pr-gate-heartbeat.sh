@@ -129,10 +129,42 @@ events | jq -e '.event_id=="pr-gate:attempt-1" and .source=="pr-gate" and .kind=
   and (.summary|test("jeryu/jeryu-tool#4 jeryu-tool/required failure in 65s"))
   and .detail.attempt=="attempt-1" and .detail.exit_code==101 and .detail.recipe=="ops/ci/pr-ci.sh" and .detail.log_bytes>20000
   and .detail.cache=="none"
+  and .detail.runner==.actor
   and (.log_tail|endswith("error: test failed\nlast line\n")) and (.log_tail|contains("early line")|not)
-  and (.log_tail|contains("root:")|not) and (.log_tail|test("\u001b|\r")|not) and ((.log_tail|utf8bytelength) <= 12288)' >/dev/null
+  and (.log_tail|contains("root:")|not) and (.log_tail|test("\u001b|\r")|not) and ((.log_tail|utf8bytelength) <= 12288)
+  and (.log_tail|startswith("error: test failed")) and (.log_tail|startswith("x")|not) and .log_url==null' >/dev/null
 [[ -e "$fixture/home/cache/events-posted/attempt-1" ]]
-printf 'PASS a finished attempt posts one gate.log event with a cleaned log tail taken from beside the receipt\n'
+printf 'PASS a finished attempt posts one gate.log event with a cleaned log tail that starts at a line boundary, the slot as detail.runner, and no log_url nobody serves\n'
+
+# One line longer than the whole tail is still reported: half a line beats no log at all.
+rm -f "$fixture/home/cache/events-posted/"*
+: > "$HEARTBEAT_TEST_CAPTURE"
+head -c 20000 /dev/zero | tr '\0' 'y' > "$attempt_dir/build.log"
+bash "$source_file"
+events | jq -se 'length==1 and (.[0].log_tail|startswith("y")) and ((.[0].log_tail|utf8bytelength) <= 12288)' >/dev/null
+printf 'PASS a log of one line longer than the tail still reports that line\n'
+{ printf 'early line that must fall outside the tail\n'; head -c 20000 /dev/zero | tr '\0' 'x'; printf '\n\033[31merror\033[0m: test failed\r\nlast line\n'; } > "$attempt_dir/build.log"
+
+# Where the logs are served, each event names this attempt's whole build.log.
+rm -f "$fixture/home/cache/events-posted/"*
+: > "$HEARTBEAT_TEST_CAPTURE"
+PR_GATE_LOG_URL_TEMPLATE='https://logs.example.test/{host}/slot{slot}/{repo}/{sha}/{attempt}/build.log' bash "$source_file"
+events | jq -se --arg host "$(hostname -s)" 'length==1 and .[0].log_url==("https://logs.example.test/" + $host
+  + "/slot0/jeryu/jeryu-tool/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/attempt-1/build.log")' >/dev/null
+rm -f "$fixture/home/cache/events-posted/"*
+: > "$HEARTBEAT_TEST_CAPTURE"
+for bad in 'ftp://logs.example.test/{attempt}' '/logs/{attempt}' $'https://logs.example.test/\033{attempt}' 'https://logs.example.test/ {attempt}'; do
+  rm -f "$fixture/home/cache/events-posted/"*
+  : > "$HEARTBEAT_TEST_CAPTURE"
+  PR_GATE_LOG_URL_TEMPLATE="$bad" bash "$source_file" 2> "$fixture/log-url.log"
+  grep -q 'PR_GATE_LOG_URL_TEMPLATE is not an http(s) URL' "$fixture/log-url.log"
+  events | jq -se 'length==1 and .[0].log_url==null' >/dev/null \
+    || { printf 'FAIL: template %s was used\n' "$bad" >&2; exit 1; }
+done
+printf 'PASS a configured log URL template becomes the event log_url; a template that is not an http(s) URL is refused and reported\n'
+rm -f "$fixture/home/cache/events-posted/"*
+: > "$HEARTBEAT_TEST_CAPTURE"
+bash "$source_file" >/dev/null
 bash "$source_file"
 [[ "$(events | wc -l)" == 1 ]]
 printf 'PASS an attempt is reported once\n'

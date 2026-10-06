@@ -20,6 +20,8 @@
 # same reason as above. It reads receipts and logs and writes only its own markers under
 # cache/events-posted; attempt evidence is never touched. Events are admin-read on the forge, and the
 # log is the recipe's own output: the recipe runs under env -i and never sees the credential.
+# The tail is cut at a line boundary, so it never starts mid-token, and the event names the whole
+# log with log_url when PR_GATE_LOG_URL_TEMPLATE says where this host's attempt logs are served.
 # Each event carries event_id pr-gate:<attempt id>, which the forge deduplicates, so a post whose
 # answer was lost is safe to repeat. GATE_RUNNER_EVENTS=0 turns it off.
 # ---------------------------------------------------------------------------
@@ -42,6 +44,15 @@ TOKEN_FILE="$(pr_gate_path "${JERYU_TOKEN_FILE:-}")"
 [[ -n "$TOKEN_FILE" ]] || { printf 'heartbeat: JERYU_TOKEN_FILE is not configured (set it in %s)\n' "$PR_GATE_CONFIG_FILE" >&2; exit 2; }
 HOME_DIR="${GATE_RUNNER_HOME:-$HOME/gate-runner}"
 HOST="$(hostname -s)"
+# Where this host's attempt logs are served, if they are served at all: a URL template whose
+# {attempt}, {host}, {slot}, {repo} and {sha} name the attempt, so a gate.log event can carry
+# log_url and the pull request page can open the whole build.log instead of only its tail. Nothing
+# here serves the logs; unset (the default) sends no log_url rather than a link that 404s.
+LOG_URL_TEMPLATE="${PR_GATE_LOG_URL_TEMPLATE:-}"
+if [[ -n "$LOG_URL_TEMPLATE" ]] && ! [[ "$LOG_URL_TEMPLATE" =~ ^https?://[^[:space:][:cntrl:]]{1,500}$ ]]; then
+  printf 'heartbeat: PR_GATE_LOG_URL_TEMPLATE is not an http(s) URL; events carry no log_url\n' >&2
+  LOG_URL_TEMPLATE=""
+fi
 # Slots are whatever pr-gate-runner@N timers are active (list-unit-files shows only the template);
 # GATE_RUNNER_SLOTS overrides.
 SLOTS="${GATE_RUNNER_SLOTS:-$(systemctl --user list-units --no-legend --plain --state=active 'pr-gate-runner@*.timer' \
@@ -169,6 +180,14 @@ pr_of() { # slot repo sha -> PR number or null. The receipt has none; the slot's
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] && printf '%s' "$pr" || printf 'null'
 }
 
+log_url_of() { # attempt slot repo sha -> the served URL of this attempt's build.log, or nothing
+  local url="$LOG_URL_TEMPLATE"
+  [[ -n "$url" ]] || return 0
+  url="${url//\{attempt\}/$1}" url="${url//\{slot\}/$2}" url="${url//\{repo\}/$3}"
+  url="${url//\{sha\}/$4}" url="${url//\{host\}/$HOST}"
+  printf '%s' "$url"
+}
+
 posted=0
 while IFS= read -r receipt; do
   ((posted < EVENT_MAX)) || break
@@ -189,9 +208,21 @@ while IFS= read -r receipt; do
     # Keep newlines and tabs; drop other control bytes (colour codes, carriage returns) and bad UTF-8.
     tail -c "$tail_bytes" "$log" | iconv -f utf-8 -t utf-8 -c 2>/dev/null \
       | sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\000-\010\013-\037\177' >"$tail_file" || : >"$tail_file"
+    # A tail of bytes begins mid-line ("otency_headers) ... ok"), so drop that first partial line and
+    # start at a line boundary -- but only when the log really was cut, and never when the cut line is
+    # all there is (one enormous line is still better read half than not at all). The forge takes at
+    # most 16 KiB of log_tail and clips the rest, so dropping a line always stays within its limit.
+    if ((log_bytes > tail_bytes)) && (($(wc -l <"$tail_file") > 0)); then
+      trimmed=$(mktemp)
+      sed -e 1d "$tail_file" >"$trimmed"
+      [[ ! -s "$trimmed" ]] || cat "$trimmed" >"$tail_file"
+      rm -f -- "$trimmed"
+    fi
   fi
+  log_url=""
+  [[ "$log_bytes" == 0 ]] || log_url=$(log_url_of "$id" "$slot" "$repo" "$sha")
   event=$(jq -c --arg host "$HOST" --arg repo "$repo" --argjson pr "$(pr_of "$slot" "$repo" "$sha")" \
-    --rawfile tail "$tail_file" --argjson log_bytes "$log_bytes" '
+    --rawfile tail "$tail_file" --argjson log_bytes "$log_bytes" --arg log_url "$log_url" '
     (.outcome // "error") as $outcome
     | ((.finished_at // .started_at | fromdateiso8601) - (.started_at | fromdateiso8601)) as $seconds
     | {event_id: ("pr-gate:" + .id), source: "pr-gate", kind: "gate.log", actor: ($host + "/slot" + (.slot // "0")),
@@ -201,8 +232,9 @@ while IFS= read -r receipt; do
                  + " " + $outcome + " in " + ($seconds | tostring) + "s on " + $host + "/slot" + (.slot // "0")),
        reason: (if .recovery_required == null then null else (.recovery_required | tostring | .[0:1000]) end),
        log_tail: (if $tail == "" then null else $tail end),
+       log_url: (if $log_url == "" then null else $log_url end),
        detail: {attempt: .id, sequence, exit_code, execution_kind, recipe: .inputs.recipe, log_sha256, log_bytes: $log_bytes,
-                cache: (.cache // null)}}
+                cache: (.cache // null), runner: ($host + "/slot" + (.slot // "0"))}}
     | .summary |= .[0:300]' "$receipt" 2>/dev/null) || event=""
   rm -f -- "$tail_file"
   [[ -n "$event" ]] || { printf 'attempt %s: receipt could not be projected to an event\n' "$id" >&2; continue; }
