@@ -1,16 +1,30 @@
 #!/usr/bin/env bash
 # Signed guest receipt: binds a lan-ci guest to the host controller that launched it.
-# Sourced by launch.sh and test/receipt-selftest.sh; it does not source common.sh, so the
-# offline selftest can exercise it on any machine. Opt-in: NH_RECEIPT_SIGNING=required
-# (for example a neverhuman-runner@.service drop-in). The default, off, leaves launch.sh
-# byte-for-byte unchanged in what it writes. Once required, a missing, unreadable,
-# loosely-permissioned or non-ed25519 key refuses the lane before any VM or JIT exists.
+# Sourced by launch.sh, receipt-keygen.sh and test/receipt-selftest.sh; it does not source
+# common.sh, so the offline selftest can exercise it on any machine. Opt-in:
+# NH_RECEIPT_SIGNING=required (for example a neverhuman-runner@.service drop-in). The
+# default, off, leaves launch.sh byte-for-byte unchanged in what it writes. Once required, a
+# missing, unreadable, loosely-permissioned or non-ed25519 key refuses the lane before any VM
+# or JIT exists.
 # shellcheck disable=SC2034 # Settings are consumed by the sourcing controller scripts.
 NH_RECEIPT_SCHEMA=neverhuman.lan-runner-receipt.v1
 NH_RECEIPT_SIGNING=${NH_RECEIPT_SIGNING:-off}
-NH_RECEIPT_KEY=${NH_RECEIPT_KEY:-/etc/neverhuman-actions/receipt-signing.key}
-NH_RECEIPT_KEY_OWNER=${NH_RECEIPT_KEY_OWNER:-0}
 NH_RECEIPT_GUEST_DIR=/etc/neverhuman-ci
+# The key path and owner are fixed. The environment cannot redirect them; only the offline
+# selftest may, through the explicit NH_RECEIPT_ALLOW_TEST_KEY=1 flag (the kit's
+# JERYU_JANKURAI_ALLOW_TEST_RECEIPT pattern), and the root controllers reject that flag.
+NH_RECEIPT_KEY=/etc/neverhuman-actions/receipt-signing.key
+NH_RECEIPT_KEY_OWNER=0
+if [[ ${NH_RECEIPT_ALLOW_TEST_KEY:-0} == 1 ]]; then
+  NH_RECEIPT_KEY=${NH_RECEIPT_TEST_KEY:?NH_RECEIPT_TEST_KEY required with NH_RECEIPT_ALLOW_TEST_KEY=1}
+  NH_RECEIPT_KEY_OWNER=${NH_RECEIPT_TEST_KEY_OWNER:?NH_RECEIPT_TEST_KEY_OWNER required with NH_RECEIPT_ALLOW_TEST_KEY=1}
+fi
+
+# Root controllers (launch.sh, receipt-keygen.sh) never accept a caller-supplied key.
+nh_receipt_refuse_test_override() {
+  [[ ${NH_RECEIPT_ALLOW_TEST_KEY:-0} == 0 ]] ||
+    { echo 'NH_RECEIPT_ALLOW_TEST_KEY is test-only and rejected by the controller' >&2; exit 2; }
+}
 
 nh_receipt_enabled() {
   case $NH_RECEIPT_SIGNING in
@@ -21,15 +35,17 @@ nh_receipt_enabled() {
 }
 
 # Root-only, regular, ed25519. Checked before the job directory, VM or JIT config exists.
+# The type check reads only the public half (-text_pub); private key text is never printed.
 nh_receipt_check_key() {
   [[ -f $NH_RECEIPT_KEY && ! -L $NH_RECEIPT_KEY ]] || { echo "Receipt signing key absent: $NH_RECEIPT_KEY" >&2; exit 2; }
-  local owner_mode
+  local owner_mode public_text
   owner_mode=$(stat -c '%u %a' -- "$NH_RECEIPT_KEY")
   case $owner_mode in
     "$NH_RECEIPT_KEY_OWNER 600" | "$NH_RECEIPT_KEY_OWNER 400") ;;
     *) echo "Receipt signing key must be owner $NH_RECEIPT_KEY_OWNER mode 0600/0400 (found $owner_mode)" >&2; exit 2 ;;
   esac
-  [[ $(openssl pkey -in "$NH_RECEIPT_KEY" -noout -text 2>/dev/null | head -n1) == 'ED25519 Private-Key:' ]] ||
+  public_text=$(openssl pkey -in "$NH_RECEIPT_KEY" -noout -text_pub 2>/dev/null) || public_text=''
+  [[ $public_text == 'ED25519 Public-Key:'* ]] ||
     { echo 'Receipt signing key is not a readable ed25519 private key' >&2; exit 2; }
 }
 

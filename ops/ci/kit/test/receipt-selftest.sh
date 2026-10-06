@@ -30,15 +30,36 @@ cp "${work}/signing.pub" "${work}/keys/xbabe2.pub"
 printf '{"phase":"image-prepared","image_sha256":"%s"}\n' "$(printf 'a%.0s' {1..64})" > "${work}/image.json"
 printf '{"phase":"vm-qualified","log_sha256":"%s"}\n' "$(printf 'b%.0s' {1..64})" > "${work}/qual.json"
 
-# Run receipt.sh functions in a subshell with a controller-like environment.
+# Run receipt.sh functions in a subshell with a controller-like environment. The key path and
+# owner can only be redirected through the explicit test-only flag.
 lib() {
   # shellcheck disable=SC2016 # The child shell expands its own positional parameters.
-  env NH_RECEIPT_SIGNING="${MODE:-required}" NH_RECEIPT_KEY="${KEY:-${work}/signing.key}" \
-    NH_RECEIPT_KEY_OWNER="$(id -u)" NH_INSTANCE=xbabe2-lan-1-20261006000000-123 NH_HOST=xbabe2 \
+  env NH_RECEIPT_SIGNING="${MODE:-required}" NH_RECEIPT_ALLOW_TEST_KEY=1 \
+    NH_RECEIPT_TEST_KEY="${KEY:-${work}/signing.key}" NH_RECEIPT_TEST_KEY_OWNER="$(id -u)" \
+    NH_INSTANCE=xbabe2-lan-1-20261006000000-123 NH_HOST=xbabe2 \
     NH_OS_LABEL=ubuntu24 NH_UBUNTU_VERSION=24.04 NH_IMAGE_RECEIPT="${work}/image.json" \
     NH_QUALIFICATION_RECEIPT="${work}/qual.json" NH_JOB="${work}/job" \
     bash -c 'set -euo pipefail; source "$0/receipt.sh"; eval "$1"' "${ga}" "$1"
 }
+# Without the flag (or with any value but 1) the environment cannot move the key or its owner.
+prod_paths() {
+  # shellcheck disable=SC2016 # The child shell expands its own variables.
+  env "$@" NH_RECEIPT_KEY="${work}/signing.key" NH_RECEIPT_KEY_OWNER="$(id -u)" \
+    NH_RECEIPT_TEST_KEY="${work}/signing.key" NH_RECEIPT_TEST_KEY_OWNER="$(id -u)" bash -c \
+    'source "$0/receipt.sh"; [[ $NH_RECEIPT_KEY == /etc/neverhuman-actions/receipt-signing.key && $NH_RECEIPT_KEY_OWNER == 0 ]]' "${ga}"
+}
+expect_ok "env cannot override the key path or owner without the test flag" prod_paths -u NH_RECEIPT_ALLOW_TEST_KEY
+expect_ok "a test flag other than 1 is ignored" prod_paths NH_RECEIPT_ALLOW_TEST_KEY=yes
+# shellcheck disable=SC2016 # The child shell expands its own positional parameters.
+expect_fail "controllers reject the test flag" env NH_RECEIPT_ALLOW_TEST_KEY=1 NH_RECEIPT_TEST_KEY=x NH_RECEIPT_TEST_KEY_OWNER=0 \
+  bash -c 'source "$0/receipt.sh"; nh_receipt_refuse_test_override' "${ga}"
+# shellcheck disable=SC2016 # The child shell expands its own positional parameters.
+expect_ok "controllers run without the test flag" env -u NH_RECEIPT_ALLOW_TEST_KEY \
+  bash -c 'source "$0/receipt.sh"; nh_receipt_refuse_test_override' "${ga}"
+for controller in launch.sh receipt-keygen.sh; do
+  expect_ok "${controller} rejects the test flag" grep -qx 'nh_receipt_refuse_test_override' "${ga}/${controller}"
+done
+expect_fail "the key-type check never prints private key text" grep -Eq -- '-noout -text($| )' "${ga}/receipt.sh"
 # shellcheck disable=SC2016 # The child shell expands its own positional parameters.
 expect_fail "signing is off by default" env -u NH_RECEIPT_SIGNING bash -c 'source "$0/receipt.sh"; nh_receipt_enabled' "${ga}"
 MODE=sometimes expect_fail "unknown signing mode is refused" lib nh_receipt_enabled
@@ -107,6 +128,67 @@ RUNNER_NAME=xbabe2-lan-1-20261006000000-123 expect_fail "a tampered receipt is r
 cp "$r" "${work}/badsig.json"; head -c 64 /dev/zero > "${work}/badsig.json.sig"
 RUNNER_NAME=xbabe2-lan-1-20261006000000-123 expect_fail "a forged signature is refused" bash "${ga}/verify-receipt.sh" --receipt "${work}/badsig.json" --pubkey "${work}/signing.pub" --boot-window 0
 expect_fail "verifier requires a pinned key" bash "${ga}/verify-receipt.sh" --receipt "$r" --runner-name x
+# Pinned key hygiene: OpenSSL 3.5 accepts a private key under -pubin, so the verifier refuses
+# private material itself, plus anything that is not exactly one ed25519 PEM public key.
+openssl pkey -in "${work}/ec.key" -pubout -out "${work}/ec.pub" 2>/dev/null
+cat "${work}/signing.pub" "${work}/signing.key" > "${work}/pub-and-private.pem"
+cat "${work}/signing.pub" "${work}/other.pub" > "${work}/two-pubs.pem"
+mkdir -p "${work}/privdir"; cp "${work}/signing.key" "${work}/privdir/xbabe2.pub"
+ln -s "${work}/signing.pub" "${work}/link.pub"
+pv() { RUNNER_NAME=xbabe2-lan-1-20261006000000-123 bash "${ga}/verify-receipt.sh" --receipt "$r" --boot-window 0 --now "$((issued + 30))" "$@"; }
+expect_fail "a private key pinned as --pubkey is refused" pv --pubkey "${work}/signing.key"
+expect_fail "a private key published as <host>.pub is refused" pv --pubkey-dir "${work}/privdir"
+expect_fail "a pinned file carrying private material after a public key is refused" pv --pubkey "${work}/pub-and-private.pem"
+expect_fail "a pinned file with two keys is refused" pv --pubkey "${work}/two-pubs.pem"
+expect_fail "a non-ed25519 pinned key is refused" pv --pubkey "${work}/ec.pub"
+expect_fail "a symlinked pinned key is refused" pv --pubkey "${work}/link.pub"
+pv --pubkey "${work}/signing.key" > /dev/null 2> "${work}/err" || true
+if grep -q 'private key material' "${work}/err"; then pass "private pinned key is refused by name"; else flunk "private pinned key is refused by name"; fi
+
+# Strict numeric options and bounded inputs.
+pvu() { pv --pubkey "${work}/signing.pub" "$@" >/dev/null 2>&1; }
+expect_usage() { # <name> <args...>: the verifier must exit 2 (usage), not 0 or 1
+  local name=$1 rc=0; shift
+  pvu "$@" || rc=$?
+  if [[ $rc == 2 ]]; then pass "${name}"; else flunk "${name} (exit ${rc})"; fi
+}
+expect_usage "leading-zero numbers are usage errors" --max-age 0100
+expect_usage "over-long numbers are usage errors" --max-age 1234567890123
+expect_usage "signed numbers are usage errors" --now -5
+cp "$r" "${work}/longsig.json"; { cat "$r.sig"; printf 'x'; } > "${work}/longsig.json.sig"
+expect_fail "a signature that is not 64 bytes is refused" bash "${ga}/verify-receipt.sh" --receipt "${work}/longsig.json" --pubkey "${work}/signing.pub" --runner-name xbabe2-lan-1-20261006000000-123 --boot-window 0
+head -c 70000 /dev/zero | tr '\0' ' ' > "${work}/huge.json"; cp "$r.sig" "${work}/huge.json.sig"
+expect_fail "an oversized receipt is refused" bash "${ga}/verify-receipt.sh" --receipt "${work}/huge.json" --pubkey "${work}/signing.pub" --runner-name xbabe2-lan-1-20261006000000-123 --boot-window 0
+
+# Single private snapshot: verification runs on 0600 copies in a private temp dir that the
+# trap removes on success and on refusal.
+mkdir -p "${work}/tmp"
+TMPDIR="${work}/tmp" expect_ok "verifies from the private copy" pv --pubkey "${work}/signing.pub"
+TMPDIR="${work}/tmp" expect_fail "refusal still verifies only the copy" pv --pubkey "${work}/other.pub"
+if [[ -z "$(ls -A "${work}/tmp")" ]]; then pass "private snapshot is removed"; else flunk "private snapshot is removed"; fi
+
+# The published key directory may hold only README.md and public *.pub keys.
+keys_clean() { # [dir]
+  local f dir=${1:-${ga}/receipt-keys}
+  for f in "${dir}"/* "${dir}"/.[!.]*; do
+    [[ -e $f || -L $f ]] || continue
+    case ${f##*/} in
+      README.md) ;;
+      *.pub) [[ -f $f && ! -L $f ]] && ! grep -q 'PRIVATE KEY' "$f" &&
+               [[ $(head -n1 "$f") == '-----BEGIN PUBLIC KEY-----' ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+  ! grep -rqs 'PRIVATE KEY' "${dir}"
+}
+expect_ok "receipt-keys holds no private key material or *.key files" keys_clean
+mkdir -p "${work}/badkeys"
+cp "${work}/signing.pub" "${work}/badkeys/xbabe2.pub"
+expect_ok "a public key directory passes the hygiene check" keys_clean "${work}/badkeys"
+cp "${work}/signing.key" "${work}/badkeys/xbabe3.key"
+expect_fail "a *.key file under receipt-keys is caught" keys_clean "${work}/badkeys"
+rm -- "${work}/badkeys/xbabe3.key"; cp "${work}/signing.key" "${work}/badkeys/xbabe3.pub"
+expect_fail "a private key named *.pub under receipt-keys is caught" keys_clean "${work}/badkeys"
 
 if (( failures > 0 )); then
   printf 'receipt selftest: %d failure(s)\n' "${failures}" >&2

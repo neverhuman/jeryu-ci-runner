@@ -15,6 +15,15 @@
   setting reappears.
 
 ## Unreleased
+- ci-kit 1.5.1: harden the signed lan-ci guest receipt after review. The
+  verifier refuses any pinned key file holding `PRIVATE KEY` material (OpenSSL
+  3.5 accepts one under `-pubin`) or anything but one ed25519 PEM public key,
+  verifies only a single private 0600 snapshot of the receipt, signature and
+  key, bounds their sizes, and accepts only canonical integers. The signing key
+  path and owner are fixed; `NH_RECEIPT_ALLOW_TEST_KEY=1` is test-only and the
+  controllers reject it. The key-type check reads only `-text_pub`. The selftest
+  rejects private material under `receipt-keys/`; the runbook adds the JopeDime
+  drain and swap-pin check before any reload, and the stale-receipt remedy.
 - ci-kit 1.5.0: opt-in ed25519-signed lan-ci guest receipt. With
   `NH_RECEIPT_SIGNING=required`, `launch.sh` seeds each guest with a receipt
   bound to its runner name, image and qualification hashes and issue time;

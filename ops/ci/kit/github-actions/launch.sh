@@ -5,6 +5,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck source=receipt.sh
 source "$(dirname "${BASH_SOURCE[0]}")/receipt.sh"
+nh_receipt_refuse_test_override
 nh_require_root
 lane=${1:?lane must be 1 through 4}
 case "$lane" in 1|2|3|4) ;; *) exit 2 ;; esac

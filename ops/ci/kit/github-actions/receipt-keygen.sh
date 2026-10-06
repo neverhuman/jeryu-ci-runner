@@ -10,6 +10,7 @@ set -euo pipefail
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 # shellcheck source=receipt.sh
 source "$(dirname "${BASH_SOURCE[0]}")/receipt.sh"
+nh_receipt_refuse_test_override
 nh_require_root
 pub=${NH_RECEIPT_KEY%.key}.pub
 [[ ! -e $NH_RECEIPT_KEY && ! -L $NH_RECEIPT_KEY ]] || { echo "Refusing to overwrite $NH_RECEIPT_KEY" >&2; exit 2; }

@@ -37,20 +37,34 @@ until a host sets `NH_RECEIPT_SIGNING=required` (for example a
   records `guest_receipt_sha256` in its runner receipt.
 - Fail closed: with `required`, a missing, symlinked, non-root, loosely
   permissioned or non-ed25519 key refuses the lane before any VM or JIT config
-  exists.
+  exists. The key path and owner are fixed; the environment cannot redirect
+  them. Only the offline selftest may, via `NH_RECEIPT_ALLOW_TEST_KEY=1`
+  (the `JERYU_JANKURAI_ALLOW_TEST_RECEIPT` pattern), and `launch.sh` and
+  `receipt-keygen.sh` reject that flag. The key-type check reads only the
+  public half (`openssl pkey -noout -text_pub`).
 - Verify (inside the job):
 
       bash verify-receipt.sh --pubkey-dir <pinned copy of receipt-keys/>
 
-  It checks the signature against the pinned key, the schema and `key_id`,
-  `runner_name == instance == $RUNNER_NAME`, freshness (`--max-age`, default
-  86400 s; at most 60 s in the future) and that the guest booted within
-  `--boot-window` (default 900 s) after issue. It prints the verified receipt.
+  It reads the receipt, signature and pinned key once each into a private
+  0600 temp copy (removed by a trap) and interprets only the copies. It
+  refuses a pinned file that holds any `PRIVATE KEY` material or is not
+  exactly one ed25519 PEM public key (OpenSSL 3.5 would otherwise accept a
+  private key under `-pubin`), a signature that is not 64 bytes and a receipt
+  over 64 KiB. It then checks the signature against the pinned key, the schema
+  and `key_id`, `runner_name == instance == $RUNNER_NAME`, freshness
+  (`--max-age`, default 86400 s; at most 60 s in the future) and that the guest
+  booted within `--boot-window` (default 900 s) after issue. Numeric options
+  must be canonical integers (no sign, no leading zero, at most 12 digits). It
+  prints the verified receipt.
   Equivalent recipe without the script: `openssl pkeyutl -verify -pubin -inkey
   <host>.pub -rawin -in receipt.json -sigfile receipt.json.sig`, then compare
   the fields above with `jq`.
+- `receipt-keys/` may hold only `README.md` and public `<host>.pub` files; the
+  selftest fails on any `*.key` file or `PRIVATE KEY` material there.
 - `test/receipt-selftest.sh` (run by `test/selftest.sh`) covers signing,
-  fail-closed key checks, seed encoding and every verifier refusal offline.
+  fail-closed key checks, the test-only override, seed encoding, pinned-key
+  hygiene and every verifier refusal offline.
 
 ## Versioning
 
