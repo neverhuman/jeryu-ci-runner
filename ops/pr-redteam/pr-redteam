@@ -14,8 +14,10 @@
 # contradictory output publishes nothing. Every finding is preserved in the review and receipt.
 #
 # The quality gate comes first: where the base branch requires `jankurai/proof`, a head whose proof
-# fails, has not run, or failed to score is held with that reason and no agent budget is spent on it.
-# Nothing here can approve such a head, and the forge refuses an approval on one anyway.
+# fails or failed to score is held with that reason and no agent budget is spent on it. Nothing here
+# can approve such a head, and the forge refuses an approval on one anyway. A proof that is queued,
+# running or has not started yet is no verdict: that head is left untouched and reviewed by a later
+# pass, once the proof has a result.
 #
 # pr-redteam also lands what it approved. After the review pass, every open PR this tool approved
 # at its current head is merged as the merger identity, once the forge itself says it can merge
@@ -194,6 +196,26 @@ jankurai_gate_hold() { # owner/name number
   api GET "/api/v1/repos/${1/\//%2F}/pulls/$2/checks"
   [ "$code" = 200 ] || body='{"checks":[]}'
   jankurai_gate_reason "$detail" "$body"
+}
+
+# A gate reason that says only that the proof has no result yet: the forge has
+# queued it, is running it, or has not started it. That is not a verdict on the
+# head, so the reviewer waits for one rather than publishing a block and
+# recording this head as reviewed — a block receipt would hold the head until
+# somebody pushed a new commit, even once the proof went green a minute later.
+# A failing proof and a scorer failure both arrive as a failing context and hold.
+proof_without_result() { # gate reason -> 0 when the proof has no result yet
+  case "$1" in
+    *jankurai/proof*) ;;
+    *) return 1 ;;
+  esac
+  case "$1" in
+    *"is failing"*) return 1 ;;
+  esac
+  case "$1" in
+    *"queued or running"*|*"has not run"*) return 0 ;;
+  esac
+  return 1
 }
 
 # A draft is skipped on every pass until somebody marks it ready, so saying so
@@ -430,6 +452,17 @@ review_one() { # owner/name number dry-run force include-drafts
   row="$(pr_row "$repo" "$number")" || { say "$tag: no longer open"; return 0; }
   reason="$(skip_reason "$row" "$me" "$drafts" "$force")"
   [ -z "$reason" ] || { say "$tag: skip — $reason"; return 0; }
+
+  # The quality gate is read once per attempt, before anything is recorded: a proof with no result
+  # yet leaves this head untouched — no receipt, no post, no agent — so the next pass or poke
+  # reviews it as soon as the proof has one. The reasons that are a verdict hold below.
+  local gate_reason
+  gate_reason="$(jankurai_gate_hold "$repo" "$number")"
+  if [ -n "$gate_reason" ] && proof_without_result "$gate_reason"; then
+    say "$tag: waiting for jankurai/proof — $gate_reason"
+    return 0
+  fi
+
   sha="$(jq -r .head_sha <<<"$row")"; base_sha="$(jq -r .base_sha <<<"$row")"
   head_ref="$(jq -r .head_ref <<<"$row")"; base_ref="$(jq -r .base_ref <<<"$row")"
 
@@ -520,8 +553,7 @@ review_one() { # owner/name number dry-run force include-drafts
   # The gate before the agent: a head the quality gate blocks cannot be approved
   # whatever the review concludes, so it holds with the gate's reason and the
   # per-PR agent budget is not spent on it.
-  local verdict gate_reason
-  gate_reason="$(jankurai_gate_hold "$repo" "$number")"
+  local verdict
   if [ -n "$gate_reason" ]; then
     say "$tag: quality gate holds ${sha:0:12} — $gate_reason"
     verdict="$(jq -nc --arg reason "$gate_reason" \
@@ -949,8 +981,10 @@ case "$cmd" in
     poke "$dry" ;;
   _merge) # internal/testing: the merge pass alone, with no review pass before it
     merge_pass "$dry" ;;
-  _gate) # internal/testing: pr-detail.json checks.json -> gate reason (no forge calls)
-    jankurai_gate_reason "$(cat "$1")" "$(cat "$2")" ;;
+  _gate) # internal/testing: pr-detail.json checks.json -> "hold|wait<TAB>reason" (no forge calls)
+    reason="$(jankurai_gate_reason "$(cat "$1")" "$(cat "$2")")"
+    [ -n "$reason" ] || exit 0
+    if proof_without_result "$reason"; then printf 'wait\t%s\n' "$reason"; else printf 'hold\t%s\n' "$reason"; fi ;;
   _blobs) # internal/testing: git-dir base head diff.patch -> unpinned binaries (no forge calls)
     unpinned_blobs "$1" "$2" "$3" "$4" ;;
   _agent) # internal/testing: review-dir tag sha -> verdict JSON (no forge calls)

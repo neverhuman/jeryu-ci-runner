@@ -6,8 +6,11 @@ holds; failed processes, incomplete output and contradictory approvals publish
 nothing. Findings and terminal attempt receipts remain available for review.
 
 Where the base branch requires `jankurai/proof`, the quality gate comes first: a
-head whose proof fails, has not run, or failed to score is held with that reason
-before any agent budget is spent, and nothing here can approve it. Repositories
+head whose proof fails or failed to score is held with that reason before any
+agent budget is spent, and nothing here can approve it. A proof the forge has
+queued, is running, or has not started is not a verdict on the head: that head
+gets no review and no receipt, and a later pass reviews it once the proof has a
+result. Repositories
 outside the gate's rollout are unaffected — their proof is reported, not
 required. `ops/ci/jankurai-gate.sh` is the same verdict, run locally before the
 pull request exists.

@@ -63,6 +63,8 @@ case "$url" in
     # requires jankurai/proof on this head and whether it passes.
     if [[ -e "$PUBLISH_FIXTURE/gate-blocked" ]]; then
       printf '{"merge_passport":{"blockers":[{"code":"passport_blocked_checks","message":"Required context `jankurai/proof` is failing."}]}}\n200'
+    elif [[ -e "$PUBLISH_FIXTURE/gate-pending" ]]; then
+      printf '{"merge_passport":{"blockers":[{"code":"passport_blocked_checks","message":"Required context `jankurai/proof` is queued or running."}]}}\n200'
     else printf '{"merge_passport":{"blockers":[]}}\n200'; fi ;;
   */pulls/1/checks)
     if [[ -e "$PUBLISH_FIXTURE/gate-blocked" ]]; then
@@ -263,6 +265,27 @@ review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
 jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
 echo 'ok failing required proof held without a review, cleared proof approved'
+
+# A proof the forge has queued but not finished is not a verdict on this head: nothing is
+# recorded, nothing is posted, no review budget is spent, and the same head is reviewed and
+# approved by a later pass once the proof is out of the way. No new commit is needed.
+advance
+touch "$t/gate-pending"
+model_calls="$(count "$t/model-calls")"; posts_before="$(count "$t/posts")"
+attempts="$(find "$t/state/attempts" -type f | wc -l)"
+review
+[[ ! -e "$(receipt)" ]]
+[[ "$(find "$t/state/attempts" -type f | wc -l)" == "$attempts" ]]
+[[ "$(count "$t/model-calls")" == "$model_calls" && "$(count "$t/posts")" == "$posts_before" ]]
+grep -q 'waiting for jankurai/proof' "$t/controller.log"
+review
+[[ ! -e "$(receipt)" ]]
+[[ "$(count "$t/model-calls")" == "$model_calls" && "$(count "$t/posts")" == "$posts_before" ]]
+rm "$t/gate-pending"
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
+echo 'ok pending proof waited for, same head reviewed and approved once it has a result'
 
 # A base branch the forge does not have yet is recorded once and not retried: no model call, no
 # publication, and no second attempt for the same head however many passes run.
