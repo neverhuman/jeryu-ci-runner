@@ -15,6 +15,17 @@
   setting reappears.
 
 ## Unreleased
+- The PR gate holds a contributed pull request until a maintainer allows it, and then runs it in a
+  sandbox. A PR marked `PR_GATE_CONTRIBUTED_LABEL` (default `origin:contributed`, read from
+  jeryu's own pull request row, as jeryu-deploy's importer marks it) executes nothing -- no recipe, no prefetch, no
+  checkout -- until an `ok-to-test` from a login in `PR_GATE_OK_TO_TEST_MAINTAINERS` names its exact
+  head (`GET /api/v1/gate-allowances?state=active`); a push moves the head and spends the allowance.
+  An allowed head is gated through `PR_GATE_SANDBOX_COMMAND` with no forge token, no gate identity,
+  no host home, no governed tools and no shared writable cache, and its result is published as the
+  usual `<repo>/required` status, recorded as `sandboxed-contribution` in the status, the receipt and
+  the input identity. A contribution that changes gate inputs (`PR_GATE_GATE_INPUT_PATHS`) is
+  recorded in its receipt and named on its check run for extra review. Internal PRs are unchanged.
+  pr-gate 1.5.0.
 - A lane of the protected `jeryu-ci-runner/required` check passes only if it
   actually ran: `ops/ci/required-lane.sh` refuses a skipped, degraded, not-run,
   pending or tool-missing lane result and a run that collected zero tests. The

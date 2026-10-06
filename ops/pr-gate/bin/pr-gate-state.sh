@@ -22,6 +22,13 @@ gate_required_context() {
   fi
 }
 
+# How the attempt under preparation executes: on the gate host as the operator identity, or in the
+# site's ephemeral token-free sandbox because the head is a contribution. It is part of the input
+# identity, so a sandboxed result is never reused for a host-run one or the other way round.
+gate_execution_kind() {
+  [[ "${GATE_SANDBOX:-0}" == 1 ]] && printf 'sandboxed-contribution' || printf 'operator-unsealed'
+}
+
 # Durable replace: fsync the new file, rename it, fsync the directory. `sync FILE` fsyncs that file;
 # `sync -f` would syncfs the whole filesystem, which on a gate host waited behind every slot's build output
 # (sampled 2026-09-18: ~100 of 1300 two-second samples blocked there).
@@ -115,11 +122,12 @@ gate_begin() {
   jq -n --arg id "$id" --arg owner "$owner" --arg repo "$repo" --arg sha "$sha" \
     --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --arg at "$(date -u +%FT%TZ)" \
     --argjson pid "$$" --argjson sequence "$sequence" --arg slot "$SLOT" --slurpfile inputs "$identity" \
+    --arg kind "$(gate_execution_kind)" \
     '{schema:"jeryu.pr-gate-attempt/v1",id:$id,owner:$owner,repo:$repo,sha:$sha,
       boot_id:$boot,pid:$pid,slot:$slot,sequence:$sequence,started_at:$at,inputs:$inputs[0],
       terminal:false,outcome:null,exit_code:null,log:null,log_sha256:null,gate_definition_paths:[],
       publication:{required_status:false,check_run:false},recovery_required:null,
-      execution_kind:"operator-unsealed"}' | gate_atomic "$gate_receipt"
+      execution_kind:$kind}' | gate_atomic "$gate_receipt"
 }
 
 # Hash a fixture or vendor tree for the input identity. A native build may be running in the same
@@ -161,23 +169,30 @@ gate_inputs() {
       --arg tree "$tree" --arg lock "$lock_digest" --arg origin "$origin" \
       '{repository:$name,head:$head,tree:$tree,cargo_lock_sha256:$lock,origin:$origin}' >>"$rows" || return
   done
-  for tool in bash git just jq rustc cargo rustup cc c++ ld node npm pnpm timeout; do
-    resolved=$(command -v "$tool" || true)
-    if [[ -n "$resolved" ]]; then sha256sum "$(readlink -f "$resolved")" >>"$inputs" || return; fi
-  done
-  for tool in rustc cargo; do
-    resolved=$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup which "$tool") || return
-    sha256sum "$resolved" >>"$inputs" || return
-    "$resolved" --version >>"$versions" || return
-  done
-  # No mtime-only cache: a changed fixture or governed executable is a new input.
-  for directory in "$TOOLS" "$RUNTIME_TOOLS"; do
-    if [[ -d "$directory" ]]; then
-      hash_fixture_tree "$directory" >>"$inputs" || return
+  if [[ "${GATE_SANDBOX:-0}" == 1 ]]; then
+    # A sandboxed contribution gets none of the host's toolchain, governed tools, runtime fixtures or
+    # vendor tree (see the runner's step 4), so none of them is an input of its result. What it
+    # evaluates with is the sandbox the site configured, so that is what is bound here.
+    printf 'sandbox-command  %s\n' "${SANDBOX_COMMAND:-}" >>"$inputs" || return
+  else
+    for tool in bash git just jq rustc cargo rustup cc c++ ld node npm pnpm timeout; do
+      resolved=$(command -v "$tool" || true)
+      if [[ -n "$resolved" ]]; then sha256sum "$(readlink -f "$resolved")" >>"$inputs" || return; fi
+    done
+    for tool in rustc cargo; do
+      resolved=$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup which "$tool") || return
+      sha256sum "$resolved" >>"$inputs" || return
+      "$resolved" --version >>"$versions" || return
+    done
+    # No mtime-only cache: a changed fixture or governed executable is a new input.
+    for directory in "$TOOLS" "$RUNTIME_TOOLS"; do
+      if [[ -d "$directory" ]]; then
+        hash_fixture_tree "$directory" >>"$inputs" || return
+      fi
+    done
+    if [[ -n "${VENDOR:-}" && -d "$VENDOR" ]] && pr_gate_listed "${VENDOR_INPUT_REPOS:-}" "$repo" "$owner/$repo"; then
+      hash_fixture_tree "$VENDOR" >>"$inputs" || return
     fi
-  done
-  if [[ -n "${VENDOR:-}" && -d "$VENDOR" ]] && pr_gate_listed "${VENDOR_INPUT_REPOS:-}" "$repo" "$owner/$repo"; then
-    hash_fixture_tree "$VENDOR" >>"$inputs" || return
   fi
   # The runner's own code, as hashed when this process started (GATE_SELF_SHA256): that is what runs. A
   # runner installed mid-gate replaces the files on disk but not the running copy, and hashing the disk
@@ -188,12 +203,12 @@ gate_inputs() {
   else
     sha256sum "${BASH_SOURCE[0]}" "$GATE_RUNNER_SCRIPT" >>"$inputs" || return
   fi
-  if [[ -n "$SCCACHE" ]]; then sha256sum "$SCCACHE" >>"$inputs" || return; fi
+  if [[ -n "$SCCACHE" && "${GATE_SANDBOX:-0}" != 1 ]]; then sha256sum "$SCCACHE" >>"$inputs" || return; fi
   jq -nS --slurpfile sources "$rows" --rawfile tools "$inputs" --rawfile versions "$versions" \
     --arg recipe "$recipe_name" --arg base "$BASE" --arg runner "$MARKER" \
-    --arg context "$(gate_required_context "$owner" "$repo")" \
+    --arg context "$(gate_required_context "$owner" "$repo")" --arg kind "$(gate_execution_kind)" \
     '{schema:"jeryu.pr-gate-inputs/v1",sources:($sources|sort_by(.repository)),tools:$tools,
-      versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:"operator-unsealed"}' >"$output" || return
+      versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:$kind}' >"$output" || return
   rm -f -- "$rows" "$inputs" "$versions"
 }
 
@@ -295,7 +310,7 @@ gate_self_modification_note() { # receipt
 }
 
 gate_publish() {
-  local state outcome id digest exit_code context cause="" log note=""
+  local state outcome id digest exit_code context cause="" log note="" kind review=""
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -305,10 +320,18 @@ gate_publish() {
   context=$(jq -er '.inputs.required_context // (.repo + "/required")' "$gate_receipt") || return
   case "$outcome" in success) state=success;; failure|timed_out) state=failure;; *) state=error;; esac
   log=$(jq -r '.log // ""' "$gate_receipt")
+  # How the attempt ran is read from its own receipt, so recovering an older one says what that one did.
+  kind=$(jq -r '.execution_kind // .inputs.execution_kind // "operator-unsealed"' "$gate_receipt")
+  # A contribution that changes what the gate itself evaluates with is named on the check run, beside
+  # the self-gate note, so a reviewer sees it needs the extra review as well as a green gate. Never on
+  # the required status: its description is the gate's own verdict.
+  if jq -e '(.gate_input_paths // []) | length > 0' "$gate_receipt" >/dev/null; then
+    review="; gate inputs changed: extra review required"
+  fi
   if [[ "$state" != success && -f "$log" ]]; then cause=$(gate_failure_cause "$log"); fi
   if ! jq -e '.publication.required_status' "$gate_receipt" >/dev/null; then
     api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -nc --arg state "$state" --arg context "$context" \
-      --arg description "$MARKER operator-unsealed $outcome; exit $exit_code; attempt $id; log $digest${cause:+; cause: $cause}" \
+      --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${cause:+; cause: $cause}" \
       '{state:$state,context:$context,description:$description}')"
     : "${code:?}" "${body:?}"
     if [[ "$code" != 201 ]] || ! jq -e '.id != null' <<<"$body" >/dev/null; then
@@ -324,7 +347,7 @@ gate_publish() {
     # matching needs_human item from the same paths, so the PR also shows up on /needs-you.
     note=$(gate_self_modification_note "$gate_receipt")
     api POST "/repos/$owner/$repo/check-runs" "$(jq -nc --arg sha "$sha" --arg state "$state" \
-      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" --arg summary "Attempt $id; log sha256 $digest; operator-unsealed${note:+; changes its own gate}" \
+      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" --arg summary "Attempt $id; log sha256 $digest; $kind${note:+; changes its own gate}$review" \
       --arg note "$note" \
       '{name:"pr-gate-runner",head_sha:$sha,status:"completed",conclusion:(if $state=="error" then "failure" else $state end),
         output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}')"

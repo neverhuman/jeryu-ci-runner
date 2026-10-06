@@ -18,7 +18,8 @@ awk '
 [[ -s "$fixture/selection.sh" ]]
 
 check() (
-  local name=$1 owner=$2 repo=$3 run=$4 CANONICAL_PATH=$5 mount_available=$6 expected=$7
+  local name=$1 owner=$2 repo=$3 run=$4 CANONICAL_PATH=$5 mount_available=$6 expected=$7 sandbox=${8:-0}
+  local number=1   # named in the sandbox line the block logs
   export CANONICAL_PATH
   local worker_root
   local -a enter
@@ -48,3 +49,9 @@ check 'same name, other owner is ordinary' gate-a acme-ops "$fixture/slot5" 1 ye
 check 'slot zero stays physical' acme acme-ops "$fixture/canonical" 1 yes physical
 check 'explicit namespace disable' acme acme-deploy "$fixture/slot5" 0 yes physical
 check 'unavailable mount capability' acme acme-deploy "$fixture/slot5" 1 no physical
+# A contribution runs in the site's sandbox, which brings its own view of the filesystem: the runner
+# builds no mount namespace of its own for it, not even on a slot that would otherwise get one.
+: > "$fixture/selection.log"
+check 'a contribution never enters our namespace' acme acme-deploy "$fixture/slot5" 1 yes physical 1
+grep -q 'is a contribution: running it in the configured sandbox' "$fixture/selection.log" \
+  || { printf 'the sandbox selection was not reported\n' >&2; exit 1; }

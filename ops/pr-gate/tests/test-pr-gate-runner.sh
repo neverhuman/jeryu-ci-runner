@@ -554,7 +554,7 @@ regate() { # requested_at
 regate 2026-10-04T09:00:00Z
 touch "$mains"   # the family's mains just moved: an automatic re-gate would wait for the burst
 listed=$(GATE_RUNNER_REGATE_SETTLE=3600 bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
-grep -qx "acme fixture 1 $head -" <<<"$listed" \
+grep -qx "acme fixture 1 $head - 0" <<<"$listed" \
   || { printf 'a requested re-gate was not claimable:\n%s\n' "$listed" >&2; exit 1; }
 before_count=$(count)
 GATE_RUNNER_REGATE_SETTLE=3600 invoke
@@ -717,13 +717,13 @@ rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOT_PATTERN="$fixture/roots/{owner}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1) || {
   printf 'discovery through the checkout-root pattern failed:\n%s\n' "$listed" >&2; exit 1; }
-[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") -" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
+[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 [[ "$(cat "$fixture/runner/cache/protected-acme")" == acme/fixture ]]
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOTS="other=/nonexistent acme=$fixture/roots/acme" PR_GATE_CHECKOUT_ROOT_PATTERN="/nonexistent/{owner}" \
   bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
-[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") -" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
+[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
 grep -q 'no checkout root for owner acme' <<<"$listed" || { printf 'a missing checkout root was silent:\n%s\n' "$listed" >&2; exit 1; }

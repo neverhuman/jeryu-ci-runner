@@ -67,6 +67,56 @@ conclusion is unchanged: this is a flag for a person, not a veto. Running the re
 jeryu's attention inbox raises the matching item from the same path set, so such a pull request also
 appears on `/needs-you` (jeryu-deploy: `pr_changes_own_gate`).
 
+## Contributed pull requests
+
+The GitHub repositories are read-only mirrors; an outside contribution is imported to the forge as a
+PR the importer marks with `PR_GATE_CONTRIBUTED_LABEL` (default `origin:contributed`, read from
+jeryu's own pull request row -- `GET /api/v1/repos/:id/pulls` and `.../pulls/:n` -- where
+jeryu-deploy labels every row `origin:internal` or `origin:contributed`; the GitHub-compatible v3
+read carries no labels). A row with no marking at all is internal, so a forge older than the marking
+gates as before. Such a head carries
+code nobody of the family wrote, so the runner executes **nothing** of it -- no recipe, no
+locked-crate prefetch, no cache daemon, and it is not even checked out -- until a maintainer has
+allowed exactly that head. An internal PR is unaffected and keeps the path above.
+
+The allowance is the `PR_GATE_OK_TO_TEST_LABEL` (default `ok-to-test`) a maintainer applies on the
+forge, which the runner reads each tick from `GET /api/v1/gate-allowances?state=active` as
+
+    {"allowances":[{"repo":"acme/widgets","number":7,"head_sha":"<40 hex>","label":"ok-to-test",
+                    "allowed_by":"dana","allowed_at":"2026-10-06T09:00:00Z"}]}
+
+at most one per PR. The runner decides for itself, and fails closed: the allowance must name the
+PR's *current* head, carry the configured label, and come from a login in
+`PR_GATE_OK_TO_TEST_MAINTAINERS`. So a push moves the head, the allowance no longer names it, and
+the new head waits for a new one -- an ok-to-test is spent by the push that follows it. A forge
+without the route, one this identity cannot read it from, or an unconfigured maintainer list allows
+nothing; each is reported as the reason that head is not running, and no status is posted (the PR is
+waiting for a maintainer, not failing). jeryu-deploy does not serve this route yet, so on a jeryu
+forge today every contribution waits here: that is the fail-closed answer, not a fault.
+
+An allowed head is gated in `PR_GATE_SANDBOX_COMMAND`, the site's ephemeral, network-restricted VM
+or container, called as
+
+    <command> <tree-root> <repo> <recipe...>
+
+which mounts the tree root at that same path in the guest, enters `<repo>` and runs the repository's
+own recipe. What the runner guarantees on this side is that the execution has nothing of the gate
+host: `env -i` with no forge token and no path to one, no `GATE_RUNNER_IDENTITY`, no `HOME` or `USER`
+of the gate user, `PATH` is `PR_GATE_SANDBOX_PATH` and not the governed tools, no compile cache
+(`sccache` and `GATE_RUNNER_SHARED_TARGETS` are off, so it builds in its own tree), no prefetch into
+the shared Cargo registry, no runtime-tools or native-vendor link out of the gate home, and no mount
+namespace of ours. With no sandbox configured, an allowed contribution still runs nothing. The result
+is published as the usual exact-head `<repo>/required` status, and `sandboxed-contribution` is in its
+description, its receipt and its input identity -- so a sandboxed result is never reused as a
+host-run one, or the other way round.
+
+A contribution that changes what the gate itself evaluates with (`PR_GATE_GATE_INPUT_PATHS`:
+`ops/ci/`, `ops/ci-kit/`, `ops/pr-gate/`, `.jeryu/ci.toml`, `Justfile`, workflow directories) is
+compared against the merge base with protected `main`; the paths it changes are recorded in its
+receipt as `gate_input_paths` and its check run's summary says `gate inputs changed: extra review
+required` (beside the self-gate annotation above, never on the required status). That never changes
+whether the gate runs -- it is a green gate that still needs a human to read the change.
+
 ## Site configuration
 
 Nothing in this directory names a site. Everything that does -- the forge URL, the credential file,
@@ -119,7 +169,8 @@ and `systemd/*` to `~/.config/systemd/user`, `systemctl --user daemon-reload`, t
 
 `bash tests/required.sh` runs the whole suite offline: the config reader, the attempt journal and
 publication recovery, the complete runner against a fixture forge and real Git (including re-gate
-requests), the mount-namespace selection, lock inheritance, heartbeat and event projection, waking,
+requests), contributed heads (no ok-to-test, a stale or outside one, the sandbox's own environment), the
+mount-namespace selection, lock inheritance, heartbeat and event projection, waking,
 retention, the locked-crate prefetch's source allowlist, the installer and the database refreshers.
 Every fixture uses invented names (`acme`, `gate-a`, `example.test`); none reads the host's own site
 file. The repository's `ops/ci/pr-ci.sh` runs it.

@@ -168,6 +168,15 @@ if [[ "$code" == 200 ]] && jq -e . <<<"$body" >/dev/null 2>&1; then
 else
   { grep ' regate ' "$STATE" 2>/dev/null || true; } >>"$now"
 fi
+# An ok-to-test for a contributed head is the moment that head becomes gateable at all, so it wakes a
+# slot too. The runner still decides whether the allowance names the current head and a maintainer
+# gave it; this only says a tick is worth starting.
+get "/api/v1/gate-allowances?state=active"
+if [[ "$code" == 200 ]] && jq -e . <<<"$body" >/dev/null 2>&1; then
+  jq -r '.allowances[]? | "\(.repo) \(.number) \(.head_sha) allow \(.allowed_at)"' <<<"$body" >>"$now"
+else
+  { grep ' allow ' "$STATE" 2>/dev/null || true; } >>"$now"
+fi
 sort -u -o "$now" "$now"
 
 # First poll after boot or install: record the view, wake nothing (the timers cover the backlog).
