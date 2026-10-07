@@ -699,6 +699,12 @@ merge_receipt() { # owner/name number sha
 # Why this approved head cannot be landed yet, in the forge's own words, or empty. Read fresh on
 # every pass: the PR list row is a snapshot of one moment, and a required context that recovers on
 # a second attempt only becomes visible by asking again.
+#
+# The forge's verdict is summary.mergeable.can_merge, which already accounts for required contexts
+# and approvals; the detail route nests it under .summary, unlike the list row. The checks route
+# only explains a refusal: it can report a status-backed required context with neither state nor
+# conclusion after it went green, so treating its rows as authoritative held every approved head
+# forever (2026-10-06).
 merge_hold_reason() { # owner/name number
   local detail
   api GET "/api/v1/repos/${1/\//%2F}/pulls/$2"
@@ -707,18 +713,21 @@ merge_hold_reason() { # owner/name number
     return
   fi
   detail="$body"
+  if jq -e '(.summary // .) as $s | ($s.mergeable.can_merge // false) == true
+      and ($s.review.changes_requested // 0) == 0' <<<"$detail" >/dev/null 2>&1; then
+    return
+  fi
   api GET "/api/v1/repos/${1/\//%2F}/pulls/$2/checks"
   [ "$code" = 200 ] || body='{"checks":[]}'
   jq -nr --argjson d "$detail" --argjson c "$body" '
-    (($c.checks // []) | map(select((.required // false)
-        and ((.conclusion // .state // "pending") != "success")))) as $waiting
-    | if (($d.review.changes_requested // 0) > 0) then "changes are requested on this head"
+    ($d.summary // $d) as $s
+    | (($c.checks // []) | map(select((.required // false) and (.conclusion // .state) != null
+        and (.conclusion // .state) != "success"))) as $waiting
+    | if (($s.review.changes_requested // 0) > 0) then "changes are requested on this head"
       elif ($waiting | length) > 0 then
         ($waiting | map("required context \(.name) is \(.conclusion // .state // "pending")")
          | join(", "))
-      elif (($d.mergeable.can_merge // false) | not) then
-        ($d.mergeable.reason // $d.mergeable.level // "the forge says it cannot merge yet")
-      else "" end'
+      else ($s.mergeable.reason // $s.mergeable.level // "the forge says it cannot merge yet") end'
 }
 
 # Merge every open PR this tool approved at its current head, once the forge says it can merge.

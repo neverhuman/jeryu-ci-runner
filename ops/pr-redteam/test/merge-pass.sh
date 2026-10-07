@@ -63,7 +63,9 @@ if [[ "$bearer" != "$want" ]]; then printf 'wrong identity for %s: %s\n' "$url" 
 checks() {
   if [[ -e "$MERGE_FIXTURE/required-failing" ]]; then
     printf '{"checks":[{"name":"jeryu-deploy/required","required":true,"conclusion":"failing"}]}\n200'
-  else printf '{"checks":[{"name":"jeryu-deploy/required","required":true,"conclusion":"success"}]}\n200'; fi
+  # As the live forge answers once a status-backed required context is green: neither state nor
+  # conclusion on the row, while the pull request summary says it can merge.
+  else printf '{"checks":[{"name":"jeryu-deploy/required","required":true,"state":null,"conclusion":null}]}\n200'; fi
 }
 row() {
   jq -nc --arg sha "$(cat "$MERGE_FIXTURE/head")" --arg base "$(cat "$MERGE_FIXTURE/base")" \
@@ -80,7 +82,8 @@ case "$url" in
     else printf '{"login":"independent-reviewer"}\n200'; fi ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"jeryu","name":"fixture"},"family":"jain","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
-  */pulls/107) row | jq -c '. + {merge_passport:{blockers:[]}}'; printf '\n200' ;;
+  # The detail route nests the row under .summary, beside the passport (live forge shape).
+  */pulls/107) row | jq -c '{summary: ., merge_passport:{blockers:[]}, passport_hash, reviews: []}'; printf '\n200' ;;
   */pulls/107/checks) checks ;;
   */pulls/107/merge)
     if [[ -e "$MERGE_FIXTURE/required-failing" ]]; then printf '{"message":"required contexts are not green"}\n409'; exit 0; fi
