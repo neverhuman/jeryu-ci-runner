@@ -43,6 +43,15 @@ unreadable, the review pass still runs and nothing is landed. Installation
 stages inactive units; it does not authorize or start automated review or
 landing.
 
+`REDTEAM_AUTHOR_DOMAINS` (space-separated `owner/name=domain`, empty by default,
+also site configuration) restricts a repository to one email domain: a PR there
+is reviewed only when every commit in it is authored and committed at exactly
+that domain (any case; subdomains and lookalikes do not match). Any other PR is
+held once per head with an `author_domain` receipt, before any agent budget is
+spent, and is left for a person. Git emails are self-asserted, so this narrows
+what the controller approves; who may push is still the forge's decision.
+Changing the rules changes the review identity, so existing receipts requalify.
+
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, verdict, binary-payload,

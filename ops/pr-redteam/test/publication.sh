@@ -227,6 +227,28 @@ review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
 echo 'ok deterministic size hold reused, changed policy requalified'
 
+# A repository restricted to one email domain holds other commits before the model runs, once per
+# head; a matching domain (any case) is reviewed, and a lookalike domain is not a match.
+advance
+model_calls="$(count "$t/model-calls")"; accepted_before="$(count "$t/accepted")"
+REDTEAM_AUTHOR_DOMAINS='other/repo=example.invalid jeryu/fixture=veox.example' review
+jq -e '.decision == "author_domain" and .posted == false and .author_domain == "veox.example"
+  and .foreign_emails == ["fixture@example.invalid"]' "$(receipt)" > /dev/null
+attempts="$(find "$t/state/attempts" -type f | wc -l)"
+REDTEAM_AUTHOR_DOMAINS='other/repo=example.invalid jeryu/fixture=veox.example' review
+[[ "$(find "$t/state/attempts" -type f | wc -l)" == "$attempts" ]]
+[[ "$(count "$t/model-calls")" == "$model_calls" && "$(count "$t/accepted")" == "$accepted_before" ]]
+REDTEAM_AUTHOR_DOMAINS='jeryu/fixture=EXAMPLE.invalid' review
+jq -e '.decision != "author_domain" and .posted == true' "$(receipt)" > /dev/null
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+printf 'outsider\n' >> "$t/repo/README.md"
+"$real_git" -C "$t/repo" -c user.name=outsider -c user.email=x@notexample.invalid commit -qam outsider
+g rev-parse HEAD > "$t/head"
+REDTEAM_AUTHOR_DOMAINS='jeryu/fixture=example.invalid' review
+jq -e '.decision == "author_domain" and .foreign_emails == ["x@notexample.invalid"]' "$(receipt)" > /dev/null
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+echo 'ok author domain held before the model, matching domain reviewed'
+
 # A new base also invalidates the previous exact-head review receipt.
 model_calls="$(count "$t/model-calls")"
 g branch -f main "$(cat "$t/head")"

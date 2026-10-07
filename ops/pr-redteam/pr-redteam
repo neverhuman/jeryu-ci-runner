@@ -73,6 +73,11 @@
 #                          holds mechanically unless its sha256 appears in the diff
 #   REDTEAM_MAX_DIFF_BYTES 20000000             larger reviewed diffs (lock files excluded) are not
 #                          approved (left for a human)
+#   REDTEAM_AUTHOR_DOMAINS (none)               space-separated `owner/name=domain` rules: a PR in a
+#                          listed repository is reviewed only when every commit's author and committer
+#                          email is at exactly that domain; any other PR there is left for a person.
+#                          Git emails are self-asserted, so this narrows what is approved; it is not
+#                          access control (who may push is the forge's job)
 #   REDTEAM_STATE          ~/.local/state/pr-redteam   receipts, git cache, locks
 set -euo pipefail
 umask 077
@@ -94,6 +99,7 @@ budget="${REDTEAM_BUDGET_USD:-20}"
 agent_timeout="${REDTEAM_TIMEOUT:-2400}"
 max_diff_bytes="${REDTEAM_MAX_DIFF_BYTES:-20000000}"
 max_blob_bytes="${REDTEAM_MAX_BLOB_BYTES:-1000000}"
+read -ra author_domains <<<"${REDTEAM_AUTHOR_DOMAINS:-}"
 state="${REDTEAM_STATE:-$HOME/.local/state/pr-redteam}"
 claude_bin="${REDTEAM_CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/claude")}"
 
@@ -115,7 +121,7 @@ review_input_identity() {
   {
     (cd "$here" && sha256sum pr-redteam prompt.md verdict.schema.json validate-verdict.jq)
     if [[ -f "$claude_bin" ]]; then sha256sum "$claude_bin"; else printf 'cli-unavailable\n'; fi
-    printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes"
+    printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes" "${author_domains[*]}"
   } | sha256sum | cut -c1-64
 }
 review_identity="$(review_input_identity)"
@@ -259,13 +265,31 @@ skip_reason() { # row me include_drafts force
   receipt="$(receipt_path "$repo" "$number" "$sha")"
   if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" --arg identity "$review_identity" --arg base "$(jq -r .base_sha <<< "$row")" \
       '.review_identity == $identity and .base_sha == $base
-       and (.posted == true or .decision == "base_missing" or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
+       and (.posted == true or .decision == "base_missing" or .decision == "author_domain"
+            or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
     case "$(jq -r .decision "$receipt")" in
       base_missing) echo "$(jq -r '.base_ref // "the base branch"' "$receipt") does not exist yet; a person creates it" ;;
+      author_domain) echo "commits at ${sha:0:12} are not all @$(jq -r .author_domain "$receipt"); a person reviews it" ;;
       *) echo "already reviewed at ${sha:0:12} ($(jq -r .decision "$receipt"))" ;;
     esac
     return
   fi
+}
+
+# The email domain REDTEAM_AUTHOR_DOMAINS requires of a repository's commits, or empty.
+author_domain() { # owner/name
+  local rule
+  for rule in "${author_domains[@]}"; do
+    [ "${rule%%=*}" != "$1" ] || { printf '%s\n' "${rule#*=}"; return; }
+  done
+}
+
+# Author and committer emails in base..head that are not at exactly `domain`, one per line.
+foreign_emails() { # git-dir base head domain
+  local email
+  git -C "$1" log --format='%ae%n%ce' "$2..$3" | sort -u | while IFS= read -r email; do
+    [[ "${email,,}" == *"@${4,,}" && "${email%@*}" != *@* ]] || printf '%s\n' "$email"
+  done
 }
 
 # Branch names the forge has for one repository, one `refs/heads/...` per line.
@@ -558,6 +582,22 @@ review_one() { # owner/name number dry-run force include-drafts
       --argjson bytes "$diff_bytes" --arg identity "$review_identity" --arg base "$forge_base_sha" --arg diff_base "$base_sha" \
       '{repo:$repo, number:$number, head_sha:$sha, decision:"too_large", posted:false, diff_bytes:$bytes, reviewed_at:$at, review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$big"
     return 0
+  fi
+  # A repository restricted to one email domain: any commit outside it holds before the agent runs,
+  # once per head, like a diff that is too large. Nothing about it is approved or merged.
+  local domain foreign; domain="$(author_domain "$repo")"
+  if [ -n "$domain" ]; then
+    foreign="$(foreign_emails "$cache" "$base_sha" "$sha" "$domain")"
+    if [ -n "$foreign" ]; then
+      say "$tag: commits not all @$domain ($(paste -sd, <<<"$foreign")); NOT approving, needs a human"
+      jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" \
+        --arg domain "$domain" --arg foreign "$foreign" --arg identity "$review_identity" \
+        --arg base "$forge_base_sha" --arg diff_base "$base_sha" \
+        '{repo:$repo, number:$number, head_sha:$sha, decision:"author_domain", posted:false,
+          author_domain:$domain, foreign_emails:($foreign | split("\n")), reviewed_at:$at,
+          review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$receipt"
+      return 0
+    fi
   fi
   say "$tag: reviewing ${sha:0:12} ($(wc -l <"$d/files.txt") files, $(wc -c <"$d/diff.patch") bytes of diff)"
 
