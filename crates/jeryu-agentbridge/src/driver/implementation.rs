@@ -10,6 +10,7 @@ impl AgentDriver {
             timeout,
             output_budget_bytes,
             require_cgroup: true,
+            forbidden_token_values: Vec::new(),
         }
     }
 
@@ -37,6 +38,30 @@ impl AgentDriver {
     pub fn with_require_cgroup(mut self, require: bool) -> Self {
         self.require_cgroup = require;
         self
+    }
+
+    /// Builder: the token values, from site configuration, that must never
+    /// appear in a captured log. Nothing is forbidden by default because the
+    /// values are site data, not code.
+    #[must_use]
+    pub fn with_forbidden_token_values(mut self, values: Vec<String>) -> Self {
+        self.forbidden_token_values = values;
+        self
+    }
+
+    /// Refuse a captured log that carries a configured token value. Called on
+    /// every run before the capture leaves the driver; public so a caller that
+    /// captures output itself can apply the same guard.
+    pub fn guard_capture(&self, stdout: &[u8], stderr: &[u8]) -> Result<(), DriverError> {
+        for (label, bytes) in [("log stdout", stdout), ("log stderr", stderr)] {
+            jeryu_runner_core::credguard::deny_token_values_in_bytes(
+                label,
+                bytes,
+                &self.forbidden_token_values,
+            )
+            .map_err(|err| DriverError::CapturedTokenValue(err.message().to_string()))?;
+        }
+        Ok(())
     }
 
     /// Whether this driver requires enforced cgroup-v2 limits.
@@ -141,6 +166,7 @@ impl AgentDriver {
         sink.emit(AgentEvent::Started { pid: child.id() });
 
         let outcome = self.supervise(child, sink, started)?;
+        self.guard_capture(&outcome.stdout, &outcome.stderr)?;
 
         sink.emit(AgentEvent::Finished {
             exit_code: outcome.exit_code,

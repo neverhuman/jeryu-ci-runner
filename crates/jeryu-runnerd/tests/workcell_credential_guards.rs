@@ -1,0 +1,163 @@
+//! Host credential material must never leave a workcell through a workspace
+//! export, an artifact upload destination, a captured log, or a frozen capsule.
+//!
+//! Every case here drives the real validators the export path calls.
+
+use jeryu_runnerd::workcell::{
+    FreezeFailedCiRunRequest, HoldFailedTreeRequest, StartupSync, WorkcellClaimRequest,
+    WorkcellManager, validate_capture_text, validate_export_destination, validate_export_paths,
+};
+use std::path::PathBuf;
+
+fn root() -> PathBuf {
+    PathBuf::from("/workcells/wc-0001/repo")
+}
+
+fn rebased_claim(agent_id: &str) -> WorkcellClaimRequest {
+    WorkcellClaimRequest {
+        agent_id: agent_id.into(),
+        workspace_root: root(),
+        repo_roots: vec![root()],
+        branch_budget: 1,
+        runner_id: "xbabe0".into(),
+        runner_epoch: 7,
+        git_status_summary: "clean".into(),
+        ci_snapshot_age_ms: Some(0),
+        startup: StartupSync::Rebased {
+            main_ref: "origin/main".into(),
+            base_sha: "abc123".into(),
+            head_sha: "def456".into(),
+        },
+    }
+}
+
+/// One credential shape per line, all of them INSIDE a permitted export root so
+/// that only the credential guard can deny them. Each is also tried with
+/// Windows separators and in upper case.
+const CREDENTIAL_RELATIVE_PATHS: &[&str] = &[
+    ".home/.config/gh/hosts.yml",
+    ".claude/.credentials.json",
+    ".codex/auth.json",
+    ".jekko/users/jeryu-agent/llm.env",
+    "agent-auth/claude/env",
+    ".git-credentials",
+    "nested/.netrc",
+    "nested/_netrc",
+    ".ssh/known_hosts",
+    "keys/id_rsa",
+    "keys/id_ed25519",
+    ".aws/credentials",
+    ".config/gh/hosts.yml",
+    ".docker/config.json",
+    "state/refresh_token.json",
+    "state/refresh-token",
+];
+
+#[test]
+fn export_refuses_host_credential_material_inside_a_permitted_root() {
+    let allowed_roots = vec![root()];
+    for relative in CREDENTIAL_RELATIVE_PATHS {
+        for spelling in [
+            (*relative).to_string(),
+            relative.replace('/', "\\"),
+            relative.to_uppercase(),
+        ] {
+            let path = root().join(&spelling);
+            let err = validate_export_paths(std::slice::from_ref(&path), &allowed_roots)
+                .expect_err("credential material must never be exported");
+            assert_eq!(
+                err.reason,
+                "workcell_credential_material_denied",
+                "{} must be denied as credential material",
+                path.display()
+            );
+        }
+    }
+
+    // Repository content in the same root still exports.
+    validate_export_paths(&[root().join("src/lib.rs")], &allowed_roots)
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+fn export_destination_refuses_unlisted_roots_and_symlinks() {
+    let temp = tempfile::tempdir().unwrap_or_else(|err| panic!("{err}"));
+    let host_store = temp.path().join("host-store");
+    std::fs::create_dir(&host_store).unwrap_or_else(|err| panic!("{err}"));
+    let uploads = temp.path().join("uploads");
+    std::fs::create_dir(&uploads).unwrap_or_else(|err| panic!("{err}"));
+    let permitted = vec![uploads.clone()];
+
+    validate_export_destination(&uploads.join("wc-0001.tar"), &permitted)
+        .unwrap_or_else(|err| panic!("{err}"));
+
+    let err = validate_export_destination(&host_store.join("wc-0001.tar"), &permitted)
+        .expect_err("a destination outside the configured roots must be denied");
+    assert_eq!(err.reason, "workcell_export_destination_denied");
+
+    let linked = uploads.join("linked");
+    std::os::unix::fs::symlink(&host_store, &linked).unwrap_or_else(|err| panic!("{err}"));
+    let err = validate_export_destination(&linked.join("wc-0001.tar"), &permitted)
+        .expect_err("an upload must not be written through a symlink");
+    assert_eq!(err.reason, "workcell_export_destination_denied");
+}
+
+#[test]
+fn capture_refuses_a_configured_token_value_in_a_log() {
+    let token = "jrt-invented-value-9f3b".to_string();
+    let forbidden = vec![token.clone()];
+
+    let err = validate_capture_text(
+        "log",
+        &format!("cargo test failed: Authorization: Bearer {token}"),
+        &forbidden,
+    )
+    .expect_err("a token value in a log must fail the capture");
+    assert_eq!(err.reason, "workcell_capture_token_denied");
+    assert!(
+        !err.message().contains(&token),
+        "the denial must not echo the token value: {}",
+        err.message()
+    );
+
+    validate_capture_text("log", "cargo test failed: exit code 101", &forbidden)
+        .unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+fn a_capsule_carrying_a_token_value_is_not_frozen() {
+    let token = "jrt-invented-value-9f3b".to_string();
+    let forbidden = vec![token.clone()];
+
+    let mut manager = WorkcellManager::with_warm_pool(1);
+    let err = manager
+        .hold_failed_tree(HoldFailedTreeRequest {
+            claim: rebased_claim("agent-wrath-17"),
+            ci_run_id: "ci-19".into(),
+            failed_run_id: "run-19".into(),
+            failed_receipt_id: "receipt-19".into(),
+            failure_log_digest: format!("sha256:dead {token}"),
+            forbidden_token_values: forbidden.clone(),
+        })
+        .expect_err("a capsule carrying a token value must not be frozen");
+    assert_eq!(err.reason, "workcell_capture_token_denied");
+
+    let lease = manager
+        .claim(rebased_claim("agent-wrath-18"))
+        .unwrap_or_else(|err| panic!("{err}"));
+    let err = manager
+        .freeze_failed_ci_run(
+            &lease.workcell_id,
+            lease.runner_epoch,
+            FreezeFailedCiRunRequest {
+                ci_run_id: "ci-20".into(),
+                failed_run_id: "run-20".into(),
+                failed_receipt_id: "receipt-20".into(),
+                failure_log_digest: format!("sha256:dead {token}"),
+                snapshot_age_ms: 10,
+                forbidden_token_values: forbidden,
+            },
+        )
+        .expect_err("a capsule carrying a token value must not be frozen");
+    assert_eq!(err.reason, "workcell_capture_token_denied");
+}

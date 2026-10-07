@@ -153,7 +153,13 @@ impl WorkcellManager {
             failed_run_id,
             failed_receipt_id,
             failure_log_digest,
+            forbidden_token_values,
         } = request;
+        Self::guard_capsule(
+            &claim.git_status_summary,
+            &failure_log_digest,
+            &forbidden_token_values,
+        )?;
         let mut lease = self.claim(claim)?;
         let workcell_id = lease.workcell_id.clone();
         let cell = self
@@ -277,6 +283,11 @@ impl WorkcellManager {
             WorkcellError::epoch_fenced(format!("unknown workcell {workcell_id}"))
         })?;
         Self::require_epoch(cell, runner_epoch)?;
+        Self::guard_capsule(
+            &cell.git_status_summary,
+            &request.failure_log_digest,
+            &request.forbidden_token_values,
+        )?;
         Ok(FrozenCiSnapshot::from_workcell(
             request.ci_run_id,
             request.failed_run_id,
@@ -303,6 +314,17 @@ impl WorkcellManager {
         let workcell_id = self.mint_cell();
         self.ready_queue.push_back(workcell_id.clone());
         workcell_id
+    }
+
+    /// Refuse to freeze a capsule that carries a configured token value. The
+    /// capsule is evidence that outlives the run, so a leak here is permanent.
+    fn guard_capsule(
+        git_status_summary: &str,
+        failure_log_digest: &str,
+        forbidden_token_values: &[String],
+    ) -> WorkcellResult<()> {
+        validate_capture_text("capsule", git_status_summary, forbidden_token_values)?;
+        validate_capture_text("capsule", failure_log_digest, forbidden_token_values)
     }
 
     fn require_epoch(cell: &WorkcellLease, runner_epoch: u64) -> WorkcellResult<()> {

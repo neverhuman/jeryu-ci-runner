@@ -27,6 +27,10 @@ pub struct ArtifactPolicy {
     pub allow_absolute_paths: bool,
     pub require_metadata: bool,
     pub default_retention_days: u32,
+    /// Allowlist of workspace-relative roots an artifact may be collected
+    /// from, supplied by site configuration. Empty means the workspace root
+    /// itself is the only permitted export root.
+    pub permitted_export_roots: Vec<String>,
 }
 
 impl Default for ArtifactPolicy {
@@ -35,6 +39,7 @@ impl Default for ArtifactPolicy {
             allow_absolute_paths: false,
             require_metadata: true,
             default_retention_days: 14,
+            permitted_export_roots: Vec::new(),
         }
     }
 }

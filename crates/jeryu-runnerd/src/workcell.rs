@@ -12,6 +12,11 @@ mod model;
 
 use archive::{is_within_any_root, validate_archive_entry, validate_export_path};
 
+use jeryu_runner_core::credguard::{
+    deny_credential_material, deny_token_values, guard_write_destination,
+};
+use jeryu_runner_core::error::RunnerError;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt::{Display, Formatter};
 use std::path::{Component, Path, PathBuf};
@@ -139,6 +144,10 @@ pub struct FreezeFailedCiRunRequest {
     pub failed_receipt_id: String,
     pub failure_log_digest: String,
     pub snapshot_age_ms: u64,
+    /// Token values, supplied by site configuration, that must never appear in
+    /// the frozen capsule. A hit fails the freeze instead of storing it.
+    #[serde(default)]
+    pub forbidden_token_values: Vec<String>,
 }
 
 /// Request to hold a failed tree for live repair.
@@ -149,6 +158,10 @@ pub struct HoldFailedTreeRequest {
     pub failed_run_id: String,
     pub failed_receipt_id: String,
     pub failure_log_digest: String,
+    /// Token values, supplied by site configuration, that must never appear in
+    /// the frozen capsule. A hit fails the hold instead of storing it.
+    #[serde(default)]
+    pub forbidden_token_values: Vec<String>,
 }
 
 /// One live workcell lease.
@@ -205,7 +218,10 @@ pub fn validate_import_archive(
 }
 
 /// Validate a set of filesystem paths before exporting them into an outbound
-/// tarball.
+/// tarball. `allowed_repo_roots` is the configured allowlist of permitted
+/// export roots; on top of it, host credential material is refused even when it
+/// sits inside a permitted root, because the native runner mints the per-run
+/// agent home under the workspace.
 pub fn validate_export_paths(
     paths: &[PathBuf],
     allowed_repo_roots: &[PathBuf],
@@ -218,8 +234,33 @@ pub fn validate_export_paths(
                 path.display()
             )));
         }
+        deny_credential_material(path).map_err(WorkcellError::from_credential_guard)?;
     }
     Ok(())
+}
+
+/// Validate the destination an outbound export, uploaded artifact, log or
+/// capsule is about to be WRITTEN to. `allowed_destination_roots` is the
+/// configured allowlist; the destination must additionally not pass through a
+/// symlink, so a planted link cannot redirect the write onto host credentials.
+pub fn validate_export_destination(
+    destination: &Path,
+    allowed_destination_roots: &[PathBuf],
+) -> WorkcellResult<()> {
+    guard_write_destination(destination, allowed_destination_roots)
+        .map_err(WorkcellError::from_credential_guard)
+}
+
+/// Validate one captured log or capsule body before it leaves the workcell: a
+/// configured token value appearing in the capture fails the capture outright.
+/// `label` names the surface (`log`, `capsule`) so the denial points at it.
+pub fn validate_capture_text(
+    label: &str,
+    text: &str,
+    forbidden_token_values: &[String],
+) -> WorkcellResult<()> {
+    deny_token_values(label, text, forbidden_token_values)
+        .map_err(WorkcellError::from_credential_guard)
 }
 
 #[cfg(test)]

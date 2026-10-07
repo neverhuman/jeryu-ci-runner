@@ -22,6 +22,21 @@ const TAR_PATH_FIXES: &[&str] = &[
     "reject absolute paths, parent traversal, and special files before unpacking",
 ];
 
+const CREDENTIAL_MATERIAL_FIXES: &[&str] = &[
+    "export only repository content; leave the per-run agent home behind",
+    "keep host credential stores out of the export, upload, and capsule manifests",
+];
+
+const EXPORT_DESTINATION_FIXES: &[&str] = &[
+    "write the export into a configured destination root, never through a symlink",
+    "replace a symlinked destination with a real directory before exporting",
+];
+
+const CAPTURE_TOKEN_FIXES: &[&str] = &[
+    "fix the step that printed the token value instead of exporting the capture",
+    "keep token values out of logs and capsules; receipts record digests only",
+];
+
 const EPOCH_FENCE_FIXES: &[&str] = &[
     "refresh the workcell lease before retrying the mutation",
     "discard outdated heartbeats or releases that carry a prior epoch",
@@ -100,6 +115,39 @@ impl WorkcellError {
         )
     }
 
+    pub(super) fn credential_material_denied(message: impl Into<String>) -> Self {
+        Self::new(
+            "keep host credential material out of workcell exports",
+            "workcell_credential_material_denied",
+            CREDENTIAL_MATERIAL_FIXES,
+            "docs/boundaries.md#workcells",
+            "rerun cargo test -p jeryu-runnerd workcell --jobs 40",
+            message,
+        )
+    }
+
+    pub(super) fn export_destination_denied(message: impl Into<String>) -> Self {
+        Self::new(
+            "write an export only into a configured destination root",
+            "workcell_export_destination_denied",
+            EXPORT_DESTINATION_FIXES,
+            "docs/boundaries.md#workcells",
+            "rerun cargo test -p jeryu-runnerd workcell --jobs 40",
+            message,
+        )
+    }
+
+    pub(super) fn capture_token_denied(message: impl Into<String>) -> Self {
+        Self::new(
+            "keep token values out of captured logs and capsules",
+            "workcell_capture_token_denied",
+            CAPTURE_TOKEN_FIXES,
+            "docs/boundaries.md#workcells",
+            "rerun cargo test -p jeryu-runnerd workcell --jobs 40",
+            message,
+        )
+    }
+
     pub(super) fn epoch_fenced(message: impl Into<String>) -> Self {
         Self::new(
             "fence outdated workcell epochs",
@@ -142,6 +190,19 @@ impl WorkcellError {
             "rerun cargo test -p jeryu-runnerd workcell --jobs 40",
             message,
         )
+    }
+
+    /// Translate a `jeryu-runner-core` credential-guard denial into the
+    /// workcell repair surface, keeping the guard's message (which never
+    /// carries a secret value) as the detail.
+    pub(super) fn from_credential_guard(error: RunnerError) -> Self {
+        match error.code() {
+            "export_root_denied" | "destination_symlink_denied" => {
+                Self::export_destination_denied(error.message().to_string())
+            }
+            "token_value_in_capture" => Self::capture_token_denied(error.message().to_string()),
+            _ => Self::credential_material_denied(error.message().to_string()),
+        }
     }
 
     pub fn message(&self) -> &str {

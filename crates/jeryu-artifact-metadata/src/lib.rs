@@ -1,5 +1,7 @@
 use jeryu_ci_ir::{ArtifactWhen, Pipeline, deterministic_hash};
+use jeryu_runner_core::credguard::deny_credential_material;
 use std::fmt;
+use std::path::Path;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArtifactRecord {
@@ -19,6 +21,8 @@ pub enum ArtifactError {
     AbsolutePath { job_id: String, path: String },
     ParentTraversal { job_id: String, path: String },
     EmptyPath { job_id: String },
+    OutsidePermittedRoot { job_id: String, path: String },
+    CredentialMaterial { job_id: String, detail: String },
 }
 
 impl fmt::Display for ArtifactError {
@@ -32,6 +36,13 @@ impl fmt::Display for ArtifactError {
                 "artifact path for {job_id} cannot traverse parent dirs: {path}"
             ),
             Self::EmptyPath { job_id } => write!(f, "artifact path for {job_id} cannot be empty"),
+            Self::OutsidePermittedRoot { job_id, path } => write!(
+                f,
+                "artifact path for {job_id} is outside the permitted export roots: {path}"
+            ),
+            Self::CredentialMaterial { job_id, detail } => {
+                write!(f, "artifact path for {job_id} is refused: {detail}")
+            }
         }
     }
 }
@@ -46,6 +57,7 @@ pub fn plan_artifacts(pipeline: &Pipeline) -> Result<Vec<ArtifactRecord>, Artifa
                 &job.id,
                 &artifact.paths,
                 pipeline.artifact_policy.allow_absolute_paths,
+                &pipeline.artifact_policy.permitted_export_roots,
             )?;
             let canonical = format!(
                 "artifact|{}|{}|{}|{}|{}|{}",
@@ -73,10 +85,15 @@ pub fn plan_artifacts(pipeline: &Pipeline) -> Result<Vec<ArtifactRecord>, Artifa
     Ok(records)
 }
 
+/// `permitted_roots` is the configured allowlist of workspace-relative roots an
+/// upload may collect from; empty means the workspace root itself. Credential
+/// material is refused on top of the allowlist, because a per-run agent home
+/// lives under the workspace and would otherwise be inside a permitted root.
 fn validate_paths(
     job_id: &str,
     paths: &[String],
     allow_absolute: bool,
+    permitted_roots: &[String],
 ) -> Result<(), ArtifactError> {
     for path in paths {
         let trimmed = path.trim();
@@ -91,12 +108,28 @@ fn validate_paths(
                 path: path.clone(),
             });
         }
-        if trimmed.split('/').any(|part| part == "..") {
+        if trimmed.split(['/', '\\']).any(|part| part == "..") {
             return Err(ArtifactError::ParentTraversal {
                 job_id: job_id.to_string(),
                 path: path.clone(),
             });
         }
+        if !permitted_roots.is_empty()
+            && !permitted_roots
+                .iter()
+                .any(|root| Path::new(trimmed).starts_with(root))
+        {
+            return Err(ArtifactError::OutsidePermittedRoot {
+                job_id: job_id.to_string(),
+                path: path.clone(),
+            });
+        }
+        deny_credential_material(Path::new(trimmed)).map_err(|err| {
+            ArtifactError::CredentialMaterial {
+                job_id: job_id.to_string(),
+                detail: err.message().to_string(),
+            }
+        })?;
     }
     Ok(())
 }
@@ -145,5 +178,61 @@ mod tests {
     fn rejects_parent_traversal() {
         let result = plan_artifacts(&pipeline_with_path("target/../secret"));
         assert!(matches!(result, Err(ArtifactError::ParentTraversal { .. })));
+        let windows = plan_artifacts(&pipeline_with_path("target\\..\\secret"));
+        assert!(matches!(
+            windows,
+            Err(ArtifactError::ParentTraversal { .. })
+        ));
+    }
+
+    /// One upload case per credential shape. All of them are workspace-relative
+    /// and traversal-free, so only the credential guard can refuse them.
+    #[test]
+    fn rejects_host_credential_material_in_an_upload() {
+        for path in [
+            ".home/.config/gh/hosts.yml",
+            ".claude/.credentials.json",
+            ".codex/auth.json",
+            ".jekko/users/jeryu-agent/llm.env",
+            "agent-auth/claude/env",
+            ".git-credentials",
+            "nested/.netrc",
+            "nested/_netrc",
+            ".ssh/known_hosts",
+            "keys/id_rsa",
+            "keys/id_ed25519",
+            ".aws/credentials",
+            ".config/gh/hosts.yml",
+            ".docker/config.json",
+            "state/refresh_token.json",
+            "state/refresh-token",
+        ] {
+            for spelling in [
+                path.to_string(),
+                path.replace('/', "\\"),
+                path.to_uppercase(),
+            ] {
+                let result = plan_artifacts(&pipeline_with_path(&spelling));
+                assert!(
+                    matches!(result, Err(ArtifactError::CredentialMaterial { .. })),
+                    "{spelling} must not be uploadable: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_an_upload_outside_the_permitted_export_roots() {
+        let mut pipeline = pipeline_with_path("fixtures/junit.xml");
+        pipeline.artifact_policy.permitted_export_roots = vec!["target".to_string()];
+        let result = plan_artifacts(&pipeline);
+        assert!(
+            matches!(result, Err(ArtifactError::OutsidePermittedRoot { .. })),
+            "{result:?}"
+        );
+
+        let mut permitted = pipeline_with_path("target/junit.xml");
+        permitted.artifact_policy.permitted_export_roots = vec!["target".to_string()];
+        plan_artifacts(&permitted).unwrap_or_else(|err| panic!("{err}"));
     }
 }

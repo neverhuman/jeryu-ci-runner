@@ -186,6 +186,9 @@ pub enum DriverError {
     SandboxUnavailable(String),
     /// Supervising the child's pipes failed (I/O on the host side).
     Supervision(String),
+    /// A configured token value appeared in the captured log, so the capture is
+    /// refused instead of being handed on.
+    CapturedTokenValue(String),
 }
 
 impl std::fmt::Display for DriverError {
@@ -195,6 +198,7 @@ impl std::fmt::Display for DriverError {
             Self::Policy(m) => write!(f, "policy: {m}"),
             Self::SandboxUnavailable(m) => write!(f, "sandbox_unavailable: {m}"),
             Self::Supervision(m) => write!(f, "supervision: {m}"),
+            Self::CapturedTokenValue(m) => write!(f, "token_value_in_capture: {m}"),
         }
     }
 }
@@ -224,6 +228,10 @@ pub struct AgentDriver {
     /// Callers that knowingly run on a cgroup-less host (e.g. the Landlock/seccomp
     /// jail tests) opt out via [`AgentDriver::with_require_cgroup`].
     require_cgroup: bool,
+    /// Token values, supplied by site configuration, that must never appear in
+    /// the captured log. A hit fails the run rather than handing the capture on
+    /// to a log sink or an evidence capsule.
+    forbidden_token_values: Vec<String>,
 }
 
 impl Default for AgentDriver {

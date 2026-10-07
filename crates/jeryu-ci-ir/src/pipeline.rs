@@ -100,6 +100,11 @@ impl Pipeline {
         );
         line(
             &mut out,
+            "artifact.permitted_export_roots",
+            self.artifact_policy.permitted_export_roots.join(","),
+        );
+        line(
+            &mut out,
             "permission.fail_closed",
             self.permission_policy.fail_closed,
         );
