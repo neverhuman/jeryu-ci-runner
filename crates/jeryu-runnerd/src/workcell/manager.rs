@@ -46,6 +46,9 @@ impl WorkcellManager {
     }
 
     pub fn claim(&mut self, request: WorkcellClaimRequest) -> WorkcellResult<WorkcellLease> {
+        // Fence a stale runner lifetime before a cell is consumed, so a late
+        // claim from a previous epoch neither takes a warm cell nor mints one.
+        self.require_claim_epoch(&request.runner_id, request.runner_epoch)?;
         let warm_hit = !self.ready_queue.is_empty();
         let workcell_id = match self.ready_queue.pop_front() {
             Some(workcell_id) => workcell_id,
@@ -76,6 +79,8 @@ impl WorkcellManager {
             self.spawn_ready_cell();
         }
 
+        self.record_claim_epoch(&request.runner_id, request.runner_epoch);
+
         let lease = self
             .cells
             .get(&workcell_id)
@@ -103,12 +108,39 @@ impl WorkcellManager {
         workcell_id: &str,
         request: WorkcellClaimRequest,
     ) -> WorkcellResult<WorkcellLease> {
-        if let Some(pos) = self.ready_queue.iter().position(|id| id == workcell_id) {
-            self.ready_queue.remove(pos);
+        // Every refusal below happens before the ready queue entry is consumed
+        // and before the lease is touched, so a denied claim leaves the cell
+        // exactly as it was for the claim that is allowed to win.
+        let state = self
+            .cells
+            .get(workcell_id)
+            .ok_or_else(|| {
+                WorkcellError::claim_denied(format!("unknown warm cell {workcell_id}"))
+            })?
+            .state;
+        if !matches!(state, WorkcellState::Ready) {
+            return Err(WorkcellError::claim_denied(format!(
+                "warm cell {workcell_id} is {} and only a ready cell can be claimed",
+                state.as_str()
+            )));
         }
-        let cell = self.cells.get_mut(workcell_id).ok_or_else(|| {
-            WorkcellError::claim_denied(format!("unknown warm cell {workcell_id}"))
-        })?;
+        let queued = self
+            .ready_queue
+            .iter()
+            .position(|id| id == workcell_id)
+            .ok_or_else(|| {
+                WorkcellError::claim_denied(format!(
+                    "warm cell {workcell_id} is not in the ready queue"
+                ))
+            })?;
+        self.require_claim_epoch(&request.runner_id, request.runner_epoch)?;
+
+        self.ready_queue.remove(queued);
+        self.record_claim_epoch(&request.runner_id, request.runner_epoch);
+        let cell = self
+            .cells
+            .get_mut(workcell_id)
+            .expect("ready queue and lease table stay in sync");
         cell.apply_claim(&request);
         cell.apply_startup(&request.startup);
         let outcome = match &request.startup {
@@ -341,7 +373,7 @@ impl WorkcellManager {
     /// Mint a ready cell into the lease table without queueing it. The caller
     /// owns the new id: a claim hands it straight to one agent, so it must not
     /// also sit in the ready queue where the next claim would take it.
-    fn mint_cell(&mut self) -> String {
+    pub(super) fn mint_cell(&mut self) -> String {
         self.next_id = self.next_id.saturating_add(1);
         let workcell_id = format!("wc-{:04}", self.next_id);
         let lease = WorkcellLease::ready(workcell_id.clone());
@@ -354,6 +386,23 @@ impl WorkcellManager {
         let workcell_id = self.mint_cell();
         self.ready_queue.push_back(workcell_id.clone());
         workcell_id
+    }
+
+    /// Refuse a claim that carries an epoch below the highest one this runner
+    /// has already claimed with. The epoch is the runner's fencing token: a
+    /// lower one belongs to a lifetime the daemon has moved past.
+    fn require_claim_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
+        match self.runner_epochs.get(runner_id) {
+            Some(&active) if runner_epoch < active => Err(WorkcellError::epoch_fenced(format!(
+                "runner {runner_id} claim fenced: epoch {runner_epoch} < active {active}"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
+    fn record_claim_epoch(&mut self, runner_id: &str, runner_epoch: u64) {
+        let active = self.runner_epochs.entry(runner_id.to_string()).or_default();
+        *active = (*active).max(runner_epoch);
     }
 
     fn require_epoch(cell: &WorkcellLease, runner_epoch: u64) -> WorkcellResult<()> {

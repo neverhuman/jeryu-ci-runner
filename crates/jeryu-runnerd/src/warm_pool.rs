@@ -424,6 +424,26 @@ mod tests {
         assert!(claimed.lease.workcell_id.starts_with("wc-"));
     }
 
+    // The runner epoch fences the pool's claim path too: once a session claims
+    // at epoch 9, a later claim carrying epoch 8 is refused and the warm cell it
+    // would have taken stays available for the live epoch.
+    #[test]
+    fn a_stale_runner_epoch_is_fenced_on_the_pool_claim_path() {
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = WarmPool::new(fake, 2).expect("warm the pool");
+        pool.claim(session_claim("agent-7", "run-42", 9))
+            .expect("the current epoch claims");
+
+        let err = pool
+            .claim(session_claim("agent-8", "run-43", 8))
+            .expect_err("a stale epoch is fenced");
+        assert_eq!(err.code(), "workcell_epoch_fenced");
+        assert_eq!(pool.warm_depth(), 2, "the pool refills despite the fence");
+
+        pool.claim(session_claim("agent-9", "run-44", 9))
+            .expect("the live epoch still claims");
+    }
+
     // A failed startup rebase blocks the claim but the pool still refills, so the
     // next session is not starved of a warm cell.
     #[test]

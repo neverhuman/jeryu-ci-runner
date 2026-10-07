@@ -19,6 +19,20 @@ impl ArchiveEntryKind {
     }
 }
 
+impl WorkcellState {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Warming => "warming",
+            Self::Ready => "ready",
+            Self::Claimed => "claimed",
+            Self::Held => "held",
+            Self::Repairing => "repairing",
+            Self::Blocked => "blocked",
+            Self::Released => "released",
+        }
+    }
+}
+
 impl ArchiveEntry {
     pub fn new(path: impl Into<PathBuf>, kind: ArchiveEntryKind) -> Self {
         Self {

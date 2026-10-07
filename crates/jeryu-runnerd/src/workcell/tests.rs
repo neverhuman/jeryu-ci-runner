@@ -466,3 +466,31 @@ fn tar_import_rejects_hardlink_fifo_and_socket_entries() {
         );
     }
 }
+
+#[test]
+fn claim_ready_refuses_a_ready_cell_that_is_not_in_the_ready_queue() {
+    let mut manager = WorkcellManager::new();
+    // Minted but never queued: the warm pool owns no container for this id, so
+    // no agent may be handed it even though the lease itself reads ready.
+    let workcell_id = manager.mint_cell();
+    assert_eq!(
+        manager.workcell(&workcell_id).unwrap().state,
+        WorkcellState::Ready
+    );
+
+    let denied = manager
+        .claim_ready(&workcell_id, rebased_request("agent-wrath-21"))
+        .expect_err("a cell outside the ready queue is not claimable");
+
+    assert_eq!(denied.reason, "workcell_claim_denied");
+    assert!(
+        denied.message().contains("not in the ready queue"),
+        "message names the missing queue entry: {}",
+        denied.message()
+    );
+    assert_eq!(
+        manager.workcell(&workcell_id).unwrap().state,
+        WorkcellState::Ready,
+        "a denied claim leaves the lease untouched"
+    );
+}
