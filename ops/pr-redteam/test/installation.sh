@@ -10,7 +10,9 @@ cat > "$t/bin/systemctl" <<'FIXTURE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$INSTALL_FIXTURE/calls"
 case "$*" in
-  *is-active*|*is-enabled*) [[ "$FIXTURE_UNIT_ACTIVE" == 1 ]] ;;
+  *is-active*) [[ "$FIXTURE_UNIT_ACTIVE" == 1 ]] ;;
+  # Real systemctl prints the state and exits 0 for a static unit too.
+  *is-enabled*) printf '%s\n' "${FIXTURE_ENABLED_STATE:-static}"; [[ "${FIXTURE_ENABLED_STATE:-static}" != disabled ]] ;;
   '--user daemon-reload') exit 0 ;;
   *) echo 'unexpected activation command' >&2; exit 97 ;;
 esac
@@ -38,6 +40,8 @@ grep -q "^ExecStart=$here/pr-redteam poke\$" "$t/home/.config/systemd/user/pr-re
 if grep -Eq 'enable --now|start --no-block|disable|stop ' "$t/calls"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 sha256sum "$t/home/.config/systemd/user/"* > "$t/before"
 if run 1; then echo 'active installation was accepted' >&2; exit 1; fi
+# A unit that is stopped but still enabled would start on its own: refused too.
+if FIXTURE_ENABLED_STATE=enabled run 0; then echo 'enabled installation was accepted' >&2; exit 1; fi
 sha256sum -c "$t/before" > /dev/null
 if grep -Eq 'enable --now|start --no-block|disable|stop ' "$t/calls"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 echo 'INACTIVE INSTALLATION PASS'

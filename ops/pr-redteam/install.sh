@@ -14,7 +14,11 @@ units="$HOME/.config/systemd/user"
 # service owner to stop/disable it explicitly before staging replacement source.
 for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-redteam-heartbeat.timer \
   pr-redteam-poke.service pr-redteam-poke.timer; do
-  if systemctl --user is-active --quiet "$unit" || systemctl --user is-enabled --quiet "$unit"; then
+  # `is-enabled` also succeeds for a static unit (no [Install] section, as every
+  # pr-redteam service is), so only states that start the unit on their own count.
+  enabled_state="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+  if systemctl --user is-active --quiet "$unit" ||
+    [[ "$enabled_state" =~ ^(enabled|enabled-runtime|linked|linked-runtime|alias)$ ]]; then
     echo "$unit is active or enabled; its service owner must stop/disable it before installation" >&2
     exit 1
   fi
