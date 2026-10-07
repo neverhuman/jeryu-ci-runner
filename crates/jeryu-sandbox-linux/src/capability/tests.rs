@@ -248,3 +248,113 @@ fn delegated_cgroup_probe_checks_topology_and_concurrent_ownership() {
     assert_eq!(std::fs::read(control).unwrap(), before_control);
     assert_eq!(entries(&current), before_entries);
 }
+
+// ---- untrusted workloads: all four controls or no launch ------------------
+
+/// An untrusted plan (all four controls demanded) over this crate's default
+/// landlock rules.
+fn untrusted_plan() -> SandboxPlan {
+    plan().with_untrusted_workload(true)
+}
+
+/// Capabilities with every control present; individual tests strip one.
+fn all_controls() -> SandboxCapabilities {
+    SandboxCapabilities {
+        user_namespace: true,
+        mount_namespace: true,
+        pid_namespace: true,
+        landlock_abi: Some(4),
+        seccomp_bpf: true,
+        cgroup_v2_subtree: Some(PathBuf::from("/sys/fs/cgroup/x")),
+        no_new_privs: true,
+    }
+}
+
+#[test]
+fn untrusted_workload_implies_require_cgroup() {
+    assert!(untrusted_plan().require_cgroup);
+    // And the plain plan stays trusted, so CI jobs are untouched.
+    assert!(!plan().untrusted_workload);
+}
+
+#[test]
+fn untrusted_workload_with_all_controls_is_enforced() {
+    assert_eq!(
+        all_controls().enforcement_level(&untrusted_plan()),
+        EnforcementLevel::Enforced
+    );
+}
+
+#[test]
+fn untrusted_workload_refuses_each_missing_control() {
+    // One case per control: strip it, and the untrusted launch must resolve to
+    // Unavailable naming it — never Degraded, never Enforced.
+    let cases: [(&str, fn(&mut SandboxCapabilities)); 4] = [
+        ("NO_NEW_PRIVS", |caps| caps.no_new_privs = false),
+        ("cgroup_v2", |caps| caps.cgroup_v2_subtree = None),
+        ("landlock", |caps| caps.landlock_abi = None),
+        ("seccomp", |caps| caps.seccomp_bpf = false),
+    ];
+    for (named, strip) in cases {
+        let mut caps = all_controls();
+        strip(&mut caps);
+        match caps.enforcement_level(&untrusted_plan()) {
+            EnforcementLevel::Unavailable { reason } => assert!(
+                reason.contains(named),
+                "refusal should name {named}, got {reason:?}"
+            ),
+            other => panic!("untrusted launch must fail closed without {named}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn untrusted_workload_refuses_when_every_control_is_missing() {
+    let caps = SandboxCapabilities {
+        user_namespace: false,
+        mount_namespace: false,
+        pid_namespace: false,
+        landlock_abi: None,
+        seccomp_bpf: false,
+        cgroup_v2_subtree: None,
+        no_new_privs: true,
+    };
+    match caps.enforcement_level(&untrusted_plan()) {
+        EnforcementLevel::Unavailable { reason } => {
+            for named in ["cgroup_v2", "landlock", "seccomp"] {
+                assert!(reason.contains(named), "{named} missing from {reason:?}");
+            }
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn untrusted_workload_refuses_a_plan_without_landlock_rules() {
+    // A ruleset with no rules confines nothing, so it cannot stand in for the
+    // Landlock control even on a host whose kernel supports it.
+    let mut plan = untrusted_plan();
+    plan.landlock_rules.clear();
+    match all_controls().enforcement_level(&plan) {
+        EnforcementLevel::Unavailable { reason } => {
+            assert!(reason.contains("landlock_rules"), "got {reason:?}");
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+#[test]
+fn missing_controls_still_only_degrade_a_trusted_plan() {
+    // The untrusted gate must not change the trusted posture: the same host that
+    // refuses an untrusted launch still runs a trusted CI job degraded.
+    let mut caps = all_controls();
+    caps.landlock_abi = None;
+    caps.seccomp_bpf = false;
+    match caps.enforcement_level(&plan()) {
+        EnforcementLevel::Degraded { missing } => {
+            assert!(missing.contains(&"landlock".to_string()));
+            assert!(missing.contains(&"seccomp".to_string()));
+        }
+        other => panic!("trusted plan must degrade, got {other:?}"),
+    }
+}

@@ -65,6 +65,49 @@ pub(super) fn build_payload(
         }
         _ => None,
     };
+    // Second gate for an untrusted workload: the compiled payload itself must
+    // carry every control. The resolver already refused a host that cannot
+    // supply one, so reaching here means the payload and the probed capabilities
+    // disagree — refuse rather than exec a partially confined untrusted job.
+    if plan.untrusted_workload {
+        let mut absent = Vec::new();
+        if cgroup_procs_fd.is_none() {
+            absent.push("cgroup_v2");
+        }
+        if landlock.is_none() {
+            absent.push("landlock");
+        }
+        if seccomp_bpf.is_none() {
+            absent.push("seccomp");
+        }
+        if !absent.is_empty() {
+            let error = SandboxError::new(
+                "untrusted_isolation_incomplete",
+                format!(
+                    "untrusted workload cannot launch without {}",
+                    absent.join(", ")
+                ),
+            );
+            if let Some(control) = &mut cgroup
+                && let Err(cleanup) = control.cleanup()
+            {
+                return Err(SandboxError::new(
+                    "untrusted_isolation_incomplete",
+                    format!("{error}; cgroup cleanup unresolved: {cleanup}"),
+                ));
+            }
+            if let Some(cleanup) = &cgroup_cleanup
+                && let Err(error) = cleanup.cleanup()
+            {
+                return Err(SandboxError::new(
+                    "untrusted_isolation_incomplete",
+                    format!("untrusted workload refused; cgroup cleanup unresolved: {error}"),
+                ));
+            }
+            return Err(error);
+        }
+    }
+
     Ok((
         SandboxPayload {
             cgroup_procs_fd,

@@ -11,6 +11,7 @@ impl AgentDriver {
             output_budget_bytes,
             forbidden_token_values: Vec::new(),
             require_cgroup: true,
+            untrusted_workload: true,
         }
     }
 
@@ -62,7 +63,31 @@ impl AgentDriver {
     #[must_use]
     pub fn with_require_cgroup(mut self, require: bool) -> Self {
         self.require_cgroup = require;
+        if !require {
+            // cgroups are one of the four untrusted-workload controls, so a run
+            // that drops them cannot claim the untrusted posture either.
+            self.untrusted_workload = false;
+        }
         self
+    }
+
+    /// Builder: treat the agent command as an untrusted workload (the default).
+    ///
+    /// `true` refuses the launch unless `no_new_privs`, cgroup-v2 limits,
+    /// Landlock and seccomp are all applied; it implies `require_cgroup`.
+    #[must_use]
+    pub fn with_untrusted_workload(mut self, untrusted: bool) -> Self {
+        self.untrusted_workload = untrusted;
+        if untrusted {
+            self.require_cgroup = true;
+        }
+        self
+    }
+
+    /// Whether this driver treats the agent command as untrusted.
+    #[must_use]
+    pub fn untrusted_workload(&self) -> bool {
+        self.untrusted_workload
     }
 
     /// Whether this driver requires enforced cgroup-v2 limits.
@@ -124,7 +149,8 @@ impl AgentDriver {
         // subtree this resolves to Unavailable and spawn_sandboxed refuses to
         // launch (fail-closed), surfaced below as DriverError::SandboxUnavailable.
         let plan = SandboxPlan::from_decision(workspace, &decision)
-            .with_require_cgroup(self.require_cgroup);
+            .with_require_cgroup(self.require_cgroup)
+            .with_untrusted_workload(self.untrusted_workload);
 
         let caps = cached_capabilities();
         let level = caps.enforcement_level(&plan);

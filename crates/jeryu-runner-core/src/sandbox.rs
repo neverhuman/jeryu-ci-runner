@@ -171,6 +171,13 @@ pub struct SandboxPlan {
     /// `Unavailable` and refuses to launch (fail-closed). Defaults to `false`
     /// so existing CI/build jobs and the escape suite degrade exactly as before.
     pub require_cgroup: bool,
+    /// When `true`, the job is an UNTRUSTED workload: the launch must apply all
+    /// four kernel controls — `no_new_privs`, cgroup-v2 limits, Landlock and
+    /// seccomp-bpf. If any one of them cannot be applied the sandbox resolves to
+    /// `Unavailable` and the launch is REFUSED; there is no degraded success for
+    /// an untrusted workload. Defaults to `false` so trusted build/CI jobs keep
+    /// their honest degraded-skip posture.
+    pub untrusted_workload: bool,
 }
 
 impl SandboxPlan {
@@ -247,6 +254,9 @@ impl SandboxPlan {
             // when cgroups cannot be enforced. Agent jobs opt IN explicitly via
             // [`SandboxPlan::with_require_cgroup`].
             require_cgroup: false,
+            // Default OFF: only a caller that knows the code is untrusted asks
+            // for the all-four-controls-or-refuse posture.
+            untrusted_workload: false,
         }
     }
 
@@ -260,6 +270,20 @@ impl SandboxPlan {
     #[must_use]
     pub fn with_require_cgroup(mut self, require: bool) -> Self {
         self.require_cgroup = require;
+        self
+    }
+
+    /// Builder: mark this plan as an untrusted workload.
+    ///
+    /// With `true`, a missing `no_new_privs`, cgroup-v2 subtree, Landlock ABI or
+    /// seccomp-bpf each resolve to `EnforcementLevel::Unavailable`, so the launch
+    /// fails instead of degrading. Requiring cgroups is implied.
+    #[must_use]
+    pub fn with_untrusted_workload(mut self, untrusted: bool) -> Self {
+        self.untrusted_workload = untrusted;
+        if untrusted {
+            self.require_cgroup = true;
+        }
         self
     }
 

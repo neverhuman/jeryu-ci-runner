@@ -233,6 +233,11 @@ pub struct AgentDriver {
     /// Callers that knowingly run on a cgroup-less host (e.g. the Landlock/seccomp
     /// jail tests) opt out via [`AgentDriver::with_require_cgroup`].
     require_cgroup: bool,
+    /// Treat the agent command as an UNTRUSTED workload: the launch must apply
+    /// `no_new_privs`, cgroup-v2 limits, Landlock and seccomp, or it is refused.
+    /// Defaults to `true`; opting out of [`AgentDriver::with_require_cgroup`]
+    /// also clears this, because cgroups are one of the four controls.
+    untrusted_workload: bool,
 }
 
 impl Default for AgentDriver {
@@ -765,6 +770,21 @@ mod tests {
                 .with_require_cgroup(false)
                 .require_cgroup()
         );
+    }
+
+    #[test]
+    fn driver_treats_agent_code_as_untrusted_by_default() {
+        // Agent-authored code is untrusted: all four kernel controls or no run.
+        assert!(AgentDriver::default().untrusted_workload());
+        assert!(AgentDriver::new(Duration::from_secs(1), 1024).untrusted_workload());
+        // Dropping the cgroup requirement drops the untrusted posture with it,
+        // because cgroups are one of the four controls.
+        let opted_out = AgentDriver::default().with_require_cgroup(false);
+        assert!(!opted_out.untrusted_workload());
+        // And asking for the untrusted posture back re-requires cgroups.
+        let strict = opted_out.with_untrusted_workload(true);
+        assert!(strict.untrusted_workload());
+        assert!(strict.require_cgroup());
     }
 
     #[test]

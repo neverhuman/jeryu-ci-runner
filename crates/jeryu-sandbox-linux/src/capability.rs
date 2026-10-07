@@ -98,6 +98,35 @@ impl SandboxCapabilities {
             };
         }
 
+        // Untrusted workloads: all four kernel controls or no launch at all.
+        // `no_new_privs` is already handled above; the rest are checked together
+        // so the refusal names every control the host could not supply.
+        if plan.untrusted_workload {
+            let mut unavailable = Vec::new();
+            if self.cgroup_v2_subtree.is_none() {
+                unavailable.push("cgroup_v2");
+            }
+            if self.landlock_abi.is_none() {
+                unavailable.push("landlock");
+            }
+            if plan.landlock_rules.is_empty() {
+                // No rules means nothing is actually confined, so an applied
+                // ruleset would prove nothing.
+                unavailable.push("landlock_rules");
+            }
+            if !self.seccomp_bpf {
+                unavailable.push("seccomp");
+            }
+            if !unavailable.is_empty() {
+                return EnforcementLevel::Unavailable {
+                    reason: format!(
+                        "untrusted workload requires no_new_privs, cgroup_v2, landlock and seccomp; cannot apply: {}",
+                        unavailable.join(", ")
+                    ),
+                };
+            }
+        }
+
         // cgroups: the plan always carries nonzero limits. If the plan REQUIRES
         // enforced cgroups (agent jobs) and no delegated subtree exists, we fail
         // CLOSED — the resolver returns Unavailable and `spawn_sandboxed` refuses

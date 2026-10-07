@@ -8,6 +8,7 @@ impl PtyAgentDriver {
             timeout,
             output_budget_bytes,
             require_cgroup: true,
+            untrusted_workload: true,
             grace: Duration::from_millis(200),
         }
     }
@@ -30,7 +31,27 @@ impl PtyAgentDriver {
     #[must_use]
     pub fn with_require_cgroup(mut self, require: bool) -> Self {
         self.require_cgroup = require;
+        if !require {
+            self.untrusted_workload = false;
+        }
         self
+    }
+
+    /// Builder: treat the agent command as an untrusted workload (the default):
+    /// all four kernel controls or no launch. Implies `require_cgroup`.
+    #[must_use]
+    pub fn with_untrusted_workload(mut self, untrusted: bool) -> Self {
+        self.untrusted_workload = untrusted;
+        if untrusted {
+            self.require_cgroup = true;
+        }
+        self
+    }
+
+    /// Whether this driver treats the agent command as untrusted.
+    #[must_use]
+    pub fn untrusted_workload(&self) -> bool {
+        self.untrusted_workload
     }
 
     /// Whether this driver requires enforced cgroup-v2 limits.
@@ -121,7 +142,8 @@ impl PtyAgentDriver {
         let job = self.build_job(workspace, spec);
         let decision = select_runner(&job).map_err(|e| DriverError::Policy(e.to_string()))?;
         let mut plan = SandboxPlan::from_decision(workspace, &decision)
-            .with_require_cgroup(self.require_cgroup);
+            .with_require_cgroup(self.require_cgroup)
+            .with_untrusted_workload(self.untrusted_workload);
         // Disable user namespace for PTY sessions: CLONE_NEWUSER breaks Go's
         // pure DNS resolver (falls back to [::1]:53 instead of reading
         // /etc/resolv.conf). Landlock + seccomp still provide isolation.

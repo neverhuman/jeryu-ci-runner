@@ -98,6 +98,9 @@ pub struct PtyAgentDriver {
     timeout: Duration,
     output_budget_bytes: usize,
     require_cgroup: bool,
+    /// All-four-controls-or-refuse posture for untrusted agent code. See
+    /// [`crate::driver::AgentDriver`].
+    untrusted_workload: bool,
     grace: Duration,
 }
 
@@ -257,6 +260,36 @@ mod tests {
                 .any(|rule| rule.path == Path::new("/run")),
             "PTY sessions must allow reading /run for DNS resolution"
         );
+    }
+
+    #[test]
+    fn pty_sandbox_plan_is_untrusted_by_default() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let driver = PtyAgentDriver::new(Duration::from_secs(5), 1024);
+        let spec = CommandSpec::new("/bin/true");
+
+        assert!(driver.untrusted_workload());
+        let (_, plan, _) = driver
+            .build_sandbox_plan(workspace.path(), &spec)
+            .expect("sandbox plan");
+        assert!(plan.untrusted_workload, "PTY agent code is untrusted");
+        assert!(
+            plan.require_cgroup,
+            "the untrusted posture requires cgroups"
+        );
+        assert!(
+            !plan.landlock_rules.is_empty(),
+            "an untrusted plan must carry Landlock rules"
+        );
+
+        // Opting out of cgroups opts out of the untrusted posture, so the jail
+        // tests keep running on a host without cgroup delegation.
+        let relaxed = driver.with_require_cgroup(false);
+        assert!(!relaxed.untrusted_workload());
+        let (_, plan, _) = relaxed
+            .build_sandbox_plan(workspace.path(), &spec)
+            .expect("sandbox plan");
+        assert!(!plan.untrusted_workload);
     }
 
     #[test]
