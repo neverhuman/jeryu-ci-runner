@@ -562,8 +562,10 @@ review_one() { # owner/name number dry-run force include-drafts
   git -C "$cache" cat-file -e "$base_sha^{commit}" 2>/dev/null || base_sha="$(git -C "$cache" rev-parse "refs/pr/$number/base")"
 
   local d="$work/review"
-  jq 'del(.body, .available_actions)' <<<"$row" >"$d/pr.json"
-  jq -r '"# \(.title)\n\n\(.body // "(no description)")"' <<<"$row" >"$d/description.md"
+  # The forge's v1 API returns a pull request's text as `description`; `body` is
+  # the GitHub-style name and is null there. Read either, so the reviewer sees it.
+  jq 'del(.body, .description, .available_actions)' <<<"$row" >"$d/pr.json"
+  jq -r '"# \(.title)\n\n\(.body // .description // "(no description)")"' <<<"$row" >"$d/description.md"
   git -C "$cache" log --stat --format='commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%B' "$base_sha..$sha" >"$d/log.txt"
   git -C "$cache" diff --stat=200 "$base_sha...$sha" >"$d/stat.txt"
   git -C "$cache" diff --numstat "$base_sha...$sha" >"$d/numstat.txt"
