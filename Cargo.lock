@@ -669,6 +669,7 @@ name = "jeryu-artifact-metadata"
 version = "5.0.0"
 dependencies = [
  "jeryu-ci-ir",
+ "jeryu-runner-core",
 ]
 
 [[package]]
@@ -774,6 +775,7 @@ name = "jeryu-runner-core"
 version = "5.0.0"
 dependencies = [
  "proptest",
+ "tempfile",
 ]
 
 [[package]]
@@ -864,6 +866,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tokio",
  "tokio-rustls",
 ]
