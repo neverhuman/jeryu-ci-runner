@@ -19,7 +19,7 @@ fn rebased_claim(agent_id: &str) -> WorkcellClaimRequest {
         workspace_root: root(),
         repo_roots: vec![root()],
         branch_budget: 1,
-        runner_id: "xbabe0".into(),
+        runner_id: "runner-17".into(),
         runner_epoch: 7,
         git_status_summary: "clean".into(),
         ci_snapshot_age_ms: Some(0),
