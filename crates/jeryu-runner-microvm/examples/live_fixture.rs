@@ -94,6 +94,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let started = Instant::now();
     let mut session = MicroVmSession::start(node, &runtime, lease)?;
     println!("live_vm_handshake_ms={}", started.elapsed().as_millis());
+    session.send(&GuestRequest::ControlFence {
+        request_id: "fixture-fence".into(),
+        epoch: 1,
+        ttl_millis: 30000,
+        terminal_channels: vec![],
+    })?;
     if descendants {
         return descendants::run(&mut session);
     }
@@ -104,6 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     session.send(&GuestRequest::Resize {
         channel: "shell".into(),
         request_id: "resize-1".into(),
+        control_epoch: 1,
         rows: 37,
         cols: 93,
     })?;
@@ -135,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => (),
         }
     }
-    session.send(&GuestRequest::Input { channel: "shell".into(), request_id: "input-1".into(),
+    session.send(&GuestRequest::Input { channel: "shell".into(), request_id: "input-1".into(), control_epoch: 1,
         bytes: b"test -f main.c && test -x build && test ! -e /var/lib/jeryu-live-fixture/host-only-sentinel && stty size && printf '\\nSHELL_VERIFIED\\n'\n".to_vec() })?;
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut shell = Vec::new();

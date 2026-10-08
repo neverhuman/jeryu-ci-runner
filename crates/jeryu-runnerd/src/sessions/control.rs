@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 pub use jeryu_runner_protocol::wire::v2::ControllerLease;
 pub(super) struct Controller {
     pub actor: String,
+    pub client_id: String,
+    pub terminal_channels: Vec<String>,
     pub epoch: u64,
     pub expires: Instant,
     pub sequence: u64,
@@ -35,8 +37,15 @@ impl State {
     pub fn acquire_control(
         &mut self,
         actor: &str,
+        client_id: &str,
+        terminal_channels: &[String],
         takeover: bool,
     ) -> RunnerResult<ControllerLease> {
+        if validate_control_identity(actor, client_id).is_err()
+            || validate_terminal_channels(terminal_channels).is_err()
+        {
+            return Err(failed("session_controller_invalid"));
+        }
         if !self.can_control(actor) {
             return Err(failed("session_control_forbidden"));
         }
@@ -50,17 +59,25 @@ impl State {
             return Err(failed("session_takeover_forbidden"));
         }
         if self.controller.as_ref().is_some_and(|controller| {
-            controller.expires > Instant::now() && controller.actor != actor
+            controller.expires > Instant::now()
+                && (controller.actor != actor || controller.client_id != client_id)
         }) && !takeover
         {
             return Err(failed("session_control_busy"));
         }
         if !self.controller.as_ref().is_some_and(|controller| {
-            controller.actor == actor && controller.expires > Instant::now()
+            controller.actor == actor
+                && controller.client_id == client_id
+                && controller.expires > Instant::now()
         }) {
-            self.controller_epoch += 1;
+            self.controller_epoch = self
+                .controller_epoch
+                .checked_add(1)
+                .ok_or_else(|| failed("session_control_epoch_exhausted"))?;
             self.controller = Some(Controller {
                 actor: actor.into(),
+                client_id: client_id.into(),
+                terminal_channels: terminal_channels.to_vec(),
                 epoch: self.controller_epoch,
                 expires: Instant::now(),
                 sequence: 0,
@@ -71,9 +88,14 @@ impl State {
             .controller
             .as_mut()
             .ok_or_else(|| failed("session_controller_missing"))?;
+        controller.terminal_channels = terminal_channels.to_vec();
         controller.expires = Instant::now() + Duration::from_secs(30);
+        self.control_ready = false;
         Ok(ControllerLease {
-            controller_id: actor.into(),
+            context: self.context.clone(),
+            actor: actor.into(),
+            controller_id: client_id.into(),
+            terminal_channels: terminal_channels.to_vec(),
             epoch: controller.epoch,
             expires_in_seconds: 30,
             next_sequence: controller.sequence + 1,
@@ -90,14 +112,16 @@ impl State {
         if request.context != self.context {
             return Err(failed("session_control_fenced"));
         }
-        if request.controller_id != actor || !self.can_control(actor) {
+        if !self.can_control(actor) {
             return Err(failed("session_control_forbidden"));
         }
         let controller = self
             .controller
             .as_ref()
             .ok_or_else(|| failed("session_control_lease_required"))?;
-        if controller.actor != actor
+        if !self.control_ready
+            || controller.client_id != request.controller_id
+            || controller.actor != actor
             || controller.epoch != request.control_lease_epoch
             || controller.expires <= Instant::now()
         {
@@ -147,6 +171,7 @@ impl State {
                 GuestRequest::Input {
                     channel: request.channel_id.clone(),
                     request_id: guest_id.clone(),
+                    control_epoch: controller.epoch,
                     bytes: bytes.clone(),
                 },
             ),
@@ -155,6 +180,7 @@ impl State {
                 GuestRequest::Resize {
                     channel: request.channel_id.clone(),
                     request_id: guest_id.clone(),
+                    control_epoch: controller.epoch,
                     rows: *rows,
                     cols: *cols,
                 },
@@ -164,6 +190,7 @@ impl State {
                 GuestRequest::Interrupt {
                     channel: request.channel_id.clone(),
                     request_id: guest_id.clone(),
+                    control_epoch: controller.epoch,
                 },
             ),
             ControlCommand::Stop => (

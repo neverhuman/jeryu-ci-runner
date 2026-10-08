@@ -9,7 +9,7 @@ pub fn run(session: &mut MicroVmSession) -> Result<()> {
         profile: GuestProfile::Shell,
     })?;
     session.send(&GuestRequest::Input {
-        channel: "victim".into(), request_id: "create-detached".into(),
+        channel: "victim".into(), request_id: "create-detached".into(), control_epoch: 1,
         bytes: b"stty -echo; /usr/bin/busybox setsid /bin/sh -c 'echo $$ > /workspace/detached.pid; while :; do sleep 1; done' </dev/null >/dev/null 2>&1 & while [ ! -s detached.pid ]; do sleep .05; done; i=0; while [ $i -lt 300 ]; do printf 'RAW_TAIL_BYTES_0123456789\\n'; i=$((i+1)); done; printf '\\nFINAL_TAIL_MARKER\\n'; exit\n".to_vec(),
     })?;
     let deadline = Instant::now() + Duration::from_secs(25);
@@ -43,7 +43,7 @@ pub fn run(session: &mut MicroVmSession) -> Result<()> {
         channel: "observer".into(),
         profile: GuestProfile::Shell,
     })?;
-    session.send(&GuestRequest::Input { channel: "observer".into(), request_id: "verify-detached".into(),
+    session.send(&GuestRequest::Input { channel: "observer".into(), request_id: "verify-detached".into(), control_epoch: 1,
         bytes: b"stty -echo; sleep .2; test ! -d /proc/$(cat detached.pid) && printf '\\nDETACHED_DESCENDANT_DEAD\\n'\n".to_vec() })?;
     wait_marker(&mut reader, b"DETACHED_DESCENDANT_DEAD\r")?;
     session.send(&GuestRequest::Freeze {

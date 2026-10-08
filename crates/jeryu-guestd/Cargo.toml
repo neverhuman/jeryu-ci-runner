@@ -10,6 +10,7 @@ jeryu-runner-protocol = { path = "../jeryu-runner-protocol" }
 jeryu-sandbox-linux = { path = "../jeryu-sandbox-linux" }
 nix = { version = "0.31", features = ["mount", "user", "signal", "fs", "term"] }
 sha2.workspace = true
+vt100 = "=0.16.2"
 
 [lints]
 workspace = true

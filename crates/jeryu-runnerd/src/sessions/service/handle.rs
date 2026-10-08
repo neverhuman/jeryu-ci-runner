@@ -16,6 +16,10 @@ impl SessionHandle {
         subject: &str,
         grant: Option<AccessGrant>,
     ) -> RunnerResult<()> {
+        let _handoff = self
+            .handoff
+            .lock()
+            .map_err(|_| failed("session_state_failed"))?;
         let mut state = self
             .state
             .lock()
@@ -34,6 +38,7 @@ impl SessionHandle {
         } else {
             state.grants.remove(subject);
         }
+        let mut revoke_epoch = None;
         if !state.can_control(subject)
             && state
                 .controller
@@ -41,6 +46,12 @@ impl SessionHandle {
                 .is_some_and(|controller| controller.actor == subject)
         {
             state.controller = None;
+            state.control_ready = false;
+            state.controller_epoch = state
+                .controller_epoch
+                .checked_add(1)
+                .ok_or_else(|| failed("session_control_epoch_exhausted"))?;
+            revoke_epoch = Some(state.controller_epoch);
         }
         if !state.can_view(subject) {
             state.viewers.retain(|viewer| {
@@ -52,14 +63,11 @@ impl SessionHandle {
                 }
             });
         }
+        drop(state);
+        if let Some(epoch) = revoke_epoch {
+            self.fence(epoch, 0, vec![])?;
+        }
         Ok(())
-    }
-    pub fn acquire_control(&self, actor: &str, takeover: bool) -> RunnerResult<ControllerLease> {
-        self.ensure_lease()?;
-        self.state
-            .lock()
-            .map_err(|_| failed("session_state_failed"))?
-            .acquire_control(actor, takeover)
     }
     pub fn control(&self, actor: &str, request: ControlRequest) -> RunnerResult<ControlAck> {
         self.ensure_lease()?;
@@ -198,7 +206,7 @@ impl SessionHandle {
         self.stop.store(true, Ordering::Release);
         Ok(())
     }
-    fn ensure_lease(&self) -> RunnerResult<()> {
+    pub(super) fn ensure_lease(&self) -> RunnerResult<()> {
         if now_ms() >= u128::from(self.expires_at_unix_millis) {
             return Err(failed("session_lease_expired"));
         }

@@ -1,3 +1,4 @@
+mod fencing;
 mod handle;
 mod registry;
 use super::{
@@ -31,6 +32,9 @@ pub struct SessionService {
 pub struct SessionHandle {
     state: Arc<Mutex<State>>,
     commands: SyncSender<GuestRequest>,
+    fences: SyncSender<GuestRequest>,
+    handoff: Mutex<()>,
+    fence_id: AtomicU64,
     stop: Arc<AtomicBool>,
     expires_at_unix_millis: u64,
 }
@@ -73,9 +77,13 @@ impl SessionService {
         let state = Arc::new(Mutex::new(initial_state));
         let stop = Arc::new(AtomicBool::new(false));
         let (commands, requests) = mpsc::sync_channel::<GuestRequest>(64);
+        let (fences, fence_requests) = mpsc::sync_channel::<GuestRequest>(4);
         let handle = Arc::new(SessionHandle {
             state: state.clone(),
             commands,
+            fences,
+            handoff: Mutex::new(()),
+            fence_id: AtomicU64::new(0),
             stop: stop.clone(),
             expires_at_unix_millis: lease.expires_at_unix_millis,
         });
@@ -124,7 +132,13 @@ impl SessionService {
         });
         std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
-                let request = match requests.recv_timeout(Duration::from_millis(100)) {
+                if let Ok(fence) = fence_requests.try_recv() {
+                    if session.send(&fence).is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                let request = match requests.recv_timeout(Duration::from_millis(10)) {
                     Ok(request) => request,
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(_) => break,
@@ -259,8 +273,28 @@ pub(super) fn test_handle(
 ) {
     let state = Arc::new(Mutex::new(State::new(context)));
     let (commands, receive) = mpsc::sync_channel(64);
+    let (fences, fence_requests) = mpsc::sync_channel::<GuestRequest>(4);
+    let fake_state = state.clone();
+    std::thread::spawn(move || {
+        while let Ok(GuestRequest::ControlFence {
+            request_id, epoch, ..
+        }) = fence_requests.recv()
+        {
+            fake_state
+                .lock()
+                .unwrap()
+                .ingest(jeryu_runner_protocol::guest::GuestEvent::ControlFenced {
+                    request_id,
+                    epoch,
+                })
+                .unwrap();
+        }
+    });
     (
         SessionHandle {
+            fences,
+            handoff: Mutex::new(()),
+            fence_id: AtomicU64::new(0),
             state: state.clone(),
             commands,
             stop: Arc::new(AtomicBool::new(false)),

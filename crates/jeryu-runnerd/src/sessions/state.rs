@@ -24,6 +24,7 @@ pub(super) struct Channel {
     pub exit: Option<Option<i32>>,
     pub guest_sequence: u64,
     pub tail: Tail,
+    pub screen: Option<ScreenSnapshot>,
 }
 pub(super) struct State {
     pub context: SessionContext,
@@ -36,6 +37,8 @@ pub(super) struct State {
     pub viewers: Vec<Viewer>,
     pub controller: Option<Controller>,
     pub controller_epoch: u64,
+    pub control_ready: bool,
+    pub pending_fence: Option<(String, u64)>,
     pub frozen_request: Option<String>,
     pub receipts: BTreeMap<String, Receipt>,
     pub receipt_order: VecDeque<String>,
@@ -60,6 +63,7 @@ impl State {
                             exit: None,
                             guest_sequence: 0,
                             tail: Tail::new(),
+                            screen: None,
                         },
                     )
                 })
@@ -67,6 +71,8 @@ impl State {
             viewers: vec![],
             controller: None,
             controller_epoch: 0,
+            control_ready: false,
+            pending_fence: None,
             frozen_request: None,
             receipts: BTreeMap::new(),
             receipt_order: VecDeque::new(),
@@ -152,6 +158,39 @@ impl State {
     }
     pub fn ingest(&mut self, event: GuestEvent) -> RunnerResult<()> {
         match event {
+            GuestEvent::ControlFenced { request_id, epoch } => {
+                if self.pending_fence.as_ref() != Some(&(request_id, epoch)) {
+                    return Err(failed("guest_control_fence_invalid"));
+                }
+                self.pending_fence = None;
+                if let Some(controller) = &mut self.controller {
+                    if controller.epoch != epoch {
+                        return Err(failed("guest_control_fence_invalid"));
+                    }
+                    controller.expires =
+                        std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    self.control_ready = true;
+                }
+            }
+            GuestEvent::Screen { channel, screen } => {
+                screen
+                    .validate()
+                    .map_err(|_| failed("guest_screen_invalid"))?;
+                let channel = self
+                    .channels
+                    .get_mut(&channel)
+                    .ok_or_else(|| failed("guest_channel_unknown"))?;
+                if !channel.started
+                    || screen.sequence > channel.guest_sequence
+                    || channel
+                        .screen
+                        .as_ref()
+                        .is_some_and(|previous| screen.sequence < previous.sequence)
+                {
+                    return Err(failed("guest_screen_sequence_invalid"));
+                }
+                channel.screen = Some(screen);
+            }
             GuestEvent::Started { channel } => {
                 if self.phase == RuntimePhase::RebaseRequired && channel != "shell" {
                     return Err(failed("guest_rebase_required"));
@@ -298,7 +337,8 @@ impl State {
         matches!(
             self.phase,
             RuntimePhase::Running | RuntimePhase::RebaseRequired
-        ) && self.can_control(&receipt.actor)
+        ) && self.control_ready
+            && self.can_control(&receipt.actor)
             && receipt.ack.state == ControlState::Accepted
             && self.controller.as_ref().is_some_and(|controller| {
                 controller.actor == receipt.actor

@@ -9,7 +9,7 @@ pub use reader::FrameReader;
 pub const EXECUTION_PORT: u32 = 1024;
 pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum GuestRequest {
     Bind {
@@ -23,17 +23,28 @@ pub enum GuestRequest {
     Input {
         channel: String,
         request_id: String,
+        control_epoch: u64,
         bytes: Vec<u8>,
     },
     Resize {
         channel: String,
         request_id: String,
+        control_epoch: u64,
         rows: u16,
         cols: u16,
     },
     Interrupt {
         channel: String,
         request_id: String,
+        control_epoch: u64,
+    },
+    ControlFence {
+        request_id: String,
+        epoch: u64,
+        /// Zero revokes. Relative guest expiry may precede the node expiry.
+        #[schemars(range(max = 30000))]
+        ttl_millis: u32,
+        terminal_channels: Vec<String>,
     },
     Stop {
         request_id: String,
@@ -45,7 +56,7 @@ pub enum GuestRequest {
 
 /// Only qualified image entrypoints are selectable. Provider profiles are added
 /// after their native adapters and access-only authentication qualify.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum GuestProfile {
     Fixture,
@@ -65,10 +76,11 @@ impl GuestProfile {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum GuestEvent {
     Ready {
+        #[schemars(schema_with = "guest_version_schema")]
         protocol_version: String,
         challenge: String,
         session_id: String,
@@ -93,6 +105,14 @@ pub enum GuestEvent {
         applied: bool,
         reason: String,
     },
+    ControlFenced {
+        request_id: String,
+        epoch: u64,
+    },
+    Screen {
+        channel: String,
+        screen: crate::wire::v2::ScreenSnapshot,
+    },
     Stopped,
     Frozen {
         request_id: String,
@@ -101,6 +121,19 @@ pub enum GuestEvent {
     Error {
         code: String,
     },
+}
+
+#[derive(schemars::JsonSchema, Serialize, Deserialize)]
+#[serde(untagged)]
+enum GuestMessageSchema {
+    Request(GuestRequest),
+    Event(GuestEvent),
+}
+pub fn schema() -> schemars::Schema {
+    schemars::schema_for!(GuestMessageSchema)
+}
+fn guest_version_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type":"string", "const":GUEST_PROTOCOL_VERSION})
 }
 
 impl GuestRequest {
@@ -114,10 +147,12 @@ impl GuestRequest {
             Self::Input {
                 channel,
                 request_id,
+                control_epoch,
                 bytes,
             } => {
                 name(channel)?;
                 name(request_id)?;
+                epoch_valid(*control_epoch)?;
                 if bytes.is_empty() || bytes.len() > MAX_TERMINAL_BYTES {
                     return Err(invalid());
                 }
@@ -125,11 +160,13 @@ impl GuestRequest {
             Self::Resize {
                 channel,
                 request_id,
+                control_epoch,
                 rows,
                 cols,
             } => {
                 name(channel)?;
                 name(request_id)?;
+                epoch_valid(*control_epoch)?;
                 if *rows == 0 || *cols == 0 || *rows > 4096 || *cols > 4096 {
                     return Err(invalid());
                 }
@@ -137,9 +174,25 @@ impl GuestRequest {
             Self::Interrupt {
                 channel,
                 request_id,
+                control_epoch,
             } => {
                 name(channel)?;
                 name(request_id)?;
+                epoch_valid(*control_epoch)?;
+            }
+            Self::ControlFence {
+                request_id,
+                epoch,
+                ttl_millis,
+                terminal_channels,
+            } => {
+                name(request_id)?;
+                epoch_valid(*epoch)?;
+                if *ttl_millis > 30000 || (*ttl_millis == 0 && !terminal_channels.is_empty()) {
+                    return Err(invalid());
+                }
+                crate::wire::v2::validate_terminal_channels(terminal_channels)
+                    .map_err(|_| invalid())?;
             }
             Self::Stop { request_id } | Self::Freeze { request_id } => name(request_id)?,
         }
@@ -186,6 +239,14 @@ impl GuestEvent {
                 name(reason)?;
             }
             Self::Error { code } => name(code)?,
+            Self::ControlFenced { request_id, epoch } => {
+                name(request_id)?;
+                epoch_valid(*epoch)?;
+            }
+            Self::Screen { channel, screen } => {
+                name(channel)?;
+                screen.validate().map_err(|_| invalid())?;
+            }
             Self::Frozen {
                 request_id,
                 workspace,
@@ -249,6 +310,12 @@ fn name(value: &str) -> std::io::Result<()> {
         || value.contains("..")
         || value.contains("//")
     {
+        return Err(invalid());
+    }
+    Ok(())
+}
+fn epoch_valid(epoch: u64) -> std::io::Result<()> {
+    if epoch == 0 {
         return Err(invalid());
     }
     Ok(())

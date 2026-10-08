@@ -42,10 +42,31 @@ pub struct SessionSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ControllerLease {
+    pub context: SessionContext,
+    pub actor: String,
     pub controller_id: String,
+    pub terminal_channels: Vec<String>,
     pub epoch: u64,
     pub expires_in_seconds: u32,
     pub next_sequence: u64,
+}
+/// Only real terminals holding the writer lease suppress headless query replies.
+pub fn validate_terminal_channels(channels: &[String]) -> Result<(), WireError> {
+    if channels.len() > 2
+        || channels.iter().any(|c| c != "agent" && c != "shell")
+        || channels.windows(2).any(|c| c[0] >= c[1])
+    {
+        return Err(WireError::new(
+            WireErrorCode::InvalidCollection,
+            "terminal_channels",
+        ));
+    }
+    Ok(())
+}
+
+pub fn validate_control_identity(actor: &str, client_id: &str) -> Result<(), WireError> {
+    validate_id("actor", actor)?;
+    validate_id("controller_id", client_id)
 }
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]

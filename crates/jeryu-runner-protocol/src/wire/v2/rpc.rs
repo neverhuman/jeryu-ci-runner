@@ -36,9 +36,18 @@ pub enum SessionRpcOperation {
     },
     AcquireControl {
         actor: String,
+        /// Assigned by the control plane per client attachment, not per user.
+        controller_id: String,
+        terminal_channels: Vec<String>,
         session_id: String,
         generation: u64,
         takeover: bool,
+    },
+    Screen {
+        actor: String,
+        session_id: String,
+        generation: u64,
+        channel_id: String,
     },
     Control {
         actor: String,
@@ -76,14 +85,7 @@ impl ValidateWire for SessionRpcRequest {
             Start { lease } => lease.validate_wire(),
             Control { actor, request } => {
                 validate_id("actor", actor)?;
-                request.validate_wire()?;
-                if actor != &request.controller_id {
-                    return Err(WireError::new(
-                        WireErrorCode::ContextMismatch,
-                        "controller_id",
-                    ));
-                }
-                Ok(())
+                request.validate_wire()
             }
             Snapshot {
                 actor,
@@ -91,6 +93,12 @@ impl ValidateWire for SessionRpcRequest {
                 generation,
             }
             | AcquireControl {
+                actor,
+                session_id,
+                generation,
+                ..
+            }
+            | Screen {
                 actor,
                 session_id,
                 generation,
@@ -118,6 +126,15 @@ impl ValidateWire for SessionRpcRequest {
                 validate_id("session_id", session_id)?;
                 positive("generation", *generation)?;
                 match &self.operation {
+                    AcquireControl {
+                        controller_id,
+                        terminal_channels,
+                        ..
+                    } => {
+                        validate_id("controller_id", controller_id)?;
+                        super::validate_terminal_channels(terminal_channels)
+                    }
+                    Screen { channel_id, .. } => validate_label("channel_id", channel_id),
                     Acknowledgement {
                         control_request_id, ..
                     } => validate_id("control_request_id", control_request_id),

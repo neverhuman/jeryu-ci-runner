@@ -10,6 +10,7 @@ mod rpc;
 mod rpc_response;
 mod runtime;
 mod schema;
+mod screen;
 mod session;
 mod signature;
 mod stream_validation;
@@ -25,12 +26,13 @@ pub use runtime::{
     ArtifactIdentity, GitLimits, RuntimeArchitecture, RuntimeManifest, SessionResources,
 };
 pub use schema::schema;
+pub use screen::{ScreenSnapshot, TerminalScreen};
 pub use session::{ManagedPurpose, SessionContext, SessionLease, runtime_digest};
 pub use workspace::{WorkspaceReady, WorkspaceSource, WorkspaceSyncState};
 
 pub const PROTOCOL_VERSION: &str = "jeryu.runner.v2.1";
 pub const FIRECRACKER_VERSION: &str = "1.17.0";
-pub const GUEST_PROTOCOL_VERSION: &str = "jeryu.guest.v1";
+pub const GUEST_PROTOCOL_VERSION: &str = "jeryu.guest.v2";
 pub const MAX_TERMINAL_BYTES: usize = 32_768;
 pub const MAX_PROMPT_BYTES: usize = 32_768;
 pub const TERMINAL_TAIL_BYTES: usize = 20 * 1024 * 1024;

@@ -29,12 +29,35 @@ fn guest_requests_reject_host_commands_unknown_profiles_and_unknown_fields() {
         r#"{"type":"start","channel":"agent","profile":"codex"}"#,
         r#"{"type":"start","channel":"agent","profile":"fixture","command":"/bin/host"}"#,
         r#"{"type":"input","channel":"agent","request_id":"r","bytes":[],"token":"secret"}"#,
+        r#"{"type":"input","channel":"shell","request_id":"r","bytes":[1]}"#,
     ] {
         let mut wire = Vec::from((json.len() as u32).to_be_bytes());
         wire.extend_from_slice(json.as_bytes());
         assert!(read_frame::<GuestRequest>(&mut Cursor::new(wire)).is_err());
     }
     assert!(GuestProfile::registered("unknown").is_err());
+}
+
+#[test]
+fn guest_fences_reject_zero_epoch_unbounded_ttl_and_revoked_terminal_claims() {
+    let fence = |epoch, ttl_millis, terminal_channels| GuestRequest::ControlFence {
+        request_id: "fence".into(),
+        epoch,
+        ttl_millis,
+        terminal_channels,
+    };
+    fence(1, 30000, vec!["agent".into(), "shell".into()])
+        .validate()
+        .unwrap();
+    fence(2, 0, vec![]).validate().unwrap();
+    for bad in [
+        fence(0, 1, vec![]),
+        fence(1, 30001, vec![]),
+        fence(2, 0, vec!["shell".into()]),
+        fence(1, 30, vec!["shell".into(), "agent".into()]),
+    ] {
+        assert!(bad.validate().is_err());
+    }
 }
 
 #[test]

@@ -33,6 +33,12 @@ pub(super) fn apply(
             session_id,
             generation,
         }
+        | RpcOperation::Screen {
+            actor,
+            session_id,
+            generation,
+            ..
+        }
         | RpcOperation::AcquireControl {
             actor,
             session_id,
@@ -86,10 +92,22 @@ pub(super) fn apply(
             session_id,
             generation,
             takeover,
+            controller_id,
+            terminal_channels,
         } => SessionRpcResult::Controller(
             service
                 .get(&actor, &session_id, generation)?
-                .acquire_control(&actor, takeover)?,
+                .acquire_control(&actor, &controller_id, &terminal_channels, takeover)?,
+        ),
+        RpcOperation::Screen {
+            actor,
+            session_id,
+            generation,
+            channel_id,
+        } => SessionRpcResult::Screen(
+            service
+                .get(&actor, &session_id, generation)?
+                .screen(&actor, &channel_id)?,
         ),
         RpcOperation::Control { actor, request } => {
             let handle = service.get(

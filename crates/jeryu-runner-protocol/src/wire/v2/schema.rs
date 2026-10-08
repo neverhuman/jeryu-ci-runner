@@ -21,6 +21,7 @@ enum ManagedMessage {
     Upload(Box<BundleUpload>),
     Relay(Box<GuestRelayRequest>),
     Checkpoint(Box<CheckpointManifest>),
+    Screen(Box<super::TerminalScreen>),
 }
 
 pub fn schema() -> Schema {

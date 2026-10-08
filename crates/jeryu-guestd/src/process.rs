@@ -36,6 +36,16 @@ pub struct GuestProcess {
     finished: Arc<AtomicBool>,
     profile: GuestProfile,
     group: Arc<crate::groups::Group>,
+    terminal: Arc<Mutex<crate::terminal::Terminal>>,
+    writer: Arc<Mutex<File>>,
+    channel: String,
+}
+
+pub struct ProcessContext {
+    pub writer: Arc<Mutex<File>>,
+    pub reaper: Reaper,
+    pub activity: Arc<Mutex<Instant>>,
+    pub authority: crate::authority::SharedAuthority,
 }
 
 impl GuestProcess {
@@ -43,14 +53,21 @@ impl GuestProcess {
         channel: &str,
         profile: GuestProfile,
         resources: &SessionResources,
-        writer: Arc<Mutex<File>>,
-        reaper: Reaper,
-        activity: Arc<Mutex<Instant>>,
+        context: ProcessContext,
         workspace: &Path,
     ) -> std::io::Result<Self> {
+        let ProcessContext {
+            writer,
+            reaper,
+            activity,
+            authority,
+        } = context;
         let (master, slave) =
             open_pty().map_err(|_| std::io::Error::other("guest_pty_unavailable"))?;
         fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(std::io::Error::from)?;
+        resize_pty(master.as_raw_fd(), 24, 80)
+            .map_err(|_| std::io::Error::other("guest_resize_failed"))?;
+        let terminal = Arc::new(Mutex::new(crate::terminal::Terminal::new()));
         let group = Arc::new(crate::groups::Group::create(resources.pids_max)?);
         let membership = group.membership()?;
         let env = BTreeMap::from([
@@ -83,7 +100,13 @@ impl GuestProcess {
         drop(slave);
         let master = File::from(master);
         let finished = Arc::new(AtomicBool::new(false));
-        let input = input::start(master.try_clone()?, writer.clone(), finished.clone());
+        let input = input::start(
+            master.try_clone()?,
+            writer.clone(),
+            finished.clone(),
+            authority.clone(),
+            channel.into(),
+        );
         let process = Self {
             pid,
             master,
@@ -91,6 +114,9 @@ impl GuestProcess {
             finished: finished.clone(),
             profile,
             group: group.clone(),
+            terminal: terminal.clone(),
+            writer: writer.clone(),
+            channel: channel.into(),
         };
         let mut output = process.master.try_clone()?;
         let channel = channel.to_string();
@@ -101,13 +127,35 @@ impl GuestProcess {
                 channel: channel.clone(),
             },
         )?;
+        process.emit_screen()?;
+        let system_input = process.input.clone();
         std::thread::spawn(move || {
             let mut buffer = [0; MAX_TERMINAL_BYTES];
             let mut sequence = 0;
             let mut window = Instant::now();
             let mut window_bytes = 0;
             let mut exit = None;
+            let mut screen_time = Instant::now();
+            let mut screen_dirty = false;
             loop {
+                if screen_dirty && screen_time.elapsed() >= Duration::from_millis(200) {
+                    let Ok(vt) = terminal.lock() else {
+                        break;
+                    };
+                    if crate::emit(
+                        &writer,
+                        &GuestEvent::Screen {
+                            channel: channel.clone(),
+                            screen: vt.snapshot(),
+                        },
+                    )
+                    .is_err()
+                    {
+                        break;
+                    }
+                    screen_dirty = false;
+                    screen_time = Instant::now();
+                }
                 if let Some(code) = reaper.result(pid) {
                     exit = Some(code);
                     if group.kill().is_err() {
@@ -164,6 +212,23 @@ impl GuestProcess {
                 }
                 window_bytes += length;
                 sequence += 1;
+                let headless = authority.lock().is_ok_and(|gate| !gate.terminal(&channel));
+                let Ok(mut vt) = terminal.lock() else {
+                    break;
+                };
+                let replies = match vt.process(&buffer[..length], sequence, headless) {
+                    Ok(replies) => replies,
+                    Err(_) => {
+                        let _ = crate::emit(
+                            &writer,
+                            &GuestEvent::Error {
+                                code: "guest_vt_reply_capacity".into(),
+                            },
+                        );
+                        break;
+                    }
+                };
+                screen_dirty = true;
                 if crate::emit(
                     &writer,
                     &GuestEvent::Output {
@@ -176,6 +241,32 @@ impl GuestProcess {
                 {
                     break;
                 }
+                if !replies.is_empty()
+                    && system_input
+                        .try_send(Input {
+                            request_id: None,
+                            epoch: None,
+                            bytes: replies,
+                        })
+                        .is_err()
+                {
+                    let _ = crate::emit(
+                        &writer,
+                        &GuestEvent::Error {
+                            code: "guest_vt_reply_capacity".into(),
+                        },
+                    );
+                    break;
+                }
+            }
+            if let Ok(vt) = terminal.lock() {
+                let _ = crate::emit(
+                    &writer,
+                    &GuestEvent::Screen {
+                        channel: channel.clone(),
+                        screen: vt.snapshot(),
+                    },
+                );
             }
             finished.store(true, Ordering::Release);
             let _ = group.kill();
@@ -197,14 +288,43 @@ impl GuestProcess {
     pub fn active_agent(&self) -> bool {
         self.profile != GuestProfile::Shell && !self.finished()
     }
-    pub fn input(&self, request_id: String, bytes: Vec<u8>) -> std::io::Result<()> {
+    pub fn input(&self, request_id: String, epoch: u64, bytes: Vec<u8>) -> std::io::Result<()> {
         self.input
-            .try_send(Input { request_id, bytes })
+            .try_send(Input {
+                request_id: Some(request_id),
+                epoch: Some(epoch),
+                bytes,
+            })
             .map_err(|_| std::io::Error::other("guest_input_queue_full"))
     }
     pub fn resize(&self, rows: u16, cols: u16) -> std::io::Result<()> {
+        let mut terminal = self
+            .terminal
+            .lock()
+            .map_err(|_| std::io::Error::other("guest_vt_failed"))?;
         resize_pty(self.master.as_raw_fd(), rows, cols)
-            .map_err(|_| std::io::Error::other("guest_resize_failed"))
+            .map_err(|_| std::io::Error::other("guest_resize_failed"))?;
+        terminal.resize(rows, cols);
+        crate::emit(
+            &self.writer,
+            &GuestEvent::Screen {
+                channel: self.channel.clone(),
+                screen: terminal.snapshot(),
+            },
+        )
+    }
+    fn emit_screen(&self) -> std::io::Result<()> {
+        let terminal = self
+            .terminal
+            .lock()
+            .map_err(|_| std::io::Error::other("guest_vt_failed"))?;
+        crate::emit(
+            &self.writer,
+            &GuestEvent::Screen {
+                channel: self.channel.clone(),
+                screen: terminal.snapshot(),
+            },
+        )
     }
     pub fn interrupt(&self) -> std::io::Result<()> {
         let foreground = tcgetpgrp(&self.master)?;

@@ -364,14 +364,14 @@ fn rpc_is_closed_and_validates_identity_generation_and_replay_bounds() {
 }
 
 #[test]
-fn rpc_cannot_impersonate_a_controller_and_redacts_prompt_material() {
+fn rpc_separates_principal_from_client_and_redacts_prompt_material() {
     let control = ControlRequest {
         protocol_version: PROTOCOL_VERSION.into(),
         message_type: "session-control".into(),
         context: lease().context,
         request_id: "control-1".into(),
         channel_id: "agent".into(),
-        controller_id: "user/alice".into(),
+        controller_id: "attachment-123".into(),
         control_lease_epoch: 1,
         control_sequence: 1,
         command: ControlCommand::Prompt {
@@ -387,7 +387,9 @@ fn rpc_cannot_impersonate_a_controller_and_redacts_prompt_material() {
             request: Box::new(control),
         },
     };
-    assert!(request.validate().is_err());
+    // Structural validation does not authorize Bob to use this client. The
+    // service checks actor AND attachment AND epoch against the active lease.
+    request.validate().unwrap();
     if let SessionRpcOperation::Control { actor, .. } = &mut request.operation {
         *actor = "user/alice".into();
     }

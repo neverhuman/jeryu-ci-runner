@@ -34,6 +34,9 @@
     },
     {
       "$ref": "#/$defs/CheckpointManifest"
+    },
+    {
+      "$ref": "#/$defs/TerminalScreen"
     }
   ],
   "$defs": {
@@ -473,6 +476,12 @@
     "ControllerLease": {
       "type": "object",
       "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/$defs/SessionContext"
+        },
         "controller_id": {
           "type": "string"
         },
@@ -490,11 +499,20 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "terminal_channels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       },
       "additionalProperties": false,
       "required": [
+        "context",
+        "actor",
         "controller_id",
+        "terminal_channels",
         "epoch",
         "expires_in_seconds",
         "next_sequence"
@@ -683,7 +701,7 @@
         },
         "guest_protocol_version": {
           "type": "string",
-          "const": "jeryu.guest.v1"
+          "const": "jeryu.guest.v2"
         },
         "guestd": {
           "$ref": "#/$defs/ArtifactIdentity"
@@ -746,6 +764,59 @@
         "checkpointing",
         "stopped",
         "failed"
+      ]
+    },
+    "ScreenSnapshot": {
+      "type": "object",
+      "properties": {
+        "cols": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 400,
+          "minimum": 1
+        },
+        "cursor_col": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "cursor_row": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0
+        },
+        "rows": {
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 200,
+          "minimum": 1
+        },
+        "sequence": {
+          "description": "Last raw output sequence included, zero before the first output.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "text": {
+          "description": "At most 64 KiB of UTF-8; no scrollback, OSC clipboard or hyperlinks.",
+          "type": "string",
+          "maxLength": 65536
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "rows",
+        "cols",
+        "cursor_row",
+        "cursor_col",
+        "text",
+        "truncated"
       ]
     },
     "SessionContext": {
@@ -1054,6 +1125,10 @@
             "actor": {
               "type": "string"
             },
+            "controller_id": {
+              "description": "Assigned by the control plane per client attachment, not per user.",
+              "type": "string"
+            },
             "generation": {
               "type": "integer",
               "format": "uint64",
@@ -1064,6 +1139,45 @@
             },
             "takeover": {
               "type": "boolean"
+            },
+            "terminal_channels": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "actor",
+            "controller_id",
+            "terminal_channels",
+            "session_id",
+            "generation",
+            "takeover"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "screen"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "channel_id": {
+              "type": "string"
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string"
             }
           },
           "additionalProperties": false,
@@ -1072,7 +1186,7 @@
             "actor",
             "session_id",
             "generation",
-            "takeover"
+            "channel_id"
           ]
         },
         {
@@ -1310,6 +1424,9 @@
         },
         {
           "$ref": "#/$defs/GrantApplied"
+        },
+        {
+          "$ref": "#/$defs/TerminalScreen"
         }
       ]
     },
@@ -1598,6 +1715,35 @@
         "sequence",
         "gap",
         "bytes"
+      ]
+    },
+    "TerminalScreen": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/$defs/SessionContext"
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "screen": {
+          "$ref": "#/$defs/ScreenSnapshot"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "context",
+        "channel_id",
+        "screen"
       ]
     },
     "WorkspaceReady": {

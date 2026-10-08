@@ -12,6 +12,8 @@ mod recovery;
 mod resources;
 #[path = "live_session/source.rs"]
 mod source;
+#[path = "live_session/terminal.rs"]
+mod terminal;
 use jeryu_runner_core::receipt::now_ms;
 use jeryu_runner_microvm::{NodeConfig, artifacts::VerifiedRuntime};
 use jeryu_runner_protocol::wire::v2::*;
@@ -55,6 +57,7 @@ fn main() -> Result<()> {
             || mode == "cleanup-fixture"
             || mode == "corrupt-record"
             || mode == "resource-limits"
+            || mode == "control-terminal"
         {
             "empty"
         } else if mode == "checkpoint-main" || mode == "graph-override" {
@@ -110,6 +113,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let handle = result?;
+    if mode == "control-terminal" {
+        return terminal::run(&handle, &context, &node);
+    }
     if mode == "resource-limits" {
         resources::verify_sparse(&context)?;
     }
@@ -163,7 +169,10 @@ fn main() -> Result<()> {
         source::verify(&handle, &context)?;
     }
     let viewer = handle.subscribe("fixture-viewer", "shell")?;
-    if handle.acquire_control("fixture-viewer", false).is_ok() {
+    if handle
+        .acquire_control("fixture-viewer", "viewer-client", &[], false)
+        .is_ok()
+    {
         return Err("viewer obtained input lease".into());
     }
     apply(
@@ -239,14 +248,14 @@ fn apply(handle: &SessionHandle, context: &SessionContext, command: ControlComma
     } else {
         Duration::from_secs(8)
     };
-    let controller = handle.acquire_control(OWNER, false)?;
+    let controller = handle.acquire_control(OWNER, "fixture-client", &[], false)?;
     let request = ControlRequest {
         protocol_version: PROTOCOL_VERSION.into(),
         message_type: "session-control".into(),
         context: context.clone(),
         request_id: format!("control-{}-{}", controller.epoch, controller.next_sequence),
         channel_id: "shell".into(),
-        controller_id: OWNER.into(),
+        controller_id: "fixture-client".into(),
         control_lease_epoch: controller.epoch,
         control_sequence: controller.next_sequence,
         command,

@@ -12,3 +12,8 @@ manual_edits = false
 path = "ops/ci/kit/"
 generator = "bash ops/ci-kit/bin/vendor.sh ."
 manual_edits = false
+
+[[zones]]
+path = "schemas/jeryu.guest.v2.schema.json"
+generator = "cargo run --locked -p jeryu-runner-protocol --example generate_guest_schema > schemas/jeryu.guest.v2.schema.json"
+manual_edits = false

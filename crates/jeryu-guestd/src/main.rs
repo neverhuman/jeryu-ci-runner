@@ -1,10 +1,12 @@
 //! PID 1 supervisor for the credential-free fixture runtime.
+mod authority;
 mod filesystem;
 mod freeze;
 mod groups;
 mod input;
 mod process;
 mod reaper;
+mod terminal;
 mod workspace;
 use jeryu_runner_protocol::{
     guest::{EXECUTION_PORT, GuestEvent, GuestRequest, read_frame, write_frame},
@@ -103,6 +105,7 @@ fn session(
     let activity = Arc::new(Mutex::new(Instant::now()));
     let mut processes = BTreeMap::<String, process::GuestProcess>::new();
     let mut frozen = false;
+    let authority = Arc::new(Mutex::new(authority::Authority::default()));
     loop {
         if started.elapsed() >= Duration::from_secs(lease.resources.runtime_seconds.into())
             || (!processes.values().any(process::GuestProcess::active_agent)
@@ -123,6 +126,18 @@ fn session(
             return Err(std::io::Error::other("guest_workspace_frozen"));
         }
         match request {
+            GuestRequest::ControlFence {
+                request_id,
+                epoch,
+                ttl_millis,
+                terminal_channels,
+            } => {
+                authority
+                    .lock()
+                    .map_err(|_| std::io::Error::other("guest_authority_failed"))?
+                    .fence(epoch, ttl_millis, terminal_channels)?;
+                emit(&writer, &GuestEvent::ControlFenced { request_id, epoch })?;
+            }
             GuestRequest::Bind { .. } => return Err(std::io::Error::other("guest_rebind_denied")),
             GuestRequest::Start { channel, profile } => {
                 if rebase_required && profile != jeryu_runner_protocol::guest::GuestProfile::Shell {
@@ -141,9 +156,12 @@ fn session(
                         &channel,
                         profile,
                         &lease.resources,
-                        writer.clone(),
-                        reaper.clone(),
-                        activity.clone(),
+                        process::ProcessContext {
+                            writer: writer.clone(),
+                            reaper: reaper.clone(),
+                            activity: activity.clone(),
+                            authority: authority.clone(),
+                        },
                         if repo_ready {
                             std::path::Path::new("/workspace/repo")
                         } else {
@@ -167,11 +185,12 @@ fn session(
             GuestRequest::Input {
                 channel,
                 request_id,
+                control_epoch,
                 bytes,
             } => {
                 let applied = processes
                     .get_mut(&channel)
-                    .is_some_and(|p| p.input(request_id.clone(), bytes).is_ok());
+                    .is_some_and(|p| p.input(request_id.clone(), control_epoch, bytes).is_ok());
                 if applied {
                     *activity
                         .lock()
@@ -184,21 +203,33 @@ fn session(
             GuestRequest::Resize {
                 channel,
                 request_id,
+                control_epoch,
                 rows,
                 cols,
             } => {
-                let applied = processes
-                    .get_mut(&channel)
-                    .is_some_and(|p| p.resize(rows, cols).is_ok());
+                let permission = authority
+                    .lock()
+                    .map_err(|_| std::io::Error::other("guest_authority_failed"))?;
+                let applied = permission.permits(control_epoch)
+                    && processes
+                        .get_mut(&channel)
+                        .is_some_and(|p| p.resize(rows, cols).is_ok());
+                drop(permission);
                 acknowledge(&writer, request_id, applied)?;
             }
             GuestRequest::Interrupt {
                 channel,
                 request_id,
+                control_epoch,
             } => {
-                let applied = processes
-                    .get_mut(&channel)
-                    .is_some_and(|p| p.interrupt().is_ok());
+                let permission = authority
+                    .lock()
+                    .map_err(|_| std::io::Error::other("guest_authority_failed"))?;
+                let applied = permission.permits(control_epoch)
+                    && processes
+                        .get_mut(&channel)
+                        .is_some_and(|p| p.interrupt().is_ok());
+                drop(permission);
                 acknowledge(&writer, request_id, applied)?;
             }
             GuestRequest::Stop { request_id } => {

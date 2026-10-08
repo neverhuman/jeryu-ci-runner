@@ -30,6 +30,7 @@ pub enum SessionRpcResult {
     Control(ControlAck),
     Replay(Vec<TerminalFrame>),
     Grant(GrantApplied),
+    Screen(super::TerminalScreen),
 }
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -70,7 +71,10 @@ impl ValidateWire for SessionRpcResponse {
                     .validate()
                 }
                 SessionRpcResult::Controller(controller) => {
+                    controller.context.validate()?;
+                    validate_id("actor", &controller.actor)?;
                     validate_id("controller_id", &controller.controller_id)?;
+                    super::validate_terminal_channels(&controller.terminal_channels)?;
                     positive("epoch", controller.epoch)?;
                     positive("next_sequence", controller.next_sequence)?;
                     if !(1..=30).contains(&controller.expires_in_seconds) {
@@ -79,6 +83,7 @@ impl ValidateWire for SessionRpcResponse {
                     Ok(())
                 }
                 SessionRpcResult::Control(ack) => ack.validate(),
+                SessionRpcResult::Screen(screen) => screen.validate(),
                 SessionRpcResult::Replay(frames) => {
                     if frames.len() > 5 || frames.iter().filter(|f| !f.gap).count() > 4 {
                         return Err(invalid());
@@ -165,6 +170,11 @@ impl SessionRpcResponse {
                 generation,
                 ..
             }
+            | Op::Screen {
+                session_id,
+                generation,
+                ..
+            }
             | Op::Acknowledgement {
                 session_id,
                 generation,
@@ -193,8 +203,23 @@ impl SessionRpcResponse {
             {
                 Ok(())
             }
-            (Op::AcquireControl { actor, .. }, SessionRpcResult::Controller(lease))
-                if lease.controller_id == *actor =>
+            (
+                Op::AcquireControl {
+                    actor,
+                    controller_id,
+                    terminal_channels,
+                    ..
+                },
+                SessionRpcResult::Controller(lease),
+            ) if lease.context == *context
+                && lease.actor == *actor
+                && lease.controller_id == *controller_id
+                && lease.terminal_channels == *terminal_channels =>
+            {
+                Ok(())
+            }
+            (Op::Screen { channel_id, .. }, SessionRpcResult::Screen(screen))
+                if screen.context == *context && screen.channel_id == *channel_id =>
             {
                 Ok(())
             }
