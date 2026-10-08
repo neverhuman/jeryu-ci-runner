@@ -41,6 +41,7 @@ pub fn initialize(restored: bool) -> std::io::Result<()> {
         Some("size=4m,mode=0755"),
     )
     .map_err(|_| std::io::Error::other("guest_dev_mount_failed"))?;
+    initialize_descriptor_links(Path::new("/dev"))?;
     for (name, major, minor) in [
         ("null", 1, 3),
         ("zero", 1, 5),
@@ -131,4 +132,57 @@ pub fn initialize(restored: bool) -> std::io::Result<()> {
         .map_err(|_| std::io::Error::other("guest_identity_failed"))?;
     }
     Ok(())
+}
+
+// /dev is a fresh tmpfs: rootfs links are hidden by the mount above. These
+// fixed links support inherited descriptors without exposing any host paths.
+fn initialize_descriptor_links(device_directory: &Path) -> std::io::Result<()> {
+    for (name, target) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "fd/0"),
+        ("stdout", "fd/1"),
+        ("stderr", "fd/2"),
+    ] {
+        symlink(target, device_directory.join(name))
+            .map_err(|_| std::io::Error::other("guest_descriptor_links_failed"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_links_are_fixed_and_do_not_replace_existing_entries() {
+        let directory = std::env::temp_dir().join(format!(
+            "guest-descriptors-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock")
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).expect("create test device directory");
+        initialize_descriptor_links(&directory).expect("initialize fixed links");
+        for (name, target) in [
+            ("fd", "/proc/self/fd"),
+            ("stdin", "fd/0"),
+            ("stdout", "fd/1"),
+            ("stderr", "fd/2"),
+        ] {
+            assert_eq!(
+                fs::read_link(directory.join(name)).expect("link"),
+                Path::new(target)
+            );
+        }
+        fs::remove_file(directory.join("fd")).expect("remove test link");
+        fs::write(directory.join("fd"), b"must remain unchanged").expect("test sentinel");
+        assert!(initialize_descriptor_links(&directory).is_err());
+        assert_eq!(
+            fs::read(directory.join("fd")).expect("preserved entry"),
+            b"must remain unchanged"
+        );
+        fs::remove_dir_all(directory).expect("remove own test directory");
+    }
 }

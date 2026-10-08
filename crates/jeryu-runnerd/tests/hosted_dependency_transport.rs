@@ -144,7 +144,7 @@ fn run_library_jankurai(
     command
         .args([
             "-lc",
-            "export PATH=\"$2:$PATH\"; cd \"$1\"; source ops/ci/lib.sh; require_jankurai; printf 'command=%s\\nfile=%s\\nversion=' \"$(command -v jankurai)\" \"$(type -P -- jankurai)\"; jankurai --version",
+            "export PATH=\"$2:$PATH\"; cd \"$1\"; source ops/ci/lib.sh || exit $?; require_jankurai || exit $?; printf 'command=%s\\nfile=%s\\nversion=' \"$(command -v jankurai)\" \"$(type -P -- jankurai)\"; jankurai --version",
             "_",
             root.to_str().expect("UTF-8 workspace root"),
             earlier_path.to_str().expect("UTF-8 hostile PATH"),
@@ -306,13 +306,17 @@ fn source_helper_rejects_unsafe_caller_configs_and_scrubs_injections() {
         symlink_path,
         hardlink_path,
     ] {
-        let output = source_helper(&helper, &invalid, "source \"$1\"");
+        let output = source_helper(&helper, &invalid, "source \"$1\" || exit $?");
         assert!(
             !output.status.success(),
             "unsafe caller config was accepted"
         );
     }
-    let relative = source_helper(&helper, Path::new("relative.config"), "source \"$1\"");
+    let relative = source_helper(
+        &helper,
+        Path::new("relative.config"),
+        "source \"$1\" || exit $?",
+    );
     assert!(
         !relative.status.success(),
         "relative caller config was accepted"
@@ -321,7 +325,7 @@ fn source_helper_rejects_unsafe_caller_configs_and_scrubs_injections() {
     let accepted = source_helper(
         &helper,
         &equivalent,
-        "source \"$1\"; printf '%s' \"$GIT_CONFIG_GLOBAL\"",
+        "source \"$1\" || exit $?; printf '%s' \"$GIT_CONFIG_GLOBAL\"",
     );
     assert!(
         accepted.status.success(),
@@ -333,10 +337,52 @@ fn source_helper_rejects_unsafe_caller_configs_and_scrubs_injections() {
         overlay.to_str().expect("UTF-8 overlay path")
     );
 
-    let mismatched = source_helper(&helper, &root.join("deny.toml"), "source \"$1\"");
+    let mismatched = source_helper(&helper, &root.join("deny.toml"), "source \"$1\" || exit $?");
     assert!(!mismatched.status.success());
     assert!(
         String::from_utf8_lossy(&mismatched.stderr).contains("differs from the exact reviewed")
+    );
+
+    // A source failure must survive the caller's next successful command.
+    for name in [
+        "GIT_CONFIG_COUNT",
+        "GIT_DIR",
+        "GIT_SSL_NO_VERIFY",
+        "HTTPS_PROXY",
+        "CURL_CA_BUNDLE",
+        "GIT_CONFIG_KEY_0",
+        "GIT_CONFIG_VALUE_0",
+        "GIT_TRACE_CURL",
+        "GIT_CONFIG_NOSYSTEM",
+        "CARGO_NET_GIT_FETCH_WITH_CLI",
+        "GIT_TERMINAL_PROMPT",
+        "hosted_git_env_root",
+        "hosted_git_env_overlay",
+        "hosted_git_env_overlay_sha256",
+        "hosted_git_env_caller_global",
+        "hosted_git_env_injected",
+    ] {
+        let body =
+            format!("readonly {name}=injected; source \"$1\" || exit $?; printf readonly-accepted");
+        let rejected = source_helper(&helper, &overlay, &body);
+        assert!(
+            !rejected.status.success(),
+            "readonly variable {name} was accepted: {}",
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(
+            rejected.stdout.is_empty(),
+            "readonly rejection fell through"
+        );
+    }
+    let global_readonly = source_helper(
+        &helper,
+        &equivalent,
+        "readonly GIT_CONFIG_GLOBAL; source \"$1\" || exit $?; printf readonly-accepted",
+    );
+    assert!(
+        !global_readonly.status.success() && global_readonly.stdout.is_empty(),
+        "readonly global configuration was accepted"
     );
 
     let mut command = Command::new("bash");
@@ -344,7 +390,7 @@ fn source_helper_rejects_unsafe_caller_configs_and_scrubs_injections() {
         .current_dir(&root)
         .args([
             "-c",
-            "source \"$1\"; [[ -z ${GIT_CONFIG_COUNT+x} && -z ${GIT_CONFIG_KEY_0+x} && -z ${GIT_CONFIG_VALUE_0+x} && -z ${GIT_SSL_NO_VERIFY+x} && -z ${GIT_TRACE_CURL+x} && -z ${GIT_EXEC_PATH+x} && -z ${GIT_DIR+x} && -z ${GIT_OBJECT_DIRECTORY+x} && -z ${HTTPS_PROXY+x} && -z ${https_proxy+x} && -z ${CURL_CA_BUNDLE+x} && -z ${SSL_CERT_FILE+x} && $GIT_TERMINAL_PROMPT == 0 && $CARGO_NET_GIT_FETCH_WITH_CLI == true ]]",
+            "source \"$1\" || exit $?; [[ -z ${GIT_CONFIG_COUNT+x} && -z ${GIT_CONFIG_KEY_0+x} && -z ${GIT_CONFIG_VALUE_0+x} && -z ${GIT_SSL_NO_VERIFY+x} && -z ${GIT_TRACE_CURL+x} && -z ${GIT_EXEC_PATH+x} && -z ${GIT_DIR+x} && -z ${GIT_OBJECT_DIRECTORY+x} && -z ${HTTPS_PROXY+x} && -z ${https_proxy+x} && -z ${CURL_CA_BUNDLE+x} && -z ${SSL_CERT_FILE+x} && $GIT_TERMINAL_PROMPT == 0 && $CARGO_NET_GIT_FETCH_WITH_CLI == true ]]",
             "_",
             helper.to_str().expect("UTF-8 helper"),
         ])
