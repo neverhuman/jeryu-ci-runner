@@ -130,6 +130,31 @@ collision, truncation, extra bytes, capacity failure, or digest mismatch rejects
 the upload. Runtime admission is a separate signed-artifact operation. Upload
 does not authorize a lease, resolve protected main, or promote compiled caches.
 
+Success (HTTP 200) is BundleRegistered: protocol_version, message_type
+bundle-registered, request_id, role source_bundle, artifact (opaque artifact_id
+and the full padded digest), bundle_bytes and stored_bytes. validate_for binds
+the receipt to the exact upload. New and identical existing objects have the
+same response; no caller chooses a host path. Rejections use the closed
+SessionRpcResponse error envelope, with the exact request_id once metadata was
+parsed. A nameless pre-parse failure cannot complete a named upload.
+
+Trusted node configuration sets source_bundle_budget_gib (1..64); RPC cannot
+override it. At most four uploads are active, with charged exclusive staging
+and a cumulative source-bundle quota. HTTP has a 75-second total bound and each
+body frame a five-second idle bound. Failed uploads discard only their owned
+staging object; startup reconciles its own staging namespace. No provider
+credentials or agent-controlled filesystems are inspected.
+
+At most 4096 source objects (including reservations) are charged, with 64 KiB
+per-object metadata overhead in addition to stored bytes. Node and registry
+must share a filesystem. Physical upload reservations share the VM admission
+mutex and include outstanding sparse-workspace/checkpoint promises. Registry
+quota is a separate operator allocation; published objects occupy actual blocks.
+An invalid/unknown staging entry blocks uploads and is preserved for repair;
+valid owned records still reconcile. Only a valid root-owned UUID journal may
+authorize deletion of its fixed staging file. Immutable objects are never
+replaced, and source upload alone does not authorize their eventual eviction.
+
 Checkpoint references include an opaque checkpoint id and manifest digest.
 The manifest binds owner/repository/session, prior generation, runtime and
 environment, actual frozen Git head, approved main, consistency/flush status,

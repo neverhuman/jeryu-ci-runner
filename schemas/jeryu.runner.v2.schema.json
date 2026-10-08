@@ -30,6 +30,9 @@
       "$ref": "#/$defs/BundleUpload"
     },
     {
+      "$ref": "#/$defs/BundleRegistered"
+    },
+    {
       "$ref": "#/$defs/GuestRelayRequest"
     },
     {
@@ -59,6 +62,48 @@
       "required": [
         "artifact_id",
         "digest"
+      ]
+    },
+    "BundleRegistered": {
+      "description": "Successful K4 registration binds the uploaded bytes, not repository trust.",
+      "type": "object",
+      "properties": {
+        "artifact": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        },
+        "bundle_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/BundleRole"
+        },
+        "stored_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "request_id",
+        "role",
+        "artifact",
+        "bundle_bytes",
+        "stored_bytes"
       ]
     },
     "BundleRole": {

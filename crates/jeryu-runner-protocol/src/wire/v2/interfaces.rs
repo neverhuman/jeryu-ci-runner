@@ -161,6 +161,59 @@ impl ValidateWire for BundleUpload {
 }
 message_io!(BundleUpload);
 
+/// Successful K4 registration binds the uploaded bytes, not repository trust.
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BundleRegistered {
+    #[schemars(schema_with = "super::schema::version")]
+    pub protocol_version: String,
+    pub message_type: String,
+    pub request_id: String,
+    pub role: BundleRole,
+    pub artifact: super::ArtifactIdentity,
+    pub bundle_bytes: u64,
+    pub stored_bytes: u64,
+}
+impl ValidateWire for BundleRegistered {
+    fn validate_wire(&self) -> Result<(), WireError> {
+        header(
+            &self.protocol_version,
+            &self.message_type,
+            "bundle-registered",
+        )?;
+        self.artifact.validate_wire()?;
+        BundleUpload {
+            protocol_version: self.protocol_version.clone(),
+            message_type: "bundle-upload".into(),
+            request_id: self.request_id.clone(),
+            role: self.role,
+            digest: self.artifact.digest.clone(),
+            bundle_bytes: self.bundle_bytes,
+            stored_bytes: self.stored_bytes,
+        }
+        .validate()
+    }
+}
+message_io!(BundleRegistered);
+impl BundleRegistered {
+    pub fn validate_for(&self, upload: &BundleUpload) -> Result<(), WireError> {
+        self.validate()?;
+        upload.validate()?;
+        if self.request_id != upload.request_id
+            || self.role != upload.role
+            || self.artifact.digest != upload.digest
+            || self.bundle_bytes != upload.bundle_bytes
+            || self.stored_bytes != upload.stored_bytes
+        {
+            return Err(WireError::new(
+                WireErrorCode::ContextMismatch,
+                "bundle_registration",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum RelayMethod {

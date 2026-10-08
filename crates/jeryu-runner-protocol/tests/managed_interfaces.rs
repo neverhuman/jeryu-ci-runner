@@ -90,6 +90,51 @@ fn registry_lengths_are_bounded_before_alignment_and_legacy_delivery_modes_rejec
 }
 
 #[test]
+fn registration_receipts_bind_request_role_digest_and_both_lengths() {
+    let upload = BundleUpload {
+        protocol_version: PROTOCOL_VERSION.into(),
+        message_type: "bundle-upload".into(),
+        request_id: "upload".into(),
+        role: BundleRole::SourceBundle,
+        digest: format!("sha256:{}", "a".repeat(64)),
+        bundle_bytes: 511,
+        stored_bytes: 512,
+    };
+    let receipt = BundleRegistered {
+        protocol_version: PROTOCOL_VERSION.into(),
+        message_type: "bundle-registered".into(),
+        request_id: upload.request_id.clone(),
+        role: upload.role,
+        artifact: ArtifactIdentity {
+            artifact_id: "bundle-test".into(),
+            digest: upload.digest.clone(),
+        },
+        bundle_bytes: upload.bundle_bytes,
+        stored_bytes: upload.stored_bytes,
+    };
+    BundleRegistered::from_json(&receipt.to_json().unwrap())
+        .unwrap()
+        .validate_for(&upload)
+        .unwrap();
+    for field in ["request", "digest", "length"] {
+        let mut changed = receipt.clone();
+        match field {
+            "request" => changed.request_id = "different".into(),
+            "digest" => changed.artifact.digest = format!("sha256:{}", "b".repeat(64)),
+            _ => {
+                changed.bundle_bytes = 513;
+                changed.stored_bytes = 1024;
+            }
+        }
+        changed.validate().unwrap();
+        assert!(changed.validate_for(&upload).is_err(), "{field}");
+    }
+    let mut value = serde_json::to_value(receipt).unwrap();
+    value["host_path"] = json!("/tmp/forbidden");
+    assert!(BundleRegistered::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+#[test]
 fn replay_rejects_mixed_authority_reordered_bytes_and_extra_frames() {
     let frame = TerminalFrame {
         protocol_version: PROTOCOL_VERSION.into(),

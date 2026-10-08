@@ -19,6 +19,7 @@ enum ManagedMessage {
     Subscribe(Box<SessionSubscribe>),
     Stream(Box<SessionStreamFrame>),
     Upload(Box<BundleUpload>),
+    Registered(Box<super::BundleRegistered>),
     Relay(Box<GuestRelayRequest>),
     Checkpoint(Box<CheckpointManifest>),
     Screen(Box<super::TerminalScreen>),
