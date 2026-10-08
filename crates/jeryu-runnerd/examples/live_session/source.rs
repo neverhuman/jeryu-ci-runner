@@ -83,7 +83,21 @@ pub fn conflict(
         b"REBASE_CONFLICT_RETAINED\r",
         Duration::from_secs(5),
     )?;
-    apply(handle, context, ControlCommand::Stop)?;
+    handle.stop(OWNER)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let snapshot = handle.snapshot(OWNER)?;
+        if snapshot.phase == RuntimePhase::Stopped {
+            if snapshot.reason.as_deref() != Some("main_sync_conflict") {
+                return Err("direct conflict stop lost its context".into());
+            }
+            break;
+        }
+        if snapshot.phase == RuntimePhase::Failed || Instant::now() > deadline {
+            return Err("direct conflict stop failed during retention".into());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let checkpoint = handle
         .snapshot(OWNER)?
         .checkpoint
@@ -105,7 +119,7 @@ pub fn conflict(
         return Err("conflict VM survived stop".into());
     }
     println!(
-        "main_sync_conflict=passed phase=rebase_required shell_attachable=true agent_started=false encrypted_checkpoint=true vm_destroyed=true"
+        "main_sync_conflict=passed phase=rebase_required shell_attachable=true agent_started=false direct_stop=true stopped=true encrypted_checkpoint=true vm_destroyed=true"
     );
     Ok(())
 }

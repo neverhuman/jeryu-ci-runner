@@ -2,6 +2,35 @@
 use super::*;
 use std::time::Instant;
 
+/// The guest freeze is complete or exhausted. Retention no longer consumes
+/// owner execution quota, but node resources and generation fencing stay held.
+pub(super) fn begin_retention(state: &Arc<Mutex<State>>) {
+    if let Ok(mut state) = state.lock() {
+        state.control_ready = false;
+        if state.phase != RuntimePhase::Failed {
+            state.phase = RuntimePhase::Stopping;
+        }
+        let snapshot = state.snapshot();
+        state.publish(super::super::state::SessionEvent::Snapshot(snapshot));
+    }
+}
+pub(super) fn finish_retention(state: &mut State, result: RunnerResult<()>, flushed: bool) {
+    let failed = state.phase == RuntimePhase::Failed || result.is_err();
+    let reason = result
+        .err()
+        .map(|error| error.code().into())
+        .or_else(|| state.reason.clone())
+        .or_else(|| (!flushed).then(|| "checkpoint_unflushed".into()));
+    state.finish(
+        if failed {
+            RuntimePhase::Failed
+        } else {
+            RuntimePhase::Stopped
+        },
+        reason,
+    );
+}
+
 pub(super) fn freeze(session: &mut MicroVmSession, state: &Arc<Mutex<State>>, id: &str) -> bool {
     let already = {
         let Ok(mut state) = state.lock() else {
@@ -49,3 +78,6 @@ pub(super) fn freeze(session: &mut MicroVmSession, state: &Arc<Mutex<State>>, id
     }
     false
 }
+
+#[cfg(test)]
+mod tests;

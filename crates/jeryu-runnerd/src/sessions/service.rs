@@ -143,7 +143,10 @@ impl SessionService {
                     break;
                 }
                 if let Ok(fence) = fence_requests.try_recv() {
-                    if session.send(&fence).is_err() {
+                    if let Err(error) = session.send(&fence) {
+                        if let Ok(mut state) = state.lock() {
+                            state.finish(RuntimePhase::Failed, Some(error.code().into()));
+                        }
                         break;
                     }
                     continue;
@@ -172,6 +175,7 @@ impl SessionService {
                 if matches!(request, GuestRequest::Stop { .. }) {
                     let flushed = shutdown::freeze(&mut session, &state, id);
                     reader_done.store(true, Ordering::Release);
+                    shutdown::begin_retention(&state);
                     let result = session.stop();
                     if let Ok(mut state) = state.lock() {
                         state.checkpoint = session.checkpoint().cloned();
@@ -185,17 +189,7 @@ impl SessionService {
                             },
                             true,
                         );
-                        state.finish(
-                            if result.is_ok() {
-                                RuntimePhase::Stopped
-                            } else {
-                                RuntimePhase::Failed
-                            },
-                            result
-                                .err()
-                                .map(|error| error.code().into())
-                                .or_else(|| (!flushed).then(|| "checkpoint_unflushed".into())),
-                        );
+                        shutdown::finish_retention(&mut state, result, flushed);
                     }
                     return;
                 }
@@ -209,30 +203,11 @@ impl SessionService {
             }
             let flushed = shutdown::freeze(&mut session, &state, "service-stop-freeze");
             reader_done.store(true, Ordering::Release);
+            shutdown::begin_retention(&state);
             let result = session.stop();
             if let Ok(mut state) = state.lock() {
                 state.checkpoint = session.checkpoint().cloned();
-                let failed_before = state.phase == RuntimePhase::Failed;
-                let reason = result
-                    .err()
-                    .map(|error| error.code().into())
-                    .or_else(|| state.reason.clone())
-                    .or_else(|| (!flushed).then(|| "checkpoint_unflushed".into()));
-                state.finish(
-                    if failed_before
-                        || (reason.as_deref().is_some_and(|reason| {
-                            !matches!(
-                                reason,
-                                "idle_timeout" | "runtime_limit" | "checkpoint_unflushed"
-                            )
-                        }))
-                    {
-                        RuntimePhase::Failed
-                    } else {
-                        RuntimePhase::Stopped
-                    },
-                    reason,
-                );
+                shutdown::finish_retention(&mut state, result, flushed);
             }
         });
         reservation.complete(handle.clone())?;

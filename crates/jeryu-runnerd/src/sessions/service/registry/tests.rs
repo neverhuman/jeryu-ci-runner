@@ -42,7 +42,10 @@ fn stopping_releases_owner_quota_but_fences_concurrent_writable_generations() {
     let (handle, state, _) = super::super::test_handle(first_context.clone());
     first.complete(Arc::new(handle)).unwrap();
     assert!(Reservation::acquire(&store, &context("second", "user/alice"), 1).is_err());
-    state.lock().unwrap().phase = RuntimePhase::Stopping;
+    state.lock().unwrap().phase = RuntimePhase::Checkpointing;
+    assert!(Reservation::acquire(&store, &context("second", "user/alice"), 1).is_err());
+    super::super::shutdown::begin_retention(&state);
+    assert_eq!(state.lock().unwrap().phase, RuntimePhase::Stopping);
     assert!(Reservation::acquire(&store, &context("second", "user/alice"), 1).is_ok());
     let mut successor = first_context;
     successor.generation = 2;

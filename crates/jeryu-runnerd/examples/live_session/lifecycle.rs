@@ -26,7 +26,7 @@ pub fn run(
     let record = owned_record(&first_context)?;
     let observing = Instant::now();
     let execution_deadline = if mode == "runtime-stop" {
-        lease.expires_at_unix_millis + 1000
+        lease.expires_at_unix_millis
     } else {
         u64::try_from(now_ms())? + if mode == "idle-stop" { 8000 } else { 5000 }
     };
