@@ -33,6 +33,10 @@ pub enum RuntimeArchitecture {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeManifest {
+    pub image_class: super::RuntimeImageClass,
+    /// Closed, sorted declarations bound into the signed manifest and job.
+    #[schemars(length(min = 1, max = 8))]
+    pub profile_ids: Vec<super::RuntimeProfile>,
     #[schemars(schema_with = "super::schema::firecracker_version")]
     pub firecracker_version: String,
     #[schemars(schema_with = "super::schema::guest_version")]
@@ -58,6 +62,7 @@ pub struct RuntimeManifest {
 
 impl ValidateWire for RuntimeManifest {
     fn validate_wire(&self) -> Result<(), WireError> {
+        super::image::validate_profiles(self.image_class, &self.profile_ids)?;
         if self.firecracker_version != FIRECRACKER_VERSION
             || self.guest_protocol_version != GUEST_PROTOCOL_VERSION
         {
@@ -95,6 +100,12 @@ impl ValidateWire for RuntimeManifest {
     }
 }
 message_io!(RuntimeManifest);
+
+impl RuntimeManifest {
+    pub fn permits_profile(&self, id: &str) -> bool {
+        self.profile_ids.iter().any(|profile| profile.id() == id)
+    }
+}
 
 /// Admission bounds. Defaults are the initial session shape, not a capacity grant.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

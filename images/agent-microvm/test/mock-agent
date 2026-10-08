@@ -1,0 +1,14 @@
+#!/bin/sh
+# Credential-free model-free agent fixture. Installed only in a test rootfs.
+set -eu
+case "${1-}" in
+  claude|codex|grok) provider="$1" ;;
+  *) exit 64 ;;
+esac
+test "$(id -u)" = 1000
+test ! -e /home/ubuntu
+printf 'mock:guest provider=%s\n' "$provider"
+printf 'int main(void){return 0;}\n' > main.c
+cc main.c -o build
+./build
+printf 'fixture:built\nmock:built provider=%s\n' "$provider"

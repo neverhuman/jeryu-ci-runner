@@ -63,7 +63,8 @@
     "tools/": "ops",
     "agent/tool-adoption.toml": "agent",
     "db/": "jeryu-ci-runner",
-    "crates/jeryu-guestd/": "jeryu-ci-runner"
+    "crates/jeryu-guestd/": "jeryu-ci-runner",
+    "images/agent-microvm/": "jeryu-ci-runner"
   },
   "workspace": "jeryu-ci-runner"
 }

@@ -42,14 +42,35 @@ fn main() -> Result<()> {
     let key = fs::read(root.join("fixture.pub"))?
         .try_into()
         .map_err(|_| "key length")?;
-    let runtime = Arc::new(VerifiedRuntime::admit(
+    let release_key = fs::read(root.join("release-authority.pub"))?
+        .try_into()
+        .map_err(|_| "release authority length")?;
+    let runtime = Arc::new(VerifiedRuntime::admit_test(
         manifest.clone(),
         &signature,
+        &release_key,
         &key,
         &root.join("artifacts"),
     )?);
-    let mut lease = fixture_lease(manifest)?;
     let mode = std::env::args().nth(1).unwrap_or_else(|| "empty".into());
+    if mode == "image-authority" {
+        if !matches!(VerifiedRuntime::admit(manifest.clone(), &signature, &release_key, &root.join("artifacts")), Err(e) if e.code() == "runtime_test_image_denied")
+        {
+            return Err("test image entered production admission".into());
+        }
+        if !matches!(VerifiedRuntime::admit_test(manifest, &signature, &key, &key, &root.join("artifacts")), Err(e) if e.code() == "runtime_test_authority_not_distinct")
+        {
+            return Err("test image shared the production signer".into());
+        }
+        println!(
+            "image_authority=passed test_image_refused_by_production=true equal_authorities_refused=true"
+        );
+        return Ok(());
+    }
+    let mut lease = fixture_lease(manifest)?;
+    if ["mock-claude", "mock-codex", "mock-grok"].contains(&mode.as_str()) {
+        lease.profile_id = mode.clone();
+    }
     source::configure(
         &mut lease,
         if mode == "missing-cgroup"
@@ -61,6 +82,7 @@ fn main() -> Result<()> {
             || mode == "resource-limits"
             || mode == "control-terminal"
             || mode == "guestd-mismatch"
+            || mode == "image-class-mismatch"
         {
             "empty"
         } else if [
@@ -69,6 +91,9 @@ fn main() -> Result<()> {
             "idle-stop",
             "runtime-stop",
             "direct-stop",
+            "mock-claude",
+            "mock-codex",
+            "mock-grok",
         ]
         .contains(&mode.as_str())
         {
@@ -114,16 +139,21 @@ fn main() -> Result<()> {
     }
     let started = Instant::now();
     let result = DispatchEngine::new().dispatch_managed_session(&service, lease);
-    if mode == "guestd-mismatch" {
+    if mode == "guestd-mismatch" || mode == "image-class-mismatch" {
+        let expected = if mode == "guestd-mismatch" {
+            "guestd_identity_mismatch"
+        } else {
+            "guest_image_class_mismatch"
+        };
         match result {
-            Err(error) if error.to_string().contains("guestd_identity_mismatch") => (),
+            Err(error) if error.to_string().contains(expected) => (),
             _ => return Err("booted guestd identity was not rejected".into()),
         }
         if fs::read_dir(root.join("node/records"))?.next().is_some() {
             return Err("mismatched boot retained a VM resource".into());
         }
         println!(
-            "booted_guestd_mismatch=passed scope=development ready=false agent_started=false vm_destroyed=true"
+            "booted_runtime_mismatch=passed scope=development mode={mode} ready=false agent_started=false vm_destroyed=true"
         );
         return Ok(());
     }
@@ -264,6 +294,11 @@ fn main() -> Result<()> {
     println!(
         "managed_session_fixture=passed scope=development guest_build=true shell=true resize=true interrupt=true replay=true viewer_revocation=true vm_destroyed=true"
     );
+    if mode.starts_with("mock-") {
+        println!(
+            "mock_agent_runtime=passed profile={mode} real_vm=true provider_invoked=false provider_bindings=none"
+        );
+    }
     Ok(())
 }
 

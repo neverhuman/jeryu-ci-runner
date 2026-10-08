@@ -61,6 +61,9 @@ pub enum GuestRequest {
 pub enum GuestProfile {
     Fixture,
     Shell,
+    MockClaude,
+    MockCodex,
+    MockGrok,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -75,10 +78,22 @@ impl GuestProfile {
         match id {
             "fixture" => Ok(Self::Fixture),
             "shell" => Ok(Self::Shell),
+            "mock-claude" => Ok(Self::MockClaude),
+            "mock-codex" => Ok(Self::MockCodex),
+            "mock-grok" => Ok(Self::MockGrok),
             _ => Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "unknown_agent_profile",
             )),
+        }
+    }
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Fixture => "fixture",
+            Self::Shell => "shell",
+            Self::MockClaude => "mock-claude",
+            Self::MockCodex => "mock-codex",
+            Self::MockGrok => "mock-grok",
         }
     }
 }

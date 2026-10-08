@@ -8,6 +8,8 @@
 *.receipt.json
 *.bench.json
 .DS_Store
+__pycache__/
+*.pyc
 /target
 **/target
 node_modules

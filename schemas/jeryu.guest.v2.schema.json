@@ -395,7 +395,10 @@
       "type": "string",
       "enum": [
         "fixture",
-        "shell"
+        "shell",
+        "mock-claude",
+        "mock-codex",
+        "mock-grok"
       ]
     },
     "GuestRequest": {
@@ -650,6 +653,13 @@
         "aarch64"
       ]
     },
+    "RuntimeImageClass": {
+      "type": "string",
+      "enum": [
+        "production",
+        "test"
+      ]
+    },
     "RuntimeManifest": {
       "description": "Release identity. Signature verification and live qualification must precede\nregistry admission; a well-formed manifest alone is not evidence of either.",
       "type": "object",
@@ -678,6 +688,9 @@
         "guestd": {
           "$ref": "#/$defs/ArtifactIdentity"
         },
+        "image_class": {
+          "$ref": "#/$defs/RuntimeImageClass"
+        },
         "jailer": {
           "$ref": "#/$defs/ArtifactIdentity"
         },
@@ -690,6 +703,15 @@
         "policy_revision": {
           "type": "string",
           "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "profile_ids": {
+          "description": "Closed, sorted declarations bound into the signed manifest and job.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RuntimeProfile"
+          },
+          "maxItems": 8,
+          "minItems": 1
         },
         "recipe_digest": {
           "type": "string",
@@ -710,6 +732,8 @@
       },
       "additionalProperties": false,
       "required": [
+        "image_class",
+        "profile_ids",
         "firecracker_version",
         "guest_protocol_version",
         "architecture",
@@ -725,6 +749,20 @@
         "recipe_digest",
         "policy_revision",
         "snapshot_compatibility"
+      ]
+    },
+    "RuntimeProfile": {
+      "description": "Declaration is necessary but does not qualify an adapter or authentication.",
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "fixture",
+        "grok",
+        "mock-claude",
+        "mock-codex",
+        "mock-grok",
+        "shell"
       ]
     },
     "ScreenSnapshot": {

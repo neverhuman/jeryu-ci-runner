@@ -151,7 +151,8 @@ impl ValidateWire for SessionLease {
         self.context.validate_wire()?;
         validate_label("profile_id", &self.profile_id)?;
         super::connection::validate_bindings(&self.connection_bindings)?;
-        if matches!(self.profile_id.as_str(), "fixture" | "shell")
+        if (self.runtime.image_class == super::RuntimeImageClass::Test
+            || self.profile_id == "shell")
             && !self.connection_bindings.is_empty()
         {
             return Err(WireError::new(
@@ -193,6 +194,12 @@ impl ValidateWire for SessionLease {
             checkpoint.validate_wire()?;
         }
         self.runtime.validate_wire()?;
+        if !self.runtime.permits_profile(&self.profile_id) {
+            return Err(WireError::new(
+                WireErrorCode::ContextMismatch,
+                "runtime_profile",
+            ));
+        }
         self.resources.validate_wire()?;
         validate_timestamp("issued_at_unix_millis", self.issued_at_unix_millis)?;
         validate_timestamp("expires_at_unix_millis", self.expires_at_unix_millis)?;

@@ -13,6 +13,8 @@ fn artifact(id: &str) -> ArtifactIdentity {
 }
 fn lease() -> SessionLease {
     let runtime = RuntimeManifest {
+        image_class: RuntimeImageClass::Test,
+        profile_ids: vec![RuntimeProfile::Fixture, RuntimeProfile::Shell],
         firecracker_version: FIRECRACKER_VERSION.into(),
         guest_protocol_version: GUEST_PROTOCOL_VERSION.into(),
         architecture: RuntimeArchitecture::X86_64,
@@ -64,9 +66,59 @@ fn lease() -> SessionLease {
 }
 
 #[test]
+fn image_class_profiles_and_mock_credential_denial_are_bound_and_required() {
+    let original = lease();
+    for profile in [
+        RuntimeProfile::Fixture,
+        RuntimeProfile::MockClaude,
+        RuntimeProfile::MockCodex,
+        RuntimeProfile::MockGrok,
+    ] {
+        let mut mock = original.clone();
+        mock.runtime.profile_ids = vec![profile, RuntimeProfile::Shell];
+        mock.profile_id = profile.id().into();
+        mock.context.runtime_digest = runtime_digest(&mock.runtime).unwrap();
+        mock.context.job_digest = mock.job_digest().unwrap();
+        mock.validate().unwrap();
+        mock.connection_bindings = vec![ConnectionBinding {
+            provider: Provider::Codex,
+            connection_id: "wrong-real-connection".into(),
+            connection_generation: 1,
+            mode: ConnectionMode::GatewayHelper,
+        }];
+        mock.context.job_digest = mock.job_digest().unwrap();
+        assert!(mock.validate().is_err());
+        mock.runtime.image_class = RuntimeImageClass::Production;
+        assert!(mock.runtime.validate().is_err());
+    }
+    for field in ["image_class", "profile_ids"] {
+        let mut value = serde_json::to_value(&original).unwrap();
+        value["runtime"].as_object_mut().unwrap().remove(field);
+        assert!(SessionLease::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+    }
+    let mut changed = original.clone();
+    changed.profile_id = "mock-codex".into();
+    changed.context.job_digest = changed.job_digest().unwrap();
+    assert!(changed.validate().is_err());
+    changed.runtime.profile_ids = vec![RuntimeProfile::Shell, RuntimeProfile::Fixture];
+    assert!(changed.runtime.validate().is_err());
+    changed.runtime.profile_ids = vec![
+        RuntimeProfile::Fixture,
+        RuntimeProfile::Fixture,
+        RuntimeProfile::Shell,
+    ];
+    assert!(changed.runtime.validate().is_err());
+    changed.runtime.profile_ids = vec![RuntimeProfile::Codex, RuntimeProfile::Shell];
+    assert!(changed.runtime.validate().is_err());
+}
+
+#[test]
 fn connection_bindings_are_required_canonical_and_in_the_job_identity() {
     let mut original = lease();
     original.profile_id = "codex".into();
+    original.runtime.image_class = RuntimeImageClass::Production;
+    original.runtime.profile_ids = vec![RuntimeProfile::Codex, RuntimeProfile::Shell];
+    original.context.runtime_digest = runtime_digest(&original.runtime).unwrap();
     original.workspace = WorkspaceSource::GitBundle {
         bundle: artifact("bundle"),
         bundle_bytes: 512,

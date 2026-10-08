@@ -5,6 +5,19 @@ use std::io::Read;
 pub fn verify(expected: &str) -> std::io::Result<()> {
     check(&mut std::fs::File::open("/proc/self/exe")?, expected)
 }
+pub fn verify_class(
+    class: jeryu_runner_protocol::wire::v2::RuntimeImageClass,
+) -> std::io::Result<()> {
+    let actual = std::fs::read("/etc/jeryu/runtime-image-class")?;
+    let expected: &[u8] = match class {
+        jeryu_runner_protocol::wire::v2::RuntimeImageClass::Production => b"production\n",
+        jeryu_runner_protocol::wire::v2::RuntimeImageClass::Test => b"test\n",
+    };
+    if actual != expected {
+        return Err(std::io::Error::other("guest_image_class_mismatch"));
+    }
+    Ok(())
+}
 fn check(source: &mut impl Read, expected: &str) -> std::io::Result<()> {
     let mut hash = Sha256::new();
     let mut buffer = [0; 65536];

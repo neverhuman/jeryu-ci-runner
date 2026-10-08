@@ -26,8 +26,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let key: [u8; 32] = fs::read(root.join("fixture.pub"))?
         .try_into()
         .map_err(|_| "key length")?;
-    let runtime =
-        VerifiedRuntime::admit(manifest.clone(), &signature, &key, &root.join("artifacts"))?;
+    let release_key = fs::read(root.join("release-authority.pub"))?
+        .try_into()
+        .map_err(|_| "release authority length")?;
+    let runtime = VerifiedRuntime::admit_test(
+        manifest.clone(),
+        &signature,
+        &release_key,
+        &key,
+        &root.join("artifacts"),
+    )?;
     let now = u64::try_from(now_ms())?;
     let descendants = std::env::args().nth(1).as_deref() == Some("descendants");
     let mut lease = SessionLease {

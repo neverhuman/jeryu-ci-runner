@@ -37,6 +37,8 @@ mod tests {
             digest: digest.clone(),
         };
         let runtime = RuntimeManifest {
+            image_class: RuntimeImageClass::Production,
+            profile_ids: vec![RuntimeProfile::Codex, RuntimeProfile::Shell],
             firecracker_version: FIRECRACKER_VERSION.into(),
             guest_protocol_version: GUEST_PROTOCOL_VERSION.into(),
             architecture: RuntimeArchitecture::X86_64,

@@ -83,6 +83,9 @@ impl GuestProcess {
                 "set -eu; test \"$(id -u)\" = 1000; test ! -e /home/ubuntu; printf 'fixture:guest\\n'; printf 'int main(void){return 0;}\\n' > main.c; cc main.c -o build; ./build; printf 'fixture:built\\n'",
             ],
             GuestProfile::Shell => &["-i"],
+            GuestProfile::MockClaude => &["/usr/lib/jeryu/mock/agent", "claude"],
+            GuestProfile::MockCodex => &["/usr/lib/jeryu/mock/agent", "codex"],
+            GuestProfile::MockGrok => &["/usr/lib/jeryu/mock/agent", "grok"],
         };
         let pid = reaper.spawn(|| {
             spawn_unprivileged_pty(

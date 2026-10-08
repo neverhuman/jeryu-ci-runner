@@ -18,6 +18,14 @@ workspace revisions, resource bounds and provider connection bindings.
 Transport uses TLS 1.3 with mutual authentication and an exact control-plane
 certificate pin. A different client under the same CA cannot claim work.
 
+Production admission accepts only release-signed production images. Test nodes
+explicitly enroll a distinct test public key through root-only configuration.
+The signed image class and sorted closed profile declarations bind each lease;
+test leases cannot carry provider connection bindings. Guestd checks its booted
+executable digest and read-only rootfs class marker before Ready. Production
+refuses mock declarations and unqualified native profiles. Test mock scripts
+are installed only by the fixed overlay in images/agent-microvm/.
+
 Node configuration includes capacity, `cpu_budget_vcpus` (1–2048),
 `memory_budget_mib`, `disk_budget_gib` and per-owner limits. Operators specify
 budgets after host reserve. RPC cannot override them. CPU charges include
@@ -88,8 +96,13 @@ The model-free drivers in `examples/live_fixture.rs` and runnerd's
 registry. Unit tests cannot count as live qualification. No evidence images,
 keys or terminal recordings belong in this repository.
 
+Development KVM fixtures prove headless query responses, per-client control
+handoff, flushed idle/runtime/direct-stop retention, resume onto newer main and
+credential-free mock agents. These are development fixtures, not production
+artifact or provider qualification.
+
 This foundation does not prove provider authentication, gateway/relay, bundle
-upload, headless VT, per-client control handoff, durable control-plane enrollment,
+upload, durable control-plane enrollment,
 web/CLI/MCP migration, publication/merge cleanup, production artifact signing or
 default-resource canary targets. Legacy launch migration and its inventory gate
 remain required. Real-provider modes stay disabled. Protected security,

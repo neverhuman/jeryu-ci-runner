@@ -62,6 +62,15 @@ fn run() -> std::io::Result<()> {
         )?;
         return Err(std::io::Error::other("guestd_identity_mismatch"));
     }
+    if identity::verify_class(lease.runtime.image_class).is_err() {
+        write_frame(
+            &mut transport,
+            &GuestEvent::Error {
+                code: "guest_image_class_mismatch".into(),
+            },
+        )?;
+        return Err(std::io::Error::other("guest_image_class_mismatch"));
+    }
     let workspace = match workspace::prepare(&lease) {
         Ok(ready) => ready,
         Err(error) => {
@@ -166,6 +175,9 @@ fn session(
             }
             GuestRequest::Bind { .. } => return Err(std::io::Error::other("guest_rebind_denied")),
             GuestRequest::Start { channel, profile } => {
+                if !lease.runtime.permits_profile(profile.id()) {
+                    return Err(std::io::Error::other("guest_profile_not_declared"));
+                }
                 if rebase_required && profile != jeryu_runner_protocol::guest::GuestProfile::Shell {
                     return Err(std::io::Error::other("guest_rebase_required"));
                 }

@@ -5,6 +5,7 @@
 mod checkpoint;
 mod connection;
 mod control;
+mod image;
 mod interfaces;
 mod rpc;
 mod rpc_response;
@@ -19,6 +20,7 @@ mod workspace;
 pub use checkpoint::{CheckpointManifest, CheckpointReference};
 pub use connection::{ConnectionBinding, ConnectionMode, Provider};
 pub use control::{ControlAck, ControlCommand, ControlRequest, ControlState, TerminalFrame};
+pub use image::{RuntimeImageClass, RuntimeProfile};
 pub use interfaces::*;
 pub use rpc::{SessionGrant, SessionRpcOperation, SessionRpcRequest};
 pub use rpc_response::{GrantApplied, SessionRpcError, SessionRpcResponse, SessionRpcResult};

@@ -21,10 +21,17 @@ pub enum WorkspaceSource {
 impl WorkspaceSource {
     pub fn validate_for(&self, context: &SessionContext, profile: &str) -> Result<(), WireError> {
         match self {
-            Self::EmptyFixture if profile != "fixture" => Err(WireError::new(
-                WireErrorCode::ContextMismatch,
-                "workspace_source",
-            )),
+            Self::EmptyFixture
+                if !matches!(
+                    profile,
+                    "fixture" | "mock-claude" | "mock-codex" | "mock-grok"
+                ) =>
+            {
+                Err(WireError::new(
+                    WireErrorCode::ContextMismatch,
+                    "workspace_source",
+                ))
+            }
             Self::EmptyFixture => Ok(()),
             Self::GitBundle {
                 bundle,

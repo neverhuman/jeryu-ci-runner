@@ -10,6 +10,7 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
+mod authority;
 
 #[derive(Debug, Clone)]
 pub struct VerifiedRuntime {
@@ -30,13 +31,31 @@ impl VerifiedRuntime {
         release_key: &[u8; 32],
         store: &Path,
     ) -> RunnerResult<Self> {
-        let canonical = manifest
-            .to_json()
-            .map_err(|_| denied("runtime_manifest_invalid"))?;
-        let key = VerifyingKey::from_bytes(release_key)
-            .map_err(|_| denied("runtime_signature_invalid"))?;
-        key.verify_strict(&canonical, &Signature::from_bytes(signature))
-            .map_err(|_| denied("runtime_signature_invalid"))?;
+        authority::production(&manifest, signature, release_key)?;
+        Self::admit_artifacts(manifest, store)
+    }
+
+    /// Explicit development/CI service composition. This key is separately
+    /// enrolled; no guest or RPC caller can select it. Never release-qualified.
+    pub fn admit_test(
+        manifest: RuntimeManifest,
+        signature: &[u8; 64],
+        release_key: &[u8; 32],
+        test_key: &[u8; 32],
+        store: &Path,
+    ) -> RunnerResult<Self> {
+        authority::test(&manifest, signature, release_key, test_key)?;
+        Self::admit_artifacts(manifest, store)
+    }
+
+    fn admit_artifacts(manifest: RuntimeManifest, store: &Path) -> RunnerResult<Self> {
+        // Closed declarations alone never enable a provider adapter. The fixed
+        // guest registry currently qualifies only shell and test fixtures.
+        if manifest.profile_ids.iter().any(|profile| {
+            jeryu_runner_protocol::guest::GuestProfile::registered(profile.id()).is_err()
+        }) {
+            return Err(denied("runtime_profile_unqualified"));
+        }
         let architecture = if cfg!(target_arch = "x86_64") {
             RuntimeArchitecture::X86_64
         } else if cfg!(target_arch = "aarch64") {

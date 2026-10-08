@@ -1,6 +1,6 @@
 use jeryu_runner_core::{RunnerError, RunnerResult};
 use jeryu_runner_microvm::{NodeConfig, artifacts::VerifiedRuntime};
-use jeryu_runner_protocol::wire::v2::RuntimeManifest;
+use jeryu_runner_protocol::wire::v2::{RuntimeImageClass, RuntimeManifest};
 use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
 use serde::Deserialize;
 use std::{
@@ -28,6 +28,9 @@ pub struct SessionNodeConfig {
     pub runtime_manifest: PathBuf,
     pub runtime_signature: PathBuf,
     pub release_public_key: PathBuf,
+    /// Omitted in production. An explicitly enrolled distinct fixture authority.
+    #[serde(default)]
+    pub test_runtime_public_key: Option<PathBuf>,
     pub control_plane_lease_public_key: PathBuf,
     pub server_certificate: PathBuf,
     pub server_private_key: PathBuf,
@@ -52,7 +55,28 @@ impl SessionNodeConfig {
             .map_err(|_| failed("session_release_key_invalid"))?;
         // Public keys cannot be selected by RPC. Config and key custody are
         // verified separately; signature does not itself qualify a runtime.
-        VerifiedRuntime::admit(manifest, &signature, &key, &self.artifact_store)
+        match manifest.image_class {
+            RuntimeImageClass::Production if self.test_runtime_public_key.is_none() => {
+                VerifiedRuntime::admit(manifest, &signature, &key, &self.artifact_store)
+            }
+            RuntimeImageClass::Production => Err(failed("session_test_authority_in_production")),
+            RuntimeImageClass::Test => {
+                let path = self
+                    .test_runtime_public_key
+                    .as_ref()
+                    .ok_or_else(|| failed("session_test_authority_missing"))?;
+                let test_key = trusted_bytes(path)?
+                    .try_into()
+                    .map_err(|_| failed("session_test_authority_invalid"))?;
+                VerifiedRuntime::admit_test(
+                    manifest,
+                    &signature,
+                    &key,
+                    &test_key,
+                    &self.artifact_store,
+                )
+            }
+        }
     }
     pub(super) fn node(&self) -> RunnerResult<NodeConfig> {
         Ok(NodeConfig {
