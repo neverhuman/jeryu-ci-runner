@@ -37,6 +37,7 @@ fn same_write_path_succeeds_inside_and_is_blocked_outside() {
     // host (it is not a cgroup test, and must NOT be weakened otherwise).
     let driver = AgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(10));
 
     // INSIDE: absolute path under the cell -> must succeed and land.
@@ -154,6 +155,7 @@ fn budget_kill_is_live_and_truncates() {
     // Budget-kill refutation, not a cgroup test: opt out of require_cgroup.
     let driver = AgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(60))
         .with_output_budget(budget);
     let spec = CommandSpec::new(bot.to_string_lossy().to_string()).env("EDITBOT_SPEW", "8192"); // 8 MiB
@@ -195,6 +197,7 @@ fn watchdog_kill_is_live() {
     // Watchdog-kill refutation, not a cgroup test: opt out of require_cgroup.
     let driver = AgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_millis(200))
         .with_output_budget(64 * 1024 * 1024);
     let spec = CommandSpec::new(bot.to_string_lossy().to_string()).env("EDITBOT_SPIN", "1");

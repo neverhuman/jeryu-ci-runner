@@ -62,12 +62,11 @@ impl AgentDriver {
     /// without cgroup delegation.
     #[must_use]
     pub fn with_require_cgroup(mut self, require: bool) -> Self {
+        // This never relaxes the untrusted posture on its own: a caller that
+        // really runs agent code without cgroups must also say
+        // `with_untrusted_workload(false)`, so dropping one control cannot
+        // silently drop Landlock and seccomp with it.
         self.require_cgroup = require;
-        if !require {
-            // cgroups are one of the four untrusted-workload controls, so a run
-            // that drops them cannot claim the untrusted posture either.
-            self.untrusted_workload = false;
-        }
         self
     }
 
@@ -93,7 +92,8 @@ impl AgentDriver {
     /// Whether this driver requires enforced cgroup-v2 limits.
     #[must_use]
     pub fn require_cgroup(&self) -> bool {
-        self.require_cgroup
+        // An untrusted workload needs cgroups whatever this flag says.
+        self.require_cgroup || self.untrusted_workload
     }
 
     /// Build the confined [`JobRequest`] for an in-cell agent run.

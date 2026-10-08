@@ -235,8 +235,9 @@ pub struct AgentDriver {
     require_cgroup: bool,
     /// Treat the agent command as an UNTRUSTED workload: the launch must apply
     /// `no_new_privs`, cgroup-v2 limits, Landlock and seccomp, or it is refused.
-    /// Defaults to `true`; opting out of [`AgentDriver::with_require_cgroup`]
-    /// also clears this, because cgroups are one of the four controls.
+    /// Defaults to `true` and implies cgroups; it is cleared only by an explicit
+    /// [`AgentDriver::with_untrusted_workload`]`(false)`, never as a side effect
+    /// of [`AgentDriver::with_require_cgroup`].
     untrusted_workload: bool,
 }
 
@@ -764,10 +765,12 @@ mod tests {
         // Agent jobs are confined by default: require_cgroup is ON.
         assert!(AgentDriver::default().require_cgroup());
         assert!(AgentDriver::new(Duration::from_secs(1), 1024).require_cgroup());
-        // Tests that exercise only the Landlock/seccomp jail opt out.
+        // Tests that exercise only the Landlock/seccomp jail opt out, which
+        // takes dropping the untrusted posture explicitly as well.
         assert!(
             !AgentDriver::default()
                 .with_require_cgroup(false)
+                .with_untrusted_workload(false)
                 .require_cgroup()
         );
     }
@@ -777,10 +780,15 @@ mod tests {
         // Agent-authored code is untrusted: all four kernel controls or no run.
         assert!(AgentDriver::default().untrusted_workload());
         assert!(AgentDriver::new(Duration::from_secs(1), 1024).untrusted_workload());
-        // Dropping the cgroup requirement drops the untrusted posture with it,
-        // because cgroups are one of the four controls.
-        let opted_out = AgentDriver::default().with_require_cgroup(false);
+        // Dropping the cgroup requirement alone does not drop the posture:
+        // cgroups stay required and Landlock/seccomp stay mandatory.
+        let cgroup_only = AgentDriver::default().with_require_cgroup(false);
+        assert!(cgroup_only.untrusted_workload());
+        assert!(cgroup_only.require_cgroup());
+        // Only the named opt-out relaxes it.
+        let opted_out = cgroup_only.with_untrusted_workload(false);
         assert!(!opted_out.untrusted_workload());
+        assert!(!opted_out.require_cgroup());
         // And asking for the untrusted posture back re-requires cgroups.
         let strict = opted_out.with_untrusted_workload(true);
         assert!(strict.untrusted_workload());

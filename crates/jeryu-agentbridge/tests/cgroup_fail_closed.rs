@@ -92,6 +92,7 @@ fn opt_out_driver_runs_on_this_no_delegation_host() {
 
     let driver = AgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(10));
 
     match driver.run(&ws, &spec, &NullSink) {

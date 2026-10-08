@@ -62,6 +62,7 @@ fn editbot_writes_inside_the_cell() {
     // host (it is not a cgroup test).
     let driver = AgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(10));
     // Relative target resolves against the sandbox cwd, which IS the cell.
     let spec = CommandSpec::new(bot.to_string_lossy().to_string())
@@ -128,6 +129,7 @@ fn editbot_writing_outside_the_cell_is_denied_by_landlock() {
     // runs on this no-delegation host.
     let driver = AgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(10));
     let spec = CommandSpec::new(bot.to_string_lossy().to_string())
         .env("EDITBOT_TARGET", outside.to_string_lossy().to_string())
@@ -170,6 +172,7 @@ fn watchdog_kills_a_runaway_editbot() {
     // Watchdog test, not a cgroup test: opt out of require_cgroup.
     let driver = AgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_millis(300))
         .with_output_budget(1024 * 1024); // large, so timeout (not budget) wins
     let spec = CommandSpec::new(bot.to_string_lossy().to_string()).env("EDITBOT_SPIN", "1");
@@ -217,6 +220,7 @@ fn output_budget_exceeded_kills_the_child() {
     // Output-budget test, not a cgroup test: opt out of require_cgroup.
     let driver = AgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(30))
         .with_output_budget(budget);
     let spec = CommandSpec::new(bot.to_string_lossy().to_string()).env("EDITBOT_SPEW", "4096"); // KiB

@@ -282,9 +282,17 @@ mod tests {
             "an untrusted plan must carry Landlock rules"
         );
 
-        // Opting out of cgroups opts out of the untrusted posture, so the jail
-        // tests keep running on a host without cgroup delegation.
-        let relaxed = driver.with_require_cgroup(false);
+        // Opting out of cgroups alone keeps the untrusted posture; the jail
+        // tests that run without cgroup delegation also opt out by name.
+        let cgroup_only = driver.clone().with_require_cgroup(false);
+        assert!(cgroup_only.untrusted_workload());
+        let (_, plan, _) = cgroup_only
+            .build_sandbox_plan(workspace.path(), &spec)
+            .expect("sandbox plan");
+        assert!(plan.untrusted_workload && plan.require_cgroup);
+        let relaxed = driver
+            .with_require_cgroup(false)
+            .with_untrusted_workload(false);
         assert!(!relaxed.untrusted_workload());
         let (_, plan, _) = relaxed
             .build_sandbox_plan(workspace.path(), &spec)

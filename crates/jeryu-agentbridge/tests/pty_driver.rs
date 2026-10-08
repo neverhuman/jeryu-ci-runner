@@ -38,6 +38,7 @@ fn streams_terminal_output_to_the_sink() {
     let ws = cell_workspace("out");
     let driver = PtyAgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(10));
     let spec = CommandSpec::new("/bin/sh")
         .arg("-c")
@@ -72,6 +73,7 @@ fn control_input_reaches_the_agent_stdin() {
     let ws = cell_workspace("input");
     let driver = PtyAgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(10));
     // Read ONE line from stdin (the PTY) and echo it back.
     let spec = CommandSpec::new("/bin/sh")
@@ -101,6 +103,7 @@ fn terminate_stops_a_runaway_agent() {
     let ws = cell_workspace("term");
     let driver = PtyAgentDriver::default()
         .with_require_cgroup(false)
+        .with_untrusted_workload(false)
         .with_timeout(Duration::from_secs(30));
     let spec = CommandSpec::new("/bin/sh")
         .arg("-c")

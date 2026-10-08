@@ -30,10 +30,9 @@ impl PtyAgentDriver {
     /// Builder: require (or not) enforced cgroup-v2 limits for the agent job.
     #[must_use]
     pub fn with_require_cgroup(mut self, require: bool) -> Self {
+        // Never relaxes the untrusted posture on its own; see
+        // `AgentDriver::with_require_cgroup`.
         self.require_cgroup = require;
-        if !require {
-            self.untrusted_workload = false;
-        }
         self
     }
 
@@ -57,7 +56,8 @@ impl PtyAgentDriver {
     /// Whether this driver requires enforced cgroup-v2 limits.
     #[must_use]
     pub fn require_cgroup(&self) -> bool {
-        self.require_cgroup
+        // An untrusted workload needs cgroups whatever this flag says.
+        self.require_cgroup || self.untrusted_workload
     }
 
     /// Build the confined job for a PTY agent run. Network-deny by default; the
