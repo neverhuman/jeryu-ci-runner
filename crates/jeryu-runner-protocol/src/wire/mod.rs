@@ -47,6 +47,7 @@ mod job;
 mod lease;
 mod register;
 mod result;
+pub mod v2;
 mod validation;
 
 pub use body::{WireArtifactPath, WireArtifactWhen, WireCacheMode, WireCacheMount, WireStep};

@@ -4,6 +4,11 @@ generator = "just score"
 manual_edits = false
 
 [[zones]]
+path = "schemas/jeryu.runner.v2.schema.json"
+generator = "cargo run --locked -p jeryu-runner-protocol --example generate_v2_schema > schemas/jeryu.runner.v2.schema.json"
+manual_edits = false
+
+[[zones]]
 path = "ops/ci/kit/"
 generator = "bash ops/ci-kit/bin/vendor.sh ."
 manual_edits = false

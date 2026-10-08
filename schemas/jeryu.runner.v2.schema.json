@@ -1,0 +1,1654 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ManagedMessage",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/SessionLease"
+    },
+    {
+      "$ref": "#/$defs/ControlRequest"
+    },
+    {
+      "$ref": "#/$defs/ControlAck"
+    },
+    {
+      "$ref": "#/$defs/TerminalFrame"
+    },
+    {
+      "$ref": "#/$defs/SessionRpcRequest"
+    },
+    {
+      "$ref": "#/$defs/SessionRpcResponse"
+    },
+    {
+      "$ref": "#/$defs/SessionSubscribe"
+    },
+    {
+      "$ref": "#/$defs/SessionStreamFrame"
+    },
+    {
+      "$ref": "#/$defs/BundleUpload"
+    },
+    {
+      "$ref": "#/$defs/GuestRelayRequest"
+    },
+    {
+      "$ref": "#/$defs/CheckpointManifest"
+    }
+  ],
+  "$defs": {
+    "ArtifactIdentity": {
+      "description": "Content identity resolved by a trusted artifact registry, never by guest paths.",
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$|^[a-z0-9]$"
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "artifact_id",
+        "digest"
+      ]
+    },
+    "BundleRole": {
+      "type": "string",
+      "enum": [
+        "source_bundle"
+      ]
+    },
+    "BundleUpload": {
+      "type": "object",
+      "properties": {
+        "bundle_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "role": {
+          "$ref": "#/$defs/BundleRole"
+        },
+        "stored_bytes": {
+          "description": "Registry bytes include deterministic zero padding to a block boundary.",
+          "type": "integer",
+          "format": "uint64",
+          "maximum": 1073741824,
+          "minimum": 512
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "request_id",
+        "role",
+        "digest",
+        "stored_bytes",
+        "bundle_bytes"
+      ]
+    },
+    "ChannelSnapshot": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string"
+        },
+        "cursor": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "earliest_cursor": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "exit_code": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "exited": {
+          "type": "boolean"
+        },
+        "started": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "channel_id",
+        "started",
+        "exited",
+        "cursor",
+        "earliest_cursor"
+      ]
+    },
+    "CheckpointManifest": {
+      "type": "object",
+      "properties": {
+        "checkpoint_id": {
+          "type": "string"
+        },
+        "ciphertext_digest": {
+          "type": "string"
+        },
+        "context": {
+          "$ref": "#/$defs/SessionContext"
+        },
+        "created_at_unix_millis": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expires_at_unix_millis": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "filesystem_flushed": {
+          "type": "boolean"
+        },
+        "plaintext_bytes": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "plaintext_digest": {
+          "type": "string"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceReady"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_id",
+        "context",
+        "plaintext_bytes",
+        "plaintext_digest",
+        "ciphertext_digest",
+        "filesystem_flushed",
+        "created_at_unix_millis",
+        "expires_at_unix_millis"
+      ]
+    },
+    "CheckpointReference": {
+      "type": "object",
+      "properties": {
+        "checkpoint_id": {
+          "type": "string"
+        },
+        "manifest_digest": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "checkpoint_id",
+        "manifest_digest"
+      ]
+    },
+    "ConnectionBinding": {
+      "type": "object",
+      "properties": {
+        "connection_generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "connection_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        },
+        "mode": {
+          "$ref": "#/$defs/ConnectionMode"
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "provider",
+        "connection_id",
+        "connection_generation",
+        "mode"
+      ]
+    },
+    "ConnectionMode": {
+      "type": "string",
+      "enum": [
+        "gateway_helper",
+        "qualified_ram_token"
+      ]
+    },
+    "ControlAck": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$|^[a-z0-9]$"
+        },
+        "context": {
+          "$ref": "#/$defs/SessionContext"
+        },
+        "message_type": {
+          "type": "string",
+          "const": "session-control-ack"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "reason": {
+          "description": "Machine-readable reason; never contains a rejected prompt or input.",
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$|^[a-z0-9]$"
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        },
+        "state": {
+          "$ref": "#/$defs/ControlState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "context",
+        "request_id",
+        "channel_id",
+        "state",
+        "reason"
+      ]
+    },
+    "ControlCommand": {
+      "description": "Input and process controls are interpreted inside the guest. Prompt requires\na native provider adapter; PTY input is never acknowledged as a prompt.",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "input"
+            },
+            "bytes": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "uint8",
+                "maximum": 255,
+                "minimum": 0
+              }
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "bytes"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "prompt"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "text"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "resize"
+            },
+            "cols": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            },
+            "rows": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "rows",
+            "cols"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "interrupt"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "stop"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action"
+          ]
+        }
+      ]
+    },
+    "ControlRequest": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$|^[a-z0-9]$"
+        },
+        "command": {
+          "$ref": "#/$defs/ControlCommand"
+        },
+        "context": {
+          "$ref": "#/$defs/SessionContext"
+        },
+        "control_lease_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "control_sequence": {
+          "description": "Strictly increasing within a control lease. Fences replay after bounded\nacknowledgement history has been evicted.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "controller_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        },
+        "message_type": {
+          "type": "string",
+          "const": "session-control"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "context",
+        "request_id",
+        "channel_id",
+        "controller_id",
+        "control_lease_epoch",
+        "control_sequence",
+        "command"
+      ]
+    },
+    "ControlState": {
+      "type": "string",
+      "enum": [
+        "accepted",
+        "applied",
+        "rejected",
+        "interrupted"
+      ]
+    },
+    "ControllerLease": {
+      "type": "object",
+      "properties": {
+        "controller_id": {
+          "type": "string"
+        },
+        "epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "expires_in_seconds": {
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "next_sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "controller_id",
+        "epoch",
+        "expires_in_seconds",
+        "next_sequence"
+      ]
+    },
+    "GrantApplied": {
+      "type": "object",
+      "properties": {
+        "applied": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "applied"
+      ]
+    },
+    "GuestRelayRequest": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "headers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/RelayHeader"
+          },
+          "maxItems": 2
+        },
+        "lease_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "lease_id": {
+          "type": "string"
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "method": {
+          "$ref": "#/$defs/RelayMethod"
+        },
+        "path": {
+          "description": "Relative provider API path, no authority, fragment, or credentials.",
+          "type": "string"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "provider": {
+          "$ref": "#/$defs/Provider"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "request_id",
+        "session_id",
+        "generation",
+        "run_id",
+        "lease_id",
+        "lease_epoch",
+        "provider",
+        "method",
+        "path",
+        "headers"
+      ]
+    },
+    "ManagedPurpose": {
+      "description": "V2 managed leases cannot encode CI or request another runner backend.",
+      "type": "string",
+      "enum": [
+        "managed-agent"
+      ]
+    },
+    "Provider": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "grok"
+      ]
+    },
+    "RelayHeader": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/RelayHeaderName"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ]
+    },
+    "RelayHeaderName": {
+      "type": "string",
+      "enum": [
+        "accept",
+        "content-type"
+      ]
+    },
+    "RelayMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST"
+      ]
+    },
+    "RuntimeArchitecture": {
+      "type": "string",
+      "enum": [
+        "x86-64",
+        "aarch64"
+      ]
+    },
+    "RuntimeManifest": {
+      "description": "Release identity. Signature verification and live qualification must precede\nregistry admission; a well-formed manifest alone is not evidence of either.",
+      "type": "object",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        },
+        "architecture": {
+          "$ref": "#/$defs/RuntimeArchitecture"
+        },
+        "environment_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "firecracker": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        },
+        "firecracker_version": {
+          "type": "string",
+          "const": "1.17.0"
+        },
+        "guest_protocol_version": {
+          "type": "string",
+          "const": "jeryu.guest.v1"
+        },
+        "guestd": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        },
+        "jailer": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        },
+        "kernel": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        },
+        "kernel_version": {
+          "type": "string"
+        },
+        "policy_revision": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "recipe_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "rootfs": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        },
+        "snapshot_compatibility": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$|^[a-z0-9]$"
+        },
+        "toolchain": {
+          "$ref": "#/$defs/ArtifactIdentity"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "firecracker_version",
+        "guest_protocol_version",
+        "architecture",
+        "kernel_version",
+        "firecracker",
+        "jailer",
+        "kernel",
+        "rootfs",
+        "guestd",
+        "agent",
+        "toolchain",
+        "environment_digest",
+        "recipe_digest",
+        "policy_revision",
+        "snapshot_compatibility"
+      ]
+    },
+    "RuntimePhase": {
+      "type": "string",
+      "enum": [
+        "running",
+        "rebase-required",
+        "stopping",
+        "checkpointing",
+        "stopped",
+        "failed"
+      ]
+    },
+    "SessionContext": {
+      "type": "object",
+      "properties": {
+        "environment_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "job_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "lease_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "lease_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        },
+        "owner_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 6,
+          "pattern": "^(user|service)/[a-zA-Z0-9]([a-zA-Z0-9._:/-]*[a-zA-Z0-9])?$"
+        },
+        "policy_revision": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "repository": {
+          "type": "string"
+        },
+        "run_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        },
+        "runner_epoch": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "runner_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        },
+        "runtime_digest": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "session_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        },
+        "source_revision": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "session_id",
+        "generation",
+        "run_id",
+        "owner_id",
+        "repository",
+        "source_revision",
+        "runner_id",
+        "runner_epoch",
+        "lease_id",
+        "lease_epoch",
+        "job_digest",
+        "environment_digest",
+        "runtime_digest",
+        "policy_revision"
+      ]
+    },
+    "SessionGrant": {
+      "type": "string",
+      "enum": [
+        "viewer",
+        "controller"
+      ]
+    },
+    "SessionLease": {
+      "type": "object",
+      "properties": {
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CheckpointReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "connection_bindings": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ConnectionBinding"
+          },
+          "maxItems": 3
+        },
+        "context": {
+          "$ref": "#/$defs/SessionContext"
+        },
+        "expires_at_unix_millis": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "issued_at_unix_millis": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "message_type": {
+          "type": "string",
+          "const": "session-lease"
+        },
+        "profile_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$|^[a-z0-9]$"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "purpose": {
+          "$ref": "#/$defs/ManagedPurpose"
+        },
+        "resources": {
+          "$ref": "#/$defs/SessionResources"
+        },
+        "runtime": {
+          "$ref": "#/$defs/RuntimeManifest"
+        },
+        "signature": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{128}$"
+        },
+        "workspace": {
+          "$ref": "#/$defs/WorkspaceSource"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "purpose",
+        "context",
+        "profile_id",
+        "workspace",
+        "connection_bindings",
+        "runtime",
+        "resources",
+        "issued_at_unix_millis",
+        "expires_at_unix_millis",
+        "signature"
+      ]
+    },
+    "SessionResources": {
+      "description": "Admission bounds. Defaults are the initial session shape, not a capacity grant.",
+      "type": "object",
+      "properties": {
+        "idle_seconds": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 900,
+          "minimum": 1
+        },
+        "memory_mib": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 128
+        },
+        "output_bytes_per_second": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 1048576,
+          "minimum": 1024
+        },
+        "pids_max": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 4096,
+          "minimum": 16
+        },
+        "runtime_seconds": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 7200,
+          "minimum": 1
+        },
+        "vcpus": {
+          "type": "integer",
+          "format": "uint8",
+          "maximum": 32,
+          "minimum": 1
+        },
+        "workspace_gib": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 512,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "vcpus",
+        "memory_mib",
+        "workspace_gib",
+        "pids_max",
+        "output_bytes_per_second",
+        "runtime_seconds",
+        "idle_seconds"
+      ]
+    },
+    "SessionRpcError": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ]
+    },
+    "SessionRpcOperation": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "start"
+            },
+            "lease": {
+              "$ref": "#/$defs/SessionLease"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "lease"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "snapshot"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "actor",
+            "session_id",
+            "generation"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "acquire-control"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "takeover": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "actor",
+            "session_id",
+            "generation",
+            "takeover"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "control"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "request": {
+              "$ref": "#/$defs/ControlRequest"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "actor",
+            "request"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "acknowledgement"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "control_request_id": {
+              "type": "string"
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "actor",
+            "session_id",
+            "generation",
+            "control_request_id"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "replay"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "channel_id": {
+              "type": "string"
+            },
+            "cursor": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "limit": {
+              "type": "integer",
+              "format": "uint",
+              "maximum": 4,
+              "minimum": 1
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "actor",
+            "session_id",
+            "generation",
+            "channel_id",
+            "cursor",
+            "limit"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "grant"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "grant": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/SessionGrant"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "subject": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "actor",
+            "session_id",
+            "generation",
+            "subject"
+          ]
+        }
+      ]
+    },
+    "SessionRpcRequest": {
+      "type": "object",
+      "properties": {
+        "message_type": {
+          "type": "string",
+          "const": "session-rpc"
+        },
+        "operation": {
+          "$ref": "#/$defs/SessionRpcOperation"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "request_id",
+        "operation"
+      ]
+    },
+    "SessionRpcResponse": {
+      "type": "object",
+      "properties": {
+        "error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRpcError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "message_type": {
+          "type": "string",
+          "const": "session-rpc-response"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionRpcResult"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "ok"
+      ]
+    },
+    "SessionRpcResult": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/SessionSnapshot"
+        },
+        {
+          "$ref": "#/$defs/ControllerLease"
+        },
+        {
+          "$ref": "#/$defs/ControlAck"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/TerminalFrame"
+          }
+        },
+        {
+          "$ref": "#/$defs/GrantApplied"
+        }
+      ]
+    },
+    "SessionSnapshot": {
+      "type": "object",
+      "properties": {
+        "channels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ChannelSnapshot"
+          },
+          "maxItems": 2
+        },
+        "checkpoint": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CheckpointReference"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "context": {
+          "$ref": "#/$defs/SessionContext"
+        },
+        "phase": {
+          "$ref": "#/$defs/RuntimePhase"
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceReady"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "context",
+        "phase",
+        "channels"
+      ]
+    },
+    "SessionStreamEvent": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "terminal"
+            },
+            "frame": {
+              "$ref": "#/$defs/TerminalFrame"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "frame"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "acknowledgement": {
+              "$ref": "#/$defs/ControlAck"
+            },
+            "event": {
+              "type": "string",
+              "const": "control"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "acknowledgement"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "snapshot"
+            },
+            "snapshot": {
+              "$ref": "#/$defs/SessionSnapshot"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "snapshot"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "end"
+            },
+            "reason": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "event": {
+              "type": "string",
+              "const": "heartbeat"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "event"
+          ]
+        }
+      ]
+    },
+    "SessionStreamFrame": {
+      "type": "object",
+      "properties": {
+        "channel_id": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "payload": {
+          "$ref": "#/$defs/SessionStreamEvent"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "request_id",
+        "session_id",
+        "generation",
+        "channel_id",
+        "payload"
+      ]
+    },
+    "SessionSubscribe": {
+      "type": "object",
+      "properties": {
+        "actor": {
+          "type": "string"
+        },
+        "after_sequence": {
+          "description": "Last consumed terminal sequence, exclusive. Zero starts retained replay.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "channel_id": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "message_type": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "request_id",
+        "actor",
+        "session_id",
+        "generation",
+        "channel_id",
+        "after_sequence"
+      ]
+    },
+    "TerminalFrame": {
+      "description": "Raw terminal bytes with generation-aware replay. A gap frame carries the\nearliest available cursor in `sequence` and no data. Viewers resync from it.",
+      "type": "object",
+      "properties": {
+        "bytes": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0
+          },
+          "maxItems": 32768
+        },
+        "channel_id": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1,
+          "pattern": "^[a-z0-9][a-z0-9._-]*[a-z0-9]$|^[a-z0-9]$"
+        },
+        "gap": {
+          "type": "boolean"
+        },
+        "generation": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "message_type": {
+          "type": "string",
+          "const": "session-terminal"
+        },
+        "protocol_version": {
+          "type": "string",
+          "const": "jeryu.runner.v2.1"
+        },
+        "run_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        },
+        "sequence": {
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "session_id": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._:/-]*[a-zA-Z0-9]$|^[a-zA-Z0-9]$"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "message_type",
+        "session_id",
+        "generation",
+        "run_id",
+        "channel_id",
+        "sequence",
+        "gap",
+        "bytes"
+      ]
+    },
+    "WorkspaceReady": {
+      "description": "Produced by guest Git, after checking the bundle refs and successful rebase.",
+      "type": "object",
+      "properties": {
+        "head_revision": {
+          "type": "string"
+        },
+        "main_revision": {
+          "type": "string"
+        },
+        "source_revision": {
+          "type": "string"
+        },
+        "sync_state": {
+          "$ref": "#/$defs/WorkspaceSyncState"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "source_revision",
+        "main_revision",
+        "head_revision",
+        "sync_state"
+      ]
+    },
+    "WorkspaceSource": {
+      "oneOf": [
+        {
+          "description": "Model-free empty-disk fixture only. Never a repository readiness receipt.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "empty-fixture"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "base_revision": {
+              "description": "Base of retained work. The source head is bound in SessionContext.",
+              "type": "string"
+            },
+            "bundle": {
+              "$ref": "#/$defs/ArtifactIdentity"
+            },
+            "bundle_bytes": {
+              "description": "Exact bundle length, excluding block-device alignment padding.",
+              "type": "integer",
+              "format": "uint64",
+              "maximum": 1073741824,
+              "minimum": 1
+            },
+            "kind": {
+              "type": "string",
+              "const": "git-bundle"
+            },
+            "main_revision": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "bundle",
+            "bundle_bytes",
+            "main_revision",
+            "base_revision"
+          ]
+        }
+      ]
+    },
+    "WorkspaceSyncState": {
+      "type": "string",
+      "enum": [
+        "ready",
+        "rebase-required"
+      ]
+    }
+  }
+}

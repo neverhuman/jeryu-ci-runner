@@ -26,7 +26,7 @@ test-native:
   cargo nextest run -p jeryu-runner-native --locked
 
 contract-drift:
-  cargo test -p jeryu-runner-protocol --locked --test schema_contract_drift
+  cargo test -p jeryu-runner-protocol --locked --test schema_contract_drift --test schema_contract_drift_v2
 
 artifact-support:
   ./ops/ci/artifact_support.sh

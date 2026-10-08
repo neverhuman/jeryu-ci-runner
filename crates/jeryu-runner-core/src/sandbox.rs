@@ -224,6 +224,13 @@ impl SandboxPlan {
             read_only: true,
         }));
 
+        // A microVM receives private block devices and a bounded guest channel.
+        // Host path rules and bind mounts have no meaning across this boundary.
+        if runner_class == RunnerClass::MicroVmRust {
+            landlock_rules.clear();
+            mounts.clear();
+        }
+
         Self {
             runner_class,
             user_namespace: true,
