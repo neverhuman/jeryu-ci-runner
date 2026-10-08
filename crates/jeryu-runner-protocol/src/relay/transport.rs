@@ -2,7 +2,23 @@
 use super::*;
 use serde::de::DeserializeOwned;
 use std::io::{Read, Write};
-pub trait RelayMessage: Serialize + DeserializeOwned {
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for super::GuestRelayFrame {}
+    impl Sealed for super::NodeRelayFrame {}
+}
+/// Only the closed guest and node directions can use this transport.
+/// A consumer cannot add an arbitrary serializer that bypasses validation.
+///
+/// ```compile_fail
+/// use jeryu_runner_protocol::relay::{RelayMessage, RelayErrorCode};
+/// #[derive(serde::Serialize, serde::Deserialize)]
+/// struct Unexpected { arbitrary_field: String }
+/// impl RelayMessage for Unexpected {
+///     fn validate_message(&self) -> Result<(), RelayErrorCode> { Ok(()) }
+/// }
+/// ```
+pub trait RelayMessage: sealed::Sealed + Serialize + DeserializeOwned {
     fn validate_message(&self) -> Result<(), RelayErrorCode>;
 }
 impl RelayMessage for GuestRelayFrame {
