@@ -193,7 +193,10 @@ fn workspace_sources_are_required_bound_to_the_job_and_cannot_downgrade_profiles
     changed.context.source_revision = "d".repeat(40);
     assert!(changed.validate().is_err());
     let mut changed = original.clone();
-    changed.resources.vcpus = 2;
+    changed.resources.vcpus = original.resources.vcpus + 1;
+    assert!(changed.validate().is_err());
+    let mut changed = original.clone();
+    changed.resources.git_limits.stdout_bytes *= 2;
     assert!(changed.validate().is_err());
     let mut changed = original.clone();
     changed.context.owner_id = "user/bob".into();
@@ -206,6 +209,63 @@ fn workspace_sources_are_required_bound_to_the_job_and_cannot_downgrade_profiles
     let mut value = serde_json::to_value(original).unwrap();
     value.as_object_mut().unwrap().remove("workspace");
     assert!(SessionLease::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
+}
+
+#[test]
+fn rpc_replay_binds_the_expected_request_and_run_even_if_internal_frames_agree() {
+    let context = lease().context;
+    let request = SessionRpcRequest {
+        protocol_version: PROTOCOL_VERSION.into(),
+        message_type: "session-rpc".into(),
+        request_id: "rpc".into(),
+        operation: SessionRpcOperation::Replay {
+            actor: context.owner_id.clone(),
+            session_id: context.session_id.clone(),
+            generation: context.generation,
+            channel_id: "shell".into(),
+            cursor: 0,
+            limit: 4,
+        },
+    };
+    let frame = TerminalFrame {
+        protocol_version: PROTOCOL_VERSION.into(),
+        message_type: "session-terminal".into(),
+        session_id: context.session_id.clone(),
+        generation: context.generation,
+        run_id: context.run_id.clone(),
+        channel_id: "shell".into(),
+        sequence: 1,
+        gap: false,
+        bytes: vec![255],
+    };
+    let mut response = SessionRpcResponse {
+        protocol_version: PROTOCOL_VERSION.into(),
+        message_type: "session-rpc-response".into(),
+        request_id: Some(request.request_id.clone()),
+        ok: true,
+        result: Some(SessionRpcResult::Replay(vec![frame.clone()])),
+        error: None,
+    };
+    response.validate_for(&request, &context).unwrap();
+    for field in ["session", "generation", "run", "channel"] {
+        let mut foreign = frame.clone();
+        match field {
+            "session" => foreign.session_id = "foreign".into(),
+            "generation" => foreign.generation += 1,
+            "run" => foreign.run_id = "foreign".into(),
+            _ => foreign.channel_id = "agent".into(),
+        }
+        response.result = Some(SessionRpcResult::Replay(vec![foreign]));
+        response.validate().unwrap();
+        assert!(response.validate_for(&request, &context).is_err());
+    }
+    response.result = Some(SessionRpcResult::Replay(vec![]));
+    response.validate_for(&request, &context).unwrap();
+    response.request_id = Some("wrong".into());
+    assert!(response.validate_for(&request, &context).is_err());
+    response.request_id = Some(request.request_id.clone());
+    response.result = Some(SessionRpcResult::Grant(GrantApplied { applied: true }));
+    assert!(response.validate_for(&request, &context).is_err());
 }
 
 #[test]

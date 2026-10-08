@@ -101,8 +101,12 @@ impl ValidateWire for SessionRpcResponse {
                             return Err(invalid());
                         }
                         if let Some(previous) = index.checked_sub(1).map(|i| &frames[i])
-                            && (frame.sequence < previous.sequence
-                                || (frame.sequence == previous.sequence && !previous.gap))
+                            && Some(frame.sequence)
+                                != if previous.gap {
+                                    Some(previous.sequence)
+                                } else {
+                                    previous.sequence.checked_add(1)
+                                }
                         {
                             return Err(invalid());
                         }
@@ -118,6 +122,114 @@ impl ValidateWire for SessionRpcResponse {
     }
 }
 message_io!(SessionRpcResponse);
+
+impl SessionRpcResponse {
+    /// Clients and services bind a response to the signed context they expect.
+    /// This validates identity; it never grants the actor view/control rights.
+    pub fn validate_for(
+        &self,
+        request: &super::SessionRpcRequest,
+        context: &super::SessionContext,
+    ) -> Result<(), WireError> {
+        use super::SessionRpcOperation as Op;
+        self.validate()?;
+        request.validate()?;
+        context.validate()?;
+        if self
+            .request_id
+            .as_deref()
+            .is_some_and(|id| id != request.request_id)
+        {
+            return Err(invalid());
+        }
+        let target = match &request.operation {
+            Op::Start { lease } => {
+                if lease.context != *context {
+                    return Err(invalid());
+                }
+                (&context.session_id, context.generation)
+            }
+            Op::Control { request, .. } => {
+                if request.context != *context {
+                    return Err(invalid());
+                }
+                (&context.session_id, context.generation)
+            }
+            Op::Snapshot {
+                session_id,
+                generation,
+                ..
+            }
+            | Op::AcquireControl {
+                session_id,
+                generation,
+                ..
+            }
+            | Op::Acknowledgement {
+                session_id,
+                generation,
+                ..
+            }
+            | Op::Replay {
+                session_id,
+                generation,
+                ..
+            }
+            | Op::Grant {
+                session_id,
+                generation,
+                ..
+            } => (session_id, *generation),
+        };
+        if target != (&context.session_id, context.generation) {
+            return Err(invalid());
+        }
+        let Some(result) = &self.result else {
+            return Ok(());
+        };
+        match (&request.operation, result) {
+            (Op::Start { .. } | Op::Snapshot { .. }, SessionRpcResult::Snapshot(snapshot))
+                if snapshot.context == *context =>
+            {
+                Ok(())
+            }
+            (Op::AcquireControl { actor, .. }, SessionRpcResult::Controller(lease))
+                if lease.controller_id == *actor =>
+            {
+                Ok(())
+            }
+            (Op::Control { request, .. }, SessionRpcResult::Control(ack)) => {
+                ack.validate_for(request)
+            }
+            (
+                Op::Acknowledgement {
+                    control_request_id, ..
+                },
+                SessionRpcResult::Control(ack),
+            ) if ack.context == *context && ack.request_id == *control_request_id => Ok(()),
+            (
+                Op::Replay {
+                    channel_id, limit, ..
+                },
+                SessionRpcResult::Replay(frames),
+            ) => {
+                if frames.iter().filter(|f| !f.gap).count() > *limit
+                    || frames.iter().any(|f| {
+                        f.session_id != context.session_id
+                            || f.generation != context.generation
+                            || f.run_id != context.run_id
+                            || f.channel_id != *channel_id
+                    })
+                {
+                    return Err(invalid());
+                }
+                Ok(())
+            }
+            (Op::Grant { .. }, SessionRpcResult::Grant(_)) => Ok(()),
+            _ => Err(invalid()),
+        }
+    }
+}
 fn invalid() -> WireError {
     WireError::new(WireErrorCode::ContextMismatch, "rpc_result")
 }

@@ -10,6 +10,15 @@ name. The protocol string is **`jeryu.runner.v2.1`**. Unknown fields are rejecte
 Existing `jeryu.runner.v1` CI contracts remain unchanged. There is no implicit
 acceptance of unsigned v2.0 leases by the managed node.
 
+Session defaults follow the user's runtime decision: 2 vCPU, 4 GiB RAM and a
+16 GiB logical workspace. Sparse backing still requires logical node admission;
+these defaults do not prove accounting or host reserve by themselves.
+Resources include required `git_limits`: `timeout_seconds` (1–300, default 30),
+`stdout_bytes` (4096–8388608, default 65536) and `stderr_bytes` (256–65536,
+default 4096). They are inside the job digest and signed lease. Guest setup cannot
+take these limits from an agent environment. Diagnostics report only whitelisted
+operation/exit/byte-count/truncation metadata, with all stderr text redacted.
+
 ## K1: signed lease and public connection bindings
 
 `SessionLease.connection_bindings` is required, contains at most three entries,
@@ -84,7 +93,10 @@ and emits the final snapshot/end. Losing a viewer never blocks guest execution.
 The four-frame replay RPC remains a compatibility read.
 Every replay result binds all frames to one session, generation, run and channel.
 At most four data frames follow an optional first gap marker; data sequences must
-increase. A gap's earliest sequence may equal the first following data sequence.
+be contiguous. A gap's earliest sequence must equal the first following data
+sequence. Services and clients call `SessionRpcResponse::validate_for` with the
+request and expected signed context; internal frame agreement alone is not a
+request binding. Transport EOF requests reconnect; only explicit End finishes.
 
 Shared snapshot/controller DTOs and `SessionRpcResponse` are in this schema.
 The closed response adds `message_type: session-rpc-response`, protocol version,

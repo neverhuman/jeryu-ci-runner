@@ -500,6 +500,36 @@
         "next_sequence"
       ]
     },
+    "GitLimits": {
+      "description": "Trusted preparation bounds, signed as part of resources and the job digest.",
+      "type": "object",
+      "properties": {
+        "stderr_bytes": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 65536,
+          "minimum": 256
+        },
+        "stdout_bytes": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 8388608,
+          "minimum": 4096
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 300,
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "timeout_seconds",
+        "stdout_bytes",
+        "stderr_bytes"
+      ]
+    },
     "GrantApplied": {
       "type": "object",
       "properties": {
@@ -898,6 +928,9 @@
       "description": "Admission bounds. Defaults are the initial session shape, not a capacity grant.",
       "type": "object",
       "properties": {
+        "git_limits": {
+          "$ref": "#/$defs/GitLimits"
+        },
         "idle_seconds": {
           "type": "integer",
           "format": "uint32",
@@ -949,7 +982,8 @@
         "pids_max",
         "output_bytes_per_second",
         "runtime_seconds",
-        "idle_seconds"
+        "idle_seconds",
+        "git_limits"
       ]
     },
     "SessionRpcError": {

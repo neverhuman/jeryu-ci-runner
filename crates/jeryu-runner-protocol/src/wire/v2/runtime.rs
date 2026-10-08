@@ -114,18 +114,20 @@ pub struct SessionResources {
     pub runtime_seconds: u32,
     #[schemars(range(min = 1, max = 900))]
     pub idle_seconds: u32,
+    pub git_limits: GitLimits,
 }
 
 impl Default for SessionResources {
     fn default() -> Self {
         Self {
-            vcpus: 4,
-            memory_mib: 8192,
-            workspace_gib: 64,
+            vcpus: 2,
+            memory_mib: 4096,
+            workspace_gib: 16,
             pids_max: 1024,
             output_bytes_per_second: 1024 * 1024,
             runtime_seconds: 7200,
             idle_seconds: 900,
+            git_limits: GitLimits::default(),
         }
     }
 }
@@ -143,7 +145,40 @@ impl ValidateWire for SessionResources {
         {
             return Err(WireError::new(WireErrorCode::InvalidField, "resources"));
         }
-        Ok(())
+        self.git_limits.validate()
     }
 }
 message_io!(SessionResources);
+
+/// Trusted preparation bounds, signed as part of resources and the job digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct GitLimits {
+    #[schemars(range(min = 1, max = 300))]
+    pub timeout_seconds: u32,
+    #[schemars(range(min = 4096, max = 8388608))]
+    pub stdout_bytes: u32,
+    #[schemars(range(min = 256, max = 65536))]
+    pub stderr_bytes: u32,
+}
+impl Default for GitLimits {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: 30,
+            stdout_bytes: 65536,
+            stderr_bytes: 4096,
+        }
+    }
+}
+impl ValidateWire for GitLimits {
+    fn validate_wire(&self) -> Result<(), WireError> {
+        if !(1..=300).contains(&self.timeout_seconds)
+            || !(4096..=8 * 1024 * 1024).contains(&self.stdout_bytes)
+            || !(256..=65536).contains(&self.stderr_bytes)
+        {
+            return Err(WireError::new(WireErrorCode::InvalidField, "git_limits"));
+        }
+        Ok(())
+    }
+}
+message_io!(GitLimits);

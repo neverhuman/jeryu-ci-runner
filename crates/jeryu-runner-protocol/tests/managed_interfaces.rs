@@ -128,10 +128,14 @@ fn replay_rejects_mixed_authority_reordered_bytes_and_extra_frames() {
     }
     assert!(check(vec![next, frame.clone()]).is_err());
     assert!(check(vec![frame.clone(), frame.clone()]).is_err());
+    let mut jumped = frame.clone();
+    jumped.sequence += 5;
+    assert!(check(vec![frame.clone(), jumped.clone()]).is_err());
     let mut gap = frame.clone();
     gap.gap = true;
     gap.bytes.clear();
     check(vec![gap.clone(), frame.clone()]).unwrap();
+    assert!(check(vec![gap.clone(), jumped]).is_err());
     assert!(check(vec![frame.clone(), gap.clone()]).is_err());
     let frames: Vec<_> = (0..5)
         .map(|i| {
@@ -144,4 +148,36 @@ fn replay_rejects_mixed_authority_reordered_bytes_and_extra_frames() {
     let mut valid = vec![gap];
     valid.extend(frames.into_iter().take(4));
     check(valid).unwrap();
+}
+
+#[test]
+fn git_limits_are_required_and_reject_unbounded_preparation() {
+    let resources = SessionResources::default();
+    resources.validate().unwrap();
+    let mut value = serde_json::to_value(resources).unwrap();
+    value.as_object_mut().unwrap().remove("git_limits");
+    assert!(serde_json::from_value::<SessionResources>(value).is_err());
+    for limits in [
+        GitLimits {
+            timeout_seconds: 0,
+            ..GitLimits::default()
+        },
+        GitLimits {
+            stdout_bytes: u32::MAX,
+            ..GitLimits::default()
+        },
+        GitLimits {
+            stderr_bytes: u32::MAX,
+            ..GitLimits::default()
+        },
+    ] {
+        assert!(
+            SessionResources {
+                git_limits: limits,
+                ..resources
+            }
+            .validate()
+            .is_err()
+        );
+    }
 }

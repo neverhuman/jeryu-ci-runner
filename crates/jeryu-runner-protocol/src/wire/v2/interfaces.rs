@@ -196,7 +196,7 @@ impl ValidateWire for GuestRelayRequest {
         positive("lease_epoch", self.lease_epoch)?;
         if self.path.len() > 2048
             || !self.path.starts_with('/')
-            || self.path.starts_with("//")
+            || self.path.contains("//")
             || !self.path.is_ascii()
             || self.path.bytes().any(|b| b <= 32 || b == 127)
             || self.path.contains(['#', '\\', '@', '?', '%'])

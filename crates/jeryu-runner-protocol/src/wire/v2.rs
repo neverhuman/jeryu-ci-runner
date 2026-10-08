@@ -21,7 +21,9 @@ pub use control::{ControlAck, ControlCommand, ControlRequest, ControlState, Term
 pub use interfaces::*;
 pub use rpc::{SessionGrant, SessionRpcOperation, SessionRpcRequest};
 pub use rpc_response::{GrantApplied, SessionRpcError, SessionRpcResponse, SessionRpcResult};
-pub use runtime::{ArtifactIdentity, RuntimeArchitecture, RuntimeManifest, SessionResources};
+pub use runtime::{
+    ArtifactIdentity, GitLimits, RuntimeArchitecture, RuntimeManifest, SessionResources,
+};
 pub use schema::schema;
 pub use session::{ManagedPurpose, SessionContext, SessionLease, runtime_digest};
 pub use workspace::{WorkspaceReady, WorkspaceSource, WorkspaceSyncState};
