@@ -15,6 +15,17 @@
   setting reappears.
 
 ## Unreleased
+- A gate starts on the push instead of on the next timer tick. `pr-gate-wake.sh` long-polls the
+  forge's wake-up signal (jeryu-deploy: `GET /api/v1/gate-wanted?after=<seq>&wait=<secs>`, recorded
+  when a push moves a branch, when the merge queue builds a queue commit and when a re-gate is
+  asked for) and starts an idle slot per signal for a repository this host gates, so a head reaches
+  a free slot in about as long as the push took rather than up to a tick later -- twice over for a
+  pull request queued after its base moved. One signal buys one tick; a sequence that goes backwards
+  is a restarted forge and resyncs without waking anything. A forge with no signal is read exactly
+  as before, and the slot timers stay the fallback either way, so a missed signal costs only
+  today's latency. `GATE_RUNNER_WAKE_WAIT` sets how long a look waits (default 30s), and
+  `pr-gate-wake.timer` now looks 1s after the last one finished. No new credential: the signal is
+  read with the gate identity, which sees only repositories it may read. pr-gate 1.4.0.
 - The PR gate honours a re-gate asked for on the forge (jeryu-deploy: `POST
   /api/v1/repos/:id/pulls/:n/regate`, read as `GET /api/v1/gate-regate?state=pending`): a request
   naming an admitted head gates that head again although a terminal result exists for it, and is

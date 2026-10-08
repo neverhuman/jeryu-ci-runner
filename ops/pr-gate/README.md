@@ -18,7 +18,7 @@ identity authored.
 | `bin/pr-gate-state.sh` | the durable attempt journal, input identity, publication and recovery |
 | `bin/pr-gate-config.sh` | the site configuration reader every script uses |
 | `bin/pr-gate-heartbeat.sh` | reports every slot to the forge's `/runners` page and finished attempts as events |
-| `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears, moves, or is asked for again |
+| `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears, moves, or is asked for again: on the forge's `gate-wanted` signal, else by reading the gated heads |
 | `bin/pr-gate-install.sh` | keeps the installed copy equal to the source branch (drains slots first) |
 | `bin/pr-gate-advisory-refresh.sh`, `bin/pr-gate-grype-db-refresh.sh` | keep security databases fresh outside the gates |
 | `systemd/` | the `--user` units and timers; `pr-gate-runner@N` is one slot |

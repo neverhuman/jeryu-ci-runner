@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Exercise pr-gate-wake.sh against a fixture forge and a systemctl shim that records what it starts.
+# Exercise pr-gate-wake.sh against a fixture forge and a slot-control shim that records what it
+# starts: first the fallback that reads gated heads (a forge with no wake-up signal), then the signal.
 set -euo pipefail
 while read -r leaked; do unset "$leaked"; done < <(compgen -e | grep -E '^(GATE_RUNNER_|GATE_INSTALL_|JERYU_|PR_GATE_)' || true)
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)
@@ -22,6 +23,7 @@ case "\$url" in
   */repos/gate-a%2Fgate-b/pulls*) f=b;;
   */merge-queue*) f=queue;;
   */gate-regate*) f=regate;;
+  */gate-wanted*) f=wanted;;
   *) f=none;;
 esac
 if [[ -e "$fx/forge/\$f.json" ]]; then printf '%s\n200' "\$(cat "$fx/forge/\$f.json")"; else printf 'oops\n500'; fi
@@ -48,6 +50,8 @@ pulls a "$(pr 1 "$A1")"; pulls b; printf '{"entries":[]}' >"$fx/forge/queue.json
 run
 must 'first poll records and wakes nothing' test "$(started)" == 0
 must 'view recorded' grep -qx "acme/acme-a 1 $A1" "$fx/home/cache/wake-heads"
+must 'the fallback says why it read heads' grep -q 'no gate-wanted signal' "$fx/out"
+must 'no sequence is kept without the signal' test ! -e "$fx/home/cache/wake-seq"
 must 'token never reaches argv' test "$(grep -c WAKE-TOKEN-7f3a "$fx/curl.log" || true)" == 0
 run
 must 'unchanged view wakes nothing' test "$(started)" == 0
@@ -116,3 +120,87 @@ if HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" PR_GATE_CONF
 must 'missing forge named' grep -q 'PR_GATE_FORGE_URL is not configured' "$fx/err"
 must 'nothing started' test "$(started)" == 0
 printf 'PASS a foreign origin and an unconfigured forge are refused before any request\n'
+
+# ---------------------------------------------------------------------------
+# The forge's wake-up signal: one cheap long poll replaces the head reads above, and a signal the
+# forge recorded on a push, a queue build or a re-gate starts an idle slot straight away.
+# ---------------------------------------------------------------------------
+rm -rf -- "$fx/home"; mkdir -p "$fx/home/cache"
+printf 'acme/acme-a\ngate-a/gate-b\n' >"$fx/home/cache/protected-acme"
+pulls a "$(pr 1 "$A1")"; pulls b; printf '{"entries":[]}' >"$fx/forge/queue.json"
+signal() { # seq signal-json...
+  local seq=$1; shift
+  printf '{"seq":%s,"signals":[%s]}' "$seq" "$(IFS=,; echo "$*")" >"$fx/forge/wanted.json"
+}
+wanted() { # repo sha source
+  printf '{"seq":1,"repo":"%s","sha":"%s","source":"%s","at":"2026-10-08T09:00:00Z"}' "$1" "$2" "$3"
+}
+seq_file() { cat "$fx/home/cache/wake-seq" 2>/dev/null || true; }
+
+signal 4 "$(wanted acme/acme-a "$A1" push)"
+: >"$fx/curl.log"
+run
+must 'first look records the sequence and wakes nothing' test "$(started)" == 0
+must 'the sequence is the forge current one' test "$(seq_file)" == 4
+must 'the first look does not wait' grep -q 'gate-wanted?after=0&wait=0' "$fx/curl.log"
+must 'no heads were read' test "$(grep -c '/pulls' "$fx/curl.log" || true)" == 0
+printf 'PASS the first look records the sequence, reads no heads and wakes nothing\n'
+
+signal 6 "$(wanted acme/acme-a "$A2" push)" "$(wanted acme/acme-a "$Q1" queue)"
+: >"$fx/curl.log"
+run
+must 'two signals wake two idle slots' test "$(started)" == 2
+must 'the next look waits past the sequence it acted on' grep -q 'gate-wanted?after=4&wait=30' "$fx/curl.log"
+must 'the sequence advanced' test "$(seq_file)" == 6
+# What the forge answers once it has nothing above the sequence the runner asked past: the same
+# sequence and no signals, so one signal buys exactly one tick.
+signal 6
+run
+must 'nothing above the sequence wakes nothing again' test "$(started)" == 0
+must 'and the sequence stands' test "$(seq_file)" == 6
+printf 'PASS a push and a queue build each wake one idle slot, once\n'
+
+# The forge hands over every repository the identity may read; only the ones this host gates are
+# worth a slot, and the sequence still advances past the rest.
+signal 9 "$(wanted other/elsewhere "$B1" push)"
+run
+must 'a signal for a repo this host does not gate wakes nothing' test "$(started)" == 0
+must 'but its sequence is not read again' test "$(seq_file)" == 9
+printf 'PASS a signal for an ungated repository is skipped, not re-read\n'
+
+# A forge that restarted hands out a smaller sequence: that is a resync, not a backlog of work.
+signal 2 "$(wanted acme/acme-a "$A1" push)"
+run
+must 'a restarted forge wakes nothing' test "$(started)" == 0
+must 'and its sequence is adopted' test "$(seq_file)" == 2
+printf 'PASS a sequence that went backwards resyncs without waking a slot\n'
+
+# With every slot busy the signal is spent, exactly as a new head is in the fallback: the running
+# ticks and the slot timers behind them pick that work up.
+touch "$fx/busy-0" "$fx/busy-1" "$fx/busy-2"
+signal 3 "$(wanted acme/acme-a "$A2" regate)"
+run
+must 'no idle slot, nothing started' test "$(started)" == 0
+must 'says so' grep -q 'none idle' "$fx/out"
+must 'the signal is not kept for later' test "$(seq_file)" == 3
+rm -f "$fx"/busy-*
+printf 'PASS all slots busy: the signal is spent and the timers pick it up\n'
+
+# A forge that answers the signal route with something unusable falls back to reading heads, so the
+# timer path keeps working against a forge that does not have the signal.
+printf '{"seq":"not-a-number","signals":[]}' >"$fx/forge/wanted.json"
+if run 2>"$fx/err"; then printf 'FAIL: a nonnumeric sequence was accepted\n' >&2; exit 1; fi
+must 'nonnumeric sequence refused' grep -q 'nonnumeric gate-wanted sequence' "$fx/err"
+printf '{"signals":[]}' >"$fx/forge/wanted.json"
+pulls a "$(pr 1 "$A1")"
+run
+must 'an answer with no sequence reads heads instead' grep -q 'no gate-wanted signal' "$fx/out"
+must 'and records the head view' grep -qx "acme/acme-a 1 $A1" "$fx/home/cache/wake-heads"
+printf 'PASS a forge without a usable signal falls back to reading gated heads\n'
+
+: >"$fx/curl.log"
+if GATE_RUNNER_WAKE_WAIT=x run 2>"$fx/err"; then
+  printf 'FAIL: a nonnumeric wait was accepted\n' >&2; exit 1; fi
+must 'a nonnumeric wait is refused' grep -q 'GATE_RUNNER_WAKE_WAIT' "$fx/err"
+must 'and nothing was requested' test "$(grep -c . "$fx/curl.log" || true)" == 0
+printf 'PASS the wait is validated before any request\n'
