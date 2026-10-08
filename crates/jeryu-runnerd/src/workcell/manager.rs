@@ -323,6 +323,16 @@ impl WorkcellManager {
         workcell_id
     }
 
+    fn require_epoch(cell: &WorkcellLease, runner_epoch: u64) -> WorkcellResult<()> {
+        if cell.runner_epoch != runner_epoch {
+            return Err(WorkcellError::epoch_fenced(format!(
+                "workcell {} fenced: epoch {} != active {}",
+                cell.workcell_id, runner_epoch, cell.runner_epoch
+            )));
+        }
+        Ok(())
+    }
+
     /// Refuse to freeze a capsule that carries a configured token value. The
     /// capsule is evidence that outlives the run, so a leak here is permanent.
     fn guard_capsule(
@@ -332,15 +342,5 @@ impl WorkcellManager {
     ) -> WorkcellResult<()> {
         validate_capture_text("capsule", git_status_summary, forbidden_token_values)?;
         validate_capture_text("capsule", failure_log_digest, forbidden_token_values)
-    }
-
-    fn require_epoch(cell: &WorkcellLease, runner_epoch: u64) -> WorkcellResult<()> {
-        if cell.runner_epoch != runner_epoch {
-            return Err(WorkcellError::epoch_fenced(format!(
-                "workcell {} fenced: epoch {} != active {}",
-                cell.workcell_id, runner_epoch, cell.runner_epoch
-            )));
-        }
-        Ok(())
     }
 }

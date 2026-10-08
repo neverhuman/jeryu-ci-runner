@@ -9,8 +9,8 @@ impl AgentDriver {
         Self {
             timeout,
             output_budget_bytes,
-            require_cgroup: true,
             forbidden_token_values: Vec::new(),
+            require_cgroup: true,
         }
     }
 
@@ -25,18 +25,6 @@ impl AgentDriver {
     #[must_use]
     pub fn with_output_budget(mut self, bytes: usize) -> Self {
         self.output_budget_bytes = bytes;
-        self
-    }
-
-    /// Builder: require (or not) enforced cgroup-v2 limits for the agent job.
-    ///
-    /// `true` (the default) fails the launch closed when the host has no
-    /// delegated cgroup subtree. Pass `false` ONLY when the run is exercising the
-    /// Landlock/seccomp jail rather than cgroups and must proceed on a host
-    /// without cgroup delegation.
-    #[must_use]
-    pub fn with_require_cgroup(mut self, require: bool) -> Self {
-        self.require_cgroup = require;
         self
     }
 
@@ -63,6 +51,18 @@ impl AgentDriver {
             .map_err(|err| DriverError::CapturedTokenValue(err.message().to_string()))?;
         }
         Ok(())
+    }
+
+    /// Builder: require (or not) enforced cgroup-v2 limits for the agent job.
+    ///
+    /// `true` (the default) fails the launch closed when the host has no
+    /// delegated cgroup subtree. Pass `false` ONLY when the run is exercising the
+    /// Landlock/seccomp jail rather than cgroups and must proceed on a host
+    /// without cgroup delegation.
+    #[must_use]
+    pub fn with_require_cgroup(mut self, require: bool) -> Self {
+        self.require_cgroup = require;
+        self
     }
 
     /// Whether this driver requires enforced cgroup-v2 limits.

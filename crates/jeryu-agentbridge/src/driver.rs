@@ -221,6 +221,11 @@ pub struct AgentDriver {
     /// Cap on total captured stdout+stderr bytes. A real token budget wraps this
     /// byte budget for now.
     output_budget_bytes: usize,
+    /// Token values, supplied by site configuration, that must never appear in
+    /// the captured log. A streamed line carrying one is withheld from the
+    /// event sink before it is emitted, and the run then fails rather than
+    /// handing the capture on.
+    forbidden_token_values: Vec<String>,
     /// Require ENFORCED cgroup-v2 limits for the agent job. Defaults to `true`:
     /// an LLM-driven code generator must never run without real memory/pids
     /// confinement, so on a host lacking a delegated cgroup subtree the launch
@@ -228,11 +233,6 @@ pub struct AgentDriver {
     /// Callers that knowingly run on a cgroup-less host (e.g. the Landlock/seccomp
     /// jail tests) opt out via [`AgentDriver::with_require_cgroup`].
     require_cgroup: bool,
-    /// Token values, supplied by site configuration, that must never appear in
-    /// the captured log. A streamed line carrying one is withheld from the
-    /// event sink before it is emitted, and the run then fails rather than
-    /// handing the capture on.
-    forbidden_token_values: Vec<String>,
 }
 
 impl Default for AgentDriver {
