@@ -82,6 +82,9 @@ At most 16 global streaming connections leave capacity for control RPCs.
 Heartbeat interval is ten seconds. Terminal end drains already accepted output
 and emits the final snapshot/end. Losing a viewer never blocks guest execution.
 The four-frame replay RPC remains a compatibility read.
+Every replay result binds all frames to one session, generation, run and channel.
+At most four data frames follow an optional first gap marker; data sequences must
+increase. A gap's earliest sequence may equal the first following data sequence.
 
 Shared snapshot/controller DTOs and `SessionRpcResponse` are in this schema.
 The closed response adds `message_type: session-rpc-response`, protocol version,

@@ -80,11 +80,32 @@ impl ValidateWire for SessionRpcResponse {
                 }
                 SessionRpcResult::Control(ack) => ack.validate(),
                 SessionRpcResult::Replay(frames) => {
-                    if frames.len() > 5 {
+                    if frames.len() > 5 || frames.iter().filter(|f| !f.gap).count() > 4 {
                         return Err(invalid());
                     }
-                    for frame in frames {
+                    for (index, frame) in frames.iter().enumerate() {
                         frame.validate()?;
+                        let first = &frames[0];
+                        if (
+                            frame.session_id.as_str(),
+                            frame.generation,
+                            frame.run_id.as_str(),
+                            frame.channel_id.as_str(),
+                        ) != (
+                            first.session_id.as_str(),
+                            first.generation,
+                            first.run_id.as_str(),
+                            first.channel_id.as_str(),
+                        ) || (frame.gap && index != 0)
+                        {
+                            return Err(invalid());
+                        }
+                        if let Some(previous) = index.checked_sub(1).map(|i| &frames[i])
+                            && (frame.sequence < previous.sequence
+                                || (frame.sequence == previous.sequence && !previous.gap))
+                        {
+                            return Err(invalid());
+                        }
                     }
                     Ok(())
                 }

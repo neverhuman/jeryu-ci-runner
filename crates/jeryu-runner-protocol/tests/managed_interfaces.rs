@@ -88,3 +88,60 @@ fn registry_lengths_are_bounded_before_alignment_and_legacy_delivery_modes_rejec
         json!("gateway_helper")
     );
 }
+
+#[test]
+fn replay_rejects_mixed_authority_reordered_bytes_and_extra_frames() {
+    let frame = TerminalFrame {
+        protocol_version: PROTOCOL_VERSION.into(),
+        message_type: "session-terminal".into(),
+        session_id: "session".into(),
+        generation: 1,
+        run_id: "run".into(),
+        channel_id: "shell".into(),
+        sequence: 7,
+        gap: false,
+        bytes: vec![255],
+    };
+    let check = |frames: Vec<TerminalFrame>| {
+        SessionRpcResponse {
+            protocol_version: PROTOCOL_VERSION.into(),
+            message_type: "session-rpc-response".into(),
+            request_id: Some("replay".into()),
+            ok: true,
+            result: Some(SessionRpcResult::Replay(frames)),
+            error: None,
+        }
+        .validate()
+    };
+    let mut next = frame.clone();
+    next.sequence += 1;
+    check(vec![frame.clone(), next.clone()]).unwrap();
+    for field in ["session", "generation", "run", "channel"] {
+        let mut mixed = next.clone();
+        match field {
+            "session" => mixed.session_id = "other".into(),
+            "generation" => mixed.generation = 2,
+            "run" => mixed.run_id = "other".into(),
+            _ => mixed.channel_id = "agent".into(),
+        }
+        assert!(check(vec![frame.clone(), mixed]).is_err(), "{field}");
+    }
+    assert!(check(vec![next, frame.clone()]).is_err());
+    assert!(check(vec![frame.clone(), frame.clone()]).is_err());
+    let mut gap = frame.clone();
+    gap.gap = true;
+    gap.bytes.clear();
+    check(vec![gap.clone(), frame.clone()]).unwrap();
+    assert!(check(vec![frame.clone(), gap.clone()]).is_err());
+    let frames: Vec<_> = (0..5)
+        .map(|i| {
+            let mut f = frame.clone();
+            f.sequence += i;
+            f
+        })
+        .collect();
+    assert!(check(frames.clone()).is_err());
+    let mut valid = vec![gap];
+    valid.extend(frames.into_iter().take(4));
+    check(valid).unwrap();
+}
