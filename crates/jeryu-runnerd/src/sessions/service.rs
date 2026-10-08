@@ -1,6 +1,7 @@
 mod fencing;
 mod handle;
 mod registry;
+mod shutdown;
 use super::{
     RunnerResult,
     control::ControllerLease,
@@ -100,8 +101,10 @@ impl SessionService {
         }
         let reading_state = state.clone();
         let reading_stop = stop.clone();
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let reading_done = reader_done.clone();
         std::thread::spawn(move || {
-            while !reading_stop.load(Ordering::Acquire) {
+            while !reading_done.load(Ordering::Acquire) {
                 match reader.poll(Duration::from_millis(100)) {
                     Ok(Some(event)) => {
                         let Ok(mut state) = reading_state.lock() else {
@@ -126,12 +129,19 @@ impl SessionService {
                             state.finish(RuntimePhase::Failed, Some(error.code().into()));
                         }
                         reading_stop.store(true, Ordering::Release);
+                        break;
                     }
                 }
             }
         });
         std::thread::spawn(move || {
             while !stop.load(Ordering::Acquire) {
+                if now_ms() >= u128::from(lease.expires_at_unix_millis.saturating_sub(3000)) {
+                    if let Ok(mut state) = state.lock() {
+                        state.reason = Some("runtime_limit".into());
+                    }
+                    break;
+                }
                 if let Ok(fence) = fence_requests.try_recv() {
                     if session.send(&fence).is_err() {
                         break;
@@ -160,29 +170,8 @@ impl SessionService {
                     }
                 }
                 if matches!(request, GuestRequest::Stop { .. }) {
-                    if let Ok(mut state) = state.lock() {
-                        state.phase = RuntimePhase::Checkpointing;
-                    }
-                    if session
-                        .send(&GuestRequest::Freeze {
-                            request_id: id.clone(),
-                        })
-                        .is_ok()
-                    {
-                        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-                        while std::time::Instant::now() < deadline {
-                            if state
-                                .lock()
-                                .is_ok_and(|state| state.frozen_request.as_deref() == Some(id))
-                            {
-                                if let Ok(state) = state.lock() {
-                                    let _ = session.mark_workspace_flushed(state.workspace.clone());
-                                }
-                                break;
-                            }
-                            std::thread::sleep(Duration::from_millis(10));
-                        }
-                    }
+                    let flushed = shutdown::freeze(&mut session, &state, id);
+                    reader_done.store(true, Ordering::Release);
                     let result = session.stop();
                     if let Ok(mut state) = state.lock() {
                         state.checkpoint = session.checkpoint().cloned();
@@ -202,7 +191,10 @@ impl SessionService {
                             } else {
                                 RuntimePhase::Failed
                             },
-                            result.err().map(|error| error.code().into()),
+                            result
+                                .err()
+                                .map(|error| error.code().into())
+                                .or_else(|| (!flushed).then(|| "checkpoint_unflushed".into())),
                         );
                     }
                     return;
@@ -215,6 +207,8 @@ impl SessionService {
                     break;
                 }
             }
+            let flushed = shutdown::freeze(&mut session, &state, "service-stop-freeze");
+            reader_done.store(true, Ordering::Release);
             let result = session.stop();
             if let Ok(mut state) = state.lock() {
                 state.checkpoint = session.checkpoint().cloned();
@@ -222,9 +216,17 @@ impl SessionService {
                 let reason = result
                     .err()
                     .map(|error| error.code().into())
-                    .or_else(|| state.reason.clone());
+                    .or_else(|| state.reason.clone())
+                    .or_else(|| (!flushed).then(|| "checkpoint_unflushed".into()));
                 state.finish(
-                    if failed_before || reason.is_some() {
+                    if failed_before
+                        || (reason.as_deref().is_some_and(|reason| {
+                            !matches!(
+                                reason,
+                                "idle_timeout" | "runtime_limit" | "checkpoint_unflushed"
+                            )
+                        }))
+                    {
                         RuntimePhase::Failed
                     } else {
                         RuntimePhase::Stopped

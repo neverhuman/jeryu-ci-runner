@@ -63,6 +63,13 @@ pub enum GuestProfile {
     Shell,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleReason {
+    IdleTimeout,
+    RuntimeLimit,
+}
+
 impl GuestProfile {
     pub fn registered(id: &str) -> std::io::Result<Self> {
         match id {
@@ -116,6 +123,10 @@ pub enum GuestEvent {
     Stopped,
     Frozen {
         request_id: String,
+        workspace: Option<WorkspaceReady>,
+    },
+    LifecycleStopped {
+        reason: LifecycleReason,
         workspace: Option<WorkspaceReady>,
     },
     Error {
@@ -252,6 +263,11 @@ impl GuestEvent {
                 workspace,
             } => {
                 name(request_id)?;
+                if let Some(workspace) = workspace {
+                    workspace.validate().map_err(|_| invalid())?;
+                }
+            }
+            Self::LifecycleStopped { workspace, .. } => {
                 if let Some(workspace) = workspace {
                     workspace.validate().map_err(|_| invalid())?;
                 }

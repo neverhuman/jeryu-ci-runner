@@ -6,6 +6,8 @@ mod authority;
 mod checkpoint;
 #[path = "live_session/concurrent.rs"]
 mod concurrent;
+#[path = "live_session/lifecycle.rs"]
+mod lifecycle;
 #[path = "live_session/recovery.rs"]
 mod recovery;
 #[path = "live_session/resources.rs"]
@@ -58,9 +60,18 @@ fn main() -> Result<()> {
             || mode == "corrupt-record"
             || mode == "resource-limits"
             || mode == "control-terminal"
+            || mode == "guestd-mismatch"
         {
             "empty"
-        } else if mode == "checkpoint-main" || mode == "graph-override" {
+        } else if [
+            "checkpoint-main",
+            "graph-override",
+            "idle-stop",
+            "runtime-stop",
+            "direct-stop",
+        ]
+        .contains(&mode.as_str())
+        {
             "main-sync"
         } else {
             &mode
@@ -89,6 +100,9 @@ fn main() -> Result<()> {
         return recovery::discard_checkpoints(&node);
     }
     let service = SessionService::new(node.clone(), runtime);
+    if ["idle-stop", "runtime-stop", "direct-stop"].contains(&mode.as_str()) {
+        return lifecycle::run(&service, &node, lease, &mode);
+    }
     if mode == "resource-limits" {
         resources::deny_cpu(&service, &lease)?;
     }
@@ -100,6 +114,19 @@ fn main() -> Result<()> {
     }
     let started = Instant::now();
     let result = DispatchEngine::new().dispatch_managed_session(&service, lease);
+    if mode == "guestd-mismatch" {
+        match result {
+            Err(error) if error.to_string().contains("guestd_identity_mismatch") => (),
+            _ => return Err("booted guestd identity was not rejected".into()),
+        }
+        if fs::read_dir(root.join("node/records"))?.next().is_some() {
+            return Err("mismatched boot retained a VM resource".into());
+        }
+        println!(
+            "booted_guestd_mismatch=passed scope=development ready=false agent_started=false vm_destroyed=true"
+        );
+        return Ok(());
+    }
     if mode == "mismatch" {
         let expected = "guest_source_revision_mismatch";
         match result {
@@ -244,7 +271,7 @@ fn apply(handle: &SessionHandle, context: &SessionContext, command: ControlComma
     // Stop includes encrypted disk retention and fsync. This development bound
     // does not change the service's bounded freeze or VM termination deadline.
     let acknowledgement_timeout = if matches!(command, ControlCommand::Stop) {
-        Duration::from_secs(30)
+        Duration::from_secs(120)
     } else {
         Duration::from_secs(8)
     };

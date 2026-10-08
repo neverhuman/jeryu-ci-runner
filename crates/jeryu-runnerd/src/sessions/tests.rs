@@ -403,3 +403,36 @@ fn two_clients_of_one_actor_do_not_share_a_writer_and_screens_are_bound() {
             .is_err()
     );
 }
+
+#[test]
+fn freeze_acks_need_a_trusted_pending_request_and_lifecycle_stops_are_single_use() {
+    let (_, state, _) = test_handle(context());
+    let mut state = state.lock().unwrap();
+    state.phase = RuntimePhase::Checkpointing;
+    assert!(
+        state
+            .ingest(GuestEvent::Frozen {
+                request_id: "unsolicited".into(),
+                workspace: None
+            })
+            .is_err()
+    );
+    state.pending_freeze = Some("expected".into());
+    state
+        .ingest(GuestEvent::Frozen {
+            request_id: "expected".into(),
+            workspace: None,
+        })
+        .unwrap();
+    assert_eq!(state.frozen_request.as_deref(), Some("expected"));
+    state.phase = RuntimePhase::Running;
+    let event = GuestEvent::LifecycleStopped {
+        reason: jeryu_runner_protocol::guest::LifecycleReason::IdleTimeout,
+        workspace: None,
+    };
+    state.ingest(event.clone()).unwrap();
+    assert!(state.automatic_frozen);
+    assert_eq!(state.phase, RuntimePhase::Stopping);
+    assert_eq!(state.reason.as_deref(), Some("idle_timeout"));
+    assert!(state.ingest(event).is_err());
+}

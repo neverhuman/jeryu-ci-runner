@@ -3,6 +3,7 @@ mod authority;
 mod filesystem;
 mod freeze;
 mod groups;
+mod identity;
 mod input;
 mod process;
 mod reaper;
@@ -51,6 +52,15 @@ fn run() -> std::io::Result<()> {
             },
         )?;
         return Err(error);
+    }
+    if identity::verify(&lease.runtime.guestd.digest).is_err() {
+        write_frame(
+            &mut transport,
+            &GuestEvent::Error {
+                code: "guestd_identity_mismatch".into(),
+            },
+        )?;
+        return Err(std::io::Error::other("guestd_identity_mismatch"));
     }
     let workspace = match workspace::prepare(&lease) {
         Ok(ready) => ready,
@@ -107,15 +117,31 @@ fn session(
     let mut frozen = false;
     let authority = Arc::new(Mutex::new(authority::Authority::default()));
     loop {
-        if started.elapsed() >= Duration::from_secs(lease.resources.runtime_seconds.into())
-            || (!processes.values().any(process::GuestProcess::active_agent)
-                && activity
-                    .lock()
-                    .map_err(|_| std::io::Error::other("guest_activity_failed"))?
-                    .elapsed()
-                    >= Duration::from_secs(lease.resources.idle_seconds.into()))
+        let runtime_limit =
+            started.elapsed() >= Duration::from_secs(lease.resources.runtime_seconds.into());
+        if !frozen
+            && (runtime_limit
+                || (!processes.values().any(process::GuestProcess::active_agent)
+                    && activity
+                        .lock()
+                        .map_err(|_| std::io::Error::other("guest_activity_failed"))?
+                        .elapsed()
+                        >= Duration::from_secs(lease.resources.idle_seconds.into())))
         {
-            break;
+            processes.clear();
+            let workspace = freeze::workspace(&reaper, &workspace, lease.context.generation)?;
+            emit(
+                &writer,
+                &GuestEvent::LifecycleStopped {
+                    reason: if runtime_limit {
+                        jeryu_runner_protocol::guest::LifecycleReason::RuntimeLimit
+                    } else {
+                        jeryu_runner_protocol::guest::LifecycleReason::IdleTimeout
+                    },
+                    workspace,
+                },
+            )?;
+            frozen = true;
         }
         let request = match requests.recv_timeout(Duration::from_millis(100)) {
             Ok(request) => request,

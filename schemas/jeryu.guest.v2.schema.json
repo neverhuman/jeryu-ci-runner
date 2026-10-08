@@ -347,6 +347,33 @@
         {
           "type": "object",
           "properties": {
+            "reason": {
+              "$ref": "#/$defs/LifecycleReason"
+            },
+            "type": {
+              "type": "string",
+              "const": "lifecycle-stopped"
+            },
+            "workspace": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/WorkspaceReady"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "reason"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
             "code": {
               "type": "string"
             },
@@ -592,6 +619,13 @@
             "request_id"
           ]
         }
+      ]
+    },
+    "LifecycleReason": {
+      "type": "string",
+      "enum": [
+        "idle-timeout",
+        "runtime-limit"
       ]
     },
     "ManagedPurpose": {

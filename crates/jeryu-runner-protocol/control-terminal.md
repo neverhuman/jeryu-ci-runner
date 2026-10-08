@@ -60,3 +60,20 @@ context/channel just like replay. Guest screens cannot advance past raw output.
 This amendment does not qualify a provider CLI, subscription mode, product
 client, production rootfs, release artifact or the complete launch migration.
 Until independent review and actual KVM tests pass, it is development only.
+
+## Automatic shutdown and boot identity
+
+Guest-v2 LifecycleStopped carries a closed idle-timeout/runtime-limit reason
+and the same validated workspace receipt as Frozen, only after quiescence,
+checkpoint-ref creation, sync and a read-only remount. The node binds that
+receipt to the signed source/main and marks the disk flushed before retention.
+It stops input during checkpointing. Normal stop uses the same freeze barrier;
+a missing acknowledgement retains an explicitly unflushed crash-consistent disk.
+Before the hard signed lease deadline, the node reserves a bounded three-second
+freeze window. This window consumes lease time; it never extends the lease.
+The existing watchdog still kills on expiry even when no caller polls.
+
+Before preparation or Ready, guestd verifies /proc/self/exe against the signed
+runtime guestd digest. Failure is a fixed guestd identity error, without byte or
+path diagnostics. This binds the booted binary; it does not replace signed
+build provenance proving all rootfs/toolchain/profile contents.

@@ -40,6 +40,8 @@ pub(super) struct State {
     pub control_ready: bool,
     pub pending_fence: Option<(String, u64)>,
     pub frozen_request: Option<String>,
+    pub pending_freeze: Option<String>,
+    pub automatic_frozen: bool,
     pub receipts: BTreeMap<String, Receipt>,
     pub receipt_order: VecDeque<String>,
 }
@@ -74,6 +76,8 @@ impl State {
             control_ready: false,
             pending_fence: None,
             frozen_request: None,
+            pending_freeze: None,
+            automatic_frozen: false,
             receipts: BTreeMap::new(),
             receipt_order: VecDeque::new(),
         }
@@ -251,21 +255,42 @@ impl State {
                 workspace,
             } => {
                 if self.phase != RuntimePhase::Checkpointing
-                    || !self.receipts.values().any(|receipt| {
-                        receipt.kind == CommandKind::Stop && receipt.guest_id == request_id
-                    })
+                    || self.pending_freeze.as_deref() != Some(&request_id)
                 {
                     return Err(failed("guest_freeze_ack_invalid"));
                 }
-                match (&self.workspace, &workspace) {
-                    (Some(previous), Some(frozen))
-                        if frozen.source_revision == self.context.source_revision
-                            && frozen.main_revision == previous.main_revision => {}
-                    (None, None) => (),
-                    _ => return Err(failed("guest_freeze_workspace_invalid")),
-                }
+                self.validate_frozen(&workspace)?;
                 self.workspace = workspace;
                 self.frozen_request = Some(request_id);
+            }
+            GuestEvent::LifecycleStopped { reason, workspace } => {
+                if self.automatic_frozen
+                    || !matches!(
+                        self.phase,
+                        RuntimePhase::Running
+                            | RuntimePhase::RebaseRequired
+                            | RuntimePhase::Checkpointing
+                    )
+                {
+                    return Err(failed("guest_lifecycle_stop_invalid"));
+                }
+                self.validate_frozen(&workspace)?;
+                self.workspace = workspace;
+                self.automatic_frozen = true;
+                self.control_ready = false;
+                self.phase = RuntimePhase::Stopping;
+                self.reason = Some(
+                    match reason {
+                        jeryu_runner_protocol::guest::LifecycleReason::IdleTimeout => {
+                            "idle_timeout"
+                        }
+                        jeryu_runner_protocol::guest::LifecycleReason::RuntimeLimit => {
+                            "runtime_limit"
+                        }
+                    }
+                    .into(),
+                );
+                self.publish(SessionEvent::Snapshot(self.snapshot()));
             }
             GuestEvent::Error { .. } | GuestEvent::Ready { .. } => {
                 return Err(failed("guest_session_failed"));
@@ -297,6 +322,18 @@ impl State {
                 break;
             }
             self.receipts.remove(&id);
+        }
+    }
+    fn validate_frozen(&self, workspace: &Option<WorkspaceReady>) -> RunnerResult<()> {
+        match (&self.workspace, workspace) {
+            (Some(previous), Some(frozen))
+                if frozen.source_revision == self.context.source_revision
+                    && frozen.main_revision == previous.main_revision =>
+            {
+                Ok(())
+            }
+            (None, None) => Ok(()),
+            _ => Err(failed("guest_freeze_workspace_invalid")),
         }
     }
     pub fn acknowledge_guest(
