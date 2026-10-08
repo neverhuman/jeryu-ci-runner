@@ -12,6 +12,7 @@ pub mod checkpoint;
 mod diagnostics;
 pub mod journal;
 pub mod lease_authority;
+pub mod source_registry;
 pub mod supervisor;
 pub mod transport;
 mod vmm;

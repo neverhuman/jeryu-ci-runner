@@ -22,6 +22,11 @@ pub async fn serve(config: SessionNodeConfig) -> RunnerResult<()> {
     let acceptor = TlsAcceptor::from(config.tls()?);
     let runtime = Arc::new(config.runtime()?);
     let node = config.node()?.open()?;
+    let bundles = jeryu_runner_microvm::source_registry::SourceBundleRegistry::open(
+        &config.artifact_store,
+        config.source_bundle_budget_gib,
+        node.clone(),
+    )?;
     let service =
         Arc::new(SessionService::new(node, runtime).with_owner_limit(config.owner_limit)?);
     let listener = TcpListener::bind(config.listen).await?;
@@ -35,6 +40,7 @@ pub async fn serve(config: SessionNodeConfig) -> RunnerResult<()> {
         let acceptor = acceptor.clone();
         let service = service.clone();
         let streams = streams.clone();
+        let bundles = bundles.clone();
         let approved_peer = config.control_plane_certificate_sha256.clone();
         tokio::spawn(async move {
             let _slot = slot;
@@ -56,7 +62,9 @@ pub async fn serve(config: SessionNodeConfig) -> RunnerResult<()> {
             if digest != approved_peer {
                 return;
             }
-            let http = service_fn(move |request| handle(request, service.clone(), streams.clone()));
+            let http = service_fn(move |request| {
+                handle(request, service.clone(), streams.clone(), bundles.clone())
+            });
             // One request per connection. The outer bound also covers a slow
             // request/response peer; guest execution has independent supervision.
             let _ = timeout(
@@ -74,16 +82,21 @@ async fn handle(
     request: Request<Incoming>,
     service: Arc<SessionService>,
     streams: Arc<Semaphore>,
+    bundles: Arc<jeryu_runner_microvm::source_registry::SourceBundleRegistry>,
 ) -> Result<Response<HttpBody>, Infallible> {
     let subscribe = request.uri().path() == "/jeryu.runner.v2/subscribe";
+    let upload = request.uri().path() == "/jeryu.runner.v2/bundles";
     if request.method() != Method::POST
-        || (!subscribe && request.uri().path() != "/jeryu.runner.v2/session")
+        || (!subscribe && !upload && request.uri().path() != "/jeryu.runner.v2/session")
         || request.uri().query().is_some()
         || request.headers().contains_key("cookie")
         || request.headers().contains_key("authorization")
         || request.headers().contains_key("content-encoding")
     {
         return Ok(error(StatusCode::BAD_REQUEST, "session_rpc_route_invalid"));
+    }
+    if upload {
+        return Ok(super::bundles::response(request, bundles).await);
     }
     if request
         .headers()
@@ -165,6 +178,9 @@ fn reply(status: StatusCode, value: SessionRpcResponse) -> Response<HttpBody> {
             b"{\"protocol_version\":\"jeryu.runner.v2.1\",\"message_type\":\"session-rpc-response\",\"request_id\":null,\"ok\":false,\"error\":{\"code\":\"session_rpc_encode_failed\"}}".to_vec(),
         ),
     };
+    json_reply(status, bytes)
+}
+pub(super) fn json_reply(status: StatusCode, bytes: Vec<u8>) -> Response<HttpBody> {
     let mut response = Response::new(Full::new(Bytes::from(bytes)).boxed_unsync());
     *response.status_mut() = status;
     response.headers_mut().insert(

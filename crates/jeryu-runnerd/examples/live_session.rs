@@ -85,6 +85,8 @@ fn main() -> Result<()> {
             || mode == "image-class-mismatch"
         {
             "empty"
+        } else if mode == "rpc-source-lease" {
+            "uploaded"
         } else if [
             "checkpoint-main",
             "graph-override",
@@ -104,7 +106,7 @@ fn main() -> Result<()> {
     )?;
     authority::sign(&mut lease)?;
     let context = lease.context.clone();
-    if mode == "rpc-lease" {
+    if mode == "rpc-lease" || mode == "rpc-source-lease" {
         println!("{}", String::from_utf8(lease.to_json()?)?);
         return Ok(());
     }

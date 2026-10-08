@@ -14,6 +14,25 @@ pub fn configure(lease: &mut SessionLease, mode: &str) -> Result<()> {
     if mode == "empty" {
         return Ok(());
     }
+    if mode == "uploaded" {
+        let path = Path::new(ROOT).join("uploaded-source-inputs.json");
+        use std::os::unix::fs::MetadataExt;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file()
+            || metadata.uid() != 0
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+            || metadata.len() > 16384
+        {
+            return Err("uploaded fixture input custody denied".into());
+        }
+        let input: SourceFixture = serde_json::from_slice(&fs::read(path)?)?;
+        lease.context.source_revision = input.source_revision;
+        lease.workspace = input.workspace;
+        lease.context.job_digest = lease.job_digest()?;
+        lease.validate()?;
+        return Ok(());
+    }
     if !["main-sync", "conflict", "mismatch", "resume-main"].contains(&mode) {
         return Err("unsupported live fixture mode".into());
     }

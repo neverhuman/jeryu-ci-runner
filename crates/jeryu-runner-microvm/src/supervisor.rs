@@ -2,6 +2,7 @@
 //! guest results, lease expiry, and node-owned cleanup.
 mod admission;
 mod boot;
+mod storage;
 use crate::{
     api,
     artifacts::{VerifiedRuntime, trusted_directory},
@@ -26,6 +27,7 @@ use std::{
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
+pub use storage::HostStorageReservation;
 
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -46,6 +48,7 @@ pub struct Node {
     config: NodeConfig,
     journal: NodeJournal,
     admission: Mutex<()>,
+    upload_reserved_bytes: std::sync::atomic::AtomicU64,
     checkpoints: crate::checkpoint::CheckpointStore,
 }
 
@@ -125,6 +128,7 @@ impl NodeConfig {
             config: self,
             journal,
             admission: Mutex::new(()),
+            upload_reserved_bytes: std::sync::atomic::AtomicU64::new(0),
             checkpoints,
         });
         let weak = Arc::downgrade(&node);
@@ -194,7 +198,11 @@ impl MicroVmSession {
                 &node.journal,
                 &node.config.state_dir,
                 &existing,
-                admission::new_disk_charge(&lease, artifact_bytes)?,
+                admission::new_disk_charge(&lease, artifact_bytes)?
+                    + u128::from(
+                        node.upload_reserved_bytes
+                            .load(std::sync::atomic::Ordering::Acquire),
+                    ),
             )?;
             if existing
                 .iter()

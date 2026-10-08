@@ -25,6 +25,8 @@ pub struct SessionNodeConfig {
     pub owner_limit: usize,
     pub listen: SocketAddr,
     pub artifact_store: PathBuf,
+    /// Separate operator allocation, with physical VM/upload admission shared.
+    pub source_bundle_budget_gib: u32,
     pub runtime_manifest: PathBuf,
     pub runtime_signature: PathBuf,
     pub release_public_key: PathBuf,
