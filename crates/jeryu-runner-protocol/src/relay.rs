@@ -1,9 +1,13 @@
 //! Guest/node mirror of lane A's k3-relay-v1. No capability or session authority
 //! is representable on this socket. Gateway capabilities remain host-only.
+mod flow;
+mod transport;
 mod validation;
 use crate::wire::v2::{Provider, RelayHeader, RelayMethod};
+pub use flow::{BodySequence, SendWindow};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+pub use transport::{RelayMessage, read_frame, write_frame};
 pub use validation::body_bytes;
 pub(crate) use validation::metadata;
 

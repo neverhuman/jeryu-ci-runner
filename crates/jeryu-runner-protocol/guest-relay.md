@@ -19,6 +19,10 @@ There are four in-flight requests per VM, a one-MiB acknowledged body window
 per direction and a 60-second request idle timeout. Sequence numbers start at
 one, are contiguous, and end names the last body sequence (zero if empty).
 Body/end/window validation is stateful; shape validation alone is insufficient.
+`BodySequence` rejects jumps, duplicates and body/end after end. `SendWindow`
+counts unacknowledged decoded bytes; full-window reserve leaves its sequence
+and counters unchanged for retry. ACKs cannot mint credit for unsent data.
+Its ledger stores only u16 lengths, bounded by the one-byte minimum per chunk.
 Open replay, head ordering, cancellation, idle timers and renewed lease/
 connection authorization must be enforced by the consumers.
 
