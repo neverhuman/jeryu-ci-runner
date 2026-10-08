@@ -99,6 +99,19 @@ impl WorkcellManager {
         self.spawn_ready_cell()
     }
 
+    /// Forget a warm cell that is still queued as ready and was never claimed:
+    /// the warm pool calls this when it gives up the container paired with the
+    /// id, so the ledger cannot later hand out a cell no container backs.
+    /// Returns false (and changes nothing) when the id is not queued.
+    pub fn discard_ready(&mut self, workcell_id: &str) -> bool {
+        let Some(queued) = self.ready_queue.iter().position(|id| id == workcell_id) else {
+            return false;
+        };
+        self.ready_queue.remove(queued);
+        self.cells.remove(workcell_id);
+        true
+    }
+
     /// Claim the ready cell with this exact id — the warm pool has already paired
     /// it with a detached container labeled `jeryu.workcell=<id>`. Unlike
     /// [`WorkcellManager::claim`], the ready queue entry is consumed without
@@ -114,9 +127,7 @@ impl WorkcellManager {
         let state = self
             .cells
             .get(workcell_id)
-            .ok_or_else(|| {
-                WorkcellError::claim_denied(format!("unknown warm cell {workcell_id}"))
-            })?
+            .ok_or_else(|| WorkcellError::claim_denied(format!("unknown warm cell {workcell_id}")))?
             .state;
         if !matches!(state, WorkcellState::Ready) {
             return Err(WorkcellError::claim_denied(format!(

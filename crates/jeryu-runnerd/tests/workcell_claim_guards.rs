@@ -4,9 +4,7 @@
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use jeryu_runnerd::{
-    StartupSync, WorkcellClaimRequest, WorkcellManager, WorkcellState,
-};
+use jeryu_runnerd::{StartupSync, WorkcellClaimRequest, WorkcellManager, WorkcellState};
 use std::path::PathBuf;
 
 fn root() -> PathBuf {
@@ -170,7 +168,9 @@ fn concurrent_claims_of_one_cell_leave_exactly_one_winner() {
                     .lock()
                     .expect("ledger lock")
                     .claim_ready(&workcell_id, request);
-                outcome.map(|lease| lease.agent_id).map_err(|err| err.reason)
+                outcome
+                    .map(|lease| lease.agent_id)
+                    .map_err(|err| err.reason)
             })
         })
         .collect();

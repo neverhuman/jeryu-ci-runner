@@ -131,10 +131,16 @@ impl WarmPool {
             None => self.warm_cell()?,
         };
         let agent_id = claim.agent_id.clone();
-        let lease = self
-            .manager
-            .claim_ready(&entry.workcell_id, claim)
-            .map_err(workcell_to_runner);
+        let lease = self.manager.claim_ready(&entry.workcell_id, claim);
+        if lease.is_err() && self.manager.discard_ready(&entry.workcell_id) {
+            // The ledger refused the claim before consuming the cell (stale
+            // epoch, not ready, not queued), but the entry has already left
+            // the pool. Give up the container and the ledger entry together,
+            // or each refusal would strand a running container and leave a
+            // queued id that no container backs for the next claim.
+            self.runtime.remove(&entry.container_id)?;
+        }
+        let lease = lease.map_err(workcell_to_runner);
         // Restore steady-state depth even when the claimed cell blocks on a
         // failed startup rebase, so the next session still reuses a warm cell.
         self.refill()?;
@@ -430,7 +436,7 @@ mod tests {
     #[test]
     fn a_stale_runner_epoch_is_fenced_on_the_pool_claim_path() {
         let fake = Arc::new(FakeContainerRuntime::default());
-        let mut pool = WarmPool::new(fake, 2).expect("warm the pool");
+        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
         pool.claim(session_claim("agent-7", "run-42", 9))
             .expect("the current epoch claims");
 
@@ -439,9 +445,69 @@ mod tests {
             .expect_err("a stale epoch is fenced");
         assert_eq!(err.code(), "workcell_epoch_fenced");
         assert_eq!(pool.warm_depth(), 2, "the pool refills despite the fence");
+        assert_pool_matches_ledger(&pool, &fake, 1);
 
         pool.claim(session_claim("agent-9", "run-44", 9))
             .expect("the live epoch still claims");
+    }
+
+    /// The pool, the ledger and the runtime agree: every queued ready id is a
+    /// warm entry, and the runtime holds exactly the warm containers plus the
+    /// `claimed` ones handed to sessions.
+    fn assert_pool_matches_ledger(pool: &WarmPool, fake: &FakeContainerRuntime, claimed: usize) {
+        assert_eq!(
+            pool.manager.ready_count(),
+            pool.warm_depth(),
+            "no queued ready id may lack a warm container"
+        );
+        let live = fake.list_workcells().expect("list containers");
+        assert_eq!(
+            live.len(),
+            pool.warm_depth() + claimed,
+            "no stranded container"
+        );
+        let mut warm_ids: Vec<String> = pool.warm.iter().map(|e| e.workcell_id.clone()).collect();
+        warm_ids.sort();
+        let mut queued: Vec<String> = pool
+            .manager
+            .workcells()
+            .into_iter()
+            .filter(|lease| lease.state == WorkcellState::Ready)
+            .map(|lease| lease.workcell_id)
+            .collect();
+        queued.sort();
+        assert_eq!(queued, warm_ids, "ready cells and warm entries pair up");
+    }
+
+    // Replaying a fenced claim must not grow the runtime or the ready queue:
+    // each refusal gives back the container it took from the pool.
+    #[test]
+    fn replayed_refused_claims_leak_no_container_and_no_ready_entry() {
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
+        pool.claim(session_claim("agent-7", "run-42", 9))
+            .expect("the current epoch claims");
+        for attempt in 0..5 {
+            let err = pool
+                .claim(session_claim("agent-8", &format!("run-5{attempt}"), 8))
+                .expect_err("a stale epoch is fenced");
+            assert_eq!(err.code(), "workcell_epoch_fenced");
+            assert_pool_matches_ledger(&pool, &fake, 1);
+        }
+        // The auto-claim path cannot pick up a ghost id either: whatever it
+        // takes is still one of the pool's warm cells.
+        let lease = pool
+            .manager
+            .claim(session_claim("agent-9", "run-60", 9).claim)
+            .expect("the live epoch claims through the ledger");
+        assert!(
+            fake.list_workcells()
+                .expect("list containers")
+                .iter()
+                .any(|container| container.workcell_id == lease.workcell_id),
+            "the ledger handed out {} with no container behind it",
+            lease.workcell_id
+        );
     }
 
     // A failed startup rebase blocks the claim but the pool still refills, so the
