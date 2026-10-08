@@ -226,13 +226,22 @@ pub enum RelayHeaderName {
     Accept,
     ContentType,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RelayHeader {
     pub name: RelayHeaderName,
+    #[schemars(length(min = 1, max = 256))]
     pub value: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+impl std::fmt::Debug for RelayHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayHeader")
+            .field("name", &self.name)
+            .field("value", &"redacted")
+            .finish()
+    }
+}
+#[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct GuestRelayRequest {
     #[schemars(schema_with = "super::schema::version")]
@@ -251,6 +260,11 @@ pub struct GuestRelayRequest {
     #[schemars(length(max = 2))]
     pub headers: Vec<RelayHeader>,
 }
+impl std::fmt::Debug for GuestRelayRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GuestRelayRequest { content: redacted }")
+    }
+}
 impl ValidateWire for GuestRelayRequest {
     fn validate_wire(&self) -> Result<(), WireError> {
         header(
@@ -268,25 +282,8 @@ impl ValidateWire for GuestRelayRequest {
         }
         positive("generation", self.generation)?;
         positive("lease_epoch", self.lease_epoch)?;
-        if self.path.len() > 2048
-            || !self.path.starts_with('/')
-            || self.path.contains("//")
-            || !self.path.is_ascii()
-            || self.path.bytes().any(|b| b <= 32 || b == 127)
-            || self.path.contains(['#', '\\', '@', '?', '%'])
-            || self.path.split('/').any(|p| p == "." || p == "..")
-            || self.headers.len() > 2
-        {
+        if !crate::relay::metadata(&self.path, &self.headers) {
             return Err(WireError::new(WireErrorCode::InvalidField, "relay_path"));
-        }
-        for (index, header) in self.headers.iter().enumerate() {
-            if header.value.len() > 256
-                || !header.value.is_ascii()
-                || header.value.bytes().any(|b| b < 32 || b == 127)
-                || self.headers[..index].iter().any(|h| h.name == header.name)
-            {
-                return Err(WireError::new(WireErrorCode::InvalidField, "relay_header"));
-            }
         }
         Ok(())
     }

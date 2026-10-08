@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 pub mod guest;
+pub mod relay;
 pub mod wire;
 
 pub const PROTOCOL_VERSION: &str = "jeryu.runner.v1";

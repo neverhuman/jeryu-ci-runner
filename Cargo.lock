@@ -821,6 +821,7 @@ dependencies = [
 name = "jeryu-runner-protocol"
 version = "5.0.0"
 dependencies = [
+ "base64ct",
  "hex",
  "jeryu-ci-ir",
  "schemars",

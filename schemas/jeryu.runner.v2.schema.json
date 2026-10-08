@@ -693,7 +693,9 @@
           "$ref": "#/$defs/RelayHeaderName"
         },
         "value": {
-          "type": "string"
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
         }
       },
       "additionalProperties": false,

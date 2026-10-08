@@ -1,0 +1,383 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RelayFrame",
+  "description": "Schema envelope only. Transport consumers must select a concrete direction.",
+  "anyOf": [
+    {
+      "$ref": "#/$defs/GuestRelayFrame"
+    },
+    {
+      "$ref": "#/$defs/NodeRelayFrame"
+    }
+  ],
+  "$defs": {
+    "GuestRelayFrame": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "authorization": {
+              "description": "Deserialize to reject helper credentials with a fixed error only.\nRAM-token modes are disabled; this field is never forwarded.",
+              "type": "string",
+              "maxLength": 4096,
+              "minLength": 1
+            },
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RelayHeader"
+              },
+              "maxItems": 2
+            },
+            "method": {
+              "$ref": "#/$defs/RelayMethod"
+            },
+            "path": {
+              "type": "string",
+              "maxLength": 2048,
+              "minLength": 2
+            },
+            "provider": {
+              "$ref": "#/$defs/Provider"
+            },
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "type": {
+              "type": "string",
+              "const": "open"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "provider",
+            "method",
+            "path",
+            "headers"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bytes_b64": {
+              "type": "string",
+              "maxLength": 43692,
+              "minLength": 4,
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+            },
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1
+            },
+            "type": {
+              "type": "string",
+              "const": "request-body"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "seq",
+            "bytes_b64"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "seq_end": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "request-end"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "seq_end"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "through_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1
+            },
+            "type": {
+              "type": "string",
+              "const": "ack"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "through_seq"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "type": {
+              "type": "string",
+              "const": "cancel"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id"
+          ]
+        }
+      ]
+    },
+    "NodeRelayFrame": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "headers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/RelayHeader"
+              },
+              "maxItems": 1
+            },
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "status": {
+              "type": "integer",
+              "format": "uint16",
+              "maximum": 599,
+              "minimum": 100
+            },
+            "type": {
+              "type": "string",
+              "const": "head"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "status",
+            "headers"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "bytes_b64": {
+              "type": "string",
+              "maxLength": 43692,
+              "minLength": 4,
+              "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$"
+            },
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1
+            },
+            "type": {
+              "type": "string",
+              "const": "response-body"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "seq",
+            "bytes_b64"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "seq_end": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "type": {
+              "type": "string",
+              "const": "response-end"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "seq_end"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "through_seq": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 1
+            },
+            "type": {
+              "type": "string",
+              "const": "ack"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "through_seq"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "error": {
+              "$ref": "#/$defs/RelayErrorCode"
+            },
+            "request_id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9]([A-Za-z0-9._:/-]*[A-Za-z0-9])?$"
+            },
+            "type": {
+              "type": "string",
+              "const": "error"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "request_id",
+            "error"
+          ]
+        }
+      ]
+    },
+    "Provider": {
+      "type": "string",
+      "enum": [
+        "claude",
+        "codex",
+        "grok"
+      ]
+    },
+    "RelayErrorCode": {
+      "type": "string",
+      "enum": [
+        "provider_not_connected",
+        "connection_generation_stale",
+        "connection_owner_mismatch",
+        "provider_mode_disabled",
+        "provider_mode_unqualified",
+        "helper_required",
+        "ram_token_not_permitted",
+        "capability_unverified",
+        "capability_expired",
+        "capability_audience_mismatch",
+        "upstream_host_denied",
+        "refresh_persist_failed",
+        "provider_unknown",
+        "lease_binding_mismatch",
+        "connection_busy",
+        "guest_authorization_rejected",
+        "relay_idle_timeout",
+        "relay_stream_invalid"
+      ]
+    },
+    "RelayHeader": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/RelayHeaderName"
+        },
+        "value": {
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "value"
+      ]
+    },
+    "RelayHeaderName": {
+      "type": "string",
+      "enum": [
+        "accept",
+        "content-type"
+      ]
+    },
+    "RelayMethod": {
+      "type": "string",
+      "enum": [
+        "GET",
+        "POST"
+      ]
+    }
+  }
+}
