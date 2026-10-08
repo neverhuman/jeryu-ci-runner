@@ -31,6 +31,8 @@ pub struct ResourceRecord {
     pub firecracker_digest: String,
     pub vmm: Option<crate::vmm::VmmIdentity>,
     #[serde(default)]
+    pub deadline: Option<crate::guardian::Deadline>,
+    #[serde(default)]
     pub retain_workspace: bool,
     #[serde(default)]
     pub workspace_flushed: bool,
@@ -101,6 +103,7 @@ impl NodeJournal {
                 return Err(failed("node_journal_quarantined"));
             }
         }
+        crate::guardian::fence::require_owned(&self.root, &self.records()?)?;
         Ok(())
     }
 

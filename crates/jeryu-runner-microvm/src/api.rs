@@ -6,6 +6,23 @@ use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+pub(crate) fn validate_state_path(state: &Path) -> RunnerResult<()> {
+    use std::os::unix::ffi::OsStrExt;
+    // Include the longest guest service suffix Firecracker can create. Linux
+    // pathname sockets need a terminator within sockaddr_un.sun_path[108].
+    let socket = state
+        .join("j/firecracker")
+        .join("f".repeat(32))
+        .join("root/v.sock_65535");
+    if socket.as_os_str().as_bytes().len() >= 108 {
+        return Err(RunnerError::new(
+            "microvm_state_path_limit",
+            "node state path exceeds the Unix socket pathname bound",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn put(socket: &Path, path: &str, body: Value) -> RunnerResult<()> {
     let body = serde_json::to_vec(&body).map_err(|_| failed())?;
     let mut stream = UnixStream::connect(socket)?;
@@ -131,6 +148,22 @@ mod tests {
         result
     }
 
+    #[test]
+    fn socket_path_admission_uses_bytes_and_reserves_the_guest_service_suffix() {
+        validate_state_path(Path::new("/var/lib/jeryu/node")).unwrap();
+        let suffix = Path::new("j/firecracker")
+            .join("f".repeat(32))
+            .join("root/v.sock_65535");
+        let safe = format!("/{}", "a".repeat(107 - suffix.as_os_str().len() - 2));
+        validate_state_path(Path::new(&safe)).unwrap();
+        assert_eq!(
+            validate_state_path(Path::new(&(safe + "a")))
+                .unwrap_err()
+                .code(),
+            "microvm_state_path_limit"
+        );
+        assert!(validate_state_path(Path::new(&format!("/{}", "界".repeat(30)))).is_err());
+    }
     #[test]
     fn successful_api_response_does_not_require_connection_close() {
         let started = std::time::Instant::now();

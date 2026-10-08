@@ -91,10 +91,28 @@ impl MicroVmSession {
             "--api-sock".into(),
             "/a.sock".into(),
         ];
-        self.child = Some(jeryu_sandbox_linux::microvm::spawn_jailer(
+        self.child = Some(crate::guardian::Guardian::launch(
+            &self.record,
+            &self.lease,
+            self.node.config.control_plane_lease_key,
+            &root,
             runtime.jailer(),
-            &args,
+            args,
+            self.launch_fence
+                .take()
+                .ok_or_else(|| failed("microvm_launch_fence_missing"))?,
         )?);
+        self.record.vmm = Some(
+            self.child
+                .as_ref()
+                .ok_or_else(|| failed("microvm_guardian_missing"))?
+                .identity
+                .clone(),
+        );
+        let vmm = crate::vmm::VmmGuard::recover(&self.record, &root)?
+            .ok_or_else(|| failed("microvm_process_missing"))?;
+        self.vmm = Some(Arc::new(vmm));
+        self.node.journal.write(&self.record)?;
         let socket = root.join("a.sock");
         let deadline = Instant::now() + Duration::from_secs(60);
         while !socket.exists() {

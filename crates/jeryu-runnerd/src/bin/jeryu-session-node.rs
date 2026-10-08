@@ -5,6 +5,14 @@ use std::path::Path;
 
 #[tokio::main]
 async fn main() {
+    match jeryu_runner_microvm::guardian::run_if_requested() {
+        Ok(true) => return,
+        Ok(false) => (),
+        Err(error) => {
+            eprintln!("jeryu_vm_guardian_failed code={}", error.code());
+            std::process::exit(1);
+        }
+    }
     if jeryu_sandbox_linux::microvm::disable_core_dumps().is_err() {
         eprintln!("jeryu_session_node_failed code=core_dump_limit_failed");
         std::process::exit(1);

@@ -23,7 +23,6 @@ use std::{
         net::UnixStream,
     },
     path::PathBuf,
-    process::Child,
     sync::{Arc, Mutex, mpsc},
     time::{Duration, Instant},
 };
@@ -71,7 +70,11 @@ impl Node {
         let mut failure = None;
         for record in self.journal.records()? {
             if (matches!(record.state, ResourceState::Cleaning)
-                || now_ms() >= u128::from(record.expires_at_unix_millis))
+                || now_ms() >= u128::from(record.expires_at_unix_millis)
+                || record
+                    .deadline
+                    .as_ref()
+                    .is_some_and(|deadline| deadline.expired().unwrap_or(true)))
                 && let Err(error) = self.journal.cleanup(&record)
             {
                 failure.get_or_insert(error);
@@ -105,6 +108,7 @@ impl NodeConfig {
         {
             return Err(failed("microvm_node_config_invalid"));
         }
+        api::validate_state_path(&self.state_dir)?;
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -122,6 +126,7 @@ impl NodeConfig {
         if let Some(error) = failure {
             return Err(error);
         }
+        journal.require_clean_admission()?;
         let checkpoints = crate::checkpoint::CheckpointStore::open(&self.state_dir)?;
         checkpoints.reconcile()?;
         let node = Arc::new(Node {
@@ -151,7 +156,8 @@ pub struct MicroVmSession {
     node: Arc<Node>,
     record: ResourceRecord,
     lease: SessionLease,
-    child: Option<Child>,
+    child: Option<crate::guardian::Guardian>,
+    launch_fence: Option<std::fs::File>,
     channel: Option<UnixStream>,
     reader: Option<crate::transport::GuestReader>,
     started: Instant,
@@ -172,6 +178,7 @@ impl MicroVmSession {
     ) -> RunnerResult<Self> {
         let now = u64::try_from(now_ms()).map_err(|_| failed("microvm_clock_invalid"))?;
         node.validate_lease(&lease)?;
+        let lifetime = crate::guardian::Deadline::new(lease.expires_at_unix_millis)?;
         if runtime.manifest() != &lease.runtime {
             return Err(failed("microvm_runtime_mismatch"));
         }
@@ -179,7 +186,7 @@ impl MicroVmSession {
         let maximum_runtime = Duration::from_millis(lease.expires_at_unix_millis - now);
         let resource_id = uuid::Uuid::new_v4().simple().to_string();
         let artifact_bytes = admission::artifact_bytes(runtime, &lease)?;
-        let record = {
+        let (record, launch_fence) = {
             let _admission = node
                 .admission
                 .lock()
@@ -225,19 +232,22 @@ impl MicroVmSession {
                 state: ResourceState::Provisioning,
                 firecracker_digest: runtime.manifest().firecracker.digest.clone(),
                 vmm: None,
+                deadline: Some(lifetime),
                 retain_workspace: false,
                 workspace_flushed: false,
                 checkpoint: None,
                 workspace: None,
             };
+            let fence = crate::guardian::fence::create(&node.config.state_dir, &record)?;
             journal.write(&record)?;
-            record
+            (record, fence)
         };
         let mut session = Self {
             node,
             record,
             lease,
             child: None,
+            launch_fence: Some(launch_fence),
             channel: None,
             reader: None,
             started: Instant::now(),
@@ -295,6 +305,11 @@ impl MicroVmSession {
 
     fn ensure_live(&self) -> RunnerResult<()> {
         if self.stopped
+            || self
+                .record
+                .deadline
+                .as_ref()
+                .is_none_or(|deadline| deadline.expired().unwrap_or(true))
             || self.started.elapsed() >= self.maximum_runtime
             || now_ms() >= u128::from(self.lease.expires_at_unix_millis)
         {
@@ -398,10 +413,10 @@ impl MicroVmSession {
             vmm.terminate()?;
             vmm.wait_dead()?;
         }
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Some(mut child) = self.child.take() {
+            child.finish()?;
         }
+        self.launch_fence.take();
         self.checkpoint = self.node.journal.cleanup(&self.record)?;
         self.diagnostics.clear();
         if let Some(cancel) = self.watchdog_cancel.take() {

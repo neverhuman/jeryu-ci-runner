@@ -17,9 +17,17 @@ impl NodeJournal {
         if owned.context != record.context || owned.uid != record.uid {
             return Err(failed("node_cleanup_fenced"));
         }
+        let fence = crate::guardian::fence::exclusive(&self.root, &owned)?;
         let mut record = owned;
         record.state = ResourceState::Cleaning;
         self.write(&record)?;
+        // A released exclusive launch fence proves no guardian may spawn.
+        // Killing its owned subtree also covers recovery after guardian death.
+        let guardian = PathBuf::from("/sys/fs/cgroup/jeryu-guardians").join(&record.resource_id);
+        if guardian.exists() {
+            let group_result = std::fs::write(guardian.join("cgroup.kill"), "1");
+            let _ = group_result; // verified empty below; VM pidfd still runs.
+        }
         let cgroup = PathBuf::from("/sys/fs/cgroup/jeryu-microvm").join(&record.resource_id);
         let vmm = crate::vmm::VmmGuard::recover(&record, &self.jail_root(&record.resource_id)?);
         kill_writers(
@@ -36,10 +44,20 @@ impl NodeJournal {
                 }
                 Ok(())
             },
-            || wait_empty(&cgroup),
+            || {
+                wait_empty(&guardian)?;
+                wait_empty(&cgroup)
+            },
         )?;
         if cgroup.exists() {
             std::fs::remove_dir(&cgroup)?;
+        }
+        if guardian.exists() {
+            let launcher = guardian.join("launcher");
+            if launcher.exists() {
+                std::fs::remove_dir(launcher)?;
+            }
+            std::fs::remove_dir(&guardian)?;
         }
         // VMM death fences every writer. Retention must commit before deletion;
         // an encryption/storage failure leaves the disk and retry record intact.
@@ -70,6 +88,7 @@ impl NodeJournal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),
         }
+        crate::guardian::fence::remove(&self.root, &record, fence.as_ref())?;
         std::fs::remove_file(
             self.root
                 .join("records")

@@ -16,7 +16,7 @@ serde_json.workspace = true
 hex.workspace = true
 uuid.workspace = true
 nix = { version = "0.31", features = ["fs", "user"] }
-rustix = { version = "1.1", features = ["process", "event", "fs"] }
+rustix = { version = "1.1", features = ["process", "event", "fs", "time", "stdio"] }
 ring = "=0.17.14"
 zeroize = "=1.9.1"
 

@@ -222,3 +222,6 @@ mod tests {
         assert_eq!(receipt.exit_code, None);
     }
 }
+
+/// Independent privileged lifetime fencing for managed VMs.
+pub mod guardian;

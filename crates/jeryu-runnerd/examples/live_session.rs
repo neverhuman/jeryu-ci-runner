@@ -34,6 +34,9 @@ const ROOT: &str = "/var/lib/jeryu-live-fixture";
 const OWNER: &str = "user/fixture-owner";
 
 fn main() -> Result<()> {
+    if jeryu_runner_microvm::guardian::run_if_requested()? {
+        return Ok(());
+    }
     let root = Path::new(ROOT);
     let manifest = RuntimeManifest::from_json(&fs::read(root.join("runtime.json"))?)?;
     let signature = fs::read(root.join("runtime.sig"))?
