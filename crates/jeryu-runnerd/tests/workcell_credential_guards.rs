@@ -129,7 +129,8 @@ fn a_capsule_carrying_a_token_value_is_not_frozen() {
     let token = "jrt-invented-value-9f3b".to_string();
     let forbidden = vec![token.clone()];
 
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    // The denylist is daemon configuration, never part of the request.
+    let mut manager = WorkcellManager::with_warm_pool(1).with_forbidden_token_values(forbidden);
     let err = manager
         .hold_failed_tree(HoldFailedTreeRequest {
             claim: rebased_claim("agent-wrath-17"),
@@ -137,7 +138,6 @@ fn a_capsule_carrying_a_token_value_is_not_frozen() {
             failed_run_id: "run-19".into(),
             failed_receipt_id: "receipt-19".into(),
             failure_log_digest: format!("sha256:dead {token}"),
-            forbidden_token_values: forbidden.clone(),
         })
         .expect_err("a capsule carrying a token value must not be frozen");
     assert_eq!(err.reason, "workcell_capture_token_denied");
@@ -155,7 +155,6 @@ fn a_capsule_carrying_a_token_value_is_not_frozen() {
                 failed_receipt_id: "receipt-20".into(),
                 failure_log_digest: format!("sha256:dead {token}"),
                 snapshot_age_ms: 10,
-                forbidden_token_values: forbidden,
             },
         )
         .expect_err("a capsule carrying a token value must not be frozen");

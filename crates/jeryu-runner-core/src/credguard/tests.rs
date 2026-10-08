@@ -24,6 +24,8 @@ const CREDENTIAL_PATHS: &[&str] = &[
     "/workcells/wc-0001/repo/.ssh/known_hosts",
     "/workcells/wc-0001/repo/keys/id_rsa",
     "/workcells/wc-0001/repo/keys/id_ed25519",
+    "/workcells/wc-0001/repo/keys/id_rsa_work",
+    "/workcells/wc-0001/repo/keys/id_ecdsa_sk",
     // cloud credential directories
     "/workcells/wc-0001/repo/.aws/credentials",
     "/workcells/wc-0001/repo/.config/gh/hosts.yml",
@@ -62,6 +64,12 @@ fn ordinary_repository_paths_stay_exportable() {
         "/workcells/wc-0001/repo/src/lib.rs",
         "/workcells/wc-0001/repo/target/junit.xml",
         "/workcells/wc-0001/repo/keys/id_ed25519.pub",
+        // Ordinary sources that merely share a prefix or a name with a
+        // credential shape outside its owning directory.
+        "/workcells/wc-0001/repo/src/id_map.rs",
+        "/workcells/wc-0001/repo/src/id_generator.rs",
+        "/workcells/wc-0001/repo/tests/fixtures/auth.json",
+        "/workcells/wc-0001/repo/docs/credentials",
     ] {
         guard_export_path(Path::new(path), &roots())
             .unwrap_or_else(|err| panic!("{path} should be exportable: {err}"));
@@ -147,4 +155,25 @@ fn a_token_value_in_captured_text_is_denied() {
         .unwrap_or_else(|err| panic!("{err}"));
     // An empty configured value must not match every line of every log.
     deny_token_values("log", "step failed", &[String::new()]).unwrap_or_else(|err| panic!("{err}"));
+}
+
+#[test]
+fn parent_traversal_out_of_a_permitted_root_is_denied() {
+    for path in [
+        "/workcells/wc-0001/repo/../../host-store/stash.tar",
+        "/workcells/wc-0001/repo/target/../../wc-0002/repo/src/lib.rs",
+        "/workcells/wc-0001/repo/target\\..\\..\\host-store\\stash.tar",
+    ] {
+        let guards: [fn(&Path, &[PathBuf]) -> RunnerResult<()>; 3] = [
+            ensure_within_export_roots,
+            guard_export_path,
+            guard_write_destination,
+        ];
+        for guard in guards {
+            let err = guard(Path::new(path), &roots())
+                .err()
+                .unwrap_or_else(|| panic!("expected a denial for {path}"));
+            assert_eq!(err.code(), "export_root_denied", "{path}");
+        }
+    }
 }

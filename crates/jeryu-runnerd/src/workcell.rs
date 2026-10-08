@@ -144,10 +144,6 @@ pub struct FreezeFailedCiRunRequest {
     pub failed_receipt_id: String,
     pub failure_log_digest: String,
     pub snapshot_age_ms: u64,
-    /// Token values, supplied by site configuration, that must never appear in
-    /// the frozen capsule. A hit fails the freeze instead of storing it.
-    #[serde(default)]
-    pub forbidden_token_values: Vec<String>,
 }
 
 /// Request to hold a failed tree for live repair.
@@ -158,10 +154,6 @@ pub struct HoldFailedTreeRequest {
     pub failed_run_id: String,
     pub failed_receipt_id: String,
     pub failure_log_digest: String,
-    /// Token values, supplied by site configuration, that must never appear in
-    /// the frozen capsule. A hit fails the hold instead of storing it.
-    #[serde(default)]
-    pub forbidden_token_values: Vec<String>,
 }
 
 /// One live workcell lease.
@@ -193,6 +185,10 @@ pub struct WorkcellLease {
 /// In-memory workcell warm-pool and claim ledger.
 #[derive(Debug, Default, Clone)]
 pub struct WorkcellManager {
+    /// Token values from the daemon's own configuration that must never appear
+    /// in a frozen capsule. They are never taken from a freeze or hold request:
+    /// the party whose capsule is screened must not be able to empty the list.
+    forbidden_token_values: Vec<String>,
     next_id: u64,
     ready_queue: VecDeque<String>,
     cells: BTreeMap<String, WorkcellLease>,

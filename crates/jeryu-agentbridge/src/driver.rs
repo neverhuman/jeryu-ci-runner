@@ -229,8 +229,9 @@ pub struct AgentDriver {
     /// jail tests) opt out via [`AgentDriver::with_require_cgroup`].
     require_cgroup: bool,
     /// Token values, supplied by site configuration, that must never appear in
-    /// the captured log. A hit fails the run rather than handing the capture on
-    /// to a log sink or an evidence capsule.
+    /// the captured log. A streamed line carrying one is withheld from the
+    /// event sink before it is emitted, and the run then fails rather than
+    /// handing the capture on.
     forbidden_token_values: Vec<String>,
 }
 
@@ -248,6 +249,7 @@ fn cached_capabilities() -> &'static SandboxCapabilities {
 }
 
 mod implementation;
+mod token_guard;
 
 struct SuperviseOutcome {
     exit_code: Option<i32>,

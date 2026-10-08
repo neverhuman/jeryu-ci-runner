@@ -86,7 +86,8 @@ pub fn plan_artifacts(pipeline: &Pipeline) -> Result<Vec<ArtifactRecord>, Artifa
 }
 
 /// `permitted_roots` is the configured allowlist of workspace-relative roots an
-/// upload may collect from; empty means the workspace root itself. Credential
+/// upload may collect from; empty adds no restriction beyond the relative-path
+/// and traversal rules above (see `ArtifactPolicy::permitted_export_roots`). Credential
 /// material is refused on top of the allowlist, because a per-run agent home
 /// lives under the workspace and would otherwise be inside a permitted root.
 fn validate_paths(

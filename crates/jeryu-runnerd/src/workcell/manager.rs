@@ -15,6 +15,14 @@ impl WorkcellManager {
         manager
     }
 
+    /// Builder: the token values, from the daemon's configuration, that a
+    /// frozen or held capsule must never carry.
+    #[must_use]
+    pub fn with_forbidden_token_values(mut self, values: Vec<String>) -> Self {
+        self.forbidden_token_values = values;
+        self
+    }
+
     pub fn ready_count(&self) -> usize {
         self.ready_queue.len()
     }
@@ -153,12 +161,11 @@ impl WorkcellManager {
             failed_run_id,
             failed_receipt_id,
             failure_log_digest,
-            forbidden_token_values,
         } = request;
         Self::guard_capsule(
             &claim.git_status_summary,
             &failure_log_digest,
-            &forbidden_token_values,
+            &self.forbidden_token_values,
         )?;
         let mut lease = self.claim(claim)?;
         let workcell_id = lease.workcell_id.clone();
@@ -286,7 +293,7 @@ impl WorkcellManager {
         Self::guard_capsule(
             &cell.git_status_summary,
             &request.failure_log_digest,
-            &request.forbidden_token_values,
+            &self.forbidden_token_values,
         )?;
         Ok(FrozenCiSnapshot::from_workcell(
             request.ci_run_id,

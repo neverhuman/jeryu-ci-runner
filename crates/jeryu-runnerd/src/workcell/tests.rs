@@ -180,7 +180,6 @@ fn frozen_ci_snapshot_is_immutable_and_repair_uses_it() {
                 failed_receipt_id: "receipt-17".into(),
                 failure_log_digest: "sha256:deadbeef".into(),
                 snapshot_age_ms: 1_200,
-                forbidden_token_values: Vec::new(),
             },
         )
         .expect("freeze succeeds");
@@ -231,7 +230,6 @@ fn hold_failed_tree_preserves_distinct_ci_run_identity() {
             failed_run_id: "run-attempt-17".into(),
             failed_receipt_id: "receipt-17".into(),
             failure_log_digest: "sha256:deadbeef".into(),
-            forbidden_token_values: Vec::new(),
         })
         .expect("hold failed tree succeeds");
 
@@ -343,7 +341,6 @@ fn branch_budget_exhaustion_is_denied_through_export() {
             failed_run_id: "run-1".into(),
             failed_receipt_id: "receipt-1".into(),
             failure_log_digest: "sha256:dead".into(),
-            forbidden_token_values: Vec::new(),
         })
         .expect("hold succeeds");
     let id = held.workcell_id.clone();

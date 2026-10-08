@@ -28,8 +28,12 @@ pub struct ArtifactPolicy {
     pub require_metadata: bool,
     pub default_retention_days: u32,
     /// Allowlist of workspace-relative roots an artifact may be collected
-    /// from, supplied by site configuration. Empty means the workspace root
-    /// itself is the only permitted export root.
+    /// from, supplied by site configuration. Empty adds no root restriction on
+    /// top of the planner's own rules (relative unless `allow_absolute_paths`,
+    /// no `..`), so the whole workspace is collectable; credential material is
+    /// refused either way. This differs on purpose from
+    /// `jeryu_runner_core::credguard::ensure_within_export_roots`, which judges
+    /// absolute host paths and treats an empty list as "nothing is exportable".
     pub permitted_export_roots: Vec<String>,
 }
 

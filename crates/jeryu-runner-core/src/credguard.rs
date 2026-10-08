@@ -44,16 +44,36 @@ pub const DENIED_FILE_NAMES: &[&str] = &[
     ".netrc",
     "_netrc",
     "netrc",
-    "credentials",
     "credentials.json",
     ".credentials.json",
-    "auth.json",
 ];
 
 /// Credential files that are only refused under their owning directory, because
 /// the bare file name is too common to deny on its own.
-pub const DENIED_PARENT_FILE_PAIRS: &[(&str, &str)] =
-    &[("gh", "hosts.yml"), (".docker", "config.json")];
+/// A bare `credentials` or `auth.json` is ordinary repository content (a test
+/// fixture, a docs page); under these owners it is a credential store.
+pub const DENIED_PARENT_FILE_PAIRS: &[(&str, &str)] = &[
+    ("gh", "hosts.yml"),
+    (".docker", "config.json"),
+    (".aws", "credentials"),
+    ("gcloud", "credentials.db"),
+    (".codex", "auth.json"),
+    (".jekko", "auth.json"),
+];
+
+/// SSH private key stems. A name is refused when it is a stem, or a stem
+/// followed by `_` or `.` (`id_rsa_work`, `id_ed25519.old`), unless it is the
+/// `.pub` public half. Matching on the stems rather than on an `id_` prefix
+/// keeps ordinary sources such as `id_map.rs` exportable.
+pub const PRIVATE_KEY_STEMS: &[&str] = &[
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ecdsa_sk",
+    "id_ed25519",
+    "id_ed25519_sk",
+    "id_xmss",
+];
 
 /// Lowercase substrings that mark a refresh-token file wherever it appears.
 pub const DENIED_NAME_FRAGMENTS: &[&str] = &["refresh_token", "refresh-token"];
@@ -71,7 +91,11 @@ fn lowercase_segments(path: &Path) -> Vec<String> {
 /// True for an SSH private key file name (`id_rsa`, `id_ed25519`, ...). The
 /// matching `.pub` public half is not credential material.
 fn is_private_key_name(name: &str) -> bool {
-    name.starts_with("id_") && !name.ends_with(".pub")
+    !name.ends_with(".pub")
+        && PRIVATE_KEY_STEMS.iter().any(|stem| {
+            name.strip_prefix(stem)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(['_', '.']))
+        })
 }
 
 /// Refuse a path that names host credential material anywhere along it.
@@ -105,9 +129,30 @@ pub fn deny_credential_material(path: &Path) -> RunnerResult<()> {
     Ok(())
 }
 
+/// True when any segment of `path` is `..`, with `\` treated as a separator too.
+fn has_parent_traversal(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+        || path
+            .to_string_lossy()
+            .split(['/', '\\'])
+            .any(|segment| segment == "..")
+}
+
 /// Require that `path` sits inside one of the permitted export roots. The roots
-/// come from site configuration; an empty allowlist exports nothing.
+/// come from site configuration; an empty allowlist exports nothing. A path
+/// carrying a `..` segment is refused outright: `Path::starts_with` compares
+/// components lexically, so `<root>/../elsewhere` would otherwise pass.
 pub fn ensure_within_export_roots(path: &Path, permitted_roots: &[PathBuf]) -> RunnerResult<()> {
+    if has_parent_traversal(path) {
+        return Err(RunnerError::new(
+            "export_root_denied",
+            format!(
+                "path '{}' traverses a parent directory and cannot be checked against the permitted export roots",
+                path.display()
+            ),
+        ));
+    }
     if permitted_roots.iter().any(|root| path.starts_with(root)) {
         return Ok(());
     }

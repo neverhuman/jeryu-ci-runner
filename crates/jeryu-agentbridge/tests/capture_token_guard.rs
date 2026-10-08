@@ -1,8 +1,10 @@
 //! A configured token value reaching a captured agent log fails the capture.
 //!
-//! The driver applies `guard_capture` to every run's captured stdout/stderr
-//! before the result leaves it, so the guard is exercised here directly rather
-//! than behind a kernel sandbox that this host may not provide.
+//! The driver withholds a token-bearing line from its event sink while the run
+//! streams (unit-tested on the real drain path in `driver/token_guard.rs`) and
+//! applies `guard_capture` to the finished stdout/stderr as a backstop. That
+//! backstop is exercised here directly rather than behind a kernel sandbox that
+//! this host may not provide.
 
 use jeryu_agentbridge::driver::{AgentDriver, DriverError};
 

@@ -49,9 +49,10 @@ impl AgentDriver {
         self
     }
 
-    /// Refuse a captured log that carries a configured token value. Called on
-    /// every run before the capture leaves the driver; public so a caller that
-    /// captures output itself can apply the same guard.
+    /// Refuse a captured log that carries a configured token value. The live
+    /// event stream is guarded line by line before emission; this is the
+    /// backstop on the finished capture, public so a caller that captures
+    /// output itself can apply the same guard.
     pub fn guard_capture(&self, stdout: &[u8], stderr: &[u8]) -> Result<(), DriverError> {
         for (label, bytes) in [("log stdout", stdout), ("log stderr", stderr)] {
             jeryu_runner_core::credguard::deny_token_values_in_bytes(
@@ -165,7 +166,17 @@ impl AgentDriver {
 
         sink.emit(AgentEvent::Started { pid: child.id() });
 
-        let outcome = self.supervise(child, sink, started)?;
+        // Lines reach the sink while the child runs, so the token guard has to
+        // sit in front of the sink, not only on the finished capture.
+        let guarded = super::token_guard::TokenGuardSink::new(sink, &self.forbidden_token_values);
+        let outcome = self.supervise(child, &guarded, started)?;
+        if guarded.withheld_any() {
+            return Err(DriverError::CapturedTokenValue(
+                "a configured token value appeared in the agent output; the line was withheld \
+                 from the event stream and the run is refused"
+                    .to_string(),
+            ));
+        }
         self.guard_capture(&outcome.stdout, &outcome.stderr)?;
 
         sink.emit(AgentEvent::Finished {
