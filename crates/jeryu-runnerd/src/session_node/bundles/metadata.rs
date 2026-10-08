@@ -37,6 +37,7 @@ pub(super) fn decode(
         message_type: "session-rpc-response".into(),
         request_id: Some(upload.request_id.clone()),
         ok: false,
+        error_code: None,
         result: None,
         error: Some(SessionRpcError {
             code: "bundle_upload_invalid".into(),

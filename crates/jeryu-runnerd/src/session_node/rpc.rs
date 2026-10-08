@@ -16,7 +16,9 @@ pub(super) fn apply(
     request
         .validate()
         .map_err(|_| failed("session_rpc_invalid"))?;
+    deny_host_write(&request)?;
     let expected_context = match &request.operation {
+        RpcOperation::HostWrite { .. } => return Err(failed("host_write_denied")),
         RpcOperation::Start { lease } => lease.context.clone(),
         RpcOperation::Control { actor, request } => {
             service
@@ -70,6 +72,7 @@ pub(super) fn apply(
         }
     };
     let value = match request.operation.clone() {
+        RpcOperation::HostWrite { .. } => return Err(failed("host_write_denied")),
         RpcOperation::Start { lease } => {
             let owner = lease.context.owner_id.clone();
             SessionRpcResult::Snapshot(
@@ -164,6 +167,7 @@ pub(super) fn apply(
         message_type: "session-rpc-response".into(),
         request_id: Some(request.request_id.clone()),
         ok: true,
+        error_code: None,
         result: Some(value),
         error: None,
     };
@@ -175,3 +179,13 @@ pub(super) fn apply(
 fn failed(code: &'static str) -> RunnerError {
     RunnerError::new(code, "session RPC rejected")
 }
+
+/// Run before lookup/dispatch. Never decode, stat, canonicalize or open the path.
+fn deny_host_write(request: &RpcRequest) -> RunnerResult<()> {
+    if matches!(request.operation, RpcOperation::HostWrite { .. }) {
+        return Err(failed("host_write_denied"));
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod tests;

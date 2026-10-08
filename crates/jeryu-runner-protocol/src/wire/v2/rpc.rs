@@ -26,6 +26,16 @@ pub struct SessionRpcRequest {
 #[derive(Clone, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(tag = "action", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum SessionRpcOperation {
+    /// Permanently denied; opaque strings never become host filesystem inputs.
+    HostWrite {
+        actor: String,
+        session_id: String,
+        generation: u64,
+        #[schemars(length(max = 4096))]
+        path: String,
+        #[schemars(length(max = 32768))]
+        content_b64: String,
+    },
     Start {
         lease: Box<SessionLease>,
     },
@@ -87,7 +97,13 @@ impl ValidateWire for SessionRpcRequest {
                 validate_id("actor", actor)?;
                 request.validate_wire()
             }
-            Snapshot {
+            HostWrite {
+                actor,
+                session_id,
+                generation,
+                ..
+            }
+            | Snapshot {
                 actor,
                 session_id,
                 generation,
@@ -147,6 +163,17 @@ impl ValidateWire for SessionRpcRequest {
                             return Err(WireError::new(
                                 WireErrorCode::InvalidCollection,
                                 "replay_limit",
+                            ));
+                        }
+                        Ok(())
+                    }
+                    HostWrite {
+                        path, content_b64, ..
+                    } => {
+                        if path.len() > 4096 || content_b64.len() > 32768 {
+                            return Err(WireError::new(
+                                WireErrorCode::InvalidField,
+                                "host_write_bounds",
                             ));
                         }
                         Ok(())

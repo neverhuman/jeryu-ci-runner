@@ -17,10 +17,18 @@ pub struct SessionRpcResponse {
     pub message_type: String,
     pub request_id: Option<String>,
     pub ok: bool,
+    /// Compatibility alias emitted only for the new permanent host-write denial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<HostWriteErrorCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<SessionRpcResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<SessionRpcError>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HostWriteErrorCode {
+    HostWriteDenied,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(untagged)]
@@ -52,6 +60,13 @@ impl ValidateWire for SessionRpcResponse {
         )?;
         if let Some(id) = &self.request_id {
             validate_id("request_id", id)?;
+        }
+        let host_denied = self
+            .error
+            .as_ref()
+            .is_some_and(|error| error.code == "host_write_denied");
+        if self.error_code.is_some() != host_denied || (self.ok && host_denied) {
+            return Err(invalid());
         }
         match (&self.result, &self.error, self.ok) {
             (Some(result), None, true) if self.request_id.is_some() => match result {
@@ -158,7 +173,12 @@ impl SessionRpcResponse {
                 }
                 (&context.session_id, context.generation)
             }
-            Op::Snapshot {
+            Op::HostWrite {
+                session_id,
+                generation,
+                ..
+            }
+            | Op::Snapshot {
                 session_id,
                 generation,
                 ..

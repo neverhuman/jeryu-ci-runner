@@ -23,7 +23,9 @@ pub use control::{ControlAck, ControlCommand, ControlRequest, ControlState, Term
 pub use image::{RuntimeImageClass, RuntimeProfile};
 pub use interfaces::*;
 pub use rpc::{SessionGrant, SessionRpcOperation, SessionRpcRequest};
-pub use rpc_response::{GrantApplied, SessionRpcError, SessionRpcResponse, SessionRpcResult};
+pub use rpc_response::{
+    GrantApplied, HostWriteErrorCode, SessionRpcError, SessionRpcResponse, SessionRpcResult,
+};
 pub use runtime::{
     ArtifactIdentity, GitLimits, RuntimeArchitecture, RuntimeManifest, SessionResources,
 };

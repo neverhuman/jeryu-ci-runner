@@ -231,7 +231,7 @@ fn cargo_identity_and_effective_transport_are_exact() {
         "a tiny http.postBuffer aborts Git 2.43 under protocol v2: {settings:?}"
     );
     assert!(
-        !settings.iter().any(|line| *line == "[protocol]"),
+        !settings.contains(&"[protocol]"),
         "the overlay must not pin a Git protocol version: {settings:?}"
     );
     assert_eq!(effective_url(&overlay_path, SOURCE), HOSTED);

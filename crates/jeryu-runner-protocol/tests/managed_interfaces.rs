@@ -8,6 +8,7 @@ fn responses_are_closed_and_cannot_claim_both_success_and_error() {
         message_type: "session-rpc-response".into(),
         request_id: Some("request".into()),
         ok: true,
+        error_code: None,
         result: Some(SessionRpcResult::Grant(GrantApplied { applied: true })),
         error: None,
     };
@@ -153,6 +154,7 @@ fn replay_rejects_mixed_authority_reordered_bytes_and_extra_frames() {
             message_type: "session-rpc-response".into(),
             request_id: Some("replay".into()),
             ok: true,
+            error_code: None,
             result: Some(SessionRpcResult::Replay(frames)),
             error: None,
         }

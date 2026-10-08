@@ -32,6 +32,7 @@ fn response(result: SessionRpcResult) -> SessionRpcResponse {
         message_type: "session-rpc-response".into(),
         request_id: Some("req".into()),
         ok: true,
+        error_code: None,
         result: Some(result),
         error: None,
     }
@@ -48,6 +49,7 @@ fn named_calls_cannot_complete_from_uncorrelated_error_envelopes() {
         message_type: "session-rpc-response".into(),
         request_id: None,
         ok: false,
+        error_code: None,
         result: None,
         error: Some(SessionRpcError {
             code: "session_rpc_invalid".into(),

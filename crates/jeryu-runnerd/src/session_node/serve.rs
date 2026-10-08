@@ -9,7 +9,9 @@ use hyper::{
 };
 use hyper_util::rt::TokioIo;
 use jeryu_runner_core::RunnerResult;
-use jeryu_runner_protocol::wire::v2::{PROTOCOL_VERSION, SessionRpcError, SessionRpcResponse};
+use jeryu_runner_protocol::wire::v2::{
+    HostWriteErrorCode, PROTOCOL_VERSION, SessionRpcError, SessionRpcResponse,
+};
 use sha2::{Digest, Sha256};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Semaphore, time::timeout};
@@ -165,6 +167,8 @@ pub(super) fn error_for(
             message_type: "session-rpc-response".into(),
             request_id,
             ok: false,
+            error_code: (code == "host_write_denied")
+                .then_some(HostWriteErrorCode::HostWriteDenied),
             result: None,
             error: Some(SessionRpcError { code: code.into() }),
         },

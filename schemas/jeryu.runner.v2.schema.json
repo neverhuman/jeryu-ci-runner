@@ -682,6 +682,12 @@
         "headers"
       ]
     },
+    "HostWriteErrorCode": {
+      "type": "string",
+      "enum": [
+        "host_write_denied"
+      ]
+    },
     "ManagedPurpose": {
       "description": "V2 managed leases cannot encode CI or request another runner backend.",
       "type": "string",
@@ -1165,6 +1171,44 @@
     "SessionRpcOperation": {
       "oneOf": [
         {
+          "description": "Permanently denied; opaque strings never become host filesystem inputs.",
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "host-write"
+            },
+            "actor": {
+              "type": "string"
+            },
+            "content_b64": {
+              "type": "string",
+              "maxLength": 32768
+            },
+            "generation": {
+              "type": "integer",
+              "format": "uint64",
+              "minimum": 0
+            },
+            "path": {
+              "type": "string",
+              "maxLength": 4096
+            },
+            "session_id": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "actor",
+            "session_id",
+            "generation",
+            "path",
+            "content_b64"
+          ]
+        },
+        {
           "type": "object",
           "properties": {
             "action": {
@@ -1457,6 +1501,17 @@
           "anyOf": [
             {
               "$ref": "#/$defs/SessionRpcError"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "error_code": {
+          "description": "Compatibility alias emitted only for the new permanent host-write denial.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HostWriteErrorCode"
             },
             {
               "type": "null"

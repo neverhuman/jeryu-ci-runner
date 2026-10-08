@@ -236,6 +236,7 @@ fn rpc_replay_binds_the_expected_request_and_run_even_if_internal_frames_agree()
         message_type: "session-rpc-response".into(),
         request_id: Some(request.request_id.clone()),
         ok: true,
+        error_code: None,
         result: Some(SessionRpcResult::Replay(vec![frame.clone()])),
         error: None,
     };
