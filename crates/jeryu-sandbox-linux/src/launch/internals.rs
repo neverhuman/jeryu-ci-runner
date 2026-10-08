@@ -254,7 +254,12 @@ fn apply_rlimit_fallback(limits: &RlimitFallback) {
 }
 
 /// Set a single soft+hard rlimit, ignoring failure (best-effort).
-fn set_one_rlimit(resource: libc::__rlimit_resource_t, value: u64) {
+#[cfg(target_env = "gnu")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_env = "gnu"))]
+type RlimitResource = libc::c_int;
+
+fn set_one_rlimit(resource: RlimitResource, value: u64) {
     // Clamp to rlim_t to avoid truncation surprises where rlim_t is narrower
     // than u64; `unwrap_or(MAX)` saturates instead of overflowing.
     let v = libc::rlim_t::try_from(value).unwrap_or(libc::rlim_t::MAX);

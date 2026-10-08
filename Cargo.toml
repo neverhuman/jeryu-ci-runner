@@ -11,6 +11,7 @@ members = [
   "crates/jeryu-runner-protocol",
   "crates/jeryu-runner-registry",
   "crates/jeryu-runnerd",
+  "crates/jeryu-guestd",
   "crates/jeryu-sandbox-linux",
   "crates/jeryu-agentbridge",
   "crates/jeryu-agent-auth",

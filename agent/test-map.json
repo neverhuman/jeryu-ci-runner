@@ -314,6 +314,11 @@
       "command": "just fast && just check && just security && just score",
       "lane": "ci",
       "purpose": "verify host CI wrappers, security gates, and evidence stay reproducible"
+    },
+    "crates/jeryu-guestd/": {
+      "command": "just check && cargo build --locked -p jeryu-guestd --target x86_64-unknown-linux-musl",
+      "lane": "check",
+      "purpose": "verify the unprivileged guest supervisor and statically linked VM entrypoint; live KVM execution requires separate qualification"
     }
   },
   "workspace": "jeryu-ci-runner"

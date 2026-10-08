@@ -28,7 +28,10 @@ const AF_INET6: u64 = libc::AF_INET6 as u64;
 
 /// `TIOCSTI` ioctl request — terminal stdin injection. Denied under the `pty`
 /// group so a jailed agent cannot forge input into its controlling terminal.
+#[cfg(target_env = "gnu")]
 const TIOCSTI: u64 = libc::TIOCSTI;
+#[cfg(not(target_env = "gnu"))]
+const TIOCSTI: u64 = libc::TIOCSTI as u64;
 
 type RuleMap = BTreeMap<i64, Vec<SeccompRule>>;
 

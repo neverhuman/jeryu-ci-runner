@@ -14,6 +14,7 @@ cargo_members = [
   "crates/jeryu-runner-core",
   "crates/jeryu-runner-native",
   "crates/jeryu-runner-microvm",
+  "crates/jeryu-guestd",
   "crates/jeryu-runner-oci",
   "crates/jeryu-runner-protocol",
   "crates/jeryu-runner-registry",

@@ -23,7 +23,9 @@ pub mod capability;
 mod cgroup_fs;
 pub mod escape;
 mod forked_child;
+pub mod guest;
 pub mod launch;
+pub mod microvm;
 pub mod seccomp_rules;
 pub mod watchdog;
 

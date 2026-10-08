@@ -6,7 +6,17 @@ use jeryu_runner_core::policy::PolicyDecision;
 use jeryu_runner_core::receipt::{Receipt, ReceiptStatus, now_ms};
 use jeryu_runner_core::sandbox::SandboxPlan;
 use jeryu_runner_core::trust::RunnerClass;
-use std::process::{Command, Stdio};
+pub mod api;
+pub mod artifacts;
+pub mod checkpoint;
+mod diagnostics;
+pub mod journal;
+pub mod lease_authority;
+pub mod supervisor;
+pub mod transport;
+mod vmm;
+
+pub use supervisor::{MicroVmSession, NodeConfig};
 
 /// MicroVM launch specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,13 +65,13 @@ impl MicroVmSpec {
     /// Explain this spec without exposing secrets.
     pub fn explain(&self) -> String {
         format!(
-            "microvm executable={} kernel={} rootfs={} workspace={} network={} argv={}",
+            "microvm executable={} kernel={} rootfs={} workspace={} network={} guest-argv-count={}",
             self.executable,
             self.kernel_image,
             self.rootfs_image,
             self.workspace,
             self.network,
-            self.guest_command.join(" ")
+            self.guest_command.len()
         )
     }
 }
@@ -101,11 +111,25 @@ impl MicroVmRunner {
         ))
     }
 
+    /// A managed launch cannot degrade to a planned receipt or run an arbitrary
+    /// host launcher. Use `MicroVmSession::start` with a fenced v2 lease.
+    pub fn execute_required(
+        &self,
+        _job: &JobRequest,
+        _decision: &PolicyDecision,
+        _plan: &SandboxPlan,
+    ) -> RunnerResult<Receipt> {
+        Err(RunnerError::new(
+            "microvm_session_lease_required",
+            "managed execution requires a v2 session lease",
+        ))
+    }
+
     /// Plan or execute a microVM job.
     ///
     /// By default this returns a plan receipt. Set `JERYU_RUN_MICROVM=1` to
-    /// invoke the configured launcher. The launcher must consume the generated
-    /// spec through its own config adapter in production.
+    /// request execution. Legacy host launcher overrides cannot execute a job;
+    /// real execution uses the validated session supervisor.
     pub fn execute(
         &self,
         job: &JobRequest,
@@ -127,37 +151,10 @@ impl MicroVmRunner {
             ));
         }
 
-        let output = Command::new(&spec.executable)
-            .arg("--no-api")
-            .stdin(Stdio::null())
-            .output();
-        let finished = now_ms();
-        match output {
-            Ok(output) => Ok(Receipt::new(
-                job,
-                decision,
-                plan,
-                if output.status.success() {
-                    ReceiptStatus::Passed
-                } else {
-                    ReceiptStatus::Failed
-                },
-                output.status.code(),
-                started,
-                finished,
-                spec.explain(),
-            )),
-            Err(err) => Ok(Receipt::new(
-                job,
-                decision,
-                plan,
-                ReceiptStatus::Failed,
-                None,
-                started,
-                finished,
-                format!("microvm_start_failed: {err}; {}", spec.explain()),
-            )),
-        }
+        Err(RunnerError::new(
+            "microvm_session_lease_required",
+            "execution requires a v2 session lease, verified runtime, and guest transport",
+        ))
     }
 }
 

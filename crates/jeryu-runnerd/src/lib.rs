@@ -3,6 +3,8 @@
 pub mod dispatch;
 pub mod fleet;
 pub mod job_file;
+pub mod session_node;
+pub mod sessions;
 pub mod startup_probe;
 pub mod warm_pool;
 pub mod workcell;

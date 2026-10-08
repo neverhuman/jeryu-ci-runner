@@ -62,7 +62,8 @@
     "tests/sandbox_image_pin.sh": "jeryu-ci-runner",
     "tools/": "ops",
     "agent/tool-adoption.toml": "agent",
-    "db/": "jeryu-ci-runner"
+    "db/": "jeryu-ci-runner",
+    "crates/jeryu-guestd/": "jeryu-ci-runner"
   },
   "workspace": "jeryu-ci-runner"
 }

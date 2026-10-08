@@ -13,9 +13,22 @@ jeryu-runner-microvm = { path = "../jeryu-runner-microvm" }
 jeryu-runner-oci = { path = "../jeryu-runner-oci" }
 jeryu-runner-protocol = { path = "../jeryu-runner-protocol" }
 jeryu-runner-registry = { path = "../jeryu-runner-registry" }
+jeryu-sandbox-linux = { path = "../jeryu-sandbox-linux" }
+nix = { version = "0.31", features = ["fs"] }
 serde = { workspace = true }
+serde_json.workspace = true
+sha2.workspace = true
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
+ed25519-dalek = "=2.2.0"
 jeryu-test-support = { path = "../jeryu-test-support" }
 
 [lints]

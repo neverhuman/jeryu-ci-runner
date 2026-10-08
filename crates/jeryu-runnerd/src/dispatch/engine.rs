@@ -8,6 +8,7 @@ use jeryu_runner_core::policy::select_runner;
 use jeryu_runner_core::receipt::Receipt;
 use jeryu_runner_core::sandbox::SandboxPlan;
 use jeryu_runner_core::trust::{RunnerClass, TrustTier};
+use jeryu_runner_core::{ExecutionPurpose, select_runner_for};
 use jeryu_runner_microvm::MicroVmRunner;
 use jeryu_runner_native::NativeRunner;
 use jeryu_runner_oci::OciRunner;
@@ -56,6 +57,14 @@ pub struct DispatchEngine {
 }
 
 impl DispatchEngine {
+    /// Versioned managed entrypoint: every run uses the verified VM service.
+    pub fn dispatch_managed_session(
+        &self,
+        service: &crate::sessions::SessionService,
+        lease: jeryu_runner_protocol::wire::v2::SessionLease,
+    ) -> RunnerResult<std::sync::Arc<crate::sessions::SessionHandle>> {
+        service.start(lease)
+    }
     /// Create a dispatch engine.
     pub fn new() -> Self {
         Self {
@@ -70,6 +79,21 @@ impl DispatchEngine {
         match self.try_dispatch(job, mode) {
             Ok(receipt) => receipt,
             Err(err) => Receipt::denied(job, err.to_string()),
+        }
+    }
+
+    /// Trusted entrypoint for every managed agent workload. Purpose is assigned
+    /// here, rather than accepted from a client, environment, or trust tier.
+    pub fn dispatch_managed(
+        &self,
+        job: &CoreJobRequest,
+        mode: DispatchMode,
+    ) -> RunnerResult<Receipt> {
+        let decision = select_runner_for(job, ExecutionPurpose::ManagedAgent)?;
+        let plan = SandboxPlan::from_decision(&job.workspace, &decision);
+        match mode {
+            DispatchMode::Explain => self.microvm.plan_only(job, &decision, &plan),
+            DispatchMode::Run => self.microvm.execute_required(job, &decision, &plan),
         }
     }
 
