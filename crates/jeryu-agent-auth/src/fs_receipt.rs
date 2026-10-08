@@ -138,7 +138,9 @@ fn pending_nonce() -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| u64::try_from(since.as_nanos()).unwrap_or(u64::MAX));
+        .map_or(0, |since| {
+            u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+        });
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let mut hasher = Sha256::new();
     hasher.update(seed.to_le_bytes());
