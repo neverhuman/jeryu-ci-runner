@@ -195,6 +195,14 @@
         "earliest_cursor"
       ]
     },
+    "CheckpointFormat": {
+      "description": "Missing format is the historical dense image; its JSON omits the default\nso previously retained manifest/reference bytes remain unchanged.",
+      "type": "string",
+      "enum": [
+        "legacy_dense_v1",
+        "sparse_v2"
+      ]
+    },
     "CheckpointManifest": {
       "type": "object",
       "properties": {
@@ -219,6 +227,9 @@
         },
         "filesystem_flushed": {
           "type": "boolean"
+        },
+        "format": {
+          "$ref": "#/$defs/CheckpointFormat"
         },
         "plaintext_bytes": {
           "type": "integer",

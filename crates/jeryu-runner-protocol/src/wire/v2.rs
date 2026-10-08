@@ -17,7 +17,7 @@ mod signature;
 mod stream_validation;
 mod workspace;
 
-pub use checkpoint::{CheckpointManifest, CheckpointReference};
+pub use checkpoint::{CheckpointFormat, CheckpointManifest, CheckpointReference};
 pub use connection::{ConnectionBinding, ConnectionMode, Provider};
 pub use control::{ControlAck, ControlCommand, ControlRequest, ControlState, TerminalFrame};
 pub use image::{RuntimeImageClass, RuntimeProfile};

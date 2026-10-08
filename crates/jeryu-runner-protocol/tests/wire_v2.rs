@@ -415,6 +415,7 @@ fn checkpoint_references_bind_jobs_and_cannot_supply_host_paths_or_keys() {
     value["key"] = json!("secret");
     assert!(CheckpointReference::from_json(&serde_json::to_vec(&value).unwrap()).is_err());
     let mut manifest = CheckpointManifest {
+        format: CheckpointFormat::LegacyDenseV1,
         checkpoint_id: reference.checkpoint_id,
         context: original.context,
         workspace: None,

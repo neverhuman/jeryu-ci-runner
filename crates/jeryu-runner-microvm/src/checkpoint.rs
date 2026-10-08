@@ -1,18 +1,24 @@
 //! Retain opaque workspace disks, never post-authentication memory or tmpfs.
 //! This transient root is excluded from ordinary backups together with its keys.
 mod crypto;
+mod restore;
+mod sparse;
 /// Ciphertext tags/header plus bounded manifest/key/filesystem bookkeeping.
 pub(crate) fn storage_charge(plaintext: u64) -> RunnerResult<u64> {
     plaintext
-        .checked_add(plaintext.div_ceil(1024 * 1024) * 16)
-        .and_then(|n| n.checked_add(24 + 1024 * 1024))
+        .checked_add(
+            plaintext
+                .div_ceil(1024 * 1024)
+                .checked_mul(32)
+                .ok_or_else(|| failed("checkpoint_capacity_invalid"))?,
+        )
+        .and_then(|n| n.checked_add(72 + 1024 * 1024))
         .ok_or_else(|| failed("checkpoint_capacity_invalid"))
 }
 use crate::artifacts::trusted_directory;
 use jeryu_runner_core::{RunnerError, RunnerResult, receipt::now_ms};
 use jeryu_runner_protocol::wire::v2::{
-    CheckpointManifest, CheckpointReference, SessionContext, SessionLease, WorkspaceReady,
-    WorkspaceSource,
+    CheckpointFormat, CheckpointManifest, CheckpointReference, SessionContext, WorkspaceReady,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -21,7 +27,6 @@ use std::{
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
-use zeroize::Zeroizing;
 
 pub struct CheckpointStore {
     root: PathBuf,
@@ -93,10 +98,11 @@ impl CheckpointStore {
         let binding = serde_json::to_vec(&(id, context, bytes, filesystem_flushed, workspace))
             .map_err(|_| failed("checkpoint_context_invalid"))?;
         let (plaintext_digest, ciphertext_digest) =
-            crypto::encrypt(&mut image, &mut encrypted, &key, bytes, &binding)?;
+            sparse::encrypt(&mut image, &mut encrypted, &key, bytes, &binding)?;
         encrypted.sync_all()?;
         let now = u64::try_from(now_ms()).map_err(|_| failed("checkpoint_clock_invalid"))?;
         let manifest = CheckpointManifest {
+            format: CheckpointFormat::SparseV2,
             checkpoint_id: id.into(),
             context: context.clone(),
             workspace: workspace.cloned(),
@@ -149,70 +155,6 @@ impl CheckpointStore {
             return Err(failed("checkpoint_context_mismatch"));
         }
         Ok(Some(reference))
-    }
-    pub(crate) fn restore(
-        &self,
-        reference: &CheckpointReference,
-        lease: &SessionLease,
-        target: &mut File,
-    ) -> RunnerResult<()> {
-        let manifest = self.manifest(reference)?;
-        let previous = &manifest.context;
-        let next = &lease.context;
-        if previous.owner_id != next.owner_id
-            || previous.repository != next.repository
-            || previous.session_id != next.session_id
-            || next.generation
-                != previous
-                    .generation
-                    .checked_add(1)
-                    .ok_or_else(|| failed("checkpoint_generation_invalid"))?
-            || previous.runtime_digest != next.runtime_digest
-            || previous.environment_digest != next.environment_digest
-            || manifest.plaintext_bytes
-                != u64::from(lease.resources.workspace_gib) * 1024 * 1024 * 1024
-            || now_ms() >= u128::from(manifest.expires_at_unix_millis)
-        {
-            return Err(failed("checkpoint_resume_fenced"));
-        }
-        let directory = self.directory(&reference.checkpoint_id)?;
-        if let Some(workspace) = &manifest.workspace
-            && (workspace.head_revision != next.source_revision
-                || !matches!(&lease.workspace, WorkspaceSource::GitBundle { base_revision, .. } if base_revision == &workspace.main_revision))
-        {
-            return Err(failed("checkpoint_resume_main_fenced"));
-        }
-        let mut key = Zeroizing::new([0; 32]);
-        let mut key_file = self.file(&directory.join("key"), 32)?;
-        key_file.read_exact(key.as_mut())?;
-        if key_file.metadata()?.len() != 32 {
-            return Err(failed("checkpoint_key_invalid"));
-        }
-        let maximum =
-            manifest.plaintext_bytes + manifest.plaintext_bytes.div_ceil(1024 * 1024) * 16 + 24;
-        let mut image = self.file(&directory.join("image"), maximum)?;
-        if image.metadata()?.len() != maximum {
-            return Err(failed("checkpoint_image_invalid"));
-        }
-        let binding = serde_json::to_vec(&(
-            &manifest.checkpoint_id,
-            previous,
-            manifest.plaintext_bytes,
-            manifest.filesystem_flushed,
-            &manifest.workspace,
-        ))
-        .map_err(|_| failed("checkpoint_context_invalid"))?;
-        crypto::decrypt(
-            &mut image,
-            target,
-            &key,
-            manifest.plaintext_bytes,
-            &binding,
-            &manifest.plaintext_digest,
-            &manifest.ciphertext_digest,
-        )?;
-        target.sync_all()?;
-        Ok(())
     }
     /// Trusted cleanup uses an exact recorded reference and context. User or
     /// guest-provided paths never authorize deletion. Destroy the key first.

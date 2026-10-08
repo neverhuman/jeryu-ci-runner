@@ -26,9 +26,28 @@ impl ValidateWire for CheckpointReference {
 }
 message_io!(CheckpointReference);
 
+/// Missing format is the historical dense image; its JSON omits the default
+/// so previously retained manifest/reference bytes remain unchanged.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointFormat {
+    #[default]
+    LegacyDenseV1,
+    SparseV2,
+}
+impl CheckpointFormat {
+    pub fn is_legacy(&self) -> bool {
+        *self == Self::LegacyDenseV1
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CheckpointManifest {
+    #[serde(default, skip_serializing_if = "CheckpointFormat::is_legacy")]
+    pub format: CheckpointFormat,
     pub checkpoint_id: String,
     pub context: SessionContext,
     pub workspace: Option<WorkspaceReady>,

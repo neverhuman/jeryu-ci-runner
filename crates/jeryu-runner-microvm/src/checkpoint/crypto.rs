@@ -32,6 +32,8 @@ pub(super) fn random_key() -> std::io::Result<Zeroizing<[u8; 32]>> {
         .map_err(|_| failed())?;
     Ok(key)
 }
+// Frozen legacy encoder is kept only for compatibility fixtures.
+#[cfg(test)]
 pub(super) fn encrypt(
     source: &mut impl Read,
     target: &mut impl Write,
