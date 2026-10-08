@@ -245,7 +245,7 @@ report_draft_skip() { # row
   repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"
   number="$(jq -r .number <<<"$row")"; sha="$(jq -r .head_sha <<<"$row")"
   api POST /api/v1/events "$(jq -nc --arg repo "$repo" --argjson pr "$number" --arg sha "$sha" \
-    '{event_id: "pr-redteam:\($sha):skipped-draft", source: "pr-redteam", kind: "pr.skipped",
+    '{event_id: "pr-redteam:\($sha):draft", source: "pr-redteam", kind: "pr.skipped",
       actor: "pr-redteam", repo: $repo, pr: $pr, sha: $sha, outcome: "skipped",
       summary: "pr-redteam skipped \($repo)#\($pr): draft",
       detail: {automation: "pr-redteam", skipped: "draft"}}')"
@@ -464,6 +464,40 @@ store_receipt() { # destination; JSON on stdin
   sync "$(dirname "$destination")"
 }
 
+# What a review cost goes on the forge's event log as one `pr.reviewed` event, so the spend
+# behind a merged change counts its review as well as its authoring. Sent for every attempt
+# whose agent said what it cost, whatever the decision (a review that spent and then failed
+# validation cost the same), and never for a dry run. `detail.usage` is per model:
+# input, output, cache_read, cache_write and thinking tokens, and dollars. Best-effort.
+report_review_cost() { # receipt work repo number sha started-epoch
+  local receipt="$1" work="$2" repo="$3" number="$4" sha="$5" started="$6" event
+  [[ -s "$work/agent.json" ]] || return 0
+  jq -e '.dry_run == true' "$receipt" >/dev/null 2>&1 && return 0
+  event="$(jq -sc --slurpfile r "$receipt" --arg repo "$repo" --argjson pr "$number" --arg sha "$sha" \
+    --arg model "$model" --argjson started "$started" --argjson now "$(date +%s)" '
+    (map(select(type == "object" and (.total_cost_usd | type) == "number")) | last) as $res
+    | select($res != null)
+    | ($r[0].decision // "failed") as $decision
+    | {event_id: "pr-redteam:\($sha[0:12]):reviewed:\($started)", source: "pr-redteam",
+       kind: "pr.reviewed", actor: "pr-redteam", repo: $repo, pr: $pr, sha: $sha,
+       outcome: $decision, cost_usd: $res.total_cost_usd, seconds: ([$now - $started, 0] | max),
+       summary: "pr-redteam reviewed \($repo)#\($pr) at \($sha[0:12]): \($decision)",
+       detail: {automation: "pr-redteam", model: $model, decision: $decision,
+         usage: (($res.modelUsage // {}) | to_entries | map({
+           key: (.value.canonicalModel // .key),
+           value: {input: (.value.inputTokens // 0), output: (.value.outputTokens // 0),
+                   cache_read: (.value.cacheReadInputTokens // 0),
+                   cache_write: (.value.cacheCreationInputTokens // 0),
+                   thinking: (.value.thinkingTokens // 0), cost_usd: (.value.costUSD // 0)}})
+           | from_entries)}}' "$work/agent.json" 2>/dev/null)" || return 0
+  [[ -n "$event" ]] || return 0
+  api POST /api/v1/events "$event"
+  case "$code" in
+    200|201) ;;
+    *) say "could not report the review cost of $repo#$number ($code)" ;;
+  esac
+}
+
 finish_review_attempt() { # latest receipt, attempt history, repo, number, sha, start, work
   local receipt="$1" history="$2" repo="$3" number="$4" sha="$5" started="$6" work="$7" decision
   if jq -e '.decision == "reviewing"' "$receipt" > /dev/null; then
@@ -473,6 +507,7 @@ finish_review_attempt() { # latest receipt, attempt history, repo, number, sha, 
   fi
   cat "$receipt" | store_receipt "$history"
   decision="$(jq -r .decision "$receipt")"
+  (report_review_cost "$receipt" "$work" "$repo" "$number" "$sha" "$started") || true
   beat_done "$repo" "$number" "$sha" "$decision" "$started"
   rm -rf -- "$work"
 }

@@ -62,7 +62,8 @@ check .detail.automation pr-redteam
 check .summary 'pr-redteam skipped acme/widget-shop#7: draft'
 # The event_id carries the head, so the forge keeps one line however many passes
 # see the same draft: the second run posts the same body and stores nothing new.
-check .event_id 'pr-redteam:dddddddddddddddddddddddddddddddddddddddd:skipped-draft'
+check .event_id 'pr-redteam:dddddddddddddddddddddddddddddddddddddddd:draft'
+check '.event_id | length <= 64' true
 first="$(cat "$t/posted")"
 run run
 [[ "$(wc -l < "$t/posted")" == 2 ]] || { echo 'the second run posted a different number of events' >&2; exit 1; }

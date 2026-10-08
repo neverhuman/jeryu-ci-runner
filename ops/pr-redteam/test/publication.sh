@@ -79,6 +79,7 @@ case "$url" in
     elif [[ "$(jq -r .expected_head_sha <<< "$data")" != "$(cat "$PUBLISH_FIXTURE/head")" ]]; then printf '{"message":"head changed"}\n409'
     else jq -c . <<< "$data" >> "$PUBLISH_FIXTURE/accepted"; printf '{"ok":true}\n201'; fi ;;
   */heartbeat) printf '{"accepted":true}\n200' ;;
+  */api/v1/events) jq -c . <<< "$data" >> "$PUBLISH_FIXTURE/events"; printf '{"ok":true,"seqs":[1],"duplicates":0}\n201' ;;
   *) printf 'forbidden API %s\n' "$url" >> "$PUBLISH_FIXTURE/danger"; exit 98 ;;
 esac
 FIXTURE
@@ -94,6 +95,9 @@ if [[ -e "$PUBLISH_FIXTURE/model-fail" ]]; then exit 42; fi
 if [[ -e "$PUBLISH_FIXTURE/model-leak" ]]; then
   jq -nc --arg secret "$(cat "$PUBLISH_FIXTURE/token")" \
     '{type:"result",subtype:"success",is_error:false,structured_output:{verdict:"approve",summary:$secret,findings:[]}}'
+elif [[ -e "$PUBLISH_FIXTURE/model-cost" ]]; then
+  # What the real CLI adds to its result: the session's dollars, per model by token class.
+  printf '{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.4321,"modelUsage":{"model-x[1m]":{"canonicalModel":"model-x","inputTokens":12,"outputTokens":3400,"cacheReadInputTokens":250000,"cacheCreationInputTokens":9000,"thinkingTokens":800,"costUSD":0.4321}},"structured_output":%s}\n' "$(cat "$PUBLISH_FIXTURE/verdict")"
 else
   printf '{"type":"result","subtype":"success","is_error":false,"structured_output":%s}\n' "$(cat "$PUBLISH_FIXTURE/verdict")"
 fi
@@ -326,6 +330,27 @@ grep -q 'skip — main does not exist yet' "$t/controller.log"
 ! grep -q 'fetch failed' "$t/controller.log"
 g rev-parse HEAD > "$t/base"; g branch main "$(cat "$t/base")"; g switch -q topic
 echo 'ok missing base branch recorded once, never retried'
+
+# A review whose agent said what it cost puts one `pr.reviewed` event on the forge's log with the
+# dollars and per-model token usage; a dry run and an agent that reports no cost post nothing.
+[[ ! -e "$t/events" ]]
+advance
+touch "$t/model-cost"
+"$here/pr-redteam" _review 1 0 0 jeryu/fixture 1 >> "$t/controller.log" 2>&1
+[[ ! -e "$t/events" ]]
+review
+[[ "$(count "$t/events")" == 1 ]]
+jq -e --arg sha "$(cat "$t/head")" '.kind == "pr.reviewed" and .source == "pr-redteam" and .repo == "jeryu/fixture"
+  and .pr == 1 and .sha == $sha and .outcome == "approve" and .cost_usd == 0.4321 and .seconds >= 0
+  and (.event_id | length <= 64) and (.event_id | startswith("pr-redteam:\($sha[0:12]):reviewed:"))
+  and .detail.decision == "approve" and .detail.automation == "pr-redteam"
+  and .detail.usage == {"model-x": {input: 12, output: 3400, cache_read: 250000, cache_write: 9000,
+                                    thinking: 800, cost_usd: 0.4321}}' "$t/events" > /dev/null
+rm "$t/model-cost"
+advance
+review
+[[ "$(count "$t/events")" == 1 ]]
+echo 'ok review cost reported once per costed attempt, never on a dry run'
 
 # A full pass over a head this tool did not approve lands nothing and rewrites no branch, even with
 # a merger credential present. Landing an approved head is test/merge-pass.sh.

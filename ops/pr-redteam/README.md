@@ -100,6 +100,13 @@ log; `list` and `--dry-run` post nothing. Marking a draft ready for review is
 the author's or an admin's move:
 `POST /api/v1/repos/{id}/pulls/{number}/ready`.
 
+What each review cost goes to the same event log as one `pr.reviewed` event per
+attempt whose agent reported a cost, whatever the decision: `cost_usd`,
+`seconds`, `outcome` (the receipt's decision) and, in `detail.usage`, the
+session's tokens per model (`input`, `output`, `cache_read`, `cache_write`,
+`thinking`, `cost_usd`). With the authoring agent's own spend, this is what a
+merged change cost end to end. Dry runs post nothing.
+
 `JERYU_BASE` names the forge origin and `JERYU_TOKEN_FILE` selects the approval
 credential by path; both are required site settings with no default, since this
 source is public. `REDTEAM_MERGE_TOKEN_FILE` selects the merger credential. API
