@@ -37,6 +37,30 @@ fn response(result: SessionRpcResult) -> SessionRpcResponse {
     }
 }
 #[test]
+fn named_calls_cannot_complete_from_uncorrelated_error_envelopes() {
+    let request = request(SessionRpcOperation::Snapshot {
+        actor: "user/alice".into(),
+        session_id: "session".into(),
+        generation: 1,
+    });
+    let mut error = SessionRpcResponse {
+        protocol_version: PROTOCOL_VERSION.into(),
+        message_type: "session-rpc-response".into(),
+        request_id: None,
+        ok: false,
+        result: None,
+        error: Some(SessionRpcError {
+            code: "session_rpc_invalid".into(),
+        }),
+    };
+    error.validate().unwrap();
+    assert!(error.validate_for(&request, &context()).is_err());
+    error.request_id = Some("different-call".into());
+    assert!(error.validate_for(&request, &context()).is_err());
+    error.request_id = Some(request.request_id.clone());
+    error.validate_for(&request, &context()).unwrap();
+}
+#[test]
 fn writer_replies_bind_the_principal_attachment_channels_and_signed_context() {
     let request = request(SessionRpcOperation::AcquireControl {
         actor: "user/alice".into(),

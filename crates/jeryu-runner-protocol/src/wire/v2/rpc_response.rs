@@ -140,11 +140,9 @@ impl SessionRpcResponse {
         self.validate()?;
         request.validate()?;
         context.validate()?;
-        if self
-            .request_id
-            .as_deref()
-            .is_some_and(|id| id != request.request_id)
-        {
+        // A nameless pre-parse error is a legal envelope, never a response to
+        // this named call. Errors require the same correlation as successes.
+        if self.request_id.as_deref() != Some(request.request_id.as_str()) {
             return Err(invalid());
         }
         let target = match &request.operation {

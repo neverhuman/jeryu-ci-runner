@@ -23,6 +23,8 @@ do not acquire input authority. Expired/revoked clients cannot suppress headless
 responses. ControllerLease returns the signed context, actor, controller_id,
 terminal_channels, epoch, next_sequence and an expiry upper bound of 30 seconds.
 Clients renew every 10 seconds. validate_for binds all reply identities.
+It requires the exact request_id for both success and error. A nameless error
+may describe a pre-parse failure but cannot complete a named call.
 
 ## Acknowledged guest fence
 

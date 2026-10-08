@@ -142,6 +142,9 @@ mod tests {
                 .is_err()
         );
         assert!(!state.lock().unwrap().control_ready);
+        // A delayed ACK cannot leave the stored lease on its pre-wait clock.
+        state.lock().unwrap().controller.as_mut().unwrap().expires =
+            Instant::now() - Duration::from_secs(1);
         state
             .lock()
             .unwrap()
@@ -149,6 +152,10 @@ mod tests {
             .unwrap();
         assert_eq!(worker.join().unwrap().unwrap().controller_id, "client");
         assert!(state.lock().unwrap().control_ready);
+        assert!(
+            state.lock().unwrap().controller.as_ref().unwrap().expires
+                > Instant::now() + Duration::from_secs(29)
+        );
         drop(receive);
         assert_eq!(
             handle
