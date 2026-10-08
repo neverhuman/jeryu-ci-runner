@@ -15,6 +15,14 @@
   setting reappears.
 
 ## Unreleased
+- A lane of the protected `jeryu-ci-runner/required` check passes only if it
+  actually ran: `ops/ci/required-lane.sh` refuses a skipped, degraded, not-run,
+  pending or tool-missing lane result and a run that collected zero tests. The
+  workspace test suite asserts nextest reported tests, and the sandbox escape
+  matrix can no longer be stood down. `ops/ci/tests/` holds the negative suite
+  for each state and runs in `ops/ci/check.sh`. The jankurai pin drift block in
+  `pr-ci.sh` is rendered by jeryu-tool and still skips when the renderer is
+  absent; making it fail closed is a jeryu-tool template change.
 - A gate starts on the push instead of on the next timer tick. `pr-gate-wake.sh` long-polls the
   forge's wake-up signal (jeryu-deploy: `GET /api/v1/gate-wanted?after=<seq>&wait=<secs>`, recorded
   when a push moves a branch, when the merge queue builds a queue commit and when a re-gate is

@@ -49,7 +49,10 @@ bash ops/ci-kit/test/selftest.sh
 # The live escape matrix needs docker, but its image pin does not: prove the
 # pin and the cache-first pull here, offline.
 bash tests/sandbox_image_pin.sh
-for script in scripts/*.sh ops/ci/*.sh tools/*.sh ops/ci-kit/*/*.sh ops/ci/kit/*/*.sh; do
+# A required lane passes only if it ran: the accounting behind that and the
+# required check's own lane wiring are proven here (pr-ci.sh runs check.sh).
+bash ops/ci/tests/required.sh
+for script in scripts/*.sh ops/ci/*.sh ops/ci/tests/*.sh tools/*.sh ops/ci-kit/*/*.sh ops/ci/kit/*/*.sh; do
   [[ -e "$script" ]] || continue
   bash -n "$script"
 done

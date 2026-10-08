@@ -15,6 +15,8 @@ cd "$repo_root"
 
 # Resolve and verify the absolute governed auditor before any lane runs.
 source ops/ci/lib.sh
+# shellcheck source=ops/ci/required-lane.sh
+source ops/ci/required-lane.sh
 require_jankurai
 # shellcheck source=ops/ci/hosted-git-env.sh
 source "${repo_root}/ops/ci/hosted-git-env.sh"
@@ -59,9 +61,19 @@ JERYU_SECURITY_NETWORK=1 bash ops/ci/security.sh
 bash ops/ci/artifact_support.sh
 
 echo "[pr-ci] workspace test suite (sandbox runtime tests need real namespaces; see deploy pr-ci precedent)" >&2
-cargo nextest run --profile ci --locked --workspace --exclude jeryu-sandbox-linux --build-jobs "$JOBS" --test-threads "$JOBS"
-if [ "${JERYU_SKIP_SANDBOX_MATRIX:-0}" != "1" ]; then
-  echo "[pr-ci] sandbox escape matrix (docker)" >&2
-  bash tests/sandbox_escape_matrix.sh
+test_log="$(mktemp "${TMPDIR:-/tmp}/jeryu-ci-runner-nextest.XXXXXX")"
+trap 'rm -f -- "$test_log"' EXIT
+cargo nextest run --profile ci --locked --workspace --exclude jeryu-sandbox-linux --build-jobs "$JOBS" --test-threads "$JOBS" 2>&1 | tee "$test_log"
+# A green exit with no tests collected is not a pass for a required lane.
+required_lane_tests_collected "workspace test suite" \
+  "$(required_lane_nextest_count "$test_log")"
+# Required lane: the matrix needs docker, and a host without it fails the check
+# rather than standing the lane down.
+if [ "${JERYU_SKIP_SANDBOX_MATRIX:-0}" = "1" ]; then
+  required_lane_result "sandbox escape matrix" skipped \
+    'JERYU_SKIP_SANDBOX_MATRIX is set; the required check has to run this lane'
 fi
+echo "[pr-ci] sandbox escape matrix (docker)" >&2
+bash tests/sandbox_escape_matrix.sh
+required_lane_result "sandbox escape matrix" ran
 echo "[pr-ci] jeryu-ci-runner OK" >&2
