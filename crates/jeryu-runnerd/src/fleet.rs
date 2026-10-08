@@ -457,5 +457,7 @@ fn map_runner_class(class: CoreRunnerClass) -> Result<IrRunnerClass, FleetError>
     }
 }
 
+mod workcells;
+
 #[cfg(test)]
 mod tests;

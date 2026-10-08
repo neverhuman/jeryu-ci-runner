@@ -195,8 +195,9 @@ pub struct WorkcellManager {
     next_id: u64,
     ready_queue: VecDeque<String>,
     cells: BTreeMap<String, WorkcellLease>,
-    /// Current epoch per runner, as admitted by the daemon. A claim carrying any
-    /// other epoch comes from a runner lifetime the daemon did not issue.
+    /// Current epoch per active runner, as issued by the daemon's registry. A
+    /// claim from a runner not listed here, or carrying any other epoch, comes
+    /// from a runner lifetime the daemon did not issue and is fenced.
     runner_epochs: BTreeMap<String, u64>,
 }
 

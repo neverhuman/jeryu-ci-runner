@@ -89,11 +89,12 @@ impl WarmPool {
         Ok(pool)
     }
 
-    /// Record the daemon's current epoch for one runner; pool claims carrying
-    /// any other epoch for that runner are fenced. See
-    /// [`WorkcellManager::admit_runner_epoch`].
-    pub fn admit_runner_epoch(&mut self, runner_id: impl Into<String>, runner_epoch: u64) {
-        self.manager.admit_runner_epoch(runner_id, runner_epoch);
+    /// Replace the pool ledger's claim fence with the runner epochs the daemon
+    /// issued; see [`WorkcellManager::sync_runner_epochs`]. The fleet calls
+    /// this from [`crate::RunnerFleet::claim_warm_cell`]; a pool never synced
+    /// fences every claim.
+    pub fn sync_runner_epochs(&mut self, issued: impl IntoIterator<Item = (String, u64)>) {
+        self.manager.sync_runner_epochs(issued);
     }
 
     /// Number of warm containers currently idling in the pool.
@@ -180,22 +181,38 @@ impl WarmPool {
 
     /// Settle the entry a refused claim popped, then refill, and return the
     /// claim's own refusal so the caller can still tell a fence from a block.
+    /// What happens to the container follows the refusal's cause, never a
+    /// re-read of ledger state:
     ///
-    /// A cell the ledger still queues as ready was never touched (stale epoch),
-    /// so its untouched container goes back to the front of the pool. Any other
-    /// refusal means no ready lease backs the container any more (the claim
-    /// blocked on a failed startup rebase, or the pool and ledger diverged), so
-    /// the container is removed. A failed removal or refill is appended to the
-    /// refusal instead of replacing it.
+    /// - `workcell_epoch_fenced`: the fence is checked before anything else, so
+    ///   the cell is untouched and its container goes back to the front of the
+    ///   pool (if the ledger still queues it; otherwise the entry is dropped).
+    /// - `workcell_startup_rebase_failed`: the ledger consumed the cell and
+    ///   blocked it. Its container was never handed to an agent, so it holds no
+    ///   workspace or evidence; the Blocked lease is the record of the failure
+    ///   (main ref, shas, reason). The idle container is removed rather than
+    ///   left running with no handle.
+    /// - any other refusal (`workcell_claim_denied`): the pool and ledger have
+    ///   diverged and the cell may back a live session, so the container is
+    ///   never destroyed here. The entry leaves the pool and `reap_orphans`
+    ///   settles the container against the active-lease ledger.
+    ///
+    /// A failed removal or refill is appended to the refusal, never replaces it.
     fn give_back_refused(&mut self, entry: WarmEntry, err: WorkcellError) -> RunnerError {
         let mut message = err.message().to_string();
-        if self.manager.is_ready_queued(&entry.workcell_id) {
-            self.warm.push_front(entry);
-        } else if let Err(remove) = self.runtime.remove(&entry.container_id) {
-            message.push_str(&format!(
-                "; removing unbacked container {} also failed: {remove}",
-                entry.container_id
-            ));
+        match err.reason {
+            "workcell_epoch_fenced" if self.manager.is_ready_queued(&entry.workcell_id) => {
+                self.warm.push_front(entry);
+            }
+            "workcell_startup_rebase_failed" => {
+                if let Err(remove) = self.runtime.remove(&entry.container_id) {
+                    message.push_str(&format!(
+                        "; removing idle container {} of the blocked cell also failed: {remove}",
+                        entry.container_id
+                    ));
+                }
+            }
+            _ => {}
         }
         // Restore steady-state depth even when the claimed cell blocks on a
         // failed startup rebase, so the next session still reuses a warm cell.
@@ -257,6 +274,12 @@ mod tests {
         SandboxPlan::from_decision(&job.workspace, &decision)
     }
 
+    /// The epoch the fleet issued `node-0` in these tests.
+    fn synced(mut pool: WarmPool) -> WarmPool {
+        pool.sync_runner_epochs([("node-0".to_string(), 9)]);
+        pool
+    }
+
     fn session_claim(agent_id: &str, run_id: &str, epoch: u64) -> SessionClaim {
         let job = agent_job();
         let plan = sandbox_plan(&job);
@@ -292,7 +315,7 @@ mod tests {
     #[test]
     fn pool_pre_warms_exactly_n_sleep_infinity_labeled_containers() {
         let fake = Arc::new(FakeContainerRuntime::default());
-        let pool = WarmPool::new(fake.clone(), 3).expect("warm the pool");
+        let pool = synced(WarmPool::new(fake.clone(), 3).expect("warm the pool"));
         assert_eq!(pool.warm_depth(), 3);
         assert_eq!(fake.live_warm().len(), 3, "exactly N live containers");
 
@@ -327,7 +350,7 @@ mod tests {
     #[test]
     fn claim_reuses_a_warm_container_and_refills_to_target() {
         let fake = Arc::new(FakeContainerRuntime::default());
-        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
+        let mut pool = synced(WarmPool::new(fake.clone(), 2).expect("warm the pool"));
         let warmed = pool.warm_container_ids();
         let starts_before = fake
             .lifecycle_ops()
@@ -363,7 +386,7 @@ mod tests {
     #[test]
     fn claim_on_empty_pool_cold_starts() {
         let fake = Arc::new(FakeContainerRuntime::default());
-        let mut empty = WarmPool::new(fake.clone(), 0).expect("zero-depth pool");
+        let mut empty = synced(WarmPool::new(fake.clone(), 0).expect("zero-depth pool"));
         assert_eq!(empty.warm_depth(), 0);
         let starts_before = fake
             .lifecycle_ops()
@@ -372,7 +395,7 @@ mod tests {
             .count();
 
         let cold = empty
-            .claim(session_claim("agent-8", "run-2", 11))
+            .claim(session_claim("agent-8", "run-2", 9))
             .expect("claim cold-starts on an empty pool");
 
         let starts_after = fake
@@ -401,7 +424,7 @@ mod tests {
 
         // A zero-depth pool does not warm anything of its own, so the only
         // labeled containers are the four seeded above.
-        let pool = WarmPool::new(fake.clone(), 0).expect("zero-depth pool");
+        let pool = synced(WarmPool::new(fake.clone(), 0).expect("zero-depth pool"));
 
         let mut active = BTreeSet::new();
         active.insert("wc-active-1".to_string());
@@ -432,7 +455,7 @@ mod tests {
     #[test]
     fn claimed_cell_carries_the_session_branch_namespace_never_main() {
         let fake = Arc::new(FakeContainerRuntime::default());
-        let mut pool = WarmPool::new(fake, 1).expect("warm the pool");
+        let mut pool = synced(WarmPool::new(fake, 1).expect("warm the pool"));
         let claimed = pool
             .claim(session_claim("agent-7", "run-42", 9))
             .expect("claim succeeds");
@@ -457,8 +480,7 @@ mod tests {
     #[test]
     fn a_stale_runner_epoch_is_fenced_on_the_pool_claim_path() {
         let fake = Arc::new(FakeContainerRuntime::default());
-        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
-        pool.admit_runner_epoch("node-0", 9);
+        let mut pool = synced(WarmPool::new(fake.clone(), 2).expect("warm the pool"));
         pool.claim(session_claim("agent-7", "run-42", 9))
             .expect("the current epoch claims");
 
@@ -507,8 +529,7 @@ mod tests {
     #[test]
     fn replayed_refused_claims_leak_no_container_and_no_ready_entry() {
         let fake = Arc::new(FakeContainerRuntime::default());
-        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
-        pool.admit_runner_epoch("node-0", 9);
+        let mut pool = synced(WarmPool::new(fake.clone(), 2).expect("warm the pool"));
         pool.claim(session_claim("agent-7", "run-42", 9))
             .expect("the current epoch claims");
         let warm_before = pool.warm_container_ids();
@@ -536,26 +557,19 @@ mod tests {
             changes_before,
             "a fenced replay neither removes nor starts a container"
         );
-        // The auto-claim path cannot pick up a ghost id either: whatever it
-        // takes is still one of the pool's warm cells.
-        let lease = pool
-            .manager
-            .claim(session_claim("agent-9", "run-60", 9).claim)
-            .expect("the live epoch claims through the ledger");
-        assert!(
-            fake.list_workcells()
-                .expect("list containers")
-                .iter()
-                .any(|container| container.workcell_id == lease.workcell_id),
-            "the ledger handed out {} with no container behind it",
-            lease.workcell_id
-        );
+        // The live epoch then claims one of those same warm cells, and the
+        // pool, the ledger and the runtime still agree afterwards.
+        let claimed = pool
+            .claim(session_claim("agent-9", "run-60", 9))
+            .expect("the live epoch claims");
+        assert!(warm_before.contains(&claimed.container_id));
+        assert_pool_matches_ledger(&pool, &fake, 2);
     }
 
     // A failed startup rebase blocks the claim but the pool still refills, so the
     // next session is not starved of a warm cell.
     fn failed_startup_claim(agent_id: &str, run_id: &str) -> SessionClaim {
-        let mut request = session_claim(agent_id, run_id, 13);
+        let mut request = session_claim(agent_id, run_id, 9);
         request.claim.startup = StartupSync::Failed {
             main_ref: "origin/main".to_string(),
             base_sha: "abc123".to_string(),
@@ -571,7 +585,7 @@ mod tests {
     #[test]
     fn failed_startup_blocks_claim_but_pool_still_refills() {
         let fake = Arc::new(FakeContainerRuntime::default());
-        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
+        let mut pool = synced(WarmPool::new(fake.clone(), 2).expect("warm the pool"));
         let popped = pool.warm.front().cloned().expect("a warm entry");
         let err = pool
             .claim(failed_startup_claim("agent-9", "run-9"))
@@ -631,7 +645,7 @@ mod tests {
     #[test]
     fn a_failed_container_removal_keeps_the_claim_refusal_and_refills() {
         let runtime = Arc::new(RemoveFails::default());
-        let mut pool = WarmPool::new(runtime, 2).expect("warm the pool");
+        let mut pool = synced(WarmPool::new(runtime, 2).expect("warm the pool"));
         let err = pool
             .claim(failed_startup_claim("agent-10", "run-10"))
             .expect_err("failed rebase blocks the claim");
@@ -642,5 +656,71 @@ mod tests {
             err.message()
         );
         assert_eq!(pool.warm_depth(), 2, "the pool refills despite the failure");
+    }
+
+    // A pool the fleet never synced fails closed: the claim is fenced and the
+    // untouched warm container goes back to the pool.
+    #[test]
+    fn an_unsynced_pool_fences_every_claim() {
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = WarmPool::new(fake.clone(), 1).expect("warm the pool");
+        let warm_before = pool.warm_container_ids();
+        let err = pool
+            .claim(session_claim("agent-11", "run-11", 9))
+            .expect_err("no issued epoch, no claim");
+        assert_eq!(err.code(), "workcell_epoch_fenced");
+        assert_eq!(pool.warm_container_ids(), warm_before);
+        assert_pool_matches_ledger(&pool, &fake, 0);
+    }
+
+    // The production entry point: the fleet syncs the pool's fence from its
+    // registry, so only the epoch the registry issued `node-0` claims.
+    #[test]
+    fn the_fleet_claims_warm_cells_only_at_the_issued_epoch() {
+        let fleet = crate::RunnerFleet::deterministic_fixture();
+        let issued = fleet.claimable_runner_epochs()["node-0"];
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
+
+        let err = fleet
+            .claim_warm_cell(&mut pool, session_claim("agent-12", "run-12", issued + 1))
+            .expect_err("an epoch the registry never issued is fenced");
+        assert_eq!(err.code(), "workcell_epoch_fenced");
+        assert_pool_matches_ledger(&pool, &fake, 0);
+
+        let claimed = fleet
+            .claim_warm_cell(&mut pool, session_claim("agent-13", "run-13", issued))
+            .expect("the issued epoch claims");
+        assert_eq!(claimed.lease.runner_epoch, issued);
+        assert_pool_matches_ledger(&pool, &fake, 1);
+    }
+
+    // A denial that is not a fence (here: the popped cell is already claimed
+    // because pool and ledger diverged) never destroys the container, which
+    // may back a live session; the entry just leaves the pool.
+    #[test]
+    fn a_claim_denial_never_removes_the_container() {
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = synced(WarmPool::new(fake.clone(), 1).expect("warm the pool"));
+        let front = pool.warm.front().cloned().expect("a warm entry");
+        pool.manager
+            .claim_ready(
+                &front.workcell_id,
+                session_claim("agent-14", "run-14", 9).claim,
+            )
+            .expect("a session holds the cell outside the pool");
+
+        let err = pool
+            .claim(session_claim("agent-15", "run-15", 9))
+            .expect_err("the popped cell is already claimed");
+        assert_eq!(err.code(), "workcell_claim_denied");
+        assert!(
+            !fake.lifecycle_ops().contains(&LifecycleOp::Remove {
+                container_id: front.container_id.clone()
+            }),
+            "the live session's container is kept"
+        );
+        assert!(!pool.warm_container_ids().contains(&front.container_id));
+        assert_eq!(pool.warm_depth(), 1, "the pool refills");
     }
 }
