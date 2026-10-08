@@ -74,6 +74,10 @@ while (($#)); do
   case "$1" in -X) method=$2; shift 2;; --data) payload=$2; shift 2;; *) url=$1; shift;; esac
 done
 head=$(cat "$FAKE_FORGE/head")
+if [[ -f "$FAKE_FORGE/rate-limit" && "$method" == GET ]]; then
+  printf '%s\n' "$url" >>"$FAKE_FORGE/rate-limited.log"
+  printf '{"message":"rate limited"}\n429'; exit
+fi
 case "$method $url" in
   'GET '*'/pulls?state=open')
     jq -nc --arg sha "$head" '{items:[{number:1,head_sha:$sha}]}'
@@ -749,3 +753,17 @@ if [[ "$runner_exit" == 0 ]] || ! grep -q 'has no owner and PR_GATE_PRIMARY_OWNE
   printf 'a bare repository name was guessed an owner\n' >&2; cat "$fixture/runner.log" >&2; exit 1
 fi
 printf 'PASS an unconfigured forge, credential, identity or primary owner is refused by name\n'
+
+# A 429 on a read starts one back-off for every slot: the next tick makes no request at all, and
+# the first answer that is not a 429 ends it.
+rm -f "$fixture/runner/cache/forge-backoff" "$fixture/rate-limited.log"
+touch "$fixture/rate-limit"
+env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
+[[ -s "$fixture/runner/cache/forge-backoff" ]] || { printf 'a 429 started no back-off\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+grep -q 'answered 429' "$fixture/runner.log"
+sent=$(wc -l <"$fixture/rate-limited.log")
+env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
+[[ "$(wc -l <"$fixture/rate-limited.log")" == "$sent" ]] || { printf 'a request went out during the back-off\n' >&2; exit 1; }
+grep -q 'rate limiting this identity' "$fixture/runner.log"
+rm -f "$fixture/rate-limit" "$fixture/runner/cache/forge-backoff"
+printf 'PASS a 429 backs every slot off: no request goes out until the back-off passes\n'

@@ -165,6 +165,30 @@ and `systemd/*` to `~/.config/systemd/user`, `systemctl --user daemon-reload`, t
 `pr-gate-install.timer` (it enables the other singleton timers) and the slot timers
 `pr-gate-runner@0.timer` .. `pr-gate-runner@N.timer`.
 
+## Compatibility: a runner newer than its forge must degrade, not flood
+
+The runner is installed from its own branch and the forge is deployed separately, so a runner can run
+against a forge that lacks a route or field it knows (pr-gate 1.4.0 met a forge with no
+`gate-wanted`, and gating stopped for the whole host). Every new dependency on the forge needs a
+degraded mode that costs the forge no more than the slot timers do:
+
+- **wake**: `pr-gate-wake.sh` does nothing unless the forge serves `GET /api/v1/gate-wanted`. A 404 is
+  cached for `GATE_RUNNER_WAKE_PROBE_TTL` seconds (default 600) and any other failed look pauses the
+  signal for a minute; the slot timers carry the work. Reading gated heads is an operator opt-in
+  (`GATE_RUNNER_WAKE_POLL_HEADS=1`) and then at most every `GATE_RUNNER_WAKE_POLL_INTERVAL` seconds
+  (default 30).
+- **429**: a 429 on any read starts one shared back-off (`cache/forge-backoff`, `pr-gate-backoff.sh`):
+  `Retry-After` is honoured, otherwise 30s doubling per consecutive 429 up to 15 minutes
+  (`GATE_RUNNER_BACKOFF_BASE`, `GATE_RUNNER_BACKOFF_CAP`). Until it passes, no slot, wake or head read
+  sends a request; the first non-429 answer clears it. Status writes still go out.
+- **heartbeat**: a 422 drops `tools`, then `code`, then falls back to the oldest contract
+  (`gate_heartbeat_minimal`), so `/runners` stays alive. The heartbeat timer remembers the level that
+  worked for 30 minutes (`cache/heartbeat-level`).
+- **installer**: `pr-gate-wake.timer` is enabled only when the forge answers `gate-wanted` with 200
+  (it is considered again on the next unit change, or enable it by hand), and a unit the operator
+  masked (a `/dev/null` link in the unit directory, or masked in the user manager) is neither
+  overwritten nor enabled.
+
 ## Qualification
 
 `bash tests/required.sh` runs the whole suite offline: the config reader, the attempt journal and

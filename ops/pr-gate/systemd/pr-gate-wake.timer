@@ -1,7 +1,7 @@
 # 1s after the last look finished. A look is one long-polled `gate-wanted` request that the forge
 # holds open until a head appears, so this is near-continuous and still cheaper than one idle slot
-# tick; against a forge with no signal it falls back to one open-PR list per gated repo plus one
-# merge-queue and one re-gate read. The slot timers remain the fallback if this stops.
+# tick. Against a forge with no signal it does nothing (the 404 is cached) and the slot timers carry
+# the work; a 429 backs it off with every other slot.
 [Unit]
 Description=Wait for the forge's gate-wanted signal and wake an idle PR gate slot
 

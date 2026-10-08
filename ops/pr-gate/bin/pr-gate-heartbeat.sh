@@ -138,27 +138,51 @@ runner_code="" runner_tools=""
 declare -F gate_runner_code >/dev/null && runner_code=$(gate_runner_code "$HOME_DIR")
 declare -F gate_runner_tools >/dev/null && runner_tools=$(gate_runner_tools "$HOME_DIR")
 
+# The shape the forge last accepted is remembered for 30 minutes (cache/heartbeat-level: 0 full, 1 no
+# tools, 2 no code, 3 the oldest contract), so an older forge costs one request a slot, not four. After
+# that the newest shape is tried again, so an upgraded forge is noticed.
+LEVEL_FILE="$HOME_DIR/cache/heartbeat-level"
+level=0 minimal=0
+if [[ -n "$(find "$LEVEL_FILE" -mmin -30 2>/dev/null)" ]]; then level="$(cat "$LEVEL_FILE" 2>/dev/null || echo 0)"; fi
+[[ "$level" =~ ^[0-3]$ ]] || level=0
+((level < 1)) || runner_tools=""
+((level < 2)) || runner_code=""
+((level < 3)) || minimal=1
+level_seen=$level
+
 for slot in $SLOTS; do
   body=$(jq -nc --arg id "$HOST/slot$slot" --arg host "$HOST" --argjson slot "$slot" \
     --argjson current "$(current "$slot")" --argjson last "$(last "$slot")" \
     '{runnerId:$id, host:$host, slot:$slot, labels:["pr-gate"], current:$current, last:$last}')
-  if [[ -n "$runner_code$runner_tools" ]]; then
+  if ((minimal)); then
+    post_heartbeat "$(gate_heartbeat_minimal "$body")"
+  elif [[ -n "$runner_code$runner_tools" ]]; then
     post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "$runner_tools")"
   else
     post_heartbeat "$body"
   fi
   if [[ "$code" == 422 && -n "$runner_tools" ]]; then
     printf 'heartbeat tools refused (422); retrying without them\n' >&2
-    runner_tools=""
+    runner_tools="" level=1
     post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "")"
   fi
   if [[ "$code" == 422 && -n "$runner_code" ]]; then
     printf 'heartbeat code refused (422); retrying without it\n' >&2
-    runner_code=""
+    runner_code="" level=2
     post_heartbeat "$body"
+  fi
+  # Still refused: the forge predates the shape itself. Fall back to the oldest contract it accepted.
+  if [[ "$code" == 422 ]] && ((!minimal)); then
+    printf 'heartbeat shape refused (422); retrying with the oldest contract\n' >&2
+    minimal=1 level=3
+    post_heartbeat "$(gate_heartbeat_minimal "$body")"
   fi
   [[ "$code" == 200 ]] || printf 'slot %s: heartbeat answered %s: %s\n' "$slot" "$code" "${out%$'\n'*}" >&2
 done
+if ((level != level_seen)); then
+  mkdir -p "$HOME_DIR/cache"
+  printf '%s\n' "$level" >"$LEVEL_FILE"
+fi
 
 # ---- finished attempts -> pipeline events -------------------------------------------------------
 [[ "${GATE_RUNNER_EVENTS:-1}" != 0 ]] || exit 0

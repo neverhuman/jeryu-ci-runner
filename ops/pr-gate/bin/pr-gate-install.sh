@@ -16,7 +16,8 @@
 #      GATE_INSTALL_DRAIN_SECONDS, default 45 minutes, else install nothing);
 #   4. install each differing file atomically, keeping the old copy as
 #      <file>.<old-commit>-pre-<new-commit>.bak, reload systemd if a unit
-#      changed, enable any managed singleton timer, restart the slot timers;
+#      changed, enable any managed singleton timer the operator has not masked (and, for the wake
+#      timer, only when the forge serves the gate-wanted route), restart the slot timers;
 #   5. record the installed commit in installed-main.json, with its version
 #      `pr-gate <VERSION>` read from <subdir>/VERSION at that commit (e.g. `pr-gate 1.0.0`): the
 #      gate component is versioned on its own, independent of the repository's release tags.
@@ -51,6 +52,26 @@ GOVERNED_JANKURAI="$(pr_gate_path "${PR_GATE_GOVERNED_JANKURAI:-}")"
 # Managed singleton timers: enabled when their unit is installed. Slot timers are instances and are
 # only stopped and started around a drain, never enabled or disabled here.
 SINGLETON_TIMERS="pr-gate-heartbeat.timer pr-gate-install.timer pr-gate-advisory-refresh.timer pr-gate-grype-db-refresh.timer pr-gate-wake.timer"
+
+# A timer the operator masked (a unit file that is a symlink to /dev/null, or one systemd reports
+# masked) is theirs: it is neither overwritten nor enabled here.
+mask_link() { [[ "$(readlink -- "$UNITS/$1" 2>/dev/null)" == /dev/null ]]; } # unit-name
+masked() { # unit-name
+  mask_link "$1" && return 0
+  [[ "$(systemctl --user is-enabled "$1" 2>/dev/null || true)" == masked* ]]
+}
+# Whether the forge answers the gate-wanted route (pr-gate-wake.timer is useless, and a source of
+# load, against a forge that does not). Anything but a 200 -- 404, 429, an outage -- says not now.
+forge_serves_gate_wanted() {
+  local base="${PR_GATE_FORGE_URL:-}" tokfile token code
+  base="${base%/}"; tokfile="$(pr_gate_path "${JERYU_TOKEN_FILE:-}")"
+  [[ -n "$base" && -f "$tokfile" && ! -L "$tokfile" ]] || return 1
+  token="$(cat "$tokfile")"
+  [[ "$token" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] || return 1
+  code="$(printf 'header = "Authorization: Bearer %s"\n' "$token" \
+    | curl --silent --output /dev/null --max-time 15 --config - -w '%{http_code}' "$base/api/v1/gate-wanted?after=0&wait=0" 2>/dev/null)" || return 1
+  [[ "$code" == 200 ]]
+}
 
 say() { printf '[gate-install %s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ && "$BRANCH" != *..* ]] || { say "PR_GATE_SOURCE_BRANCH $BRANCH is not a branch name"; exit 2; }
@@ -140,6 +161,9 @@ for src in "${!dest[@]}"; do
   git -C "$MIRROR" cat-file -e "$commit:$src" 2>/dev/null || continue
   git -C "$MIRROR" show "$commit:$src" >"$stage/${src//\//_}"
   if ! cmp -s "$stage/${src//\//_}" "${dest[$src]}" 2>/dev/null; then
+    if [[ "$src" == "$SUBDIR/systemd/"* ]] && mask_link "$(basename "$src")"; then
+      say "$(basename "$src") is masked by the operator; leaving it alone"; continue
+    fi
     changed+=("$src")
     case "$src" in "$SUBDIR/bin/pr-gate-runner.sh"|"$SUBDIR/bin/pr-gate-state.sh"|"$SUBDIR/bin/pr-gate-config.sh") drain=1;; esac
     [[ "$src" != "$SUBDIR/systemd/"* ]] || units_changed=1
@@ -192,7 +216,12 @@ done
 if ((units_changed)); then
   systemctl --user daemon-reload
   for timer in $SINGLETON_TIMERS; do
-    [[ -e "$UNITS/$timer" ]] && systemctl --user enable --now "$timer" >/dev/null 2>&1 || true
+    [[ -e "$UNITS/$timer" ]] || continue
+    masked "$timer" && { say "$timer is masked; not enabling it"; continue; }
+    if [[ "$timer" == pr-gate-wake.timer ]] && ! forge_serves_gate_wanted; then
+      say "the forge does not serve gate-wanted; not enabling $timer"; continue
+    fi
+    systemctl --user enable --now "$timer" >/dev/null 2>&1 || true
   done
 fi
 resume

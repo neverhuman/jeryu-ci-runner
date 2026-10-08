@@ -489,6 +489,14 @@ gate_runner_tools() { # gate-runner-home
 }
 
 # A heartbeat payload with the optional code and tools added (each only when non-empty).
+# The oldest heartbeat shape a forge accepted: identity, labels, and only the identifying fields of
+# `current` and `last`. The last resort when a forge refuses a newer shape with 422 even without code
+# and tools, so a newer runner against an older forge keeps its slots on /runners.
+gate_heartbeat_minimal() { # payload
+  jq -c '{runnerId, host, slot, labels,
+    current: (.current | if . == null then null else {repo, pr, sha, startedAt} end),
+    last: (.last | if . == null then null else {repo, pr, sha, finishedAt, conclusion} end)}' <<<"$1"
+}
 gate_heartbeat_with() { # payload code-json tools-json
   jq -c --arg code "$2" --arg tools "$3" \
     '. + (if $code != "" then {code: ($code | fromjson)} else {} end)

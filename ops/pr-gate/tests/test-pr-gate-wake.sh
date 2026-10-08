@@ -17,6 +17,8 @@ cat >"$fx/bin/curl" <<SH
 #!/usr/bin/env bash
 [[ "\$*" != *WAKE-TOKEN-7f3a* ]] || exit 9
 url="\${@: -1}"
+hdr=""; prev=""
+for a in "\$@"; do [[ "\$prev" != --dump-header ]] || hdr=\$a; prev=\$a; done
 printf '%s\n' "\$url" >>"$fx/curl.log"
 case "\$url" in
   */repos/acme%2Facme-a/pulls*) f=a;;
@@ -26,7 +28,10 @@ case "\$url" in
   */gate-wanted*) f=wanted;;
   *) f=none;;
 esac
-if [[ -e "$fx/forge/\$f.json" ]]; then printf '%s\n200' "\$(cat "$fx/forge/\$f.json")"; else printf 'oops\n500'; fi
+if [[ -e "$fx/forge/\$f.status" ]]; then
+  [[ -z "\$hdr" ]] || cat "$fx/forge/retry-after" >"\$hdr" 2>/dev/null || true
+  printf 'nope\n%s' "\$(cat "$fx/forge/\$f.status")"
+elif [[ -e "$fx/forge/\$f.json" ]]; then printf '%s\n200' "\$(cat "$fx/forge/\$f.json")"; else printf 'oops\n500'; fi
 SH
 # Slots 0..2 have active timers; a slot is busy when $fx/busy-N exists.
 cat >"$fx/bin/systemctl" <<SH
@@ -41,7 +46,7 @@ chmod +x "$fx/bin/curl" "$fx/bin/systemctl"
 pulls() { local f=$1; shift; printf '{"items":[%s]}' "$(IFS=,; echo "$*")" >"$fx/forge/$f.json"; }
 pr() { printf '{"number":%s,"head_sha":"%s"}' "$1" "$2"; }
 run() { : >"$fx/started.log"; HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" JERYU_TOKEN_FILE="$fx/token" \
-  PR_GATE_CONFIG="$fx/pr-gate.env" bash "$wake" >"$fx/out"; }
+  GATE_RUNNER_WAKE_POLL_HEADS="${poll:-1}" GATE_RUNNER_WAKE_POLL_INTERVAL=0 PR_GATE_CONFIG="$fx/pr-gate.env" bash "$wake" >"$fx/out"; }
 must() { local why=$1; shift; "$@" || { printf 'FAIL: %s\n' "$why" >&2; cat "$fx/out" "$fx/started.log" >&2; exit 1; }; }
 started() { grep -c . "$fx/started.log" || true; }
 A1=$(printf 'a%.0s' {1..40}) A2=$(printf 'c%.0s' {1..40}) B1=$(printf 'b%.0s' {1..40}) Q1=$(printf 'd%.0s' {1..40})
@@ -51,6 +56,7 @@ run
 must 'first poll records and wakes nothing' test "$(started)" == 0
 must 'view recorded' grep -qx "acme/acme-a 1 $A1" "$fx/home/cache/wake-heads"
 must 'the fallback says why it read heads' grep -q 'no gate-wanted signal' "$fx/out"
+rm -f "$fx/home/cache/wake-signal-pause"
 must 'no sequence is kept without the signal' test ! -e "$fx/home/cache/wake-seq"
 must 'token never reaches argv' test "$(grep -c WAKE-TOKEN-7f3a "$fx/curl.log" || true)" == 0
 run
@@ -204,3 +210,59 @@ if GATE_RUNNER_WAKE_WAIT=x run 2>"$fx/err"; then
 must 'a nonnumeric wait is refused' grep -q 'GATE_RUNNER_WAKE_WAIT' "$fx/err"
 must 'and nothing was requested' test "$(grep -c . "$fx/curl.log" || true)" == 0
 printf 'PASS the wait is validated before any request\n'
+
+# ---------------------------------------------------------------------------
+# A runner newer than its forge: the forge has no gate-wanted route. Wake probes once, remembers the
+# 404, reads no heads, and wakes nothing, instead of flooding the forge every second.
+# ---------------------------------------------------------------------------
+reset_home() {
+  rm -rf -- "$fx/home" "$fx/forge"; mkdir -p "$fx/home/cache" "$fx/forge"
+  printf 'acme/acme-a\ngate-a/gate-b\n' >"$fx/home/cache/protected-acme"
+  pulls a "$(pr 1 "$A1")"; pulls b; printf '{"entries":[]}' >"$fx/forge/queue.json"
+  : >"$fx/curl.log"
+}
+reset_home
+printf 404 >"$fx/forge/wanted.status"
+poll=0 run
+must 'a 404 wakes nothing' test "$(started)" == 0
+must 'the 404 is probed once' test "$(grep -c gate-wanted "$fx/curl.log")" == 1
+must 'and no head is read' test "$(grep -c -e /pulls -e merge-queue -e gate-regate "$fx/curl.log" || true)" == 0
+must 'it says the endpoint is absent' grep -q 'no gate-wanted endpoint' "$fx/out"
+for _ in 1 2 3 4 5; do poll=0 run; done
+must 'the cached 404 means no further request' test "$(grep -c . "$fx/curl.log")" == 1
+printf '%s\n' "$(( $(date +%s) - 1 ))" >"$fx/home/cache/wake-signal-pause"
+poll=0 run
+must 'after the TTL the route is probed again' test "$(grep -c gate-wanted "$fx/curl.log")" == 2
+printf 'PASS a 404 for gate-wanted is probed once, cached, and costs no further request\n'
+
+# Even when head reads are opted into, they are throttled to the poll interval, never every tick.
+reset_home
+printf 404 >"$fx/forge/wanted.status"
+HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" JERYU_TOKEN_FILE="$fx/token" \
+  GATE_RUNNER_WAKE_POLL_HEADS=1 GATE_RUNNER_WAKE_POLL_INTERVAL=3600 PR_GATE_CONFIG="$fx/pr-gate.env" bash "$wake" >"$fx/out"
+HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" JERYU_TOKEN_FILE="$fx/token" \
+  GATE_RUNNER_WAKE_POLL_HEADS=1 GATE_RUNNER_WAKE_POLL_INTERVAL=3600 PR_GATE_CONFIG="$fx/pr-gate.env" bash "$wake" >"$fx/out"
+must 'opted-in head reads happen once per interval' test "$(grep -c '/pulls' "$fx/curl.log")" == 2
+printf 'PASS opted-in head reads are throttled to the poll interval\n'
+
+# Any other failure pauses the signal for a minute rather than retrying each second.
+reset_home
+printf 500 >"$fx/forge/wanted.status"
+poll=0 run
+for _ in 1 2 3; do poll=0 run; done
+must 'a 500 is not retried each tick' test "$(grep -c gate-wanted "$fx/curl.log")" == 1
+printf 'PASS a failing signal route is paused, not retried every second\n'
+
+# 429: the shared back-off honours Retry-After, makes no request while it lasts, and ends on success.
+reset_home
+printf 429 >"$fx/forge/wanted.status"
+printf 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\n\r\n' >"$fx/forge/retry-after"
+poll=0 run
+until_=$(cut -d' ' -f1 "$fx/home/cache/forge-backoff")
+must 'Retry-After is honoured' test "$until_" -ge "$(( $(date +%s) + 100 ))"
+for _ in 1 2 3; do poll=0 run; done
+must 'no request while backing off' test "$(grep -c . "$fx/curl.log")" == 1
+poll=1 run
+must 'not even head reads while backing off' test "$(grep -c . "$fx/curl.log")" == 1
+must 'nothing woken' test "$(started)" == 0
+printf 'PASS a 429 backs off for Retry-After across runs, signal and head reads alike\n'

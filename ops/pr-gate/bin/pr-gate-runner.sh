@@ -80,6 +80,8 @@ BASE="${BASE%/}"
 TOKEN_FILE="$(pr_gate_path "${JERYU_TOKEN_FILE:-}")"
 [[ -n "$TOKEN_FILE" ]] || not_configured JERYU_TOKEN_FILE
 HOME_DIR="${GATE_RUNNER_HOME:-$HOME/gate-runner}"
+# shellcheck source=ops/pr-gate/bin/pr-gate-backoff.sh
+source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-backoff.sh"
 REPOS="${GATE_RUNNER_REPOS:-auto}"
 OWNERS="${GATE_RUNNER_OWNERS:-}"
 [[ "$REPOS" != auto || -n "${OWNERS// }" ]] || not_configured "GATE_RUNNER_OWNERS (or GATE_RUNNER_REPOS)"
@@ -202,14 +204,21 @@ printf 'header = "Authorization: Bearer %s"\n' "$(cat "$TOKEN_FILE")" >"$AUTH_CO
 # into pieces, and the forge then answers as if the token were bad.
 # It sets the globals $body and $code rather than printing: `x="$(api ...)"` would run it
 # in a subshell, and $code would never reach the caller.
+#
+# A 429 from any call starts the shared forge back-off (pr-gate-backoff.sh): until it passes, reads
+# answer 429 locally without a request, so every slot stands back together instead of retrying each
+# tick. Writes still go out, because a gate's verdict must not be lost to a read-side limit.
 api() { # method path [json]
-  local args=(--silent --show-error --max-time 60 -X "$1"
+  local hdr out args=(--silent --show-error --max-time 60 -X "$1"
     --config "$AUTH_CONFIG" -H 'Accept: application/json')
   [[ -z "${3:-}" ]] || args+=(-H 'Content-Type: application/json' --data "$3")
-  local out
-  out="$(curl "${args[@]}" -w '\n%{http_code}' "$BASE$2")" || out=$'\n000'
+  if [[ "$1" == GET ]] && (($(backoff_remaining) > 0)); then code=429 body=""; return 0; fi
+  hdr="$(mktemp)"
+  out="$(curl "${args[@]}" --dump-header "$hdr" -w '\n%{http_code}' "$BASE$2")" || out=$'\n000'
   code="${out##*$'\n'}"
   body="${out%$'\n'*}"
+  if [[ "$code" == 429 ]]; then backoff_note_429 "$hdr"; elif [[ "$code" =~ ^2 ]]; then backoff_clear; fi
+  rm -f -- "$hdr"
 }
 
 post_status() { # owner repo sha state description
@@ -245,6 +254,10 @@ heartbeat() { # [current-gate-json]
     say "heartbeat code refused (422); retrying without it"
     HEARTBEAT_CODE=""
     api POST "/api/v1/runners/heartbeat" "$payload"
+  fi
+  if [[ "$code" == 422 ]]; then
+    say "heartbeat shape refused (422); retrying with the oldest contract"
+    api POST "/api/v1/runners/heartbeat" "$(gate_heartbeat_minimal "$payload")"
   fi
   if ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1 && jq -e . <<<"$body" >/dev/null 2>&1; then
     say "heartbeat refused ($code): $(jq -c '.message // .' <<<"$body")"
@@ -305,6 +318,13 @@ discover_repos() {
 for q in $REPOS $only_repo; do
   [[ "$q" == */* || -n "$PRIMARY_OWNER" ]] || die "repository $q has no owner and PR_GATE_PRIMARY_OWNER is not configured"
 done
+
+# While the forge is rate limiting this identity (429), look at nothing:
+# the shared back-off says when to come back, and the slot timer finds the work then.
+if (( $(backoff_remaining) > 0 )); then
+  say "the forge is rate limiting this identity; standing back for $(backoff_remaining)s"
+  exit 0
+fi
 
 # Maintainer allowances for contributed heads, read once a tick: the forge records which head a
 # maintainer applied the ok-to-test label to, as
