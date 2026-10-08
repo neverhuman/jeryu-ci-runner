@@ -1,6 +1,7 @@
 //! PID 1 supervisor for the credential-free fixture runtime.
 mod filesystem;
 mod freeze;
+mod groups;
 mod input;
 mod process;
 mod reaper;

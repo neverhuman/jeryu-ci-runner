@@ -95,6 +95,7 @@ pub fn initialize(restored: bool) -> std::io::Result<()> {
         )
         .map_err(|_| std::io::Error::other("guest_tmpfs_mount_failed"))?;
     }
+    crate::groups::initialize().map_err(|_| std::io::Error::other("guest_cgroup_unavailable"))?;
     if !restored {
         let status = Command::new("/sbin/mkfs.ext4")
             .args(["-q", "-F", "/dev/vdb"])

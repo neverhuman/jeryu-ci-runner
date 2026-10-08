@@ -1,5 +1,6 @@
 //! Real VM supervision: admission, Jailer, API boot, private vsock handshake,
 //! guest results, lease expiry, and node-owned cleanup.
+mod admission;
 mod boot;
 use crate::{
     api,
@@ -35,6 +36,8 @@ pub struct NodeConfig {
     /// Root-owned service state, with no untrusted parent directories.
     pub state_dir: PathBuf,
     pub capacity: usize,
+    /// Explicit node share after host reserve, never implicit CPU overcommit.
+    pub cpu_budget_vcpus: u16,
     pub memory_budget_mib: u32,
     pub disk_budget_gib: u32,
 }
@@ -91,6 +94,9 @@ impl NodeConfig {
         if self.capacity == 0
             || self.capacity > 64
             || self.runner_epoch == 0
+            || !(1..=2048).contains(&self.cpu_budget_vcpus)
+            || self.memory_budget_mib == 0
+            || self.disk_budget_gib == 0
             || self.control_plane_lease_key == [0; 32]
             || ed25519_dalek::VerifyingKey::from_bytes(&self.control_plane_lease_key).is_err()
         {
@@ -168,6 +174,7 @@ impl MicroVmSession {
         GuestProfile::registered(&lease.profile_id).map_err(|_| failed("unknown_agent_profile"))?;
         let maximum_runtime = Duration::from_millis(lease.expires_at_unix_millis - now);
         let resource_id = uuid::Uuid::new_v4().simple().to_string();
+        let artifact_bytes = admission::artifact_bytes(runtime, &lease)?;
         let record = {
             let _admission = node
                 .admission
@@ -176,27 +183,19 @@ impl MicroVmSession {
             let journal = &node.journal;
             let existing = journal.records()?;
             journal.require_clean_admission()?;
-            if existing.len() >= node.config.capacity
-                || existing
-                    .iter()
-                    .map(|r| u64::from(r.memory_mib) + 256)
-                    .sum::<u64>()
-                    + u64::from(lease.resources.memory_mib)
-                    + 256
-                    > u64::from(node.config.memory_budget_mib)
-                || existing
-                    .iter()
-                    .map(|r| u64::from(r.workspace_gib))
-                    .sum::<u64>()
-                    + u64::from(lease.resources.workspace_gib)
-                    + node
-                        .checkpoints
-                        .retained_bytes()?
-                        .div_ceil(1024 * 1024 * 1024)
-                    > u64::from(node.config.disk_budget_gib)
-            {
-                return Err(failed("microvm_capacity_unavailable"));
-            }
+            admission::check(
+                &node.config,
+                &existing,
+                &lease,
+                node.checkpoints.retained_bytes()?,
+                artifact_bytes,
+            )?;
+            admission::check_free_space(
+                &node.journal,
+                &node.config.state_dir,
+                &existing,
+                admission::new_disk_charge(&lease, artifact_bytes)?,
+            )?;
             if existing
                 .iter()
                 .any(|r| r.context.session_id == lease.context.session_id)
@@ -209,6 +208,8 @@ impl MicroVmSession {
             let record = ResourceRecord {
                 resource_id,
                 uid,
+                vcpus: lease.resources.vcpus,
+                artifact_bytes,
                 memory_mib: lease.resources.memory_mib,
                 workspace_gib: lease.resources.workspace_gib,
                 context: lease.context.clone(),

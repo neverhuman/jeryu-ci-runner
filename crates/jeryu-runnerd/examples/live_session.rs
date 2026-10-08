@@ -8,6 +8,8 @@ mod checkpoint;
 mod concurrent;
 #[path = "live_session/recovery.rs"]
 mod recovery;
+#[path = "live_session/resources.rs"]
+mod resources;
 #[path = "live_session/source.rs"]
 mod source;
 use jeryu_runner_core::receipt::now_ms;
@@ -52,6 +54,7 @@ fn main() -> Result<()> {
             || mode == "checkpoint"
             || mode == "cleanup-fixture"
             || mode == "corrupt-record"
+            || mode == "resource-limits"
         {
             "empty"
         } else if mode == "checkpoint-main" || mode == "graph-override" {
@@ -74,14 +77,18 @@ fn main() -> Result<()> {
             .map_err(|_| "fixture lease public key length")?,
         state_dir: root.join("node"),
         capacity: 4,
+        cpu_budget_vcpus: 4,
         memory_budget_mib: 2048,
-        disk_budget_gib: 4,
+        disk_budget_gib: 16,
     }
     .open()?;
     if mode == "cleanup-fixture" {
         return recovery::discard_checkpoints(&node);
     }
     let service = SessionService::new(node.clone(), runtime);
+    if mode == "resource-limits" {
+        resources::deny_cpu(&service, &lease)?;
+    }
     if mode == "checkpoint" || mode == "checkpoint-main" {
         return checkpoint::run(&service, &node, lease, mode == "checkpoint-main");
     }
@@ -103,6 +110,9 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let handle = result?;
+    if mode == "resource-limits" {
+        resources::verify_sparse(&context)?;
+    }
     if mode == "conflict" {
         return source::conflict(&handle, &context, &node);
     }
@@ -143,6 +153,9 @@ fn main() -> Result<()> {
         std::thread::sleep(Duration::from_millis(10));
     }
     handle.grant(OWNER, "fixture-viewer", Some(AccessGrant::Viewer))?;
+    if mode == "resource-limits" {
+        resources::verify_backpressure(&handle, &context)?;
+    }
     if mode == "corrupt-record" {
         return recovery::corrupt_record(&service, &node, &handle, &context);
     }

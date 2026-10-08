@@ -10,7 +10,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc::{self, SyncSender},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 pub struct Input {
@@ -31,27 +31,12 @@ pub fn start(
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             };
-            let mut offset = 0;
-            let deadline = Instant::now() + Duration::from_secs(1);
-            while offset < input.bytes.len()
-                && Instant::now() < deadline
-                && !finished.load(Ordering::Acquire)
-            {
-                match master.write(&input.bytes[offset..]) {
-                    Ok(0) => break,
-                    Ok(size) => offset += size,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(5))
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
+            let offset = deliver(&mut master, &input.bytes, &finished);
             let applied = offset == input.bytes.len();
             let reason = if applied {
                 "applied"
             } else if offset > 0 {
-                "partial_input"
+                "channel_closed_after_partial_input"
             } else {
                 "input_unavailable"
             };
@@ -70,4 +55,62 @@ pub fn start(
         }
     });
     send
+}
+
+fn deliver(master: &mut impl Write, bytes: &[u8], finished: &AtomicBool) -> usize {
+    let mut offset = 0;
+    // A slow PTY applies backpressure to this bounded writer. It cannot silently
+    // lose the tail at a timer boundary; stop/exit still cancels the worker.
+    while offset < bytes.len() && !finished.load(Ordering::Acquire) {
+        match master.write(&bytes[offset..]) {
+            Ok(0) => break,
+            Ok(size) => offset += size,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    offset
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    struct SlowWriter {
+        ready: Instant,
+        bytes: Vec<u8>,
+    }
+    impl Write for SlowWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if Instant::now() < self.ready {
+                return Err(std::io::ErrorKind::WouldBlock.into());
+            }
+            let count = bytes.len().min(7);
+            self.bytes.extend_from_slice(&bytes[..count]);
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn a_pty_blocked_longer_than_one_second_preserves_all_input_bytes() {
+        let bytes = [0, 255, 0x1b, b'[', b'3', b'1', b'm'].repeat(50);
+        let mut writer = SlowWriter {
+            ready: Instant::now() + Duration::from_millis(1200),
+            bytes: vec![],
+        };
+        assert_eq!(
+            deliver(&mut writer, &bytes, &AtomicBool::new(false)),
+            bytes.len()
+        );
+        assert_eq!(writer.bytes, bytes);
+        let stopped = AtomicBool::new(true);
+        assert_eq!(deliver(&mut writer, b"must-not-write", &stopped), 0);
+        assert_eq!(writer.bytes, bytes);
+    }
 }

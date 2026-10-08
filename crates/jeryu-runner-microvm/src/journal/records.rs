@@ -50,8 +50,10 @@ fn decode(bytes: &[u8], id: &str) -> RunnerResult<ResourceRecord> {
         serde_json::from_slice(bytes).map_err(|_| failed("node_journal_invalid"))?;
     if record.resource_id != id
         || !(200000..200064).contains(&record.uid)
-        || record.memory_mib == 0
-        || record.workspace_gib == 0
+        || !(1..=32).contains(&record.vcpus)
+        || record.artifact_bytes > 64 * (1 << 30)
+        || !(128..=65536).contains(&record.memory_mib)
+        || !(1..=512).contains(&record.workspace_gib)
         || record.context.validate().is_err()
         || record
             .firecracker_digest

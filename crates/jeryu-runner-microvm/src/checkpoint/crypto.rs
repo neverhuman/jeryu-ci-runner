@@ -144,6 +144,10 @@ mod tests {
             b"session-generation-1",
         )
         .unwrap();
+        assert!(
+            super::super::storage_charge(source.len() as u64).unwrap() >= encrypted.len() as u64
+        );
+        assert!(super::super::storage_charge(u64::MAX).is_err());
         let decode = |bytes: &[u8], binding: &[u8]| {
             let mut output = vec![];
             decrypt(

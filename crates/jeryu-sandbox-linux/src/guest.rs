@@ -131,17 +131,27 @@ mod tests {
             .expect_err("the host must not execute guest Git");
         assert_eq!(error.to_string(), "guest_pid1_required");
         let (_master, slave) = crate::open_pty().unwrap();
+        let membership = File::open("/dev/null").unwrap();
         let error = spawn_unprivileged_pty(
             "/bin/true",
             &[],
             &BTreeMap::new(),
             Path::new("/"),
-            &slave,
-            128,
+            &GuestPty {
+                slave: &slave,
+                cgroup_procs: &membership,
+                pids_max: 128,
+            },
         )
         .expect_err("the host must not execute a guest profile");
         assert_eq!(error.to_string(), "guest_pid1_required");
     }
+}
+
+pub struct GuestPty<'a> {
+    pub slave: &'a OwnedFd,
+    pub cgroup_procs: &'a File,
+    pub pids_max: u32,
 }
 
 pub fn spawn_unprivileged_pty(
@@ -149,13 +159,14 @@ pub fn spawn_unprivileged_pty(
     args: &[&str],
     env: &BTreeMap<String, String>,
     workspace: &Path,
-    slave: &OwnedFd,
-    pids_max: u32,
+    pty: &GuestPty<'_>,
 ) -> std::io::Result<Child> {
     if std::process::id() != 1 {
         return Err(std::io::Error::other("guest_pid1_required"));
     }
-    let fd = slave.as_raw_fd();
+    let fd = pty.slave.as_raw_fd();
+    let cgroup_fd = pty.cgroup_procs.as_raw_fd();
+    let pids_max = pty.pids_max;
     let mut command = Command::new(program);
     command
         .args(args)
@@ -169,7 +180,9 @@ pub fn spawn_unprivileged_pty(
     // It clears supplementary groups and drops root before executing agent code.
     unsafe {
         command.pre_exec(move || {
-            if libc::setsid() == -1
+            // A write of 0 enrolls this child before any uid-1000 code runs.
+            if libc::write(cgroup_fd, b"0".as_ptr().cast(), 1) != 1
+                || libc::setsid() == -1
                 || libc::ioctl(fd, libc::TIOCSCTTY, 0) == -1
                 || libc::setgroups(0, std::ptr::null()) == -1
                 || libc::setgid(1000) == -1

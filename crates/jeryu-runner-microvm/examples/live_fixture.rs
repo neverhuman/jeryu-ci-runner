@@ -1,5 +1,7 @@
 //! Dedicated local qualification fixture. Its test key is separate from release
 //! authority and its evidence cannot qualify providers or a production release.
+#[path = "live_fixture/descendants.rs"]
+mod descendants;
 use ed25519_dalek::{Signer, SigningKey};
 use jeryu_runner_core::receipt::now_ms;
 use jeryu_runner_microvm::{MicroVmSession, NodeConfig, artifacts::VerifiedRuntime};
@@ -27,6 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let runtime =
         VerifiedRuntime::admit(manifest.clone(), &signature, &key, &root.join("artifacts"))?;
     let now = u64::try_from(now_ms())?;
+    let descendants = std::env::args().nth(1).as_deref() == Some("descendants");
     let mut lease = SessionLease {
         protocol_version: PROTOCOL_VERSION.into(),
         message_type: "session-lease".into(),
@@ -60,6 +63,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pids_max: 128,
             runtime_seconds: 120,
             idle_seconds: 60,
+            output_bytes_per_second: if descendants { 1024 } else { 1024 * 1024 },
             ..SessionResources::default()
         },
         issued_at_unix_millis: now,
@@ -82,13 +86,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|_| "fixture lease public key length")?,
         state_dir: root.join("node"),
         capacity: 4,
+        cpu_budget_vcpus: 4,
         memory_budget_mib: 2048,
-        disk_budget_gib: 4,
+        disk_budget_gib: 16,
     }
     .open()?;
     let started = Instant::now();
     let mut session = MicroVmSession::start(node, &runtime, lease)?;
     println!("live_vm_handshake_ms={}", started.elapsed().as_millis());
+    if descendants {
+        return descendants::run(&mut session);
+    }
     session.send(&GuestRequest::Start {
         channel: "shell".into(),
         profile: GuestProfile::Shell,

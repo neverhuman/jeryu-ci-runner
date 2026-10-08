@@ -6,7 +6,10 @@ use jeryu_runner_protocol::{
     guest::{GuestEvent, GuestProfile},
     wire::v2::{MAX_TERMINAL_BYTES, SessionResources},
 };
-use jeryu_sandbox_linux::{guest::spawn_unprivileged_pty, open_pty, resize_pty};
+use jeryu_sandbox_linux::{
+    guest::{GuestPty, spawn_unprivileged_pty},
+    open_pty, resize_pty,
+};
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
     sys::signal::{Signal, killpg},
@@ -32,6 +35,7 @@ pub struct GuestProcess {
     input: SyncSender<Input>,
     finished: Arc<AtomicBool>,
     profile: GuestProfile,
+    group: Arc<crate::groups::Group>,
 }
 
 impl GuestProcess {
@@ -47,6 +51,8 @@ impl GuestProcess {
         let (master, slave) =
             open_pty().map_err(|_| std::io::Error::other("guest_pty_unavailable"))?;
         fcntl(&master, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).map_err(std::io::Error::from)?;
+        let group = Arc::new(crate::groups::Group::create(resources.pids_max)?);
+        let membership = group.membership()?;
         let env = BTreeMap::from([
             ("HOME".into(), "/run/agent-home".into()),
             ("PATH".into(), "/usr/bin:/bin".into()),
@@ -62,7 +68,17 @@ impl GuestProcess {
             GuestProfile::Shell => &["-i"],
         };
         let pid = reaper.spawn(|| {
-            spawn_unprivileged_pty("/bin/sh", args, &env, workspace, &slave, resources.pids_max)
+            spawn_unprivileged_pty(
+                "/bin/sh",
+                args,
+                &env,
+                workspace,
+                &GuestPty {
+                    slave: &slave,
+                    cgroup_procs: &membership,
+                    pids_max: resources.pids_max,
+                },
+            )
         })?;
         drop(slave);
         let master = File::from(master);
@@ -74,6 +90,7 @@ impl GuestProcess {
             input,
             finished: finished.clone(),
             profile,
+            group: group.clone(),
         };
         let mut output = process.master.try_clone()?;
         let channel = channel.to_string();
@@ -90,21 +107,26 @@ impl GuestProcess {
             let mut window = Instant::now();
             let mut window_bytes = 0;
             let mut exit = None;
-            let mut exit_deadline = None;
             loop {
                 if let Some(code) = reaper.result(pid) {
                     exit = Some(code);
+                    if group.kill().is_err() {
+                        let _ = crate::emit(
+                            &writer,
+                            &GuestEvent::Error {
+                                code: "guest_channel_cleanup_failed".into(),
+                            },
+                        );
+                        break;
+                    }
                     if let Ok(foreground) = tcgetpgrp(&output)
                         && foreground.as_raw() > 1
                     {
                         let _ = killpg(foreground, Signal::SIGKILL);
                     }
                     let _ = killpg(pid, Signal::SIGKILL);
-                    exit_deadline = Some(Instant::now() + Duration::from_millis(100));
                 }
-                if finished.load(Ordering::Acquire)
-                    || exit_deadline.is_some_and(|deadline| Instant::now() >= deadline)
-                {
+                if finished.load(Ordering::Acquire) {
                     break;
                 }
                 if window.elapsed() >= Duration::from_secs(1) {
@@ -156,6 +178,7 @@ impl GuestProcess {
                 }
             }
             finished.store(true, Ordering::Release);
+            let _ = group.kill();
             let _ = killpg(pid, Signal::SIGKILL);
             let _ = crate::emit(
                 &writer,
@@ -194,6 +217,7 @@ impl GuestProcess {
 
 impl Drop for GuestProcess {
     fn drop(&mut self) {
+        let _ = self.group.kill();
         if self.finished.swap(true, Ordering::AcqRel) {
             return;
         }

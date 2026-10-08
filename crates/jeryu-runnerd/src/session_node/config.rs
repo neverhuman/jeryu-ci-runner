@@ -19,6 +19,7 @@ pub struct SessionNodeConfig {
     pub runner_epoch: u64,
     pub state_dir: PathBuf,
     pub capacity: usize,
+    pub cpu_budget_vcpus: u16,
     pub memory_budget_mib: u32,
     pub disk_budget_gib: u32,
     pub owner_limit: usize,
@@ -62,6 +63,7 @@ impl SessionNodeConfig {
                 .map_err(|_| failed("session_lease_authority_invalid"))?,
             state_dir: self.state_dir.clone(),
             capacity: self.capacity,
+            cpu_budget_vcpus: self.cpu_budget_vcpus,
             memory_budget_mib: self.memory_budget_mib,
             disk_budget_gib: self.disk_budget_gib,
         })

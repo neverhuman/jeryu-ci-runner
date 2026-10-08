@@ -1,6 +1,13 @@
 //! Retain opaque workspace disks, never post-authentication memory or tmpfs.
 //! This transient root is excluded from ordinary backups together with its keys.
 mod crypto;
+/// Ciphertext tags/header plus bounded manifest/key/filesystem bookkeeping.
+pub(crate) fn storage_charge(plaintext: u64) -> RunnerResult<u64> {
+    plaintext
+        .checked_add(plaintext.div_ceil(1024 * 1024) * 16)
+        .and_then(|n| n.checked_add(24 + 1024 * 1024))
+        .ok_or_else(|| failed("checkpoint_capacity_invalid"))
+}
 use crate::artifacts::trusted_directory;
 use jeryu_runner_core::{RunnerError, RunnerResult, receipt::now_ms};
 use jeryu_runner_protocol::wire::v2::{
@@ -231,11 +238,12 @@ impl CheckpointStore {
         Ok(())
     }
     pub(crate) fn retained_bytes(&self) -> RunnerResult<u64> {
-        Ok(self
-            .manifests()?
+        self.manifests()?
             .into_iter()
-            .map(|(_, manifest)| manifest.plaintext_bytes)
-            .sum())
+            .try_fold(0u64, |sum, (_, manifest)| {
+                sum.checked_add(storage_charge(manifest.plaintext_bytes)?)
+                    .ok_or_else(|| failed("checkpoint_capacity_invalid"))
+            })
     }
     pub(crate) fn reconcile(&self) -> RunnerResult<()> {
         for (reference, manifest) in self.manifests()? {

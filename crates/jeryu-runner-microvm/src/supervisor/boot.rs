@@ -36,14 +36,11 @@ impl MicroVmSession {
             .create_new(true)
             .mode(0o600)
             .open(root.join("workspace"))?;
-        // Allocate before launch. Sparse overcommit cannot defeat disk admission.
-        nix::fcntl::fallocate(
-            &workspace,
-            nix::fcntl::FallocateFlags::empty(),
-            0,
-            i64::from(self.lease.resources.workspace_gib) * 1024 * 1024 * 1024,
-        )
-        .map_err(|_| failed("microvm_disk_capacity_unavailable"))?;
+        // Admission charges the full logical maximum, not allocated blocks.
+        // A sparse disk never grants extra capacity to another session.
+        workspace
+            .set_len(u64::from(self.lease.resources.workspace_gib) * 1024 * 1024 * 1024)
+            .map_err(|_| failed("microvm_disk_capacity_unavailable"))?;
         if let Some(checkpoint) = &self.lease.checkpoint {
             self.node
                 .checkpoints

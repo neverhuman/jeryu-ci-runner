@@ -19,6 +19,10 @@ mod records;
 pub struct ResourceRecord {
     pub resource_id: String,
     pub uid: u32,
+    #[serde(default = "maximum_cpu_charge")]
+    pub vcpus: u8,
+    #[serde(default = "historic_artifact_charge")]
+    pub artifact_bytes: u64,
     pub memory_mib: u32,
     pub workspace_gib: u32,
     pub context: SessionContext,
@@ -32,6 +36,13 @@ pub struct ResourceRecord {
     pub workspace_flushed: bool,
     pub checkpoint: Option<CheckpointReference>,
     pub workspace: Option<WorkspaceReady>,
+}
+
+fn maximum_cpu_charge() -> u8 {
+    32
+}
+fn historic_artifact_charge() -> u64 {
+    1 << 30
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
