@@ -1,6 +1,6 @@
 //! Signature- and digest-bound runtime admission. The public verification key is
 //! installed by release operations, separately from manifests and databases.
-use ed25519_dalek::{Signature, VerifyingKey};
+use crate::runtime_authority;
 use jeryu_runner_core::{RunnerError, RunnerResult};
 use jeryu_runner_protocol::wire::v2::{
     ArtifactIdentity, RuntimeArchitecture, RuntimeManifest, WorkspaceSource,
@@ -10,7 +10,6 @@ use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
-mod authority;
 
 #[derive(Debug, Clone)]
 pub struct VerifiedRuntime {
@@ -31,7 +30,7 @@ impl VerifiedRuntime {
         release_key: &[u8; 32],
         store: &Path,
     ) -> RunnerResult<Self> {
-        authority::production(&manifest, signature, release_key)?;
+        runtime_authority::production(&manifest, signature, release_key)?;
         Self::admit_artifacts(manifest, store)
     }
 
@@ -44,7 +43,7 @@ impl VerifiedRuntime {
         test_key: &[u8; 32],
         store: &Path,
     ) -> RunnerResult<Self> {
-        authority::test(&manifest, signature, release_key, test_key)?;
+        runtime_authority::test(&manifest, signature, release_key, test_key)?;
         Self::admit_artifacts(manifest, store)
     }
 
@@ -198,6 +197,6 @@ pub(crate) fn trusted_file(path: &Path, executable: bool) -> RunnerResult<File> 
     Ok(file)
 }
 
-fn denied(code: &'static str) -> RunnerError {
+pub(crate) fn denied(code: &'static str) -> RunnerError {
     RunnerError::new(code, "runtime admission failed")
 }

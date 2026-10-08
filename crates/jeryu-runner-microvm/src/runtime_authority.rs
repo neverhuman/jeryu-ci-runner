@@ -1,8 +1,10 @@
 //! Admission trusts one enrolled role, not whichever key verifies a signature.
-use super::*;
-use jeryu_runner_protocol::wire::v2::RuntimeImageClass;
+use crate::artifacts::denied;
+use ed25519_dalek::{Signature, VerifyingKey};
+use jeryu_runner_core::RunnerResult;
+use jeryu_runner_protocol::wire::v2::{RuntimeImageClass, RuntimeManifest};
 
-pub(super) fn production(
+pub(crate) fn production(
     manifest: &RuntimeManifest,
     signature: &[u8; 64],
     release_key: &[u8; 32],
@@ -12,7 +14,7 @@ pub(super) fn production(
     }
     verify(manifest, signature, release_key)
 }
-pub(super) fn test(
+pub(crate) fn test(
     manifest: &RuntimeManifest,
     signature: &[u8; 64],
     release_key: &[u8; 32],
@@ -40,8 +42,10 @@ fn verify(manifest: &RuntimeManifest, signature: &[u8; 64], key: &[u8; 32]) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::VerifiedRuntime;
     use ed25519_dalek::{Signer, SigningKey};
     use jeryu_runner_protocol::wire::v2::*;
+    use std::path::Path;
     #[test]
     fn test_and_release_authorities_cannot_be_substituted_even_with_valid_signatures() {
         let artifact = ArtifactIdentity {
