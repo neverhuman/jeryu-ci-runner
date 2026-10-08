@@ -4,7 +4,9 @@
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use jeryu_runnerd::{StartupSync, WorkcellClaimRequest, WorkcellManager, WorkcellState};
+use jeryu_runnerd::{
+    HoldFailedTreeRequest, StartupSync, WorkcellClaimRequest, WorkcellManager, WorkcellState,
+};
 use std::path::PathBuf;
 
 fn root() -> PathBuf {
@@ -95,11 +97,12 @@ fn an_unknown_cell_id_is_not_claimable() {
     assert!(denied.message().contains("unknown warm cell"));
 }
 
-// The runner epoch is the fencing token: once a claim at epoch 9 lands, a
+// The runner epoch is the fencing token: once the daemon admits epoch 9, a
 // claim carrying epoch 8 belongs to a runner lifetime already moved past.
 #[test]
 fn a_claim_carrying_a_stale_runner_epoch_is_fenced() {
     let mut manager = WorkcellManager::new();
+    manager.admit_runner_epoch("runner-anvil-3", 9);
     let first = manager.warm_one();
     manager
         .claim_ready(&first, claim_request("agent-anvil-7", 9))
@@ -132,6 +135,7 @@ fn a_claim_carrying_a_stale_runner_epoch_is_fenced() {
 #[test]
 fn the_auto_claim_path_is_fenced_on_a_stale_epoch() {
     let mut manager = WorkcellManager::with_warm_pool(1);
+    manager.admit_runner_epoch("runner-anvil-3", 12);
     manager
         .claim(claim_request("agent-anvil-10", 12))
         .expect("the current epoch claims");
@@ -144,6 +148,92 @@ fn the_auto_claim_path_is_fenced_on_a_stale_epoch() {
     assert_eq!(fenced.reason, "workcell_epoch_fenced");
     assert_eq!(manager.ready_count(), ready_before, "no warm cell consumed");
     assert_eq!(manager.workcells().len(), cells_before, "no cell minted");
+}
+
+// A claim's own epoch never moves the fence: an epoch the daemon did not
+// issue is refused, and the live runner keeps claiming at its real epoch.
+#[test]
+fn an_epoch_the_daemon_never_issued_cannot_fence_out_the_live_runner() {
+    let mut manager = WorkcellManager::new();
+    manager.admit_runner_epoch("runner-anvil-3", 5);
+    let workcell_id = manager.warm_one();
+
+    let fenced = manager
+        .claim_ready(&workcell_id, claim_request("agent-anvil-12", u64::MAX))
+        .expect_err("an inflated epoch is fenced");
+    assert_eq!(fenced.reason, "workcell_epoch_fenced");
+    assert_eq!(manager.ready_count(), 1, "the refusal consumed nothing");
+
+    manager
+        .claim_ready(&workcell_id, claim_request("agent-anvil-13", 5))
+        .expect("the admitted epoch still claims after an inflated one");
+    manager
+        .claim(claim_request("agent-anvil-14", 5))
+        .expect("and keeps claiming on the auto path");
+}
+
+fn hold_and_repair(manager: &mut WorkcellManager, runner_epoch: u64) {
+    let held = manager
+        .hold_failed_tree(HoldFailedTreeRequest {
+            claim: claim_request("agent-anvil-15", runner_epoch),
+            ci_run_id: "ci-anvil-15".into(),
+            failed_run_id: "run-anvil-15".into(),
+            failed_receipt_id: "receipt-anvil-15".into(),
+            failure_log_digest: "sha256:0badc0de".into(),
+        })
+        .expect("hold the failed tree");
+    let snapshot = held.frozen_snapshot.expect("held tree is frozen");
+    let repair = manager
+        .repair_from_snapshot(
+            &snapshot,
+            StartupSync::Rebased {
+                main_ref: "origin/main".into(),
+                base_sha: "cc33dd44".into(),
+                head_sha: "ee55ff66".into(),
+            },
+        )
+        .expect("repair from the frozen snapshot");
+    assert_eq!(repair.state, WorkcellState::Held);
+    assert_eq!(
+        repair.runner_epoch,
+        runner_epoch + 1,
+        "the repair cell carries its own bumped fencing token"
+    );
+}
+
+// Repair mints its cell at snapshot epoch + 1 as a per-cell token. That bump
+// must not become the runner's claim epoch, or the live runner would be
+// fenced out of every later claim at its real epoch.
+#[test]
+fn repair_from_snapshot_does_not_fence_the_live_runner_out_of_claims() {
+    let mut manager = WorkcellManager::with_warm_pool(1);
+    hold_and_repair(&mut manager, 4);
+
+    let next = manager
+        .claim(claim_request("agent-anvil-16", 4))
+        .expect("the live runner still claims at its real epoch after a repair");
+    assert_eq!(next.state, WorkcellState::Claimed);
+    let warm = manager.warm_one();
+    manager
+        .claim_ready(&warm, claim_request("agent-anvil-17", 4))
+        .expect("and on the warm-pool path");
+}
+
+// The same holds when the daemon has admitted the runner's epoch: repair
+// neither trips the fence nor moves it.
+#[test]
+fn repair_under_an_admitted_epoch_leaves_the_fence_where_the_daemon_set_it() {
+    let mut manager = WorkcellManager::with_warm_pool(1);
+    manager.admit_runner_epoch("runner-anvil-3", 4);
+    hold_and_repair(&mut manager, 4);
+
+    manager
+        .claim(claim_request("agent-anvil-18", 4))
+        .expect("the admitted epoch still claims after a repair");
+    let fenced = manager
+        .claim(claim_request("agent-anvil-19", 5))
+        .expect_err("the repair's bumped token is not a runner epoch");
+    assert_eq!(fenced.reason, "workcell_epoch_fenced");
 }
 
 // Eight agents race for one warm cell behind the daemon's ledger lock:

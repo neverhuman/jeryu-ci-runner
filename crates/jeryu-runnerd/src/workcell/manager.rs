@@ -45,10 +45,26 @@ impl WorkcellManager {
         leases
     }
 
+    /// Record the daemon's current epoch for one runner. This is the only
+    /// writer of the claim fence: a claim's own `runner_epoch` is checked
+    /// against it but never raises it, so a caller cannot fence the live runner
+    /// out by sending an inflated epoch. A runner the daemon has not admitted
+    /// is not fenced at the claim, as before the fence existed.
+    pub fn admit_runner_epoch(&mut self, runner_id: impl Into<String>, runner_epoch: u64) {
+        self.runner_epochs.insert(runner_id.into(), runner_epoch);
+    }
+
     pub fn claim(&mut self, request: WorkcellClaimRequest) -> WorkcellResult<WorkcellLease> {
         // Fence a stale runner lifetime before a cell is consumed, so a late
         // claim from a previous epoch neither takes a warm cell nor mints one.
         self.require_claim_epoch(&request.runner_id, request.runner_epoch)?;
+        self.claim_unfenced(request)
+    }
+
+    /// Hand one cell to `request` without the runner-level claim fence. Only the
+    /// daemon's own repair path uses this directly: it mints a fresh per-cell
+    /// token from a frozen snapshot rather than claiming for a live runner.
+    fn claim_unfenced(&mut self, request: WorkcellClaimRequest) -> WorkcellResult<WorkcellLease> {
         let warm_hit = !self.ready_queue.is_empty();
         let workcell_id = match self.ready_queue.pop_front() {
             Some(workcell_id) => workcell_id,
@@ -79,8 +95,6 @@ impl WorkcellManager {
             self.spawn_ready_cell();
         }
 
-        self.record_claim_epoch(&request.runner_id, request.runner_epoch);
-
         let lease = self
             .cells
             .get(&workcell_id)
@@ -99,17 +113,15 @@ impl WorkcellManager {
         self.spawn_ready_cell()
     }
 
-    /// Forget a warm cell that is still queued as ready and was never claimed:
-    /// the warm pool calls this when it gives up the container paired with the
-    /// id, so the ledger cannot later hand out a cell no container backs.
-    /// Returns false (and changes nothing) when the id is not queued.
-    pub fn discard_ready(&mut self, workcell_id: &str) -> bool {
-        let Some(queued) = self.ready_queue.iter().position(|id| id == workcell_id) else {
-            return false;
-        };
-        self.ready_queue.remove(queued);
-        self.cells.remove(workcell_id);
-        true
+    /// True while `workcell_id` is still queued as a ready, never-claimed cell.
+    /// The warm pool asks this after a refused claim: a cell that is still
+    /// queued keeps its container, any other container is no longer backed.
+    pub(crate) fn is_ready_queued(&self, workcell_id: &str) -> bool {
+        self.ready_queue.iter().any(|id| id == workcell_id)
+            && self
+                .cells
+                .get(workcell_id)
+                .is_some_and(|cell| matches!(cell.state, WorkcellState::Ready))
     }
 
     /// Claim the ready cell with this exact id — the warm pool has already paired
@@ -147,7 +159,6 @@ impl WorkcellManager {
         self.require_claim_epoch(&request.runner_id, request.runner_epoch)?;
 
         self.ready_queue.remove(queued);
-        self.record_claim_epoch(&request.runner_id, request.runner_epoch);
         let cell = self
             .cells
             .get_mut(workcell_id)
@@ -182,7 +193,9 @@ impl WorkcellManager {
             ci_snapshot_age_ms: Some(snapshot.snapshot_age_ms),
             startup,
         };
-        let mut lease = self.claim(request)?;
+        // The bumped epoch is this repair cell's own fencing token, not a new
+        // runner lifetime, so it must neither pass nor move the runner fence.
+        let mut lease = self.claim_unfenced(request)?;
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
@@ -399,21 +412,17 @@ impl WorkcellManager {
         workcell_id
     }
 
-    /// Refuse a claim that carries an epoch below the highest one this runner
-    /// has already claimed with. The epoch is the runner's fencing token: a
-    /// lower one belongs to a lifetime the daemon has moved past.
+    /// Refuse a claim whose epoch is not the one the daemon admitted for this
+    /// runner. Like the per-cell fence and the fleet daemon, this is an exact
+    /// match: a lower epoch is a lifetime the daemon moved past, and a higher
+    /// one is a lifetime the daemon never issued.
     fn require_claim_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
         match self.runner_epochs.get(runner_id) {
-            Some(&active) if runner_epoch < active => Err(WorkcellError::epoch_fenced(format!(
-                "runner {runner_id} claim fenced: epoch {runner_epoch} < active {active}"
+            Some(&active) if runner_epoch != active => Err(WorkcellError::epoch_fenced(format!(
+                "runner {runner_id} claim fenced: epoch {runner_epoch} != active {active}"
             ))),
             _ => Ok(()),
         }
-    }
-
-    fn record_claim_epoch(&mut self, runner_id: &str, runner_epoch: u64) {
-        let active = self.runner_epochs.entry(runner_id.to_string()).or_default();
-        *active = (*active).max(runner_epoch);
     }
 
     fn require_epoch(cell: &WorkcellLease, runner_epoch: u64) -> WorkcellResult<()> {

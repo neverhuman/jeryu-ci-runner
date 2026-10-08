@@ -195,8 +195,8 @@ pub struct WorkcellManager {
     next_id: u64,
     ready_queue: VecDeque<String>,
     cells: BTreeMap<String, WorkcellLease>,
-    /// Highest claim epoch accepted per runner. A claim carrying a lower epoch
-    /// comes from a runner lifetime that has already been fenced off.
+    /// Current epoch per runner, as admitted by the daemon. A claim carrying any
+    /// other epoch comes from a runner lifetime the daemon did not issue.
     runner_epochs: BTreeMap<String, u64>,
 }
 

@@ -89,6 +89,13 @@ impl WarmPool {
         Ok(pool)
     }
 
+    /// Record the daemon's current epoch for one runner; pool claims carrying
+    /// any other epoch for that runner are fenced. See
+    /// [`WorkcellManager::admit_runner_epoch`].
+    pub fn admit_runner_epoch(&mut self, runner_id: impl Into<String>, runner_epoch: u64) {
+        self.manager.admit_runner_epoch(runner_id, runner_epoch);
+    }
+
     /// Number of warm containers currently idling in the pool.
     pub fn warm_depth(&self) -> usize {
         self.warm.len()
@@ -131,20 +138,11 @@ impl WarmPool {
             None => self.warm_cell()?,
         };
         let agent_id = claim.agent_id.clone();
-        let lease = self.manager.claim_ready(&entry.workcell_id, claim);
-        if lease.is_err() && self.manager.discard_ready(&entry.workcell_id) {
-            // The ledger refused the claim before consuming the cell (stale
-            // epoch, not ready, not queued), but the entry has already left
-            // the pool. Give up the container and the ledger entry together,
-            // or each refusal would strand a running container and leave a
-            // queued id that no container backs for the next claim.
-            self.runtime.remove(&entry.container_id)?;
-        }
-        let lease = lease.map_err(workcell_to_runner);
-        // Restore steady-state depth even when the claimed cell blocks on a
-        // failed startup rebase, so the next session still reuses a warm cell.
+        let lease = match self.manager.claim_ready(&entry.workcell_id, claim) {
+            Ok(lease) => lease,
+            Err(err) => return Err(self.give_back_refused(entry, err)),
+        };
         self.refill()?;
-        let lease = lease?;
 
         let session = plan_agent_session(
             &owner,
@@ -180,6 +178,33 @@ impl WarmPool {
         Ok(reaped)
     }
 
+    /// Settle the entry a refused claim popped, then refill, and return the
+    /// claim's own refusal so the caller can still tell a fence from a block.
+    ///
+    /// A cell the ledger still queues as ready was never touched (stale epoch),
+    /// so its untouched container goes back to the front of the pool. Any other
+    /// refusal means no ready lease backs the container any more (the claim
+    /// blocked on a failed startup rebase, or the pool and ledger diverged), so
+    /// the container is removed. A failed removal or refill is appended to the
+    /// refusal instead of replacing it.
+    fn give_back_refused(&mut self, entry: WarmEntry, err: WorkcellError) -> RunnerError {
+        let mut message = err.message().to_string();
+        if self.manager.is_ready_queued(&entry.workcell_id) {
+            self.warm.push_front(entry);
+        } else if let Err(remove) = self.runtime.remove(&entry.container_id) {
+            message.push_str(&format!(
+                "; removing unbacked container {} also failed: {remove}",
+                entry.container_id
+            ));
+        }
+        // Restore steady-state depth even when the claimed cell blocks on a
+        // failed startup rebase, so the next session still reuses a warm cell.
+        if let Err(refill) = self.refill() {
+            message.push_str(&format!("; refilling the warm pool also failed: {refill}"));
+        }
+        RunnerError::new(err.reason, message)
+    }
+
     fn refill(&mut self) -> RunnerResult<()> {
         while self.warm.len() < self.target {
             let entry = self.warm_cell()?;
@@ -196,10 +221,6 @@ impl WarmPool {
             container_id,
         })
     }
-}
-
-fn workcell_to_runner(err: WorkcellError) -> RunnerError {
-    RunnerError::new(err.reason, err.message().to_string())
 }
 
 #[cfg(test)]
@@ -430,13 +451,14 @@ mod tests {
         assert!(claimed.lease.workcell_id.starts_with("wc-"));
     }
 
-    // The runner epoch fences the pool's claim path too: once a session claims
-    // at epoch 9, a later claim carrying epoch 8 is refused and the warm cell it
-    // would have taken stays available for the live epoch.
+    // The runner epoch fences the pool's claim path too: once the daemon admits
+    // epoch 9, a claim carrying epoch 8 is refused and the warm cell it would
+    // have taken stays available for the live epoch.
     #[test]
     fn a_stale_runner_epoch_is_fenced_on_the_pool_claim_path() {
         let fake = Arc::new(FakeContainerRuntime::default());
         let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
+        pool.admit_runner_epoch("node-0", 9);
         pool.claim(session_claim("agent-7", "run-42", 9))
             .expect("the current epoch claims");
 
@@ -480,13 +502,23 @@ mod tests {
     }
 
     // Replaying a fenced claim must not grow the runtime or the ready queue:
-    // each refusal gives back the container it took from the pool.
+    // each refusal gives back the untouched container it took from the pool,
+    // so a replay churns no container either.
     #[test]
     fn replayed_refused_claims_leak_no_container_and_no_ready_entry() {
         let fake = Arc::new(FakeContainerRuntime::default());
         let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
+        pool.admit_runner_epoch("node-0", 9);
         pool.claim(session_claim("agent-7", "run-42", 9))
             .expect("the current epoch claims");
+        let warm_before = pool.warm_container_ids();
+        let changes = || {
+            fake.lifecycle_ops()
+                .into_iter()
+                .filter(|op| !matches!(op, LifecycleOp::List))
+                .count()
+        };
+        let changes_before = changes();
         for attempt in 0..5 {
             let err = pool
                 .claim(session_claim("agent-8", &format!("run-5{attempt}"), 8))
@@ -494,6 +526,16 @@ mod tests {
             assert_eq!(err.code(), "workcell_epoch_fenced");
             assert_pool_matches_ledger(&pool, &fake, 1);
         }
+        assert_eq!(
+            pool.warm_container_ids(),
+            warm_before,
+            "the same warm containers back the pool"
+        );
+        assert_eq!(
+            changes(),
+            changes_before,
+            "a fenced replay neither removes nor starts a container"
+        );
         // The auto-claim path cannot pick up a ghost id either: whatever it
         // takes is still one of the pool's warm cells.
         let lease = pool
@@ -512,21 +554,93 @@ mod tests {
 
     // A failed startup rebase blocks the claim but the pool still refills, so the
     // next session is not starved of a warm cell.
-    #[test]
-    fn failed_startup_blocks_claim_but_pool_still_refills() {
-        let fake = Arc::new(FakeContainerRuntime::default());
-        let mut pool = WarmPool::new(fake, 2).expect("warm the pool");
-        let mut request = session_claim("agent-9", "run-9", 13);
+    fn failed_startup_claim(agent_id: &str, run_id: &str) -> SessionClaim {
+        let mut request = session_claim(agent_id, run_id, 13);
         request.claim.startup = StartupSync::Failed {
             main_ref: "origin/main".to_string(),
             base_sha: "abc123".to_string(),
             head_sha: "def456".to_string(),
             reason: "rebase conflict".to_string(),
         };
+        request
+    }
+
+    // A failed startup rebase blocks the cell after the ledger consumed it, so
+    // no ready lease backs its container any more: the pool removes that
+    // container instead of dropping its handle, and still refills.
+    #[test]
+    fn failed_startup_blocks_claim_but_pool_still_refills() {
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
+        let popped = pool.warm.front().cloned().expect("a warm entry");
         let err = pool
-            .claim(request)
+            .claim(failed_startup_claim("agent-9", "run-9"))
             .expect_err("failed rebase blocks the claim");
         assert_eq!(err.code(), "workcell_startup_rebase_failed");
         assert_eq!(pool.warm_depth(), 2, "the pool refills despite the block");
+        assert_pool_matches_ledger(&pool, &fake, 0);
+        assert!(
+            fake.lifecycle_ops().contains(&LifecycleOp::Remove {
+                container_id: popped.container_id.clone()
+            }),
+            "the blocked cell's container is removed, not stranded"
+        );
+        assert_eq!(
+            pool.manager.workcell(&popped.workcell_id).map(|l| l.state),
+            Some(WorkcellState::Blocked),
+            "the ledger keeps the blocked lease as the record of the refusal"
+        );
+    }
+
+    /// Fake runtime whose container removal always fails.
+    #[derive(Debug, Default)]
+    struct RemoveFails(FakeContainerRuntime);
+
+    impl jeryu_runner_oci::ContainerRuntime for RemoveFails {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+
+        fn run(
+            &self,
+            spec: &jeryu_runner_oci::OciSpec,
+        ) -> RunnerResult<jeryu_runner_oci::RuntimeOutcome> {
+            self.0.run(spec)
+        }
+    }
+
+    impl ContainerLifecycle for RemoveFails {
+        fn start_warm(&self, workcell_id: &str) -> RunnerResult<String> {
+            self.0.start_warm(workcell_id)
+        }
+
+        fn list_workcells(&self) -> RunnerResult<Vec<jeryu_runner_oci::WarmContainer>> {
+            self.0.list_workcells()
+        }
+
+        fn remove(&self, container_id: &str) -> RunnerResult<()> {
+            Err(RunnerError::new(
+                "container_remove_failed",
+                format!("engine refused to remove {container_id}"),
+            ))
+        }
+    }
+
+    // A failed removal must not mask the claim's own refusal or skip the
+    // refill: the caller still gets the refusal code it decides retries on.
+    #[test]
+    fn a_failed_container_removal_keeps_the_claim_refusal_and_refills() {
+        let runtime = Arc::new(RemoveFails::default());
+        let mut pool = WarmPool::new(runtime, 2).expect("warm the pool");
+        let err = pool
+            .claim(failed_startup_claim("agent-10", "run-10"))
+            .expect_err("failed rebase blocks the claim");
+        assert_eq!(err.code(), "workcell_startup_rebase_failed");
+        assert!(
+            err.message().contains("engine refused to remove"),
+            "the removal failure is reported alongside: {}",
+            err.message()
+        );
+        assert_eq!(pool.warm_depth(), 2, "the pool refills despite the failure");
     }
 }
