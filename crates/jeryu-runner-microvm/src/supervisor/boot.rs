@@ -173,6 +173,18 @@ impl MicroVmSession {
             &GuestRequest::Bind {
                 lease: Box::new(self.lease.clone()),
                 challenge: challenge.clone(),
+                remaining_lease_millis: u32::try_from(
+                    self.lease
+                        .expires_at_unix_millis
+                        .saturating_sub(
+                            u64::try_from(jeryu_runner_core::receipt::now_ms())
+                                .map_err(|_| failed("microvm_clock_invalid"))?,
+                        )
+                        .checked_sub(1000)
+                        .filter(|remaining| *remaining > 0)
+                        .ok_or_else(|| failed("microvm_lease_expired"))?,
+                )
+                .map_err(|_| failed("microvm_lease_invalid"))?,
             },
         )?;
         match read_frame::<GuestEvent>(&mut channel)? {

@@ -1,5 +1,27 @@
 use jeryu_runner_protocol::guest::*;
 use std::io::Cursor;
+#[path = "support/managed_lease.rs"]
+mod fixture;
+
+#[test]
+fn guest_deadline_is_required_and_cannot_extend_the_signed_lease() {
+    let bind = |remaining| GuestRequest::Bind {
+        lease: Box::new(fixture::lease()),
+        challenge: "a".repeat(64),
+        remaining_lease_millis: remaining,
+    };
+    bind(1).validate().unwrap();
+    bind(30000).validate().unwrap();
+    for remaining in [0, 30001, u32::MAX] {
+        assert!(bind(remaining).validate().is_err());
+    }
+    let mut value = serde_json::to_value(bind(30000)).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("remaining_lease_millis");
+    assert!(serde_json::from_value::<GuestRequest>(value).is_err());
+}
 
 #[test]
 fn guest_frames_preserve_raw_bytes_and_reject_oversize_before_reading_payload() {

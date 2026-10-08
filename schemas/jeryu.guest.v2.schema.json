@@ -412,6 +412,13 @@
             "lease": {
               "$ref": "#/$defs/SessionLease"
             },
+            "remaining_lease_millis": {
+              "description": "Node-derived remaining signed lease time, anchored at guestd boot.",
+              "type": "integer",
+              "format": "uint32",
+              "maximum": 86400000,
+              "minimum": 1
+            },
             "type": {
               "type": "string",
               "const": "bind"
@@ -421,7 +428,8 @@
           "required": [
             "type",
             "lease",
-            "challenge"
+            "challenge",
+            "remaining_lease_millis"
           ]
         },
         {

@@ -7,6 +7,7 @@ mod identity;
 mod input;
 mod process;
 mod reaper;
+mod shutdown;
 mod terminal;
 mod workspace;
 use jeryu_runner_protocol::{
@@ -25,22 +26,29 @@ fn main() {
     if run().is_err() {
         // Stable diagnostics exclude prompts, credentials, and rejected payloads.
         eprintln!("jeryu_guestd_failed");
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-        }
     }
+    // PID 1 never returns or remains alive with no supervising control plane.
+    // Give a previously written fixed Error frame a short drain opportunity.
+    std::thread::sleep(Duration::from_millis(50));
+    shutdown::stop();
 }
 
 fn run() -> std::io::Result<()> {
     if std::process::id() != 1 {
         return Err(std::io::Error::other("guest_pid1_required"));
     }
+    let shutdown = shutdown::Guard::start()?;
     let listener = GuestListener::bind(EXECUTION_PORT)?;
     let mut transport = listener.accept_host()?;
-    let (lease, challenge) = match read_frame::<GuestRequest>(&mut transport)? {
-        GuestRequest::Bind { lease, challenge } => (*lease, challenge),
+    let (lease, challenge, remaining) = match read_frame::<GuestRequest>(&mut transport)? {
+        GuestRequest::Bind {
+            lease,
+            challenge,
+            remaining_lease_millis,
+        } => (*lease, challenge, remaining_lease_millis),
         _ => return Err(std::io::Error::other("guest_bind_required")),
     };
+    shutdown.bind(remaining)?;
     workspace::configure_git(lease.resources.git_limits)?;
     if let Err(error) = filesystem::initialize(lease.checkpoint.is_some()) {
         // Bootstrap errors originate from fixed trusted setup operations. Emit

@@ -15,6 +15,9 @@ pub enum GuestRequest {
     Bind {
         lease: Box<SessionLease>,
         challenge: String,
+        /// Node-derived remaining signed lease time, anchored at guestd boot.
+        #[schemars(range(min = 1, max = 86400000))]
+        remaining_lease_millis: u32,
     },
     Start {
         channel: String,
@@ -165,9 +168,21 @@ fn guest_version_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 impl GuestRequest {
     pub fn validate(&self) -> std::io::Result<()> {
         match self {
-            Self::Bind { lease, challenge } => {
+            Self::Bind {
+                lease,
+                challenge,
+                remaining_lease_millis,
+            } => {
                 lease.validate().map_err(|_| invalid())?;
                 challenge_valid(challenge)?;
+                if *remaining_lease_millis == 0
+                    || u64::from(*remaining_lease_millis)
+                        > lease.expires_at_unix_millis - lease.issued_at_unix_millis
+                    || u64::from(*remaining_lease_millis)
+                        > u64::from(lease.resources.runtime_seconds) * 1000
+                {
+                    return Err(invalid());
+                }
             }
             Self::Start { channel, .. } => name(channel)?,
             Self::Input {

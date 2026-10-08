@@ -76,6 +76,7 @@ fn main() -> Result<()> {
         if mode == "missing-cgroup"
             || mode == "concurrent"
             || mode == "rpc-lease"
+            || mode == "rpc-expiry-lease"
             || mode == "checkpoint"
             || mode == "cleanup-fixture"
             || mode == "corrupt-record"
@@ -104,9 +105,15 @@ fn main() -> Result<()> {
             &mode
         },
     )?;
+    if mode == "rpc-expiry-lease" {
+        lease.resources.runtime_seconds = 12;
+        lease.resources.idle_seconds = 12;
+        lease.issued_at_unix_millis = u64::try_from(now_ms())?;
+        lease.expires_at_unix_millis = lease.issued_at_unix_millis + 12000;
+    }
     authority::sign(&mut lease)?;
     let context = lease.context.clone();
-    if mode == "rpc-lease" || mode == "rpc-source-lease" {
+    if mode == "rpc-lease" || mode == "rpc-source-lease" || mode == "rpc-expiry-lease" {
         println!("{}", String::from_utf8(lease.to_json()?)?);
         return Ok(());
     }
