@@ -114,6 +114,7 @@ case "$method $url" in
     printf '%s\n201' "$result";;
   'POST '*'/check-runs')
     if [[ -f "$FAKE_FORGE/reject-check-run" ]]; then printf '{"message":"check runs unavailable"}\n500'; exit; fi
+    printf '%s\n' "$payload" >>"$FAKE_FORGE/check-runs.jsonl"
     printf '{"id":"check"}\n201';;
   'POST '*'/heartbeat')
     printf '%s\n' "$payload" >>"$FAKE_FORGE/heartbeats.jsonl"
@@ -251,6 +252,44 @@ if grep -q 'recovery required' "$fixture/runner.log"; then
   exit 1
 fi
 printf 'PASS complete runner: a rejected check run is recorded and never wedges the gate\n'
+
+# A head that changes the gate it is judged by is said so on the check run and recorded on the
+# attempt: the recipe that just passed is the head's own. The conclusion is unchanged, and the
+# recipe is still the head's -- running it from protected main is deliberately not done here.
+rm -f "$fixture/check-runs.jsonl"
+"$real_git" -C "$fixture/source" checkout -q -b self-gate
+mkdir -p "$fixture/source/ops/ci"
+printf 'ops/ci/pr-ci.sh\n' >"$fixture/source/ops/ci/pr-ci.sh"
+mkdir -p "$fixture/source/docs"
+# Documentation about the gate is not the gate: it must not be named.
+printf 'how the gate works\n' >"$fixture/source/docs/jankurai-gate.md"
+"$real_git" -C "$fixture/source" add ops/ci/pr-ci.sh docs/jankurai-gate.md
+"$real_git" -C "$fixture/source" commit -qm "rewrite the gate"
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" HEAD:refs/heads/self-gate
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+head=$(cat "$fixture/head")
+jq -se 'last.state=="success"' "$fixture/statuses.jsonl" >/dev/null
+jq -e '.gate_definition_paths == ["ops/ci/pr-ci.sh"]' \
+  "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null \
+  || { printf 'the attempt did not record the gate-defining paths\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+jq -se 'last.output.text | test("^Needs a human: this head changes the gate that judges it \\(ops/ci/pr-ci\\.sh\\)")' \
+  "$fixture/check-runs.jsonl" >/dev/null \
+  || { printf 'the check run was not annotated\n' >&2; cat "$fixture/check-runs.jsonl" >&2; exit 1; }
+jq -se 'last.output.summary | test("changes its own gate$")' "$fixture/check-runs.jsonl" >/dev/null
+# The required status is the gate and says only what the gate concluded.
+jq -se 'last.description | test("changes its own gate")|not' "$fixture/statuses.jsonl" >/dev/null
+grep -q 'acme/fixture#1 changes its own gate: ops/ci/pr-ci.sh' "$fixture/runner.log" \
+  || { cat "$fixture/runner.log" >&2; exit 1; }
+"$real_git" -C "$fixture/source" checkout -q main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+rm -f "$fixture/check-runs.jsonl"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -se 'last.output | has("text") | not' "$fixture/check-runs.jsonl" >/dev/null \
+  || { printf 'a head equal to main was flagged as changing its gate\n' >&2; cat "$fixture/check-runs.jsonl" >&2; exit 1; }
+printf 'PASS complete runner: a head that changes its own gate is flagged, an ordinary head is not\n'
 
 # A head whose repository has no gate recipe gets a failure status, and the tick keeps going.
 touch "$fixture/no-recipe"

@@ -388,3 +388,51 @@ gate_regate_settling "$record" 90
 ! gate_regate_settling "$record" 90 "$(( $(date +%s) + 91 ))"
 ! gate_regate_settling "$scratch/no-record" 90
 printf 'PASS re-gate coalescing: unchanged mains keep the record, a moved main opens the settle window\n'
+
+# A head that changes the gate it is judged by. The set is the recipe entry point, the CI scripts it
+# calls and the jankurai and policy files those read -- not ordinary tests, and not documentation.
+self_gate="$scratch/self-gate"
+git init -q --initial-branch=main "$self_gate"
+git -C "$self_gate" config user.name Fixture
+git -C "$self_gate" config user.email fixture@example.invalid
+mkdir -p "$self_gate/ops/ci" "$self_gate/crates/thing/tests" "$self_gate/docs" "$self_gate/agent" "$self_gate/policies"
+printf 'base\n' >"$self_gate/ops/ci/check.sh"
+printf 'base\n' >"$self_gate/Justfile"
+printf 'base\n' >"$self_gate/agent/jankurai-gate.toml"
+printf 'base\n' >"$self_gate/policies/trust-tiers.toml"
+printf 'base\n' >"$self_gate/crates/thing/tests/it.rs"
+printf 'base\n' >"$self_gate/docs/jankurai-gate.md"
+printf 'base\n' >"$self_gate/crates/thing/src.rs"
+git -C "$self_gate" add .
+git -C "$self_gate" commit -qm base
+git -C "$self_gate" checkout -q -b head
+expect_definition_paths() { # expected
+  local got; got=$(gate_definition_paths "$self_gate" main head | paste -sd' ')
+  [[ "$got" == "$1" ]] || { printf 'gate-defining paths: got %q, expected %q\n' "$got" "$1" >&2; exit 1; }
+}
+for file in crates/thing/tests/it.rs docs/jankurai-gate.md crates/thing/src.rs; do
+  printf 'changed\n' >"$self_gate/$file"
+done
+git -C "$self_gate" commit -qam 'ordinary work on tests, docs and code'
+expect_definition_paths ''
+for file in ops/ci/check.sh Justfile agent/jankurai-gate.toml policies/trust-tiers.toml; do
+  printf 'changed\n' >"$self_gate/$file"
+done
+printf 'added\n' >"$self_gate/ops/ci/new-step.sh"
+git -C "$self_gate" add ops/ci/new-step.sh
+git -C "$self_gate" commit -qam 'rewrite the gate'
+expect_definition_paths 'Justfile agent/jankurai-gate.toml ops/ci/check.sh ops/ci/new-step.sh policies/trust-tiers.toml'
+printf 'PASS gate-defining paths: the recipe, its CI scripts and the policy files it reads, not tests or docs\n'
+
+# The annotation names them, bounded, and only paths of a shape this runner recognises.
+note_receipt="$scratch/note-receipt.json"
+note_of() { printf '%s\n' "$1" >"$note_receipt"; gate_self_modification_note "$note_receipt"; }
+[[ -z "$(note_of '{}')" && -z "$(note_of '{"gate_definition_paths":[]}')" ]]
+[[ -z "$(note_of '{"gate_definition_paths":["ops/ci/$(whoami).sh"]}')" ]]
+note=$(note_of '{"gate_definition_paths":["Justfile","ops/ci/check.sh"]}')
+[[ "$note" == 'Needs a human: this head changes the gate that judges it (Justfile, ops/ci/check.sh). The gate ran this head'"'"'s own recipe, so the conclusion above is the head reporting on itself. Read the gate change against protected main before trusting it.' ]] \
+  || { printf 'annotation: %q\n' "$note" >&2; exit 1; }
+many=$(jq -nc '{gate_definition_paths:[range(0;13) | "ops/ci/step-\(.).sh"]}')
+note=$(note_of "$many")
+[[ "$note" == *'ops/ci/step-9.sh and 3 more).'* ]] || { printf 'annotation: %q\n' "$note" >&2; exit 1; }
+printf 'PASS the self-modification annotation names a bounded, recognised-shape path list\n'

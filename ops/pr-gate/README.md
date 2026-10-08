@@ -50,6 +50,23 @@ refused -- this runner's own work, a closed pull request, a head that moved -- a
 reads no requests, being a retry already. A forge without the route (404) is silent; any other
 answer is reported, because it would otherwise ignore every re-gate asked for without a word.
 
+## A head that changes its own gate
+
+The gate runs the recipe **at the head under test**, so a diff that rewrites that recipe rewrites the
+check which then passes it. Each gate therefore diffs the head against the repository's protected
+`main` (`mirror/main` in the tree) for the paths that define the gate -- `Justfile` anywhere,
+`ops/ci/**`, `ops/jankurai/**`, any `*jankurai*` file and `policies/**`, excluding `docs/**` -- and
+records them on the attempt as `gate_definition_paths`.
+
+When the list is not empty the check run `pr-gate-runner` says so: `output.summary` ends with
+`changes its own gate` and `output.text` names the paths and what to do. The required status is
+untouched -- it is the gate, and its description must stay the gate's own verdict -- and the
+conclusion is unchanged: this is a flag for a person, not a veto. Running the recipe from protected
+`main` instead is deliberately **not** done (owner decision, 2026-10-02).
+
+jeryu's attention inbox raises the matching item from the same path set, so such a pull request also
+appears on `/needs-you` (jeryu-deploy: `pr_changes_own_gate`).
+
 ## Site configuration
 
 Nothing in this directory names a site. Everything that does -- the forge URL, the credential file,

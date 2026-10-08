@@ -594,6 +594,17 @@ fi
 sync_repo "$repo" "$sha"
 [[ "$(git -C "$run/$repo" rev-parse HEAD)" == "$sha" ]] || die "could not check out $sha"
 [[ -z "$(git -C "$run/$repo" status --porcelain --ignored=no)" ]] || die "$repo is not clean at $sha"
+# Does this head change the gate it is judged by? The recipe below is the head's own, so a diff that
+# touches the Justfile, ops/ci or the jankurai and policy files it reads rewrote the check that is
+# about to report. It is recorded on the attempt and annotated on the check run (gate_publish); it
+# changes no conclusion, and nothing here reruns the recipe from protected main. mirror/main is that
+# protected main in this tree (sync_repo keeps it there).
+mapfile -t self_gate_paths < <(gate_definition_paths "$run/$repo" mirror/main "$sha")
+self_gate_json='[]'
+if ((${#self_gate_paths[@]} > 0)); then
+  self_gate_json=$(printf '%s\n' "${self_gate_paths[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  say "$owner/$repo#$number changes its own gate: ${self_gate_paths[*]}"
+fi
 # Some family integrity tests need governed runtime fixtures (a pinned typesetter, say) at the family
 # root's target/, the same shape the release host has. Without them the whole recipe fails on a
 # missing tool and says nothing about the commit under test. PR_GATE_RUNTIME_TOOLS_OWNERS names them.
@@ -724,6 +735,9 @@ if ((admitted == 0)); then
 fi
 gate_begin "$identity"
 : "${gate_attempt_dir:?}"
+# On the attempt, so recovery publishes the same annotation from the same evidence as this process would.
+gate_update --argjson paths "$self_gate_json" '.gate_definition_paths=$paths' \
+  || say "could not record the gate-defining paths of $owner/$repo@$sha"
 # The request is discharged by the attempt it started, not by the attempt's outcome: a gate that
 # dies leaves recovery to finish, and reading the request as still owed would gate the same head on
 # every tick until it moved.

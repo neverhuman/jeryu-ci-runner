@@ -117,7 +117,7 @@ gate_begin() {
     --argjson pid "$$" --argjson sequence "$sequence" --arg slot "$SLOT" --slurpfile inputs "$identity" \
     '{schema:"jeryu.pr-gate-attempt/v1",id:$id,owner:$owner,repo:$repo,sha:$sha,
       boot_id:$boot,pid:$pid,slot:$slot,sequence:$sequence,started_at:$at,inputs:$inputs[0],
-      terminal:false,outcome:null,exit_code:null,log:null,log_sha256:null,
+      terminal:false,outcome:null,exit_code:null,log:null,log_sha256:null,gate_definition_paths:[],
       publication:{required_status:false,check_run:false},recovery_required:null,
       execution_kind:"operator-unsealed"}' | gate_atomic "$gate_receipt"
 }
@@ -261,8 +261,41 @@ gate_failure_cause() { # log
   done < <(sed -E 's/\x1b\[[0-9;]*[A-Za-z]//g; s#/home/[^ ]*/gate-runner/tree[^/ ]*/##g' "$1" 2>/dev/null)
 }
 
+# The paths that define the gate a head is judged by. This runner runs the head's OWN recipe, so a
+# change to one of them rewrote the check that is about to report on it, and the result proves only
+# what the head's own gate chose to prove. Printed one per line, sorted, for base...head.
+# The set is narrow on purpose: the recipe entry point, the CI scripts it calls, and the jankurai and
+# policy files those read. Ordinary test directories are not in it -- every PR touches tests, and a
+# flag that fires on all of them says nothing. Documentation about the gate does not define it.
+gate_definition_paths() { # repo-dir base head
+  git -C "$1" diff --name-only "$2...$3" -- \
+    ':(glob)**/Justfile' ':(glob)ops/ci/**' ':(glob)ops/jankurai/**' \
+    ':(glob)**/*jankurai*' ':(glob)policies/**' ':(glob,exclude)docs/**' 2>/dev/null | LC_ALL=C sort -u
+}
+
+# How many of those paths the check run names. A rewrite that touches hundreds of them is already
+# said by the first few, and a status payload is not a place for an unbounded list.
+GATE_DEFINITION_PATHS_SHOWN=10
+
+# The check-run annotation for a head that changes its own gate, or nothing. Only paths matching a
+# relative-path charset are named -- the same allowlist rule as gate_failure_cause, so a path shape
+# this runner does not recognise is counted and not published.
+gate_self_modification_note() { # receipt
+  local paths count shown
+  paths=$(jq -r '(.gate_definition_paths // [])[]
+    | select(test("^[A-Za-z0-9_][A-Za-z0-9_./-]{0,199}$"))' "$1" 2>/dev/null) || return 0
+  [[ -n "$paths" ]] || return 0
+  count=$(printf '%s\n' "$paths" | wc -l)
+  # A comma is outside the path charset above, so joining on one cannot be misread.
+  shown=$(printf '%s\n' "$paths" | head -n "$GATE_DEFINITION_PATHS_SHOWN" | paste -sd, | sed 's/,/, /g')
+  ((count <= GATE_DEFINITION_PATHS_SHOWN)) \
+    || shown+=" and $((count - GATE_DEFINITION_PATHS_SHOWN)) more"
+  printf 'Needs a human: this head changes the gate that judges it (%s). The gate ran this head%s own recipe, so the conclusion above is the head reporting on itself. Read the gate change against protected main before trusting it.' \
+    "$shown" "'s"
+}
+
 gate_publish() {
-  local state outcome id digest exit_code context cause="" log
+  local state outcome id digest exit_code context cause="" log note=""
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -285,10 +318,16 @@ gate_publish() {
     gate_update --argjson response "$body" '.publication.required_status=true | .publication.status_id=$response.id | .publication.http_status=201' || return
   fi
   if ! jq -e '.publication.check_run' "$gate_receipt" >/dev/null; then
+    # A head that changes its own gate is annotated here, on the check run, and never on the required
+    # status: the status is the gate, and its description is what the merge panel reads as the verdict.
+    # The annotation is advisory -- it changes no conclusion. jeryu's attention inbox raises the
+    # matching needs_human item from the same paths, so the PR also shows up on /needs-you.
+    note=$(gate_self_modification_note "$gate_receipt")
     api POST "/repos/$owner/$repo/check-runs" "$(jq -nc --arg sha "$sha" --arg state "$state" \
-      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" --arg summary "Attempt $id; log sha256 $digest; operator-unsealed" \
+      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" --arg summary "Attempt $id; log sha256 $digest; operator-unsealed${note:+; changes its own gate}" \
+      --arg note "$note" \
       '{name:"pr-gate-runner",head_sha:$sha,status:"completed",conclusion:(if $state=="error" then "failure" else $state end),
-        output:{title:$title,summary:$summary}}')"
+        output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}')"
     # The check run is not a required context and never gates a merge: the required status above is
     # the gate. A rejection is recorded and reported, and must not hold the attempt in recovery or
     # stop later ticks, which is what a return 1 here did.
