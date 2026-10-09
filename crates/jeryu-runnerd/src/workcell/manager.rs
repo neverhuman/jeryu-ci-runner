@@ -23,6 +23,14 @@ impl WorkcellManager {
         self
     }
 
+    /// Builder: the roots, from the daemon's configuration, that an export may
+    /// be written under. Without any, every export is refused.
+    #[must_use]
+    pub fn with_export_destination_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.export_destination_roots = roots;
+        self
+    }
+
     pub fn ready_count(&self) -> usize {
         self.ready_queue.len()
     }
@@ -232,6 +240,31 @@ impl WorkcellManager {
             )));
         }
         cell.branch_policy.open_branch(branch_suffix)
+    }
+
+    /// Export workspace `paths` of a held or repairing workcell to
+    /// `destination`. The sources must sit inside the lease's repo roots and
+    /// carry no host credential material; the destination must sit inside a
+    /// configured export root and not pass through a symlink. Nothing is
+    /// written here: the caller writes only after this returns `Ok`.
+    pub fn export_workspace(
+        &self,
+        workcell_id: &str,
+        runner_epoch: u64,
+        paths: &[PathBuf],
+        destination: &Path,
+    ) -> WorkcellResult<()> {
+        let cell = self.cells.get(workcell_id).ok_or_else(|| {
+            WorkcellError::epoch_fenced(format!("unknown workcell {workcell_id}"))
+        })?;
+        Self::require_epoch(cell, runner_epoch)?;
+        if !matches!(cell.state, WorkcellState::Held | WorkcellState::Repairing) {
+            return Err(WorkcellError::repair_state_denied(format!(
+                "workcell {workcell_id} must be held or repairing before export"
+            )));
+        }
+        validate_export_paths(paths, &cell.repo_roots)?;
+        validate_export_destination(destination, &self.export_destination_roots)
     }
 
     pub fn heartbeat(

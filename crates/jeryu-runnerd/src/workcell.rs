@@ -189,6 +189,9 @@ pub struct WorkcellManager {
     /// in a frozen capsule. They are never taken from a freeze or hold request:
     /// the party whose capsule is screened must not be able to empty the list.
     forbidden_token_values: Vec<String>,
+    /// Roots an export may be written under, from the daemon's configuration.
+    /// Empty means no export destination is permitted.
+    export_destination_roots: Vec<PathBuf>,
     next_id: u64,
     ready_queue: VecDeque<String>,
     cells: BTreeMap<String, WorkcellLease>,

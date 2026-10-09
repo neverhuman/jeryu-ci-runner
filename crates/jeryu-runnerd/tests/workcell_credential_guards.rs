@@ -160,3 +160,68 @@ fn a_capsule_carrying_a_token_value_is_not_frozen() {
         .expect_err("a capsule carrying a token value must not be frozen");
     assert_eq!(err.reason, "workcell_capture_token_denied");
 }
+
+#[test]
+fn manager_export_enforces_path_and_destination_guards() {
+    let temp = tempfile::tempdir().unwrap_or_else(|err| panic!("{err}"));
+    let uploads = temp.path().join("uploads");
+    std::fs::create_dir(&uploads).unwrap_or_else(|err| panic!("{err}"));
+    let elsewhere = temp.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap_or_else(|err| panic!("{err}"));
+
+    let mut manager =
+        WorkcellManager::with_warm_pool(1).with_export_destination_roots(vec![uploads.clone()]);
+    let lease = manager
+        .hold_failed_tree(HoldFailedTreeRequest {
+            claim: rebased_claim("agent-wrath-21"),
+            ci_run_id: "ci-21".into(),
+            failed_run_id: "run-21".into(),
+            failed_receipt_id: "receipt-21".into(),
+            failure_log_digest: "sha256:dead".into(),
+        })
+        .unwrap_or_else(|err| panic!("{err}"));
+    let id = lease.workcell_id.as_str();
+    let epoch = lease.runner_epoch;
+    let tar = uploads.join("wc-0001.tar");
+    let source = vec![root().join("src/lib.rs")];
+
+    manager
+        .export_workspace(id, epoch, &source, &tar)
+        .unwrap_or_else(|err| panic!("{err}"));
+
+    let err = manager
+        .export_workspace(id, epoch, &[root().join(".codex/auth.json")], &tar)
+        .expect_err("credential material must not leave through the manager");
+    assert_eq!(err.reason, "workcell_credential_material_denied");
+
+    let err = manager
+        .export_workspace(id, epoch, &[PathBuf::from("/etc/passwd")], &tar)
+        .expect_err("a path outside the repo roots must be denied");
+    assert_eq!(err.reason, "workcell_tar_path_denied");
+
+    let err = manager
+        .export_workspace(id, epoch, &source, &elsewhere.join("wc-0001.tar"))
+        .expect_err("a destination outside the configured roots must be denied");
+    assert_eq!(err.reason, "workcell_export_destination_denied");
+
+    let err = manager
+        .export_workspace(id, epoch + 1, &source, &tar)
+        .expect_err("a stale epoch must be fenced");
+    assert_eq!(err.reason, "workcell_epoch_fenced");
+
+    // No configured destination root means no export at all.
+    let mut bare = WorkcellManager::with_warm_pool(1);
+    let lease = bare
+        .hold_failed_tree(HoldFailedTreeRequest {
+            claim: rebased_claim("agent-wrath-22"),
+            ci_run_id: "ci-22".into(),
+            failed_run_id: "run-22".into(),
+            failed_receipt_id: "receipt-22".into(),
+            failure_log_digest: "sha256:dead".into(),
+        })
+        .unwrap_or_else(|err| panic!("{err}"));
+    let err = bare
+        .export_workspace(&lease.workcell_id, lease.runner_epoch, &source, &tar)
+        .expect_err("an empty destination allowlist denies");
+    assert_eq!(err.reason, "workcell_export_destination_denied");
+}
