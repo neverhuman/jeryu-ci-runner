@@ -131,6 +131,9 @@ fn a_capsule_carrying_a_token_value_is_not_frozen() {
 
     // The denylist is daemon configuration, never part of the request.
     let mut manager = WorkcellManager::with_warm_pool(1).with_forbidden_token_values(forbidden);
+    // Claims are fenced on the fleet registry's epochs; admit the fixture runner's
+    // epoch as RunnerFleet would, so the token guard is what refuses below.
+    manager.sync_runner_epochs([("runner-17".to_string(), 7)]);
     let err = manager
         .hold_failed_tree(HoldFailedTreeRequest {
             claim: rebased_claim("agent-wrath-17"),
