@@ -49,7 +49,6 @@ echo "[pr-ci] offline PR gate runner regression suite" >&2
 bash ops/pr-gate/tests/required.sh
 
 echo "[pr-ci] (jobs=$JOBS) standard lanes" >&2
-bash ops/ci/fast.sh
 JERYU_SPLIT_FULL_CHECK=1 bash ops/ci/check.sh
 just contract-drift
 bash ops/ci/score.sh
