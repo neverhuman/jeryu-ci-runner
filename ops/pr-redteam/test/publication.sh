@@ -14,10 +14,15 @@ finish() {
 }
 trap finish EXIT
 real_git="$(command -v git)"
+fixture_git() {
+  env -u GIT_AUTHOR_NAME -u GIT_AUTHOR_EMAIL -u GIT_AUTHOR_DATE \
+    -u GIT_COMMITTER_NAME -u GIT_COMMITTER_EMAIL -u GIT_COMMITTER_DATE \
+    "$real_git" "$@"
+}
 mkdir -p "$t/bin" "$t/state" "$t/repo"
 printf 'fixture-bearer\n' > "$t/token"
-git init -q -b main "$t/repo"
-g() { "$real_git" -C "$t/repo" -c user.name=fixture -c user.email=fixture@example.invalid "$@"; }
+fixture_git init -q -b main "$t/repo"
+g() { fixture_git -C "$t/repo" -c user.name=fixture -c user.email=fixture@example.invalid "$@"; }
 printf 'base\n' > "$t/repo/README.md"; g add .; g commit -qm base
 g rev-parse HEAD > "$t/base"
 g switch -qc topic
@@ -246,7 +251,7 @@ REDTEAM_AUTHOR_DOMAINS='jeryu/fixture=EXAMPLE.invalid' review
 jq -e '.decision != "author_domain" and .posted == true' "$(receipt)" > /dev/null
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
 printf 'outsider\n' >> "$t/repo/README.md"
-"$real_git" -C "$t/repo" -c user.name=outsider -c user.email=x@notexample.invalid commit -qam outsider
+fixture_git -C "$t/repo" -c user.name=outsider -c user.email=x@notexample.invalid commit -qam outsider
 g rev-parse HEAD > "$t/head"
 REDTEAM_AUTHOR_DOMAINS='jeryu/fixture=example.invalid' review
 jq -e '.decision == "author_domain" and .foreign_emails == ["x@notexample.invalid"]' "$(receipt)" > /dev/null

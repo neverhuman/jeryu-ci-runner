@@ -116,6 +116,13 @@ value. The bearer travels through curl configuration
 stdin, with curlrc disabled, and is absent from curl argv. This transport guard
 is separate from model/process credential confinement.
 
+Service failure notification is also site configuration. Set `NOTIFY_COMMAND`
+in `~/.config/pr-redteam/site.env` to a shell command that receives the message
+on stdin and in `PR_REDTEAM_NOTIFY_BODY`, or set `NOTIFY_WEBHOOK_URL` to receive
+a JSON POST. With neither configured, the notification unit logs that no target
+exists and exits successfully. Hosts, channels and tokens do not belong in this
+repository.
+
 State lives in `REDTEAM_STATE` (default `~/.local/state/pr-redteam`). The per-PR
 lock excludes concurrent reviews. Receipts record admitted attempts before model
 execution; a killed worker leaves a visible pending claim. The next holder
@@ -126,18 +133,22 @@ approval. Operators should investigate pending claims when no worker owns them.
 
 ## Installation and service ownership
 
-`./install.sh` stages four user units and reloads their definitions. It refuses
-to replace active or enabled units. The existing service owner must explicitly
-stop/disable an earlier installation, qualify the selected source/model/CLI, and
-separately authorize activation. The script never starts or enables a timer.
+`./install.sh` stages seven user units and reloads their definitions: review,
+heartbeat and poke services with timers, plus the failure-notification template.
+It refuses to replace active or enabled units, and refuses to stage the
+operational units until their required site environment file exists. The existing
+service owner must explicitly stop/disable an earlier installation, qualify the
+selected source/model/CLI, and separately authorize activation. The script never
+starts or enables a timer.
 
 The units reference this source directory by absolute path. Treat any later
 source update as a service change requiring its owner's custody and qualification.
-The timer invokes a review pass and then a merge pass. `install.sh` stages all
-six units (review, heartbeat and poke, each a service and a timer) and enables none. The merger credential's
-path comes from the site's `~/.config/pr-redteam/merge.env`, read by the unit;
-`install.sh` writes no credential and no credential path. Heartbeats report liveness through Jeryu's existing
-runner-reporting allowlist. An authorization refusal is logged, not bypassed.
+The timer invokes a review pass and then a merge pass. `install.sh` enables no
+unit. The merger credential's path comes from the site's
+`~/.config/pr-redteam/merge.env`, read by the unit; `install.sh` writes no
+credential and no credential path. Heartbeats report liveness through Jeryu's
+existing runner-reporting allowlist. An authorization refusal is logged, not
+bypassed.
 
 ## Review isolation
 

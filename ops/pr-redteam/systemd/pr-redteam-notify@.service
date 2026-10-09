@@ -1,0 +1,12 @@
+[Unit]
+Description=pr-redteam: notify when %I fails
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+# Notification routing is site configuration. This is optional so a missing
+# site.env failure can still reach a configured command from the unit manager.
+EnvironmentFile=-%h/.config/pr-redteam/site.env
+ExecStart=@REDTEAM_DIR@/notify-failure %I
+Nice=15
+TimeoutStartSec=2min

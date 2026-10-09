@@ -10,10 +10,33 @@ here="$(cd "$(dirname "$0")" && pwd)"
 command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ] || { echo "claude CLI not found" >&2; exit 1; }
 
 units="$HOME/.config/systemd/user"
+required_environment_files() {
+  local file="$1" env_file
+  while IFS= read -r env_file; do
+    env_file="${env_file#EnvironmentFile=}"
+    [[ "$env_file" == -* ]] && continue
+    env_file="${env_file//%h/$HOME}"
+    env_file="${env_file//@REDTEAM_DIR@/$here}"
+    printf '%s\n' "$env_file"
+  done < <(grep -E '^EnvironmentFile=' "$file" || true)
+}
+
+for source_unit in \
+  "$here/systemd/pr-redteam.service" \
+  "$here/systemd/pr-redteam-heartbeat.service" \
+  "$here/systemd/pr-redteam-poke.service"; do
+  while IFS= read -r env_file; do
+    [ -f "$env_file" ] || {
+      echo "$(basename "$source_unit") requires EnvironmentFile=$env_file; create it before installation" >&2
+      exit 1
+    }
+  done < <(required_environment_files "$source_unit")
+done
+
 # Replacing an active or enabled unit would change its next execution. Require the
 # service owner to stop/disable it explicitly before staging replacement source.
 for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-redteam-heartbeat.timer \
-  pr-redteam-poke.service pr-redteam-poke.timer; do
+  pr-redteam-poke.service pr-redteam-poke.timer pr-redteam-notify@.service; do
   # `is-enabled` also succeeds for a static unit (no [Install] section, as every
   # pr-redteam service is), so only states that start the unit on their own count.
   enabled_state="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
@@ -35,6 +58,8 @@ cp "$here/systemd/pr-redteam-heartbeat.timer" "$units/pr-redteam-heartbeat.timer
 rm -f "$units/pr-redteam-poke.service" "$units/pr-redteam-poke.timer"
 sed "s#@REDTEAM_DIR@#$here#g" "$here/systemd/pr-redteam-poke.service" >"$units/pr-redteam-poke.service"
 cp "$here/systemd/pr-redteam-poke.timer" "$units/pr-redteam-poke.timer"
+rm -f "$units/pr-redteam-notify@.service"
+sed "s#@REDTEAM_DIR@#$here#g" "$here/systemd/pr-redteam-notify@.service" >"$units/pr-redteam-notify@.service"
 systemctl --user daemon-reload
 echo "units staged from $here; no review, heartbeat or poke was started"
 echo "the existing service owner must independently qualify and authorize activation"

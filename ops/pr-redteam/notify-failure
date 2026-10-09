@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Notify site-owned routing about a failed pr-redteam unit. The repository ships
+# no host, channel or token; site.env may provide NOTIFY_COMMAND or NOTIFY_WEBHOOK_URL.
+set -euo pipefail
+
+unit="${1:-}"
+[ -n "$unit" ] || { echo "pr-redteam notify: missing unit name" >&2; exit 1; }
+case "$unit" in
+  pr-redteam.service|pr-redteam-heartbeat.service|pr-redteam-poke.service) ;;
+  *) echo "pr-redteam notify: refusing unexpected unit $unit" >&2; exit 1 ;;
+esac
+
+lines="${NOTIFY_JOURNAL_LINES:-80}"
+[[ "$lines" =~ ^[0-9]+$ ]] || lines=80
+
+journal="$(journalctl --user -u "$unit" -n "$lines" --no-pager -o short-iso 2>&1 || true)"
+subject="pr-redteam unit failed: $unit"
+body="$(printf '%s\n\nlast %s journal lines:\n%s\n' "$subject" "$lines" "$journal")"
+
+if [ -n "${NOTIFY_COMMAND:-}" ]; then
+  export PR_REDTEAM_FAILED_UNIT="$unit"
+  export PR_REDTEAM_NOTIFY_SUBJECT="$subject"
+  export PR_REDTEAM_NOTIFY_BODY="$body"
+  printf '%s' "$body" | sh -c "$NOTIFY_COMMAND"
+  exit 0
+fi
+
+if [ -n "${NOTIFY_WEBHOOK_URL:-}" ]; then
+  command -v curl >/dev/null || { echo "pr-redteam notify: curl is required for NOTIFY_WEBHOOK_URL" >&2; exit 1; }
+  payload="$(jq -n --arg unit "$unit" --arg subject "$subject" --arg body "$body" \
+    '{source:"pr-redteam", unit:$unit, subject:$subject, body:$body}')"
+  curl --fail --silent --show-error --request POST \
+    --header 'Content-Type: application/json' \
+    --data-binary "$payload" \
+    "$NOTIFY_WEBHOOK_URL" >/dev/null
+  exit 0
+fi
+
+echo "pr-redteam notify: no NOTIFY_COMMAND or NOTIFY_WEBHOOK_URL configured for $unit" >&2
+exit 0

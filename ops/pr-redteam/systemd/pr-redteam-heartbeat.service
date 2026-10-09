@@ -5,6 +5,7 @@
 Description=pr-redteam: report runner liveness to jeryu
 After=network-online.target
 Wants=network-online.target
+OnFailure=pr-redteam-notify@%n.service
 
 [Service]
 Type=oneshot
