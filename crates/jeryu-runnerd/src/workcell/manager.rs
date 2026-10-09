@@ -46,6 +46,8 @@ impl WorkcellManager {
     }
 
     pub fn claim(&mut self, request: WorkcellClaimRequest) -> WorkcellResult<WorkcellLease> {
+        let mut request = request;
+        request.runner_epoch = self.assign_runner_epoch(&request.runner_id)?;
         let warm_hit = !self.ready_queue.is_empty();
         let workcell_id = match self.ready_queue.pop_front() {
             Some(workcell_id) => workcell_id,
@@ -101,8 +103,14 @@ impl WorkcellManager {
     pub fn claim_ready(
         &mut self,
         workcell_id: &str,
-        request: WorkcellClaimRequest,
+        mut request: WorkcellClaimRequest,
     ) -> WorkcellResult<WorkcellLease> {
+        if !self.cells.contains_key(workcell_id) {
+            return Err(WorkcellError::claim_denied(format!(
+                "unknown warm cell {workcell_id}"
+            )));
+        }
+        request.runner_epoch = self.assign_runner_epoch(&request.runner_id)?;
         if let Some(pos) = self.ready_queue.iter().position(|id| id == workcell_id) {
             self.ready_queue.remove(pos);
         }
@@ -296,6 +304,12 @@ impl WorkcellManager {
         Self::require_epoch(cell, runner_epoch)?;
         cell.state = WorkcellState::Released;
         cell.heartbeat_healthy = false;
+        let runner_id = cell.runner_id.clone();
+        if !self.cells.values().any(|other| {
+            other.runner_id == runner_id && other.state != WorkcellState::Released
+        }) {
+            self.runner_epochs.remove(&runner_id);
+        }
         Ok(())
     }
 
@@ -347,6 +361,18 @@ impl WorkcellManager {
         let lease = WorkcellLease::ready(workcell_id.clone());
         self.cells.insert(workcell_id.clone(), lease);
         workcell_id
+    }
+
+    fn assign_runner_epoch(&mut self, runner_id: &str) -> WorkcellResult<u64> {
+        if let Some(epoch) = self.runner_epochs.get(runner_id) {
+            return Ok(*epoch);
+        }
+        self.next_runner_epoch = self.next_runner_epoch.checked_add(1).ok_or_else(|| {
+            WorkcellError::claim_denied("runner epoch sequence exhausted")
+        })?;
+        let epoch = self.next_runner_epoch;
+        self.runner_epochs.insert(runner_id.to_string(), epoch);
+        Ok(epoch)
     }
 
     /// Mint a ready cell and queue it for the next claim.

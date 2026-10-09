@@ -46,6 +46,29 @@ fn claims_from_an_empty_pool_hand_out_distinct_cells() {
 }
 
 #[test]
+fn runner_epochs_are_daemon_assigned_shared_and_pruned_after_release() {
+    let mut manager = WorkcellManager::new();
+    let mut forged = rebased_request("agent-one");
+    forged.runner_epoch = u64::MAX;
+    let first = manager.claim(forged).expect("first claim");
+    assert_eq!(first.runner_epoch, 1, "client epoch is ignored");
+
+    let mut concurrent = rebased_request("agent-two");
+    concurrent.runner_epoch = 2;
+    let second = manager.claim(concurrent).expect("concurrent claim");
+    assert_eq!(second.runner_epoch, first.runner_epoch);
+    assert_eq!(manager.runner_epochs.get("node-0"), Some(&1));
+
+    manager.release(&first.workcell_id, first.runner_epoch).unwrap();
+    assert_eq!(manager.runner_epochs.get("node-0"), Some(&1));
+    manager.release(&second.workcell_id, second.runner_epoch).unwrap();
+    assert!(!manager.runner_epochs.contains_key("node-0"));
+
+    let next = manager.claim(rebased_request("agent-three")).expect("next claim");
+    assert_eq!(next.runner_epoch, 2, "new assignment gets a fresh epoch");
+}
+
+#[test]
 fn claim_replaces_warm_cell_and_assigns_branch_budget() {
     let mut manager = WorkcellManager::with_warm_pool(1);
     assert_eq!(manager.ready_count(), 1);

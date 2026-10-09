@@ -193,6 +193,8 @@ pub struct WorkcellManager {
     /// Empty means no export destination is permitted.
     export_destination_roots: Vec<PathBuf>,
     next_id: u64,
+    next_runner_epoch: u64,
+    runner_epochs: BTreeMap<String, u64>,
     ready_queue: VecDeque<String>,
     cells: BTreeMap<String, WorkcellLease>,
 }
