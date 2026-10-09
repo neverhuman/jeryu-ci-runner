@@ -182,6 +182,19 @@ pr_row() { # owner/name number
   jq -ce --argjson n "$2" '.items[] | select(.number == $n)' <<<"$body"
 }
 
+# The pull request's text as its author wrote it. The list rows pr_row reads carry
+# no text at all: only the forge's one-pull-request read does, as `description`
+# (GitHub-style APIs say `body`). A read that fails says so, so the reviewer is
+# never told an author left a pull request blank when nobody looked.
+pr_description() { # owner/name number -> text
+  api GET "/api/v1/repos/${1/\//%2F}/pulls/$2"
+  if [ "$code" != 200 ]; then
+    echo "(the description could not be read: the forge answered $code)"
+    return
+  fi
+  jq -r '.description // .summary.description // .body // "(no description)"' <<<"$body"
+}
+
 receipt_path() { echo "$state/receipts/$1/$2-$3.json"; } # owner/name number sha
 
 # The quality gate, in the forge's own words. `jankurai/proof` is a required
@@ -597,10 +610,12 @@ review_one() { # owner/name number dry-run force include-drafts
   git -C "$cache" cat-file -e "$base_sha^{commit}" 2>/dev/null || base_sha="$(git -C "$cache" rev-parse "refs/pr/$number/base")"
 
   local d="$work/review"
-  # The forge's v1 API returns a pull request's text as `description`; `body` is
-  # the GitHub-style name and is null there. Read either, so the reviewer sees it.
+  # The list row has no text, so the description comes from the pull request's own
+  # read (pr_description). pr.json never carries it: description.md is its one place.
+  local text
+  text="$(pr_description "$repo" "$number")"
   jq 'del(.body, .description, .available_actions)' <<<"$row" >"$d/pr.json"
-  jq -r '"# \(.title)\n\n\(.body // .description // "(no description)")"' <<<"$row" >"$d/description.md"
+  jq -r --arg text "$text" '"# \(.title)\n\n\($text)"' <<<"$row" >"$d/description.md"
   git -C "$cache" log --stat --format='commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%B' "$base_sha..$sha" >"$d/log.txt"
   git -C "$cache" diff --stat=200 "$base_sha...$sha" >"$d/stat.txt"
   git -C "$cache" diff --numstat "$base_sha...$sha" >"$d/numstat.txt"
