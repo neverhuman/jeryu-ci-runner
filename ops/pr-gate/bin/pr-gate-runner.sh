@@ -160,6 +160,22 @@ MARKER="pr-gate-runner@$(hostname -s)"
 # otherwise downloads them, and a missing LFS object aborts the whole tree.
 export GIT_LFS_SKIP_SMUDGE=1
 
+# git answers the forge as the runner, from the runner's own token file, never as whoever the host's
+# global git config names (a personal credential helper stopped answering for the forge and every
+# private mirror failed). The first entry clears inherited helpers for the forge's git URLs; the
+# second reads the token file when git asks, so the token is in no argv and no config file. These
+# variables outrank the global and system config, and the recipe and its prefetch get them too.
+# shellcheck disable=SC2016  # expanded by git's helper shell, not here
+GIT_HELPER='!f() { [ "$3" = get ] || exit 0; printf "username=%s\npassword=%s\n" "$1" "$(cat "$2")"; }; f'
+export GIT_CONFIG_COUNT=2 GIT_TERMINAL_PROMPT=0
+export GIT_CONFIG_KEY_0="credential.$BASE/git/.helper" GIT_CONFIG_VALUE_0=""
+export GIT_CONFIG_KEY_1="credential.$BASE/git/.helper"
+GIT_CONFIG_VALUE_1="$GIT_HELPER '$IDENTITY' '$TOKEN_FILE'"
+export GIT_CONFIG_VALUE_1
+git_env=(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2
+  GIT_CONFIG_KEY_0="$GIT_CONFIG_KEY_0" GIT_CONFIG_VALUE_0=""
+  GIT_CONFIG_KEY_1="$GIT_CONFIG_KEY_1" GIT_CONFIG_VALUE_1="$GIT_CONFIG_VALUE_1")
+
 only_repo=""; only_pr=""; list=0
 while (($#)); do case "$1" in
   --repo) only_repo="${2:?--repo needs a value}"; shift 2;;
@@ -1027,7 +1043,7 @@ if ((sandbox)); then
   say "$owner/$repo#$number skips the locked-crate prefetch: a contribution shares no registry"
 else
   "${enter[@]}" env -i -C "$worker_root" HOME="$HOME" USER="$(id -un)" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-    PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" GIT_LFS_SKIP_SMUDGE=1 \
+    PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" GIT_LFS_SKIP_SMUDGE=1 "${git_env[@]}" \
     ionice -c 3 timeout 30m bash -c "$prefetch" pr-gate-prefetch "$worker_root" "$repo" "$LOCK_SOURCES_ERE" \
     6>&- 7>&- 9>&- >"$gate_attempt_dir/prefetch.log" 2>&1 \
     || say "locked-crate prefetch for $owner/$repo ended $?; the recipe reports any real gap"
@@ -1062,7 +1078,7 @@ else
   cd "$run/$repo"
   exec setsid "${enter[@]}" env -i -C "$worker_root/$repo" HOME="$HOME" USER="$(id -un)" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
     PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
-    GIT_LFS_SKIP_SMUDGE=1 "${root_env[@]}" \
+    GIT_LFS_SKIP_SMUDGE=1 "${git_env[@]}" "${root_env[@]}" \
     JERYU_PLAYWRIGHT_WEB_PORT="$PLAYWRIGHT_WEB_PORT" \
     "${cache_env[@]}" ionice -c 3 \
     timeout --kill-after=30s 3h bash -c 'exec 6>&- 7>&- 9>&-; exec "$@"' pr-gate-worker "${recipe[@]}"
