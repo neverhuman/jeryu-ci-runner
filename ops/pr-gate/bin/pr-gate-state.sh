@@ -22,6 +22,18 @@ gate_required_context() {
   fi
 }
 
+gate_main_health_context() {
+  printf '%s/main-health' "$2"
+}
+
+gate_status_context() {
+  if [[ "${GATE_CONTEXT_KIND:-required}" == main-health ]]; then
+    gate_main_health_context "$1" "$2"
+  else
+    gate_required_context "$1" "$2"
+  fi
+}
+
 # Durable replace: fsync the new file, rename it, fsync the directory. `sync FILE` fsyncs that file;
 # `sync -f` would syncfs the whole filesystem, which on a gate host waited behind every slot's build output
 # (sampled 2026-09-18: ~100 of 1300 two-second samples blocked there).
@@ -77,10 +89,10 @@ gate_evidence_for() { # tree-owner
   return 0
 }
 
-# True when the newest status of this gate's required context on a status snapshot is a success this
+# True when the newest status of this gate's active context on a status snapshot is a success this
 # runner posted ($MARKER). A re-verification of such a head does not post `pending` over it.
 gate_newest_is_own_success() { # status-snapshot
-  jq -e --arg context "$(gate_required_context "$owner" "$repo")" --arg marker "$MARKER " '
+  jq -e --arg context "$(gate_status_context "$owner" "$repo")" --arg marker "$MARKER " '
     [.statuses[]? | select(.context == $context)] | sort_by(.updated_at // .created_at) | last
     | . != null and .state == "success" and ((.description // "") | startswith($marker))' "$1" >/dev/null
 }
@@ -191,7 +203,7 @@ gate_inputs() {
   if [[ -n "$SCCACHE" ]]; then sha256sum "$SCCACHE" >>"$inputs" || return; fi
   jq -nS --slurpfile sources "$rows" --rawfile tools "$inputs" --rawfile versions "$versions" \
     --arg recipe "$recipe_name" --arg base "$BASE" --arg runner "$MARKER" \
-    --arg context "$(gate_required_context "$owner" "$repo")" \
+    --arg context "$(gate_status_context "$owner" "$repo")" \
     '{schema:"jeryu.pr-gate-inputs/v1",sources:($sources|sort_by(.repository)),tools:$tools,
       versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:"operator-unsealed"}' >"$output" || return
   rm -f -- "$rows" "$inputs" "$versions"
@@ -215,7 +227,7 @@ gate_decision() {
     gate_action=republish
   elif jq -e '.outcome == "success" and .exit_code == 0' "$previous" >/dev/null; then
     # Do not reuse if a later required-context status superseded our publication.
-    if jq -e --slurpfile previous "$previous" --arg context "$(gate_required_context "$owner" "$repo")" '
+    if jq -e --slurpfile previous "$previous" --arg context "$(gate_status_context "$owner" "$repo")" '
       [.statuses[]? | select(.context == $context)] | sort_by(.updated_at // .created_at)
       | last | .state == "success" and .id == $previous[0].publication.status_id' "$statuses" >/dev/null; then
       gate_action=reuse

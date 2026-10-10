@@ -88,6 +88,9 @@ case "$method $url" in
   'GET '*'/branches/main/protection')
     jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'
     printf '\n200';;
+  'GET '*'/branches/main')
+    jq -nc --arg sha "$head" '{name:"main",commit:{sha:$sha}}'
+    printf '\n200';;
   'GET '*'/gate-regate'*)
     if [[ -f "$FAKE_FORGE/refuse-regate" ]]; then printf '{"message":"re-gate list denied"}\n403'; exit; fi
     if [[ -f "$FAKE_FORGE/regate.json" ]]; then cat "$FAKE_FORGE/regate.json"; else printf '{"requests":[]}'; fi
@@ -704,6 +707,32 @@ jq -se 'length>=3 and (.[0]|has("tools") and has("code")) and (.[1]|(has("tools"
 ! grep -q 'heartbeat refused' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
 rm -f "$fixture/reject-heartbeat-tools" "$fixture/reject-heartbeat-code" "$fixture/runner/tools.json"
 printf 'PASS heartbeats carry the valid tools; a 422 is retried without tools, then without code, each logged once\n'
+
+# Main-health gates the protected main commit under its own context. A green main SHA is skipped on
+# the next scheduled pass, but an explicit repo pass runs on demand.
+before_count=$(count)
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke --main-health
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" \
+  | jq -se 'length>=1 and last.context=="fixture/main-health" and last.state=="success"' >/dev/null \
+  || { printf 'main-health did not publish success on its own context\n' >&2; cat "$fixture/statuses.jsonl" >&2; exit 1; }
+invoke --main-health
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+grep -q 'skip acme/fixture main-health' "$fixture/runner.log" \
+  || { printf 'an unchanged green main-health run was not skipped\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+invoke --main-health --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 2))"
+guard="$fixture/release.guard"; : >"$guard"
+GATE_RUNNER_RELEASE_GUARD_FILE="$guard" invoke --main-health
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 2))"
+grep -q 'release guard is present; skipping main-health' "$fixture/runner.log"
+rm -f "$guard"
+printf 'PASS main-health: posts a distinct context, skips unchanged green main, runs on demand and respects the release guard\n'
 
 # Discovery reads each owner's checkout root from the site configuration: an explicit
 # PR_GATE_CHECKOUT_ROOTS entry, else PR_GATE_CHECKOUT_ROOT_PATTERN with {owner} replaced, and keeps

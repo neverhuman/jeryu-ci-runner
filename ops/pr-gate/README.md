@@ -50,6 +50,16 @@ refused -- this runner's own work, a closed pull request, a head that moved -- a
 reads no requests, being a retry already. A forge without the route (404) is silent; any other
 answer is reported, because it would otherwise ignore every re-gate asked for without a word.
 
+## Main health
+
+`pr-gate-runner.sh --main-health` gates each protected repository's current `main` with the same
+tree, recipe and slot environment as pull-request gates, then posts `<repo>/main-health` on that main
+commit. That context is deliberately distinct from `<repo>/required`, so it cannot satisfy branch
+protection for a pull request. A scheduled pass skips a repository whose main SHA already has this
+runner's latest green main-health status; `--main-health --repo owner/name` runs that repository on
+demand. If `GATE_RUNNER_RELEASE_GUARD_FILE` names an existing file, main-health exits quietly so it
+does not compete with a release.
+
 ## A head that changes its own gate
 
 The gate runs the recipe **at the head under test**, so a diff that rewrites that recipe rewrites the

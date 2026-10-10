@@ -41,8 +41,9 @@
 # against ../<sibling>), with `just required` when their justfile has it, otherwise the repo's own
 # `bash ops/ci/pr-ci.sh`. An owner whose checkout root holds one product is a single-repo tree.
 #
-# Usage: pr-gate-runner.sh [--repo [OWNER/]R --pr N] [--list]
+# Usage: pr-gate-runner.sh [--repo [OWNER/]R --pr N] [--main-health] [--list]
 #   --repo/--pr  gate this PR now, even if it already has a runner status
+#   --main-health  gate protected main and post <repo>/main-health
 #   --list       print what the next tick would gate and exit
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -134,13 +135,23 @@ MARKER="pr-gate-runner@$(hostname -s)"
 # otherwise downloads them, and a missing LFS object aborts the whole tree.
 export GIT_LFS_SKIP_SMUDGE=1
 
-only_repo=""; only_pr=""; list=0
+only_repo=""; only_pr=""; list=0; main_health=0
 while (($#)); do case "$1" in
   --repo) only_repo="${2:?--repo needs a value}"; shift 2;;
   --pr) only_pr="${2:?--pr needs a number}"; shift 2;;
+  --main-health) main_health=1; shift;;
   --list) list=1; shift;;
   *) printf 'unknown argument: %s\n' "$1" >&2; exit 2;;
 esac; done
+if ((main_health)); then
+  [[ -z "$only_pr" ]] || { printf -- '--main-health gates repository main, not a PR\n' >&2; exit 2; }
+  export GATE_CONTEXT_KIND=main-health
+  release_guard="$(pr_gate_path "${GATE_RUNNER_RELEASE_GUARD_FILE:-}")"
+  if [[ -n "$release_guard" && -e "$release_guard" ]]; then
+    printf '[gate-runner %s slot %s] release guard is present; skipping main-health\n' "$(date -u +%FT%TZ)" "$SLOT"
+    exit 0
+  fi
+fi
 
 say() { printf '[gate-runner %s slot %s] %s\n' "$(date -u +%FT%TZ)" "$SLOT" "$*"; }
 die() { say "FAIL: $*"; exit 1; }
@@ -189,9 +200,15 @@ api() { # method path [json]
 }
 
 post_status() { # owner repo sha state description
-  api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg s "$4" --arg c "$(gate_required_context "$1" "$2")" \
+  api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg s "$4" --arg c "$(gate_status_context "$1" "$2")" \
     --arg d "$5" '{state: $s, context: $c, description: $d}')"
-  [[ "$code" == 201 ]] || die "posting $1/$2 $(gate_required_context "$1" "$2")=$4 on $3 answered $code: $body"
+  [[ "$code" == 201 ]] || die "posting $1/$2 $(gate_status_context "$1" "$2")=$4 on $3 answered $code: $body"
+}
+
+main_health_is_current_green() { # status-snapshot
+  jq -e --arg context "$(gate_main_health_context "$owner" "$repo")" --arg marker "$MARKER " '
+    [.statuses[]? | select(.context == $context)] | sort_by(.updated_at // .created_at) | last
+    | . != null and .state == "success" and ((.description // "") | startswith($marker))' "$1" >/dev/null
 }
 
 # Heartbeats tell jeryu's /fleet what each slot is doing: the gate it is running and the last gate
@@ -289,6 +306,31 @@ for qualified in $REPOS; do
   qualified="$(qualify "$qualified")"
   [[ -z "$only_repo" || "$qualified" == "$only_repo" ]] || continue
   owner="${qualified%%/*}" repo="${qualified#*/}"
+  if ((main_health)); then
+    main_sha=""
+    api GET "/api/v3/repos/$owner/$repo/branches/main"
+    [[ "$code" != 200 ]] || main_sha="$(jq -r '.commit.sha // .sha // ""' <<<"$body")"
+    if [[ ! "$main_sha" =~ ^[0-9a-f]{40}$ ]]; then
+      say "cannot resolve $owner/$repo main ($code); skipping main-health"
+      continue
+    fi
+    status_snapshot=$(mktemp "$HOME_DIR/cache/main-health-status-$SLOT.XXXXXXXX")
+    api GET "/repos/$owner/$repo/commits/$main_sha/status"
+    if [[ "$code" != 200 ]]; then
+      rm -f -- "$status_snapshot"
+      say "cannot read $owner/$repo main statuses ($code); skipping main-health"
+      continue
+    fi
+    printf '%s\n' "$body" >"$status_snapshot"
+    if [[ -z "$only_repo" ]] && main_health_is_current_green "$status_snapshot"; then
+      rm -f -- "$status_snapshot"
+      say "skip $owner/$repo main-health: $main_sha is unchanged since the last green run"
+      continue
+    fi
+    rm -f -- "$status_snapshot"
+    candidates+=("$owner $repo 0 $main_sha refs/heads/main")
+    continue
+  fi
   api GET "/api/v1/repos/$owner%2F$repo/pulls?state=open"
   rows="$body"
   [[ "$code" == 200 ]] || { say "listing $owner/$repo PRs answered $code; skipping it"; continue; }
@@ -322,7 +364,7 @@ done
 # first: each is one gate from landing. A candidate's fifth field is its queue ref, "-" for a PR head.
 queued=()
 gated=" $(for q in $REPOS; do qualify "$q"; printf ' '; done)"
-if [[ -z "$only_pr" ]]; then
+if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
   api GET "/api/v1/merge-queue?state=building"
   if [[ "$code" == 200 ]]; then
     queue_rows="$body"
@@ -357,7 +399,7 @@ fi
 # so it reads nothing. A request never admits a head the rules above refused (the runner's own work,
 # a closed PR, a moved head): it only decides whether an admitted head is gated again.
 declare -A regate_at=()
-if [[ -z "$only_pr" ]]; then
+if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
   api GET "/api/v1/gate-regate?state=pending"
   if [[ "$code" == 200 ]]; then
     while IFS=$'\t' read -r rrepo rnumber rsha rat; do
@@ -398,14 +440,14 @@ for candidate in "${candidates[@]}"; do
     say "re-gate requested for $owner/$repo#$number at $sha"
     fresh+=("$candidate"); continue
   fi
-  if [[ -z "$only_pr" ]] && gate_regate_settling "$HOME_DIR/cache/mains-$owner" "$REGATE_SETTLE"; then
+  if [[ "$main_health" == 0 && -z "$only_pr" ]] && gate_regate_settling "$HOME_DIR/cache/mains-$owner" "$REGATE_SETTLE"; then
     say "deferring re-gate of $owner/$repo#$number: $owner mains moved within ${REGATE_SETTLE}s"; continue
   fi
   seen_before+=("$candidate")
 done
 candidates=("${queued[@]}" "${fresh[@]}" "${seen_before[@]}")
 
-if ((${#candidates[@]} == 0)); then ((list)) || heartbeat; say "no PR head needs gating"; exit 0; fi
+if ((${#candidates[@]} == 0)); then ((list)) || heartbeat; say "$([[ "$main_health" == 1 ]] && printf 'no main-health repo needs gating' || printf 'no PR head needs gating')"; exit 0; fi
 if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # FD7 protects the shared repository target; FD6 protects the full-head journal.
 # FD9 protects this slot's source tree. The timeout supervisor retains all three
@@ -414,7 +456,7 @@ if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 for candidate in "${candidates[@]}"; do
 read -r owner repo number sha qref <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
-   && ( "$qref" == - || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) ]] \
+   && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) ]] \
   || die "invalid repository or head in dispatch"
 if [[ -d "$HOME_DIR/claims/$owner-$repo-$sha" ]]; then
   say "recovery required: retained legacy claim for $owner/$repo@$sha; reconcile its worker before admission"
@@ -445,7 +487,7 @@ if ! gate_recover; then
   exec 6>&-; exec 7>&-
   continue
 fi
-say "preparing $owner/$repo#$number at $sha${qref:+$([[ "$qref" == - ]] || printf ' (merge queue %s)' "$qref")}"
+say "preparing $owner/$repo$([[ "$main_health" == 1 ]] && printf ' main-health' || printf '#%s' "$number") at $sha${qref:+$([[ "$qref" == - ]] || printf ' (merge queue %s)' "$qref")}"
 
 # 3. clean tree
 family="$FAMILY"
@@ -579,7 +621,14 @@ mapfile -t evidence < <(gate_evidence_for "$owner")
 if ((${#evidence[@]})); then
   while read -r line; do say "$line"; done < <(gate_mirror_evidence "$run" "$BASE" "${evidence[@]}")
 fi
-if [[ "$qref" == - ]]; then
+if [[ "$main_health" == 1 ]]; then
+  git -C "$run/$repo" fetch --quiet "$BASE/git/$owner/$repo.git" '+refs/heads/main:refs/gate/main-health'
+  if [[ "$(git -C "$run/$repo" rev-parse refs/gate/main-health)" != "$sha" ]]; then
+    say "$owner/$repo main moved on from $sha; leaving it for the next tick"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
+elif [[ "$qref" == - ]]; then
   git -C "$run/$repo" fetch --quiet "$BASE/git/$owner/$repo.git" "$sha"
 else
   # A queue commit is fetched by its advertised ref, and must still be the entry's exact sha: the forge
@@ -599,7 +648,11 @@ sync_repo "$repo" "$sha"
 # about to report. It is recorded on the attempt and annotated on the check run (gate_publish); it
 # changes no conclusion, and nothing here reruns the recipe from protected main. mirror/main is that
 # protected main in this tree (sync_repo keeps it there).
-mapfile -t self_gate_paths < <(gate_definition_paths "$run/$repo" mirror/main "$sha")
+if [[ "$main_health" == 1 ]]; then
+  self_gate_paths=()
+else
+  mapfile -t self_gate_paths < <(gate_definition_paths "$run/$repo" mirror/main "$sha")
+fi
 self_gate_json='[]'
 if ((${#self_gate_paths[@]} > 0)); then
   self_gate_json=$(printf '%s\n' "${self_gate_paths[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
@@ -689,7 +742,7 @@ PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" gat
 api GET "/repos/$owner/$repo/commits/$sha/status"
 [[ "$code" == 200 ]] || die "cannot verify current status for $owner/$repo@$sha ($code)"
 printf '%s\n' "$body" >"$status_snapshot"
-retry=0; [[ -z "$only_pr" ]] || retry=1
+retry=0; [[ -z "$only_pr" && "$main_health" == 0 ]] || retry=1
 # A requested re-gate is a retry of this head: gate_decision must neither reuse its success nor hold
 # its failure.
 regate_now=""
@@ -715,7 +768,12 @@ case "${gate_action:?}" in
 esac
 # A head moving during preparation must not run under the earlier admission. A queue commit is still
 # admitted only while its entry is building at the same sha.
-if [[ "$qref" == - ]]; then
+if [[ "$main_health" == 1 ]]; then
+  api GET "/api/v3/repos/$owner/$repo/branches/main"
+  [[ "$code" == 200 ]] || die "cannot refresh main before admission ($code)"
+  admitted=0
+  [[ "$(jq -r '.commit.sha // .sha // ""' <<<"$body")" == "$sha" ]] && admitted=1
+elif [[ "$qref" == - ]]; then
   api GET "/api/v3/repos/$owner/$repo/pulls/$number"
   [[ "$code" == 200 ]] || die "cannot refresh PR before admission ($code)"
   admitted=0
@@ -752,15 +810,15 @@ gate_newest_is_own_success "$status_snapshot" && keep_green=1
 rm -f -- "$identity" "$status_snapshot"
 log="$gate_attempt_dir/build.log"
 if ((keep_green)); then
-  say "re-verifying $owner/$repo@$sha without pending: its newest $(gate_required_context "$owner" "$repo") is this runner's success"
+  say "re-verifying $owner/$repo@$sha without pending: its newest $(gate_status_context "$owner" "$repo") is this runner's success"
 else
   post_status "$owner" "$repo" "$sha" pending "operator-unsealed $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")"
 fi
 gate_update '.phase="running"'
 started_at="$(date -u +%FT%TZ)" started_s="$(date +%s)"
 heartbeat "$(jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" \
-  --arg recipe "$recipe_name" --arg at "$started_at" \
-  '{repo:$repo,pr:$pr,sha:$sha,recipe:$recipe,startedAt:$at}')"
+  --arg recipe "$recipe_name" --arg at "$started_at" --arg kind "$([[ "$main_health" == 1 ]] && printf main-health || printf pr)" \
+  '{repo:$repo,pr:$pr,sha:$sha,recipe:$recipe,startedAt:$at,kind:$kind}')"
 # Remove inherited credential variables. This operator path is still not a
 # sealed worker: installed credential/UID isolation belongs to SplitOps promotion.
 # A slot >0 binds its tree over slot 0's path in a private mount namespace (root only for the mount;
@@ -887,10 +945,11 @@ gate_publish || die "terminal $state saved; publication recovery required in $ga
 seconds=$(( $(date +%s) - started_s ))
 jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" --arg recipe "$recipe_name" \
   --arg conclusion "$state" --argjson exit_code "$worker_exit" --argjson seconds "$seconds" --arg at "$(date -u +%FT%TZ)" \
-  '{repo:$repo,pr:$pr,sha:$sha,recipe:$recipe,conclusion:$conclusion,exit_code:$exit_code,seconds:$seconds,finishedAt:$at}' \
+  --arg kind "$([[ "$main_health" == 1 ]] && printf main-health || printf pr)" \
+  '{repo:$repo,pr:$pr,sha:$sha,recipe:$recipe,conclusion:$conclusion,exit_code:$exit_code,seconds:$seconds,finishedAt:$at,kind:$kind}' \
   | gate_atomic "$LAST_GATE"
 heartbeat
-say "recorded $owner/$repo $(gate_required_context "$owner" "$repo")=$state; exit $worker_exit; evidence $gate_receipt"
+say "recorded $owner/$repo $(gate_status_context "$owner" "$repo")=$state; exit $worker_exit; evidence $gate_receipt"
 # Attempt evidence is retained with its log, including active and unpublished results.
 # Age does not discharge a recovery obligation. Preservation-aware retention must be
 # qualified separately before any journal or legacy log is removed.

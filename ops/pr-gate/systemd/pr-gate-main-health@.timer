@@ -1,0 +1,11 @@
+[Unit]
+Description=Nightly family main-health gate pass (slot %i)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+AccuracySec=10min
+RandomizedDelaySec=45min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
