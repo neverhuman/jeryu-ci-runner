@@ -23,7 +23,8 @@ run() { HOME="$t/home" PATH="$t/bin:$PATH" INSTALL_FIXTURE="$t" FIXTURE_UNIT_ACT
 if run 0; then echo 'installation without site.env was accepted' >&2; exit 1; fi
 grep -q 'requires EnvironmentFile=' "$t/out"
 mkdir -p "$t/home/.config/pr-redteam"
-printf 'JERYU_BASE=https://forge.invalid\nJERYU_TOKEN_FILE=%s/token\n' "$t" > "$t/home/.config/pr-redteam/site.env"
+printf 'JERYU_BASE=https://forge.invalid\nJERYU_TOKEN_FILE=%s/token\nREDTEAM_CLAUDE=%s/bin/claude\nREDTEAM_CLAUDE_VERSION=9.9.9\n' "$t" "$t" > "$t/home/.config/pr-redteam/site.env"
+touch "$t/token"
 run 0
 unit="$t/home/.config/systemd/user/pr-redteam.service"
 # The merger credential path is site configuration: the unit may only point at the

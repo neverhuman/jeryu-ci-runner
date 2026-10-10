@@ -786,7 +786,14 @@ beat_done() { # owner/name number sha conclusion started-epoch
 # not accept gets a log line: a JSON refusal, but also an HTML answer (a forge that predates the
 # route, or a proxy error page) and a curl failure.
 heartbeat() {
-  local current last f i id key
+  local current last f i id key poke_last labels
+  poke_last=null; labels='["redteam"]'
+  local poke_result; poke_result="$(systemctl --user show pr-redteam-poke.service -p Result --value 2>/dev/null || true)"
+  if [ -n "$poke_result" ] && [ "$poke_result" != success ]; then
+    poke_last="$(jq -nc --arg result "$poke_result" --arg at "$(date -u +%FT%TZ)" \
+      '{recipe:"redteam-poke", conclusion:"failure", result:$result, finished_at:$at}')"
+    labels='["redteam","poke-failed"]'
+  fi
   # A review killed mid-flight leaves its current file behind; forget one after two hours rather
   # than reporting a task that is never going to finish.
   find "$beats/current" -name '*.json' -mmin +120 -delete 2>/dev/null || true
@@ -802,7 +809,9 @@ heartbeat() {
     id="$runner_id"; if [ "$i" -gt 0 ]; then id="$runner_id-$((i + 1))"; fi
     api POST "/api/v1/runners/heartbeat" "$(jq -nc --arg id "$id" --arg host "$runner_host" \
       --argjson slot "$i" --argjson current "$current" --argjson last "$last" \
-      '{runnerId: $id, host: $host, slot: $slot, labels: ["redteam"], current: $current, last: $last}')"
+      --argjson labels "$labels" --argjson poke "$poke_last" \
+      '{runnerId: $id, host: $host, slot: $slot, labels: $labels, current: $current,
+        last: (if $slot == 0 and $poke != null and ($last == null or ($poke.finished_at // "") > ($last.finished_at // "")) then $poke else $last end)}')"
     if [ "$code" = 000 ]; then
       say "heartbeat refused for $id (no answer): $body"
     elif ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1; then

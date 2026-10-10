@@ -20,6 +20,12 @@ case "$HEARTBEAT_FIXTURE" in
 esac
 FIXTURE
 chmod +x "$t/bin/curl"
+cat > "$t/bin/systemctl" <<'FIXTURE'
+#!/usr/bin/env bash
+[[ "$*" == '--user show pr-redteam-poke.service -p Result --value' ]] || exit 2
+printf '%s\n' "${POKE_RESULT:-success}"
+FIXTURE
+chmod +x "$t/bin/systemctl"
 printf 'fixture-bearer\n' > "$t/token"
 beat() { # fixture jobs
   : > "$t/sent"
@@ -57,4 +63,10 @@ ids="$(grep -o '"runnerId":"[^"]*"' "$t/sent" | tr '\n' ' ')"
 grep -q '"runnerId":"fixture/redteam-2","host":"[^"]*","slot":1,"labels":\["redteam"\],"current":{' "$t/sent" \
   || { echo "slot 1 is not the row reporting the review: $(cat "$t/sent")" >&2; exit 1; }
 echo 'ok slots'
+POKE_RESULT=exit-code HEARTBEAT_FIXTURE=accepted HEARTBEAT_SENT="$t/sent" PATH="$t/bin:$PATH" \
+  JERYU_BASE=https://forge.invalid JERYU_TOKEN_FILE="$t/token" REDTEAM_STATE="$t/state" \
+  REDTEAM_RUNNER_ID=fixture/redteam REDTEAM_JOBS=1 "$here/pr-redteam" heartbeat >"$t/out" 2>&1
+grep -q '"labels":\["redteam","poke-failed"\]' "$t/sent"
+grep -q '"recipe":"redteam-poke","conclusion":"failure","result":"exit-code"' "$t/sent"
+echo 'ok poke failure reported'
 echo 'HEARTBEAT LOG PASS'

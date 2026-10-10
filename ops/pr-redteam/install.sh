@@ -33,6 +33,22 @@ for source_unit in \
   done < <(required_environment_files "$source_unit")
 done
 
+# Presence of the shared file alone is not enough: systemd treats an unset
+# EnvironmentFile variable as an empty setting, and poke needs the same inputs
+# as review to calculate the review identity.
+site_env="$HOME/.config/pr-redteam/site.env"
+for setting in JERYU_BASE JERYU_TOKEN_FILE REDTEAM_CLAUDE REDTEAM_CLAUDE_VERSION; do
+  grep -Eq "^${setting}=.+$" "$site_env" || {
+    echo "$site_env must define $setting before installation" >&2
+    exit 1
+  }
+done
+claude_path="$(sed -n 's/^REDTEAM_CLAUDE=//p' "$site_env" | tail -n 1)"
+[[ "$claude_path" == /* && -x "$claude_path" ]] || {
+  echo "$site_env REDTEAM_CLAUDE must name an executable absolute path" >&2
+  exit 1
+}
+
 # Replacing an active or enabled unit would change its next execution. Require the
 # service owner to stop/disable it explicitly before staging replacement source.
 for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-redteam-heartbeat.timer \

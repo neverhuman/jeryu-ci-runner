@@ -109,7 +109,11 @@ merged change cost end to end. Dry runs post nothing.
 
 `JERYU_BASE` names the forge origin and `JERYU_TOKEN_FILE` selects the approval
 credential by path; both are required site settings with no default, since this
-source is public. `REDTEAM_MERGE_TOKEN_FILE` selects the merger credential. API
+source is public. Set `REDTEAM_CLAUDE` to the site's pinned CLI executable and
+`REDTEAM_CLAUDE_VERSION` to its exact version in `~/.config/pr-redteam/site.env`.
+The reviewer and poke both read this file: poke computes the same review identity
+and therefore needs the credential path and the exact CLI pin too. Installation
+refuses to stage operational units unless all four settings are present. `REDTEAM_MERGE_TOKEN_FILE` selects the merger credential. API
 calls require a bare `https://host` origin with no port, path, credentials or
 query, an owned mode0600 nonsymlink regular token file and a valid bearer
 value. The bearer travels through curl configuration
@@ -146,9 +150,10 @@ source update as a service change requiring its owner's custody and qualificatio
 The timer invokes a review pass and then a merge pass. `install.sh` enables no
 unit. The merger credential's path comes from the site's
 `~/.config/pr-redteam/merge.env`, read by the unit; `install.sh` writes no
-credential and no credential path. Heartbeats report liveness through Jeryu's
-existing runner-reporting allowlist. An authorization refusal is logged, not
-bypassed.
+credential. Heartbeats report liveness through Jeryu's existing runner-reporting
+allowlist and include the latest poke result, so a failed poke appears in the
+runner's last activity on `/runners` and can be surfaced in Needs you. An
+authorization refusal is logged, not bypassed.
 
 ## Review isolation
 
