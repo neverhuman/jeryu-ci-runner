@@ -122,8 +122,10 @@ is separate from model/process credential confinement.
 
 Service failure notification is also site configuration. Set `NOTIFY_COMMAND`
 in `~/.config/pr-redteam/site.env` to a shell command that receives the message
-on stdin and in `PR_REDTEAM_NOTIFY_BODY`, or set `NOTIFY_WEBHOOK_URL` to receive
-a JSON POST. With neither configured, the notification unit logs that no target
+on stdin and can read the same bounded body from `PR_REDTEAM_NOTIFY_BODY_FILE`,
+or set `NOTIFY_WEBHOOK_URL` to receive a JSON POST. The body is capped by
+`NOTIFY_MAX_BODY_BYTES` (default 8192) and omitted if it contains a configured
+token value. With neither configured, the notification unit logs that no target
 exists and exits successfully. Hosts, channels and tokens do not belong in this
 repository.
 

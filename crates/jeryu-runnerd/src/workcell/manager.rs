@@ -245,8 +245,12 @@ impl WorkcellManager {
     /// Export workspace `paths` of a held or repairing workcell to
     /// `destination`. The sources must sit inside the lease's repo roots and
     /// carry no host credential material; the destination must sit inside a
-    /// configured export root and not pass through a symlink. Nothing is
-    /// written here: the caller writes only after this returns `Ok`.
+    /// configured export root and not pass through a symlink.
+    ///
+    /// This is the guard integration point for a future real workspace
+    /// export/upload writer in this split repository. Nothing is written here,
+    /// and no production caller exists yet: a writer must call this and write
+    /// only after it returns `Ok`.
     pub fn export_workspace(
         &self,
         workcell_id: &str,

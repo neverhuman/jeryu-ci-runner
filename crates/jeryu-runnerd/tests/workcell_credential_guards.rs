@@ -1,7 +1,9 @@
 //! Host credential material must never leave a workcell through a workspace
 //! export, an artifact upload destination, a captured log, or a frozen capsule.
 //!
-//! Every case here drives the real validators the export path calls.
+//! The workspace export manager method is the guard integration point awaiting
+//! a production writer in this split repository; these cases bind that guard
+//! contract until a real export/upload path calls it.
 
 use jeryu_runnerd::workcell::{
     FreezeFailedCiRunRequest, HoldFailedTreeRequest, StartupSync, WorkcellClaimRequest,

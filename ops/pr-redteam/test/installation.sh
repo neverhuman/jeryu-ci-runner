@@ -68,4 +68,27 @@ NOTIFY_COMMAND='cat > "$INSTALL_FIXTURE/notification"' INSTALL_FIXTURE="$t" PATH
   "$here/notify-failure" pr-redteam-heartbeat.service > "$t/notify-command-out" 2>&1
 grep -q 'pr-redteam unit failed: pr-redteam-heartbeat.service' "$t/notification"
 grep -q 'journal for --user -u pr-redteam-heartbeat.service' "$t/notification"
+NOTIFY_COMMAND='test -n "$PR_REDTEAM_NOTIFY_BODY_FILE" && test ! -n "${PR_REDTEAM_NOTIFY_BODY:-}" && cat > "$INSTALL_FIXTURE/notification-file-ok" && cmp "$PR_REDTEAM_NOTIFY_BODY_FILE" "$INSTALL_FIXTURE/notification-file-ok"' \
+  INSTALL_FIXTURE="$t" PATH="$t/bin:$PATH" \
+  "$here/notify-failure" pr-redteam-poke.service > "$t/notify-file-out" 2>&1
+grep -q 'pr-redteam unit failed: pr-redteam-poke.service' "$t/notification-file-ok"
+cat > "$t/bin/journalctl" <<'FIXTURE'
+#!/usr/bin/env bash
+printf 'line one\nreviewer token is REVIEW-TOKEN-7f3a\nline three\n'
+FIXTURE
+chmod +x "$t/bin/journalctl"
+printf 'REVIEW-TOKEN-7f3a\n' > "$t/token"
+NOTIFY_COMMAND='cat > "$INSTALL_FIXTURE/notification-redacted"' INSTALL_FIXTURE="$t" PATH="$t/bin:$PATH" \
+  JERYU_TOKEN_FILE="$t/token" "$here/notify-failure" pr-redteam.service > "$t/notify-redacted-out" 2> "$t/notify-redacted-err"
+grep -q 'journal omitted: configured token value appeared' "$t/notification-redacted"
+! grep -q 'REVIEW-TOKEN-7f3a' "$t/notification-redacted"
+grep -q 'configured token value appeared in notification' "$t/notify-redacted-err"
+cat > "$t/bin/journalctl" <<'FIXTURE'
+#!/usr/bin/env bash
+printf '0123456789abcdef\n0123456789abcdef\n'
+FIXTURE
+chmod +x "$t/bin/journalctl"
+NOTIFY_COMMAND='cat > "$INSTALL_FIXTURE/notification-capped"' INSTALL_FIXTURE="$t" PATH="$t/bin:$PATH" \
+  NOTIFY_MAX_BODY_BYTES=64 "$here/notify-failure" pr-redteam.service > "$t/notify-capped-out" 2>&1
+[[ "$(wc -c < "$t/notification-capped")" -le 64 ]]
 echo 'INACTIVE INSTALLATION PASS'
