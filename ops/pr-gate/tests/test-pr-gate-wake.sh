@@ -143,8 +143,19 @@ run
 must 'first look records the sequence and wakes nothing' test "$(started)" == 0
 must 'the sequence is the forge current one' test "$(seq_file)" == 4
 must 'the first look does not wait' grep -q 'gate-wanted?after=0&wait=0' "$fx/curl.log"
-must 'no heads were read' test "$(grep -c '/pulls' "$fx/curl.log" || true)" == 0
-printf 'PASS the first look records the sequence, reads no heads and wakes nothing\n'
+must 'the open-PR view is recorded too' grep -qx "acme/acme-a 1 $A1" "$fx/home/cache/wake-heads"
+printf 'PASS the first look records the sequence and the head view, and wakes nothing\n'
+
+: >"$fx/curl.log"
+signal 4
+run
+must 'the view is not read again within the period' test "$(grep -c '/pulls' "$fx/curl.log" || true)" == 0
+must 'and nothing was woken' test "$(started)" == 0
+: >"$fx/curl.log"
+GATE_RUNNER_WAKE_HEADS_EVERY=0 run
+must 'a period of 0 reads it every look' test "$(grep -c '/pulls' "$fx/curl.log" || true)" == 2
+must 'an unchanged view still wakes nothing' test "$(started)" == 0
+printf 'PASS with the signal working the open-PR view is read on a period, not on every look\n'
 
 signal 6 "$(wanted acme/acme-a "$A2" push)" "$(wanted acme/acme-a "$Q1" queue)"
 : >"$fx/curl.log"
@@ -204,3 +215,52 @@ if GATE_RUNNER_WAKE_WAIT=x run 2>"$fx/err"; then
 must 'a nonnumeric wait is refused' grep -q 'GATE_RUNNER_WAKE_WAIT' "$fx/err"
 must 'and nothing was requested' test "$(grep -c . "$fx/curl.log" || true)" == 0
 printf 'PASS the wait is validated before any request\n'
+
+# ---------------------------------------------------------------------------
+# What the signal cannot say, and what the woken slot is told. A pull request opened on a branch
+# that was already pushed got its push signal before it existed, so no signal names it now: only the
+# open-PR view does. Each started slot is handed the head it was started for.
+# ---------------------------------------------------------------------------
+rm -rf -- "$fx/home"; mkdir -p "$fx/home/cache"
+printf 'acme/acme-a\n' >"$fx/home/cache/protected-acme"
+pulls a; pulls b; printf '{"entries":[]}' >"$fx/forge/queue.json"; rm -f "$fx/forge/regate.json"
+dispatch() { cat "$fx/home/cache/wake-dispatch" 2>/dev/null || true; }
+signal 4
+run
+must 'nothing open yet, nothing woken' test "$(started)" == 0
+must 'and no head was handed to anybody' test "$(dispatch)" == ""
+
+pulls a "$(pr 5 "$A1")"
+GATE_RUNNER_WAKE_HEADS_EVERY=0 run
+must 'an opened pull request wakes a slot although no signal names it' test "$(started)" == 1
+# The time is "-": the view says when it was read, not when the pull request was opened, and the
+# runner dates such a head from the pull request itself.
+must 'and the slot is told which head' test "$(dispatch)" == "acme/acme-a 5 $A1 pr-head -"
+printf 'PASS a pull request opened on an already-pushed branch wakes a slot from the open-PR view\n'
+
+: >"$fx/home/cache/wake-dispatch"
+signal 7 "$(wanted acme/acme-a "$A2" push)"
+pulls a "$(pr 5 "$A2")"
+GATE_RUNNER_WAKE_HEADS_EVERY=0 run
+must 'a signalled push wakes exactly one slot, not one per source' test "$(started)" == 1
+must 'and carries the moment the forge recorded it' \
+  test "$(dispatch)" == "acme/acme-a - $A2 push 2026-10-08T09:00:00Z"
+printf 'PASS a head the signal reported is not woken for twice by the open-PR view\n'
+
+: >"$fx/home/cache/wake-dispatch"
+touch "$fx/busy-1" "$fx/busy-2"
+signal 9 "$(wanted acme/acme-a "$B1" push)" "$(wanted acme/acme-a "$Q1" queue)"
+run
+must 'one idle slot, one slot started' test "$(started)" == 1
+must 'and one head handed over, the first of the two' \
+  test "$(dispatch)" == "acme/acme-a - $B1 push 2026-10-08T09:00:00Z"
+rm -f "$fx"/busy-*
+printf 'PASS a head with no idle slot to take it is not handed to anybody\n'
+
+# The file cannot grow without bound: it is the newest few heads, not a backlog.
+for i in $(seq 1 70); do printf 'acme/acme-a %s %s pr-head -\n' "$i" "$A1" >>"$fx/home/cache/wake-dispatch"; done
+signal 11 "$(wanted acme/acme-a "$A1" regate)"
+run
+must 'the dispatch file is held to its newest lines' test "$(dispatch | wc -l)" -le 64
+must 'and the newest head is the one just handed over' test "$(dispatch | tail -1)" == "acme/acme-a - $A1 regate 2026-10-08T09:00:00Z"
+printf 'PASS the handed-over heads are bounded\n'

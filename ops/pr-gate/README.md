@@ -18,7 +18,7 @@ identity authored.
 | `bin/pr-gate-state.sh` | the durable attempt journal, input identity, publication and recovery |
 | `bin/pr-gate-config.sh` | the site configuration reader every script uses |
 | `bin/pr-gate-heartbeat.sh` | reports every slot to the forge's `/runners` page and finished attempts as events |
-| `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears, moves, or is asked for again: on the forge's `gate-wanted` signal, else by reading the gated heads |
+| `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears, moves, or is asked for again -- on the forge's `gate-wanted` signal and from the open-PR view -- and hands it the head it started it for |
 | `bin/pr-gate-install.sh` | keeps the installed copy equal to the source branch (drains slots first) |
 | `bin/pr-gate-advisory-refresh.sh`, `bin/pr-gate-grype-db-refresh.sh` | keep security databases fresh outside the gates |
 | `systemd/` | the `--user` units and timers; `pr-gate-runner@N` is one slot |
@@ -49,6 +49,42 @@ and asking again records a newer `requested_at`. A request admits nothing the or
 refused -- this runner's own work, a closed pull request, a head that moved -- and `--repo/--pr`
 reads no requests, being a retry already. A forge without the route (404) is silent; any other
 answer is reported, because it would otherwise ignore every re-gate asked for without a word.
+
+## Starting a gate when the head appears
+
+A slot looks for work when its own timer fires, so a head that appeared just after a tick waited for
+the next one, and behind every gate running in between. `pr-gate-wake.sh` runs from its own timer and
+starts an idle slot the moment it learns a head can be gated, from two sources:
+
+- the forge's wake-up signal, `GET /api/v1/gate-wanted?after=<seq>&wait=<secs>` (jeryu-deploy),
+  recorded when a push moves a branch, when the merge queue builds a queue commit and when a re-gate
+  is asked for. One long-polled request per look, no per-repository reads;
+- the open-PR list of every gated repository, the building merge-queue entries and the pending
+  re-gate requests, waking on a line that view gained. This is the only source against a forge
+  without the signal. Alongside the signal it still runs, at most every
+  `GATE_RUNNER_WAKE_HEADS_EVERY` seconds (default 10), because the signal cannot cover a pull request
+  **opened** on a branch that was already pushed: the push was signalled before the pull request
+  existed, so nothing pointed a slot at it and it waited for a timer. A head the signal already woke
+  a slot for is not woken for twice.
+
+Each started slot is handed the head it was started for, as one line of
+`~/gate-runner/cache/wake-dispatch` (`<owner/repo> <number|-> <sha|-> <source> <when|->`). The runner
+takes one line per tick and gates that head first of the pull-request heads its own pass found --
+merge-queue entries still come first, each being one gate from landing -- and dates the queue wait
+from `<when>`. The line decides nothing else: the tick still lists, chooses, claims and gates heads
+by the ordinary rules, which is what keeps the slot timers a sufficient fallback. A line nobody takes,
+or one older than `GATE_RUNNER_DISPATCH_TTL` seconds (default 600), is dropped unread.
+
+## How long a head waited
+
+Every gate records its queue wait on the attempt as
+`queue_wait: {ready_at, source, seconds}` -- from the moment the head became gateable to the moment
+its own gate started -- and the `gate.log` event carries it as `detail.queue_wait`, so gate latency
+is a number a reader can measure instead of two timestamps on two pages. `ready_at` is the forge's
+own time when a wake-up line carried one (`source`: `push`, `queue`, `regate`), otherwise the pull
+request's own (`pr-opened`, `pr-updated`): an unrelated change to a pull request can only make a
+measured wait shorter, never invent one. Clocks that disagree record `seconds: null` and keep both
+times rather than a negative wait.
 
 ## Main health
 
@@ -100,7 +136,8 @@ the configuration re-gates open heads once, exactly like installing a new runner
 - **patch** (1.0.x) for fixes that change no behaviour a host or forge relies on;
 - **minor** (1.x.0) for new behaviour or new optional settings;
 - **major** (x.0.0) for contract changes: a required setting added or renamed, the installed layout,
-  unit names or state files changed, the heartbeat/status/receipt shape changed.
+  unit names or state files changed, the heartbeat/status/receipt shape changed. An optional field
+  added to a receipt or an event is minor: every reader of the older shape still reads the newer one.
 
 Bump it in the same change as the code. The installer records `pr-gate <VERSION>` read from this file
 at the installed commit, and each heartbeat reports the installed code as

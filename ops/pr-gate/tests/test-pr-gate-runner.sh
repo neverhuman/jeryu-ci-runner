@@ -76,14 +76,30 @@ done
 head=$(cat "$FAKE_FORGE/head")
 case "$method $url" in
   'GET '*'/pulls?state=open')
-    jq -nc --arg sha "$head" '{items:[{number:1,head_sha:$sha}]}'
+    # A second open pull request while $FAKE_FORGE/head2 names its head, for the order the tick gates in.
+    if [[ -f "$FAKE_FORGE/head2" ]]; then
+      jq -nc --arg sha "$head" --arg sha2 "$(cat "$FAKE_FORGE/head2")" \
+        '{items:[{number:1,head_sha:$sha},{number:2,head_sha:$sha2}]}'
+    else
+      jq -nc --arg sha "$head" '{items:[{number:1,head_sha:$sha}]}'
+    fi
+    printf '\n200';;
+  'GET '*'/pulls/2')
+    jq -nc --arg sha "$(cat "$FAKE_FORGE/head2")" \
+      '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/second"},
+        created_at:"2026-10-09T18:26:18Z",updated_at:"2026-10-09T18:26:18Z"}'
     printf '\n200';;
   'GET '*'/pulls/1')
     count=0
     [[ ! -f "$FAKE_FORGE/head-reads" ]] || read -r count <"$FAKE_FORGE/head-reads"
     count=$((count + 1)); printf '%s\n' "$count" >"$FAKE_FORGE/head-reads"
     if [[ -f "$FAKE_FORGE/change-head" && "$count" -gt 1 ]]; then head=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; fi
-    jq -nc --arg sha "$head" '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/feature"}}'
+    # When the pull request was opened and last changed, as the forge dates them: what the runner
+    # measures its queue wait from when nothing woke it for this head.
+    opened=2026-10-09T18:26:18Z
+    [[ ! -f "$FAKE_FORGE/pr-opened" ]] || read -r opened <"$FAKE_FORGE/pr-opened"
+    jq -nc --arg sha "$head" --arg opened "$opened" \
+      '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/feature"},created_at:$opened,updated_at:$opened}'
     printf '\n200';;
   'GET '*'/branches/main/protection')
     jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'
@@ -557,7 +573,7 @@ regate() { # requested_at
 regate 2026-10-04T09:00:00Z
 touch "$mains"   # the family's mains just moved: an automatic re-gate would wait for the burst
 listed=$(GATE_RUNNER_REGATE_SETTLE=3600 bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
-grep -qx "acme fixture 1 $head -" <<<"$listed" \
+grep -q "^acme fixture 1 $head - " <<<"$listed" \
   || { printf 'a requested re-gate was not claimable:\n%s\n' "$listed" >&2; exit 1; }
 before_count=$(count)
 GATE_RUNNER_REGATE_SETTLE=3600 invoke
@@ -746,13 +762,13 @@ rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOT_PATTERN="$fixture/roots/{owner}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1) || {
   printf 'discovery through the checkout-root pattern failed:\n%s\n' "$listed" >&2; exit 1; }
-[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") -" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
+[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 [[ "$(cat "$fixture/runner/cache/protected-acme")" == acme/fixture ]]
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOTS="other=/nonexistent acme=$fixture/roots/acme" PR_GATE_CHECKOUT_ROOT_PATTERN="/nonexistent/{owner}" \
   bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
-[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") -" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
+[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
 grep -q 'no checkout root for owner acme' <<<"$listed" || { printf 'a missing checkout root was silent:\n%s\n' "$listed" >&2; exit 1; }
@@ -778,3 +794,84 @@ if [[ "$runner_exit" == 0 ]] || ! grep -q 'has no owner and PR_GATE_PRIMARY_OWNE
   printf 'a bare repository name was guessed an owner\n' >&2; cat "$fixture/runner.log" >&2; exit 1
 fi
 printf 'PASS an unconfigured forge, credential, identity or primary owner is refused by name\n'
+
+# The head pr-gate-wake.sh woke this slot for, and the queue wait every gate records: from the
+# moment the head became gateable to the moment its gate started. Without a wake-up the pull request
+# dates itself; with one the forge's own time is used, and a line too old to be worth acting on is
+# dropped unread.
+rm -f "$fixture/runner/cache/protected-acme"
+# A head of its own per gate: an identical head reuses its result instead of running again.
+moved=0
+new_head() {
+  moved=$((moved + 1))
+  printf 'pass %s\n' "$moved" >"$fixture/source/mode"
+  "$real_git" -C "$fixture/source" add mode
+  "$real_git" -C "$fixture/source" commit -qm "move the head ($moved)"
+  "$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+  "$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+  head=$(cat "$fixture/head")
+  receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
+}
+dispatch="$fixture/runner/cache/wake-dispatch"
+
+printf '%s\n' "$(date -u -d '-90 seconds' +%FT%TZ)" >"$fixture/pr-opened"
+new_head
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -e '.queue_wait.source == "pr-opened" and .queue_wait.seconds >= 85 and .queue_wait.seconds <= 300' "$receipt" >/dev/null \
+  || { printf 'the queue wait was not measured from the pull request\n' >&2; jq -c .queue_wait "$receipt" >&2; exit 1; }
+grep -q 'queue wait .*pr-opened' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
+printf 'PASS a gate records how long its head waited, dated by the pull request itself\n'
+
+new_head
+woken_at=$(date -u -d '-30 seconds' +%FT%TZ)
+printf 'acme/fixture 1 %s push %s\n' "$head" "$woken_at" >"$dispatch"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q "woken for acme/fixture#1 (push)" "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
+[[ ! -s "$dispatch" ]] || { printf 'the wake-up line was not taken\n' >&2; cat "$dispatch" >&2; exit 1; }
+jq -e --arg at "$woken_at" '.queue_wait.source == "push" and .queue_wait.ready_at == $at
+  and .queue_wait.seconds >= 25 and .queue_wait.seconds <= 300' "$receipt" >/dev/null \
+  || { printf 'the wake-up did not date the queue wait\n' >&2; jq -c .queue_wait "$receipt" >&2; exit 1; }
+printf 'PASS a woken slot gates the head it was woken for and dates the wait from the forge\n'
+
+# A line nobody took in time is dropped rather than acted on, a malformed one is read once, and a
+# wake-up the forge gave no time for leaves the pull request to date the wait.
+new_head
+printf 'acme/fixture 1 %s push 2000-01-01T00:00:00Z\nnot a wake-up line\nacme/fixture - - pr-head -\n' "$head" >"$dispatch"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+for expected in 'dropping a stale wake-up for acme/fixture' \
+                'ignoring a malformed wake-up line: not a wake-up line' \
+                'woken for acme/fixture (pr-head)'; do
+  grep -q "$expected" "$fixture/runner.log" || { printf 'missing: %s\n' "$expected" >&2; cat "$fixture/runner.log" >&2; exit 1; }
+done
+[[ ! -s "$dispatch" ]] || { printf 'lines stepped over were kept\n' >&2; cat "$dispatch" >&2; exit 1; }
+jq -e '.queue_wait.source == "pr-opened"' "$receipt" >/dev/null \
+  || { printf 'an undated wake-up overrode the pull request\n' >&2; jq -c .queue_wait "$receipt" >&2; exit 1; }
+rm -f "$fixture/pr-opened"
+printf 'PASS a stale or malformed wake-up line is dropped once, and an undated one defers to the pull request\n'
+
+# Order: with two heads needing a gate, the tick takes the one it was woken for. That is what hands a
+# new pull request to whichever slot is idle instead of letting it wait behind the slot's own pass.
+new_head
+"$real_git" -C "$fixture/source" checkout -q -b second
+printf 'pass second\n' >"$fixture/source/mode"
+"$real_git" -C "$fixture/source" add mode
+"$real_git" -C "$fixture/source" commit -qm "a second open head"
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" second
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head2"
+"$real_git" -C "$fixture/source" checkout -q main
+printf 'acme/fixture 2 %s pr-head -\n' "$(cat "$fixture/head2")" >"$dispatch"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q 'preparing acme/fixture#2' "$fixture/runner.log" \
+  || { printf 'the tick did not gate the head it was woken for\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+! grep -q 'preparing acme/fixture#1' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
+# And with no wake-up the order is the one it always was: the lowest-numbered head of the pass.
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
+  || { printf 'without a wake-up the tick did not take the first head of its pass\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/head2"
+printf 'PASS a woken slot gates the head it was woken for before the rest of its pass\n'

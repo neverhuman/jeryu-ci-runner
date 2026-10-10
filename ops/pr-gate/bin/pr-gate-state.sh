@@ -130,6 +130,7 @@ gate_begin() {
     '{schema:"jeryu.pr-gate-attempt/v1",id:$id,owner:$owner,repo:$repo,sha:$sha,
       boot_id:$boot,pid:$pid,slot:$slot,sequence:$sequence,started_at:$at,inputs:$inputs[0],
       terminal:false,outcome:null,exit_code:null,log:null,log_sha256:null,gate_definition_paths:[],
+      queue_wait:null,
       publication:{required_status:false,check_run:false},recovery_required:null,
       execution_kind:"operator-unsealed"}' | gate_atomic "$gate_receipt"
 }

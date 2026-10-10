@@ -15,6 +15,26 @@
   setting reappears.
 
 ## Unreleased
+- A PR gate starts on the pull request, not on the next timer slot. jeryu-deploy#267 (a two-line pin
+  bump) was opened at 18:26:18 and its gate started 5m22s later, while the gate itself took 6m37s:
+  the forge signals a push, not a pull request being opened, so the push for that branch was
+  signalled before the pull request existed and nothing pointed a slot at it afterwards. The gate
+  identity cannot read the pipeline event log (`GET /api/v1/events` is admin-only on the forge), so
+  `pr-gate-wake.sh` now keeps reading the open-PR view alongside the signal, at most every
+  `GATE_RUNNER_WAKE_HEADS_EVERY` seconds (default 10), skipping heads the signal already woke a slot
+  for. Each slot it starts is handed the head it was started for in `cache/wake-dispatch`, and the
+  runner takes one line per tick and gates that head first of the pull-request heads its pass found,
+  so a new head goes to whichever slot is idle instead of waiting behind a slot's own pass.
+  Merge-queue entries still come first, the line decides nothing else, and a line nobody took or one
+  older than `GATE_RUNNER_DISPATCH_TTL` (default 600s) is dropped unread -- the slot timers remain a
+  sufficient fallback.
+- Every gate records its queue wait, from the moment its head became gateable to the moment its gate
+  started: `queue_wait: {ready_at, source, seconds}` on the attempt receipt, carried by the
+  `gate.log` event as `detail.queue_wait` and named in its summary. The time is the forge's own when
+  a wake-up carried one (`push`, `queue`, `regate`), else the pull request's own (`pr-opened`,
+  `pr-updated`); clocks that disagree record an unknown wait with both times rather than a negative
+  one. Gate latency is now measurable from the event log instead of inferred from two pages.
+  pr-gate 1.6.0.
 - A lane of the protected `jeryu-ci-runner/required` check passes only if it
   actually ran: `ops/ci/required-lane.sh` refuses a skipped, degraded, not-run,
   pending or tool-missing lane result and a run that collected zero tests. The

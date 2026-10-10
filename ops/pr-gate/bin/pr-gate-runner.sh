@@ -245,6 +245,76 @@ heartbeat() { # [current-gate-json]
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# The head this slot was woken for. pr-gate-wake.sh starts an idle slot the moment the forge says a
+# head became gateable, and leaves the head it started that slot for in cache/wake-dispatch as
+# "<owner/repo> <number|-> <sha|-> <source> <when|->". One line is taken per tick.
+#
+# It decides nothing: this tick still lists, chooses, claims and gates heads by the rules below. It
+# only puts that head first of the pull-request heads this pass found -- so a woken slot gates what
+# it was woken for instead of whatever its own pass happens to reach first -- and dates the queue
+# wait that attempt records. A line nobody takes, or one for a head this tick refuses, costs the
+# latency it was meant to save and nothing else.
+#
+# A line older than DISPATCH_TTL is dropped unread: the slot it was meant for never ran, and the
+# timers behind it have long since covered that head.
+# ---------------------------------------------------------------------------
+DISPATCH="$HOME_DIR/cache/wake-dispatch"
+DISPATCH_TTL="${GATE_RUNNER_DISPATCH_TTL:-600}"
+[[ "$DISPATCH_TTL" =~ ^[0-9]+$ ]] || die "GATE_RUNNER_DISPATCH_TTL must be a whole number of seconds"
+ISO_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
+hint_repo="" hint_pr="" hint_sha="" hint_source="" hint_at=""
+# Take the oldest line that is still worth acting on, dropping what it steps over: every line read
+# is removed, so two slots never take the same one and a malformed line is read once.
+dispatch_take() {
+  local line repo pr sha source at age rest
+  [[ -s "$DISPATCH" ]] || return 0
+  exec 5>"$DISPATCH.lock" || return 0
+  flock -w 2 5 || { exec 5>&-; return 0; }
+  while [[ -s "$DISPATCH" ]]; do
+    line="$(head -n 1 "$DISPATCH")"
+    rest="$(tail -n +2 "$DISPATCH")"
+    printf '%s' "${rest:+$rest$'\n'}" >"$DISPATCH.tmp" && mv -f -- "$DISPATCH.tmp" "$DISPATCH"
+    read -r repo pr sha source at <<<"$line"
+    if ! [[ "$repo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$pr" =~ ^([0-9]+|-)$ \
+        && "$sha" =~ ^([0-9a-f]{40}|-)$ && "$source" =~ ^[a-z-]{1,16}$ \
+        && ( "$at" == - || "$at" =~ $ISO_RE ) ]]; then
+      say "ignoring a malformed wake-up line: $line"
+      continue
+    fi
+    if [[ "$at" != - ]]; then
+      age=$(( $(date +%s) - $(date -d "$at" +%s 2>/dev/null || printf 0) ))
+      ((age <= DISPATCH_TTL)) || { say "dropping a stale wake-up for $repo (${age}s old)"; continue; }
+    fi
+    hint_repo="$repo" hint_pr="$pr" hint_sha="$sha" hint_source="$source" hint_at="$at"
+    say "woken for $repo$([[ "$pr" == - ]] || printf '#%s' "$pr") ($source)"
+    break
+  done
+  exec 5>&-
+}
+
+# Whether the wake-up names this head. A push names a ref and a sha but no pull request; a queue
+# commit and a re-gate name both.
+dispatch_names() { # owner repo number sha
+  [[ -n "$hint_repo" && "$hint_repo" == "$1/$2" ]] || return 1
+  [[ "$hint_pr" == - || "$hint_pr" == "$3" ]] || return 1
+  [[ "$hint_sha" == - || "$hint_sha" == "$4" ]] || return 1
+}
+
+# When a head became gateable, as the pull request itself dates it: it was opened, or it was changed
+# -- a push moves the head, and so does a comment, but an unrelated change can only make a measured
+# wait shorter, never invent one. The wake-up line dates it exactly when the forge told it when.
+pr_ready_at() { # pr-json -> "<iso8601>|<source>", else "-"
+  local opened moved
+  opened="$(jq -r '.created_at // ""' <<<"$1")"
+  moved="$(jq -r '.updated_at // ""' <<<"$1")"
+  [[ "$opened" =~ $ISO_RE ]] || opened=""
+  [[ "$moved" =~ $ISO_RE ]] || moved=""
+  if [[ -n "$moved" && ( -z "$opened" || "$moved" > "$opened" ) ]]; then printf '%s|pr-updated' "$moved"
+  elif [[ -n "$opened" ]]; then printf '%s|pr-opened' "$opened"
+  else printf -- '-'; fi
+}
+
 # A bare name without a primary owner is refused before any qualify (see below), never guessed.
 qualify() { [[ "$1" == */* || -z "$PRIMARY_OWNER" ]] && printf '%s' "$1" || printf '%s/%s' "$PRIMARY_OWNER" "$1"; }
 # Where each owner's canonical checkouts live (used only to discover the family): its entry in
@@ -302,6 +372,10 @@ done
 # 1-2. choose the next head
 candidates=()
 [[ -z "$only_repo" ]] || only_repo="$(qualify "$only_repo")"
+# A scheduled tick takes the head pr-gate-wake.sh woke this slot for, if it left one. --repo/--pr is
+# somebody naming a head themselves, and a main-health pass gates no pull request, so neither reads
+# one; a tick that only lists leaves it for the tick that will gate it.
+[[ -n "$only_repo" || "$main_health" == 1 || "$list" == 1 ]] || dispatch_take
 for qualified in $REPOS; do
   qualified="$(qualify "$qualified")"
   [[ -z "$only_repo" || "$qualified" == "$only_repo" ]] || continue
@@ -328,7 +402,7 @@ for qualified in $REPOS; do
       continue
     fi
     rm -f -- "$status_snapshot"
-    candidates+=("$owner $repo 0 $main_sha refs/heads/main")
+    candidates+=("$owner $repo 0 $main_sha refs/heads/main -")
     continue
   fi
   api GET "/api/v1/repos/$owner%2F$repo/pulls?state=open"
@@ -354,7 +428,9 @@ for qualified in $REPOS; do
     # A historical marker is neither a reusable success nor a live claim. The
     # durable receipt, full input identity and current publication decide below.
     [[ "$sha" == "$(jq -r '.head.sha // ""' <<<"$body")" ]] || continue
-    candidates+=("$owner $repo $number $sha -")
+    # A candidate's sixth field is when this head became gateable, for the queue wait the gate.log
+    # event reports; the fifth is its queue ref, "-" for a pull-request head.
+    candidates+=("$owner $repo $number $sha - $(pr_ready_at "$body")")
   done < <(jq -r '.items[]? | [.number, .head_sha] | @tsv' <<<"$rows" | sort -n)
 done
 # Merge queue (jeryu-deploy docs/merge-queue.md). The forge replays an approved PR onto its base tip as
@@ -382,7 +458,7 @@ if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
       if [[ "$author" == "$IDENTITY" || "$head_ref" == "$IDENTITY/"* ]]; then
         say "skipping queued $qrepo#$number: $IDENTITY's own work, which this runner must not prove"; continue
       fi
-      queued+=("$owner $repo $number $sha $qref")
+      queued+=("$owner $repo $number $sha $qref $(pr_ready_at "$body")")
     done < <(jq -r '.entries[]? | [.repo, (.number|tostring), .queue_sha, .queue_ref] | @tsv' <<<"$queue_rows")
   else
     say "merge queue answered $code; gating PR heads only this tick"
@@ -432,7 +508,7 @@ gate_regate_wanted() { # owner repo number sha
 # burst to end. --repo/--pr is never deferred.
 fresh=() seen_before=()
 for candidate in "${candidates[@]}"; do
-  read -r owner repo number sha qref <<<"$candidate"
+  read -r owner repo number sha qref ready <<<"$candidate"
   if [[ ! -d "$HOME_DIR/attempts/$owner-$repo-$sha" ]]; then fresh+=("$candidate"); continue; fi
   # Somebody asked for this head: it is as urgent as a new one, and coalescing a burst of merges is
   # not a reason to make them wait for it.
@@ -445,7 +521,16 @@ for candidate in "${candidates[@]}"; do
   fi
   seen_before+=("$candidate")
 done
-candidates=("${queued[@]}" "${fresh[@]}" "${seen_before[@]}")
+# The head this slot was woken for goes first of the pull-request heads: that is what makes a woken
+# slot gate the head it was woken for rather than whatever its own pass reached first. Merge-queue
+# entries stay ahead of all of them, each being one gate from landing. Without a wake-up the order
+# is exactly what it was.
+woken=() rest=()
+for candidate in "${fresh[@]}" "${seen_before[@]}"; do
+  read -r owner repo number sha qref ready <<<"$candidate"
+  if dispatch_names "$owner" "$repo" "$number" "$sha"; then woken+=("$candidate"); else rest+=("$candidate"); fi
+done
+candidates=("${queued[@]}" "${woken[@]}" "${rest[@]}")
 
 if ((${#candidates[@]} == 0)); then ((list)) || heartbeat; say "$([[ "$main_health" == 1 ]] && printf 'no main-health repo needs gating' || printf 'no PR head needs gating')"; exit 0; fi
 if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
@@ -454,9 +539,10 @@ if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # through parent death; the recipe closes them before it can start cache daemons.
 # The slot's cache daemon is started by the worker itself, after it has closed all three.
 for candidate in "${candidates[@]}"; do
-read -r owner repo number sha qref <<<"$candidate"
+read -r owner repo number sha qref ready <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
-   && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) ]] \
+   && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) \
+   && ( "$ready" == - || "$ready" =~ ^[^[:space:]]+\|[a-z-]+$ ) ]] \
   || die "invalid repository or head in dispatch"
 if [[ -d "$HOME_DIR/claims/$owner-$repo-$sha" ]]; then
   say "recovery required: retained legacy claim for $owner/$repo@$sha; reconcile its worker before admission"
@@ -796,6 +882,29 @@ gate_begin "$identity"
 # On the attempt, so recovery publishes the same annotation from the same evidence as this process would.
 gate_update --argjson paths "$self_gate_json" '.gate_definition_paths=$paths' \
   || say "could not record the gate-defining paths of $owner/$repo@$sha"
+# The queue wait: from the moment this head became gateable to the moment its gate started. It is
+# what says whether a gate waited for a slot rather than took one, so it is recorded on the attempt
+# and carried by the gate.log event (see pr-gate-heartbeat.sh). The wake-up that started this slot
+# dates the head when the forge told it when; otherwise the pull request dates itself. Clocks that
+# disagree are recorded as an unknown wait rather than a negative one, with both times kept.
+ready_at="" ready_source=""
+if dispatch_names "$owner" "$repo" "$number" "$sha" && [[ "$hint_at" != - ]]; then
+  ready_at="$hint_at" ready_source="$hint_source"
+elif [[ "$ready" != - ]]; then
+  ready_at="${ready%%|*}" ready_source="${ready##*|}"
+fi
+if [[ -n "$ready_at" ]]; then
+  queue_wait=null
+  ready_s="$(date -d "$ready_at" +%s 2>/dev/null || true)"
+  gate_start_s="$(date -d "$(jq -r '.started_at' "$gate_receipt")" +%s 2>/dev/null || true)"
+  if [[ "$ready_s" =~ ^[0-9]+$ && "$gate_start_s" =~ ^[0-9]+$ ]] && ((gate_start_s >= ready_s)); then
+    queue_wait=$((gate_start_s - ready_s))
+  fi
+  gate_update --arg at "$ready_at" --arg source "$ready_source" --argjson seconds "$queue_wait" \
+    '.queue_wait={ready_at:$at,source:$source,seconds:$seconds}' \
+    || say "could not record the queue wait of $owner/$repo@$sha"
+  say "queue wait $([[ "$queue_wait" == null ]] && printf unknown || printf '%ss' "$queue_wait") ($ready_source $ready_at -> gate start)"
+fi
 # The request is discharged by the attempt it started, not by the attempt's outcome: a gate that
 # dies leaves recovery to finish, and reading the request as still owed would gate the same head on
 # every tick until it moved.
