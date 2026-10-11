@@ -1005,6 +1005,10 @@ merge_hold_reason() { # owner/name number
 merge_pass() { # dry
   local dry="$1" merger row repo number sha receipt reason passport retry_base queue_retry_base
   local queue_cache_state=0 queue_cache_entries='[]'
+  # Review passes and pokes can both reach this function. Serialize the scan, but keep
+  # it independent of run.lock so an active review pass cannot hold up landing.
+  exec 8>"$state/merge.lock"
+  flock -n 8 || { say "merge pass already running; another pass owns the merge lock"; return 0; }
   if [ -z "$merge_token_file" ]; then
     say "merge pass skipped: set REDTEAM_MERGE_TOKEN_FILE to the merger credential"; return 0
   fi
@@ -1208,9 +1212,9 @@ rebase_pr() { # owner/name number reviewed-sha head_ref base_ref receipt merger 
 # something new — a PR head no pass has reviewed yet, or an approved head that the forge would now
 # land. Each head triggers at most once (state/poke-seen), so a review that keeps failing cannot turn
 # this into a pass every 30 seconds; the five-minute timer still retries it. It never reviews or
-# merges by itself.
+# merges by itself, except that a landable approval can launch the independent merge pass.
 poke() { # dry
-  local dry="$1" me row repo number sha key why="" seen="$state/poke-seen"
+  local dry="$1" me row repo number sha key why="" seen="$state/poke-seen" age=unknown receipt started
   touch "$seen"
   me="$(whoami_login)"
   while IFS= read -r row; do
@@ -1222,6 +1226,9 @@ poke() { # dry
       key="review $repo#$number $sha"
     elif merge_receipt "$repo" "$number" "$sha" >/dev/null && [ -z "$(merge_hold_reason "$repo" "$number")" ]; then
       key="merge $repo#$number $sha"
+      receipt="$(merge_receipt "$repo" "$number" "$sha")"
+      started="$(jq -r '.started_at // empty' "$receipt")"
+      [[ "$started" =~ ^[0-9]+$ ]] && age="$(( $(date +%s) - started ))"
     else
       continue
     fi
@@ -1232,7 +1239,13 @@ poke() { # dry
   [ -n "$why" ] || return 0
   if [ "$dry" = 1 ]; then say "poke: would start a pass ($why)"; return 0; fi
   if systemctl --user is-active --quiet pr-redteam.service; then
-    say "poke: pass already running ($why)"
+    case "$why" in
+      merge\ *)
+        say "poke: review pass active; launching independent merge pass ($why; review_age_seconds=$age)"
+        "$self" _merge >>"$state/merge.log" 2>&1 </dev/null &
+        ;;
+      *) say "poke: pass already running ($why)" ;;
+    esac
   else
     say "poke: starting a pass now ($why)"
     systemctl --user start --no-block pr-redteam.service

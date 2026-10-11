@@ -110,7 +110,7 @@ cat > "$t/bin/systemctl" <<'FIXTURE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$MERGE_FIXTURE/systemctl"
 case "$*" in
-  *is-active*) exit 3 ;;
+  *is-active*) [[ -e "$MERGE_FIXTURE/pass-active" ]] && exit 0 || exit 3 ;;
   '--user start --no-block pr-redteam.service') exit 0 ;;
   *) echo "unexpected systemctl $*" >> "$MERGE_FIXTURE/danger"; exit 97 ;;
 esac
@@ -152,6 +152,14 @@ poke
 [[ "$(starts)" == 2 ]]
 echo 'ok a newly landable approval starts one pass'
 
-# Poke itself never reviewed, merged or rewrote anything.
-[[ "$(count "$t/model-calls")" == 1 && "$(count "$t/merges")" == 0 && ! -e "$t/danger" ]]
+# While a review pass is active, a newly landable approval launches the independent _merge mode.
+# Remove its seen key to model a newly green required context, then wait for the detached worker.
+grep -v '^merge jeryu/fixture#107 ' "$t/state/poke-seen" > "$t/poke-seen"
+mv "$t/poke-seen" "$t/state/poke-seen"
+touch "$t/pass-active"
+poke
+grep -q 'poke: review pass active; launching independent merge pass (merge jeryu/fixture#107' "$t/controller.log"
+for _ in {1..100}; do [[ "$(count "$t/merges")" == 1 ]] && break; sleep 0.05; done
+[[ "$(count "$t/model-calls")" == 1 && "$(count "$t/merges")" == 1 && ! -e "$t/danger" ]]
+echo 'ok landable approval merges while another review pass is active'
 echo 'POKE PASS'
