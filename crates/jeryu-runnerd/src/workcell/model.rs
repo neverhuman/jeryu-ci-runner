@@ -121,6 +121,7 @@ impl FrozenCiSnapshot {
             runner_id: workcell.runner_id.clone(),
             runner_epoch: workcell.runner_epoch,
             admitted_runner_epoch: workcell.admitted_runner_epoch,
+            repair_generation: workcell.repair_generation,
             workspace_root: workcell.workspace_root.clone(),
             repo_roots: workcell.repo_roots.clone(),
             allowed_paths,
@@ -151,6 +152,7 @@ impl RepairSource {
             runner_id: cell.runner_id.clone(),
             runner_epoch: cell.runner_epoch,
             admitted_runner_epoch: cell.admitted_runner_epoch,
+            repair_generation: cell.repair_generation,
             agent_id: cell.agent_id.clone(),
             workspace_root: cell.workspace_root.clone(),
             repo_roots: cell.repo_roots.clone(),
@@ -191,6 +193,7 @@ impl WorkcellLease {
             runner_id: String::new(),
             runner_epoch: 0,
             admitted_runner_epoch: 0,
+            repair_generation: 0,
             heartbeat_healthy: false,
             startup_rebased: false,
             startup_main_ref: None,
@@ -226,6 +229,7 @@ impl WorkcellLease {
         self.runner_id = request.runner_id.clone();
         self.runner_epoch = request.runner_epoch;
         self.admitted_runner_epoch = admitted_runner_epoch;
+        self.repair_generation = 0;
         self.heartbeat_healthy = true;
         self.startup_rebased = false;
         self.startup_main_ref = None;

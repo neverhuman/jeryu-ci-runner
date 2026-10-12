@@ -100,6 +100,9 @@ pub struct FrozenCiSnapshot {
     /// The runner lifetime the registry admitted when the frozen cell's chain
     /// was first claimed. Repair is fenced on this, never on the token above.
     pub admitted_runner_epoch: u64,
+    /// The frozen cell's repair generation; repair checks it against the
+    /// ledger's record of the source cell rather than trusting it.
+    pub repair_generation: u32,
     pub workspace_root: PathBuf,
     pub repo_roots: Vec<PathBuf>,
     pub allowed_paths: Vec<PathBuf>,
@@ -191,6 +194,10 @@ pub struct WorkcellLease {
     /// It is never bumped, so a repair of a repair is still fenced on the
     /// runner's real epoch.
     pub admitted_runner_epoch: u64,
+    /// How many repairs deep this cell is: 0 for a claimed or held cell, its
+    /// source's generation plus one for a repair cell. Capped at
+    /// [`WORKCELL_MAX_REPAIR_GENERATIONS`].
+    pub repair_generation: u32,
     pub heartbeat_healthy: bool,
     pub startup_rebased: bool,
     pub startup_main_ref: Option<String>,
@@ -224,10 +231,10 @@ pub struct AdmittedRunner {
     pub admission: RunnerAdmission,
 }
 
-/// Failed repair startups a source cell may report before it is refused as a
-/// repair source. A failed startup takes no cell, so this bounds retries
-/// rather than cell consumption.
-pub const WORKCELL_MAX_FAILED_REPAIR_STARTUPS: u32 = 3;
+/// The deepest repair generation a chain may reach. A repair cell is itself
+/// a repair source, so without this bound a runner, including a draining
+/// one, could chain repairs and keep taking cells indefinitely.
+pub const WORKCELL_MAX_REPAIR_GENERATIONS: u32 = 3;
 
 /// In-memory workcell warm-pool and claim ledger.
 #[derive(Debug, Default, Clone)]
@@ -252,10 +259,6 @@ pub struct WorkcellManager {
     /// entry is dropped when its source cell is released, since a released
     /// cell is no longer a live repair source.
     repaired_sources: BTreeSet<String>,
-    /// Failed repair startups per source cell, capped at
-    /// [`WORKCELL_MAX_FAILED_REPAIR_STARTUPS`]. Dropped on a successful
-    /// repair and when the source cell is released.
-    failed_repair_startups: BTreeMap<String, u32>,
 }
 
 /// The ledger's own record of a repair's source cell, from which the repair
@@ -264,6 +267,7 @@ struct RepairSource {
     runner_id: String,
     runner_epoch: u64,
     admitted_runner_epoch: u64,
+    repair_generation: u32,
     agent_id: String,
     workspace_root: PathBuf,
     repo_roots: Vec<PathBuf>,

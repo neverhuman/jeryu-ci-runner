@@ -216,28 +216,34 @@ impl WorkcellManager {
     ///   held or repairing), and its chain belongs to the caller: same runner
     ///   and same admitted runner epoch;
     /// - the snapshot agrees with the ledger's own record of that source cell
-    ///   (runner, per-cell token, admitted epoch, agent, workspace and repo
-    ///   roots, allowed paths, git status summary, branch policy), so an
-    ///   edited snapshot is refused;
+    ///   (runner, per-cell token, admitted epoch, repair generation, agent,
+    ///   workspace and repo roots, allowed paths, git status summary, and the
+    ///   branch-policy fields a repair could escalate: agent, budget, merge,
+    ///   delete and namespace), so an edited snapshot is refused. Open
+    ///   branches are not compared: they come from the ledger, so a branch
+    ///   exported after the freeze is still counted;
+    /// - the repair stays within [`WORKCELL_MAX_REPAIR_GENERATIONS`]: the
+    ///   source's generation plus one may not exceed it;
     /// - the snapshot's capsule carries no forbidden token value, screened
     ///   like a hold's;
     /// - the source cell has not been repaired from before: repair is
     ///   one-shot per source cell, so one snapshot mints at most one live
     ///   repair cell. The repair is recorded once the repair cell's startup
-    ///   succeeds;
-    /// - the source has not used up its
-    ///   [`WORKCELL_MAX_FAILED_REPAIR_STARTUPS`] failed startups.
+    ///   succeeds.
     ///
     /// A failed startup (`StartupSync::Failed`) is known before any cell is
     /// taken, so it takes none: the ready queue and the cell table are left
-    /// as they were, the attempt is counted against the source, and the
-    /// source stays repairable until the cap is reached.
+    /// as they were and the source stays repairable.
     ///
-    /// The repair cell is seeded from the ledger's record, never the
-    /// snapshot. Its branch policy is built by `BranchPolicy::new` (budget
+    /// The repair cell's identity, roots, allowed paths, git status summary,
+    /// generation and branch policy come from the ledger's record of the
+    /// source cell. Its branch policy is built by `BranchPolicy::new` (budget
     /// clamped, merge and delete denied, new branches namespaced under the
     /// repair cell) and inherits the source's open branches, so a chain
-    /// shares one branch budget.
+    /// shares one branch budget. The failure evidence (the frozen snapshot
+    /// itself, ci and failed run ids, receipt id, failure log digest,
+    /// snapshot age, heartbeat reading) comes from the freeze, as it does
+    /// for a hold, and its capsule is token-screened.
     pub fn repair_from_snapshot(
         &mut self,
         request: RepairFromSnapshotRequest,
@@ -260,13 +266,8 @@ impl WorkcellManager {
             main_ref, reason, ..
         } = &startup
         {
-            let attempts = self
-                .failed_repair_startups
-                .entry(snapshot.workcell_id.clone())
-                .or_insert(0);
-            *attempts = attempts.saturating_add(1);
             return Err(WorkcellError::startup_rebase_failed(format!(
-                "repair of workcell {} could not rebase onto {main_ref}: {reason} (failed repair startup {attempts} of {WORKCELL_MAX_FAILED_REPAIR_STARTUPS}; no cell was taken)",
+                "repair of workcell {} could not rebase onto {main_ref}: {reason} (no cell was taken; the source stays repairable)",
                 snapshot.workcell_id
             )));
         }
@@ -291,13 +292,13 @@ impl WorkcellManager {
         // `&mut`, so no second repair can interleave between the checks above
         // and this record.
         self.repaired_sources.insert(snapshot.workcell_id.clone());
-        self.failed_repair_startups.remove(&snapshot.workcell_id);
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
             .get_mut(&workcell_id)
             .expect("claimed workcell must stay live");
         cell.state = WorkcellState::Held;
+        cell.repair_generation = source.repair_generation.saturating_add(1);
         cell.frozen_snapshot = Some(snapshot.clone());
         // The branch policy comes from the ledger, never the snapshot. The
         // claim above built it with `BranchPolicy::new`: the source's budget,
@@ -369,8 +370,28 @@ impl WorkcellManager {
                 snapshot.git_status_summary == source.git_status_summary,
             ),
             (
-                "branch_policy",
-                snapshot.branch_policy == source.branch_policy,
+                "repair_generation",
+                snapshot.repair_generation == source.repair_generation,
+            ),
+            (
+                "branch_policy.agent_id",
+                snapshot.branch_policy.agent_id == source.branch_policy.agent_id,
+            ),
+            (
+                "branch_policy.max_branches",
+                snapshot.branch_policy.max_branches == source.branch_policy.max_branches,
+            ),
+            (
+                "branch_policy.merge_allowed",
+                snapshot.branch_policy.merge_allowed == source.branch_policy.merge_allowed,
+            ),
+            (
+                "branch_policy.delete_allowed",
+                snapshot.branch_policy.delete_allowed == source.branch_policy.delete_allowed,
+            ),
+            (
+                "branch_policy.workcell_id",
+                snapshot.branch_policy.workcell_id == source.branch_policy.workcell_id,
             ),
             (
                 "allowed_paths",
@@ -392,14 +413,10 @@ impl WorkcellManager {
                 snapshot.ci_run_id, snapshot.failed_run_id
             )));
         }
-        let failed = self
-            .failed_repair_startups
-            .get(source_id)
-            .copied()
-            .unwrap_or(0);
-        if failed >= WORKCELL_MAX_FAILED_REPAIR_STARTUPS {
+        if source.repair_generation >= WORKCELL_MAX_REPAIR_GENERATIONS {
             return Err(WorkcellError::repair_state_denied(format!(
-                "workcell {source_id} reported {failed} failed repair startups, the cap of {WORKCELL_MAX_FAILED_REPAIR_STARTUPS}; it is no longer a repair source"
+                "workcell {source_id} is at repair generation {}, and a repair may not exceed generation {WORKCELL_MAX_REPAIR_GENERATIONS}",
+                source.repair_generation
             )));
         }
         Ok(source)
@@ -549,7 +566,6 @@ impl WorkcellManager {
         // A released cell is no longer a live repair source, so the state
         // check refuses any later repair from it; its one-shot record can go.
         self.repaired_sources.remove(workcell_id);
-        self.failed_repair_startups.remove(workcell_id);
         Ok(())
     }
 

@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use jeryu_ci_ir::RunnerClass;
-use jeryu_runnerd::workcell::{FreezeFailedCiRunRequest, WORKCELL_MAX_FAILED_REPAIR_STARTUPS};
+use jeryu_runnerd::workcell::{FreezeFailedCiRunRequest, WORKCELL_MAX_REPAIR_GENERATIONS};
 use jeryu_runnerd::{
     DispatchMode, FrozenCiSnapshot, HoldFailedTreeRequest, RepairFromSnapshotRequest,
     RunnerAdmission, RunnerDaemon, RunnerFleet, StartupSync, WorkcellClaimRequest, WorkcellManager,
@@ -535,11 +535,7 @@ fn an_edited_snapshot_is_refused() {
         ("merge allowed", |s| s.branch_policy.merge_allowed = true),
         ("delete allowed", |s| s.branch_policy.delete_allowed = true),
         ("branch budget", |s| s.branch_policy.max_branches = u32::MAX),
-        ("open branches", |s| {
-            s.branch_policy
-                .open_branches
-                .insert("agents/x/workcells/y/z".into());
-        }),
+        ("repair generation", |s| s.repair_generation += 1),
         ("branch namespace", |s| {
             s.branch_policy.workcell_id = "wc-other".into()
         }),
@@ -732,11 +728,11 @@ fn a_failed_repair_startup_leaves_the_source_repairable_once() {
     assert_eq!(replayed.reason, "workcell_repair_state_denied");
 }
 
-// Failed repair startups are capped per source cell: repeated failures
-// neither grow the cell table nor drain the ready queue, and once the cap is
-// reached the source is refused, even with a good startup.
+// Repeated failed repair startups take no cells and never use up the source:
+// the cell table and ready queue are unchanged however many fail, and the
+// source still repairs exactly once afterwards.
 #[test]
-fn failed_repair_startups_are_capped_and_take_no_cells() {
+fn repeated_failed_repair_startups_take_no_cells_and_leave_the_source_repairable() {
     let (fleet, epoch) = fleet();
     let mut ledger = WorkcellManager::with_warm_pool(1);
     let held = fleet
@@ -746,7 +742,7 @@ fn failed_repair_startups_are_capped_and_take_no_cells() {
     let ready_before = ledger.ready_count();
     let cells_before = ledger.workcells().len();
 
-    for attempt in 1..=WORKCELL_MAX_FAILED_REPAIR_STARTUPS {
+    for attempt in 1..=5 {
         let failed = fleet
             .repair_workcell(&mut ledger, failed_startup(&snapshot, epoch))
             .expect_err("the startup fails");
@@ -765,29 +761,123 @@ fn failed_repair_startups_are_capped_and_take_no_cells() {
             "attempt {attempt}: cells"
         );
     }
-    for request in [
-        failed_startup(&snapshot, epoch),
-        repair_as(&snapshot, epoch),
-    ] {
-        let refused = fleet
-            .repair_workcell(&mut ledger, request)
-            .expect_err("the capped source is refused");
-        assert_eq!(refused.reason, "workcell_repair_state_denied");
-        assert!(refused.message().contains("cap"), "{}", refused.message());
+    fleet
+        .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
+        .expect("the source still repairs after failed startups");
+    let replayed = fleet
+        .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
+        .expect_err("and only once");
+    assert_eq!(replayed.reason, "workcell_repair_state_denied");
+}
+
+/// Repair from `snapshot`, then keep freezing and repairing each new repair
+/// cell until the chain reaches the generation cap; returns the snapshot of
+/// the last (max-generation) repair cell.
+fn repair_chain_to_the_cap(
+    fleet: &RunnerFleet,
+    ledger: &mut WorkcellManager,
+    epoch: u64,
+    snapshot: FrozenCiSnapshot,
+) -> FrozenCiSnapshot {
+    let mut snapshot = snapshot;
+    for generation in 1..=WORKCELL_MAX_REPAIR_GENERATIONS {
+        let repair = fleet
+            .repair_workcell(ledger, repair_as(&snapshot, epoch))
+            .unwrap_or_else(|err| panic!("generation {generation}: {}", err.message()));
+        assert_eq!(repair.repair_generation, generation);
+        snapshot = freeze_repair_cell(ledger, &repair.workcell_id, repair.runner_epoch);
+        assert_eq!(snapshot.repair_generation, generation);
     }
+    snapshot
+}
+
+// Repair chains are bounded: generations 1..=max succeed, and a repair past
+// the cap is refused before any cell is taken.
+#[test]
+fn repair_chains_stop_at_the_generation_cap() {
+    let (fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-56", epoch))
+        .expect("hold the failed tree");
+    assert_eq!(held.repair_generation, 0);
+    let last = repair_chain_to_the_cap(
+        &fleet,
+        &mut ledger,
+        epoch,
+        held.frozen_snapshot.expect("frozen"),
+    );
+
+    let ready_before = ledger.ready_count();
+    let cells_before = ledger.workcells().len();
+    let refused = fleet
+        .repair_workcell(&mut ledger, repair_as(&last, epoch))
+        .expect_err("a repair past the generation cap is refused");
+    assert_eq!(refused.reason, "workcell_repair_state_denied");
+    assert!(
+        refused.message().contains("generation"),
+        "{}",
+        refused.message()
+    );
     assert_eq!(ledger.ready_count(), ready_before, "no warm cell consumed");
     assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
 
-    // A different source's budget is its own.
-    let other = fleet
-        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-55", epoch))
-        .expect("hold another failed tree");
-    fleet
-        .repair_workcell(
-            &mut ledger,
-            repair_as(other.frozen_snapshot.as_ref().expect("frozen"), epoch),
-        )
-        .expect("another source still repairs");
+    // Understating the generation on the snapshot does not lift the cap.
+    let mut understated = last.clone();
+    understated.repair_generation = 0;
+    let refused = fleet
+        .repair_workcell(&mut ledger, repair_as(&understated, epoch))
+        .expect_err("an edited generation is refused");
+    assert_eq!(refused.reason, "workcell_repair_state_denied");
+    assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
+}
+
+// A draining runner's repair chain is bounded the same way.
+#[test]
+fn a_draining_runners_repair_chain_stops_at_the_generation_cap() {
+    let (mut fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-57", epoch))
+        .expect("hold the failed tree while active");
+    assert!(fleet.drain(RUNNER));
+    let last = repair_chain_to_the_cap(
+        &fleet,
+        &mut ledger,
+        epoch,
+        held.frozen_snapshot.expect("frozen"),
+    );
+    let cells_before = ledger.workcells().len();
+    let refused = fleet
+        .repair_workcell(&mut ledger, repair_as(&last, epoch))
+        .expect_err("a draining runner's chain is bounded too");
+    assert_eq!(refused.reason, "workcell_repair_state_denied");
+    assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
+}
+
+// A branch exported after the freeze does not make the snapshot stale: the
+// repair succeeds, and the repair cell counts that branch against the
+// shared budget because open branches come from the ledger.
+#[test]
+fn a_branch_exported_after_the_freeze_still_counts_against_the_repair_budget() {
+    let (fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-58", epoch))
+        .expect("hold the failed tree");
+    let snapshot = held.frozen_snapshot.clone().expect("frozen");
+    let exported = ledger
+        .export_repair_branch(&held.workcell_id, held.runner_epoch, "fix-0")
+        .expect("the source exports its one branch after the freeze");
+
+    let repair = fleet
+        .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
+        .expect("the genuine snapshot still repairs");
+    assert!(repair.branch_policy.open_branches.contains(&exported));
+    let denied = ledger
+        .export_repair_branch(&repair.workcell_id, repair.runner_epoch, "fix-1")
+        .expect_err("the exported branch used the shared budget");
+    assert_eq!(denied.reason, "workcell_branch_budget_denied");
 }
 
 fn rebased() -> StartupSync {
