@@ -11,16 +11,39 @@ impl NodeJournal {
             .into_iter()
             .find(|owned| owned.resource_id == record.resource_id);
         let Some(owned) = owned else {
-            return crate::checkpoint::CheckpointStore::open(&self.root)?
-                .reference_for_resource(&record.resource_id, &record.context);
+            let store = crate::checkpoint::CheckpointStore::open(&self.root)?;
+            let bytes = u64::from(record.workspace_gib) * 1024 * 1024 * 1024;
+            if let Some(reference) = &record.checkpoint {
+                store.authenticate_reference(
+                    reference,
+                    &record.resource_id,
+                    &record.context,
+                    bytes,
+                    record.workspace_flushed,
+                    record.workspace.as_ref(),
+                )?;
+                return Ok(Some(reference.clone()));
+            }
+            return store.reference_for_resource(
+                &record.resource_id,
+                &record.context,
+                bytes,
+                record.workspace_flushed,
+                record.workspace.as_ref(),
+            );
         };
         if owned.context != record.context || owned.uid != record.uid {
             return Err(failed("node_cleanup_fenced"));
         }
         let fence = crate::guardian::fence::exclusive(&self.root, &owned)?;
         let mut record = owned;
-        record.state = ResourceState::Cleaning;
-        self.write(&record)?;
+        // A persisted checkpoint is not proof of recoverable encrypted bytes.
+        // Preserve its journal inode on authentication refusal. The exclusive
+        // launch fence remains held throughout writer termination and cleanup.
+        if record.checkpoint.is_none() && !matches!(record.state, ResourceState::Cleaning) {
+            record.state = ResourceState::Cleaning;
+            self.write(&record)?;
+        }
         // A released exclusive launch fence proves no guardian may spawn.
         // Killing its owned subtree also covers recovery after guardian death.
         let guardian = PathBuf::from("/sys/fs/cgroup/jeryu-guardians").join(&record.resource_id);
@@ -63,19 +86,34 @@ impl NodeJournal {
         // an encryption/storage failure leaves the disk and retry record intact.
         if record.retain_workspace && record.checkpoint.is_none() {
             let store = crate::checkpoint::CheckpointStore::open(&self.root)?;
-            let path = self.jail_root(&record.resource_id)?.join("workspace");
+            let bytes = u64::from(record.workspace_gib) * 1024 * 1024 * 1024;
+            let image = crate::custody::Directory::open(&self.root)
+                .and_then(|root| root.descend(Path::new("j/firecracker")))
+                .and_then(|parent| parent.open_directory(Path::new(&record.resource_id)))
+                .and_then(|directory| directory.open_workspace(record.uid, bytes))
+                .map_err(|_| crate::checkpoint::workspace_custody_denied())?;
             record.checkpoint = Some(store.retain(
                 &record.resource_id,
                 &record.context,
                 crate::checkpoint::RetainedDisk {
-                    path: &path,
+                    image,
                     uid: record.uid,
-                    bytes: u64::from(record.workspace_gib) * 1024 * 1024 * 1024,
+                    bytes,
                     filesystem_flushed: record.workspace_flushed,
                     workspace: record.workspace.as_ref(),
                 },
             )?);
             self.write(&record)?;
+        }
+        if let Some(reference) = &record.checkpoint {
+            crate::checkpoint::CheckpointStore::open(&self.root)?.authenticate_reference(
+                reference,
+                &record.resource_id,
+                &record.context,
+                u64::from(record.workspace_gib) * 1024 * 1024 * 1024,
+                record.workspace_flushed,
+                record.workspace.as_ref(),
+            )?;
         }
         // Opaque guest disks are removed as files. They are never mounted here.
         let jail = self
@@ -131,6 +169,9 @@ fn wait_empty(cgroup: &Path) -> RunnerResult<()> {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[cfg(test)]
+mod native;
 
 #[cfg(test)]
 mod tests {

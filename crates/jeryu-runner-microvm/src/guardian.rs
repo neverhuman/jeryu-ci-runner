@@ -38,7 +38,7 @@ struct Launch {
     lease: SessionLease,
     lease_key: [u8; 32],
     jail_root: PathBuf,
-    jailer: PathBuf,
+    executable_descriptors: [i32; 2],
     arguments: Vec<String>,
 }
 
@@ -53,29 +53,32 @@ impl Guardian {
         lease: &SessionLease,
         key: [u8; 32],
         root: &Path,
-        jailer: &Path,
+        executables: [&fs::File; 2],
         arguments: Vec<String>,
         fence: fs::File,
     ) -> RunnerResult<Self> {
         let executable = std::env::current_exe()?;
-        trusted_file(&executable, true)?;
+        let executable = trusted_file(&executable, true)?;
         let (mut channel, child_channel) = UnixStream::pair()?;
         channel.set_read_timeout(Some(Duration::from_secs(60)))?;
         channel.set_write_timeout(Some(Duration::from_secs(1)))?;
-        let mut child = jeryu_sandbox_linux::microvm::spawn_guardian(
+        let spawned = jeryu_sandbox_linux::microvm::spawn_guardian_files(
             &executable,
             OwnedFd::from(child_channel),
             fs::File::from(
                 rustix::io::fcntl_dupfd_cloexec(&fence, 3)
                     .map_err(|_| failed("microvm_guardian_descriptor_invalid"))?,
             ),
+            executables[0],
+            executables[1],
         )?;
+        let mut child = spawned.child;
         let request = Launch {
             record: record.clone(),
             lease: lease.clone(),
             lease_key: key,
             jail_root: root.into(),
-            jailer: jailer.into(),
+            executable_descriptors: spawned.descriptors,
             arguments,
         };
         // Any failure drops the private socket; the guardian never cancels its
@@ -144,12 +147,26 @@ pub fn run_if_requested() -> RunnerResult<bool> {
     channel.set_write_timeout(Some(Duration::from_secs(1)))?;
     let launch: Launch = read_message(&mut channel)?;
     let fence = fs::File::from(fence);
-    verify(&launch, &fence)?;
-    process::run(launch, channel)?;
+    let [jailer, firecracker] =
+        jeryu_sandbox_linux::microvm::inherited_executables(launch.executable_descriptors)?;
+    verify(&launch, &fence, &jailer, &firecracker)?;
+    let mut firecracker = jeryu_sandbox_linux::microvm::sealed_executable(&firecracker, 64 << 20)?;
+    // Check the snapshot, too: no modified or partial source reaches Jailer.
+    use std::io::{Seek, SeekFrom};
+    firecracker.seek(SeekFrom::Start(0))?;
+    if sha256_reader(&mut firecracker)? != launch.lease.runtime.firecracker.digest {
+        return Err(failed("microvm_guardian_custody_denied"));
+    }
+    process::run(launch, channel, jailer, firecracker)?;
     drop(fence);
     Ok(true)
 }
-fn verify(launch: &Launch, fence: &fs::File) -> RunnerResult<()> {
+fn verify(
+    launch: &Launch,
+    fence: &fs::File,
+    jailer: &fs::File,
+    firecracker: &fs::File,
+) -> RunnerResult<()> {
     crate::lease_authority::verify(&launch.lease, &launch.lease_key)?;
     if launch.record.context != launch.lease.context
         || launch.record.expires_at_unix_millis != launch.lease.expires_at_unix_millis
@@ -182,6 +199,9 @@ fn verify(launch: &Launch, fence: &fs::File) -> RunnerResult<()> {
         .and_then(Path::parent)
         .ok_or_else(|| failed("microvm_guardian_binding_invalid"))?;
     fence::bind(state, &launch.record.resource_id, fence)?;
+    if !crate::journal::UidRange::read_enrolled(state)?.contains(launch.record.uid) {
+        return Err(failed("microvm_guardian_binding_invalid"));
+    }
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(nix::libc::O_NOFOLLOW)
@@ -208,9 +228,19 @@ fn verify(launch: &Launch, fence: &fs::File) -> RunnerResult<()> {
     {
         return Err(failed("microvm_guardian_binding_invalid"));
     }
-    let digest = sha256_reader(&mut trusted_file(&launch.jailer, true)?)?;
-    if digest != launch.lease.runtime.jailer.digest {
-        return Err(failed("microvm_guardian_custody_denied"));
+    for (file, expected) in [
+        (jailer, &launch.lease.runtime.jailer.digest),
+        (firecracker, &launch.lease.runtime.firecracker.digest),
+    ] {
+        crate::custody::verify_file(
+            file,
+            crate::custody::FileRole::Immutable { executable: true },
+            64 << 20,
+        )
+        .map_err(|_| failed("microvm_guardian_custody_denied"))?;
+        if crate::artifacts::sha256_descriptor(file)? != *expected {
+            return Err(failed("microvm_guardian_custody_denied"));
+        }
     }
     if launch
         .record

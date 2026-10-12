@@ -1,47 +1,16 @@
 use super::*;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+pub(super) fn directory(path: &Path) -> RunnerResult<Directory> {
+    Directory::open(path).map_err(|_| failed("bundle_registry_custody_denied"))
+}
 
-pub(super) fn private_directory(path: &Path) -> RunnerResult<()> {
-    trusted_directory(
-        path.parent()
-            .ok_or_else(|| failed("bundle_registry_custody_denied"))?,
-    )?;
-    match std::fs::DirBuilder::new().mode(0o700).create(path) {
-        Ok(()) => File::open(
-            path.parent()
-                .ok_or_else(|| failed("bundle_registry_custody_denied"))?,
-        )?
-        .sync_all()?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
-        Err(error) => return Err(error.into()),
-    }
-    trusted_directory(path)?;
-    if std::fs::metadata(path)?.mode() & 0o077 != 0 {
+pub(super) fn staging_directory(root: &Directory) -> RunnerResult<Directory> {
+    let directory = root
+        .child_directory(Path::new(".source-staging"))
+        .map_err(|_| failed("bundle_registry_custody_denied"))?;
+    if directory.mode()? != 0o700 {
         return Err(failed("bundle_registry_custody_denied"));
     }
-    Ok(())
-}
-pub(super) fn private_file(path: &Path, create: bool) -> RunnerResult<File> {
-    trusted_directory(
-        path.parent()
-            .ok_or_else(|| failed("bundle_registry_custody_denied"))?,
-    )?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(create)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)?;
-    private_metadata(&file.metadata()?)?;
-    Ok(file)
-}
-pub(super) fn private_metadata(meta: &std::fs::Metadata) -> RunnerResult<()> {
-    if !meta.is_file() || meta.uid() != 0 || meta.nlink() != 1 || meta.mode() & 0o077 != 0 {
-        return Err(failed("bundle_registry_custody_denied"));
-    }
-    Ok(())
+    Ok(directory)
 }
 pub(super) fn source_name(name: &str) -> bool {
     name.len() == 64
@@ -49,16 +18,14 @@ pub(super) fn source_name(name: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
-pub(super) fn inventory(root: &Path) -> RunnerResult<(u64, usize)> {
+pub(super) fn inventory(root: &Directory) -> RunnerResult<(u64, usize)> {
     let mut bytes = 0u64;
     let mut objects = 0;
-    for (count, entry) in std::fs::read_dir(root)?.enumerate() {
-        if count >= 65536 {
-            return Err(failed("bundle_registry_inventory_limit"));
-        }
-        let entry = entry?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    for entry in root
+        .entries_bounded(65536)
+        .map_err(|_| failed("bundle_registry_inventory_limit"))?
+    {
+        let Some(name) = entry.to_str() else {
             return Err(failed("bundle_registry_custody_denied"));
         };
         if name == ".source-staging" {
@@ -67,14 +34,16 @@ pub(super) fn inventory(root: &Path) -> RunnerResult<(u64, usize)> {
         if !source_name(name) {
             return Err(failed("bundle_registry_custody_denied"));
         }
-        trusted_directory(&entry.path())?;
-        let path = entry.path().join("source-bundle");
-        match std::fs::symlink_metadata(&path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-            Ok(_) => (),
+        let directory = root
+            .open_directory(&entry)
+            .map_err(|_| failed("bundle_registry_custody_denied"))?;
+        let name = Path::new("source-bundle");
+        if !directory.entry_exists(name)? {
+            continue;
         }
-        let file = crate::artifacts::trusted_file(&path, false)?;
+        let file = directory
+            .open_file(name, FileRole::Immutable { executable: false }, u64::MAX)
+            .map_err(|_| failed("bundle_registry_custody_denied"))?;
         let size = file.metadata()?.len();
         if !(512..=(1 << 30)).contains(&size) || size % 512 != 0 {
             return Err(failed("bundle_registry_size_invalid"));

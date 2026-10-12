@@ -4,6 +4,12 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
+mod executables;
+pub use executables::{
+    GuardianChild, inherited_executables, sealed_executable, spawn_guarded_jailer_files,
+    spawn_guardian_files,
+};
+
 pub fn disable_core_dumps() -> std::io::Result<()> {
     let limit = libc::rlimit {
         rlim_cur: 0,

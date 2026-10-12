@@ -41,6 +41,8 @@ pub struct NodeConfig {
     pub cpu_budget_vcpus: u16,
     pub memory_budget_mib: u32,
     pub disk_budget_gib: u32,
+    /// Operator-reserved host identities; immutable once state is enrolled.
+    pub uid_base: u32,
 }
 
 pub struct Node {
@@ -114,7 +116,8 @@ impl NodeConfig {
             .write(true)
             .open("/dev/kvm")
             .map_err(|_| failed("microvm_kvm_unavailable"))?;
-        let journal = NodeJournal::open(&self.state_dir)?;
+        let journal = NodeJournal::open_with_uid_base(&self.state_dir, self.uid_base)?;
+        crate::journal::UidRange::new(self.uid_base)?.claim_host(&self.state_dir)?;
         // The node lock fences another launcher. Previous daemon resources are
         // stopped before any new writable generation can be admitted.
         let mut failure = None;
@@ -217,7 +220,8 @@ impl MicroVmSession {
             {
                 return Err(failed("microvm_generation_already_running"));
             }
-            let uid = (200000..200064)
+            let uid = crate::journal::UidRange::new(node.config.uid_base)?
+                .ids()
                 .find(|uid| existing.iter().all(|r| r.uid != *uid))
                 .ok_or_else(|| failed("microvm_capacity_unavailable"))?;
             let record = ResourceRecord {

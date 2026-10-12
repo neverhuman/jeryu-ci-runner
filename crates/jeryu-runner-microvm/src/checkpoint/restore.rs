@@ -11,7 +11,7 @@ impl CheckpointStore {
         lease: &SessionLease,
         target: &mut File,
     ) -> RunnerResult<()> {
-        let manifest = self.manifest(reference)?;
+        let (directory, manifest) = self.checked_checkpoint(reference)?;
         let previous = &manifest.context;
         let next = &lease.context;
         if previous.owner_id != next.owner_id
@@ -30,7 +30,6 @@ impl CheckpointStore {
         {
             return Err(failed("checkpoint_resume_fenced"));
         }
-        let directory = self.directory(&reference.checkpoint_id)?;
         if let Some(workspace) = &manifest.workspace
             && (workspace.head_revision != next.source_revision
                 || !matches!(&lease.workspace, WorkspaceSource::GitBundle { base_revision, .. } if base_revision == &workspace.main_revision))
@@ -38,32 +37,20 @@ impl CheckpointStore {
             return Err(failed("checkpoint_resume_main_fenced"));
         }
         let mut key = Zeroizing::new([0; 32]);
-        let mut key_file = self.file(&directory.join("key"), 32)?;
+        let mut key_file = Self::file(&directory, "key", 32)?;
         key_file.read_exact(key.as_mut())?;
         if key_file.metadata()?.len() != 32 {
             return Err(failed("checkpoint_key_invalid"));
         }
-        let maximum = match manifest.format {
-            CheckpointFormat::LegacyDenseV1 => {
-                manifest.plaintext_bytes + manifest.plaintext_bytes.div_ceil(1024 * 1024) * 16 + 24
-            }
-            CheckpointFormat::SparseV2 => sparse::maximum_size(manifest.plaintext_bytes)?,
-        };
-        let mut image = self.file(&directory.join("image"), maximum)?;
+        let maximum = Self::image_maximum(&manifest)?;
+        let mut image = Self::file(&directory, "image", maximum)?;
         let length = image.metadata()?.len();
         if (manifest.format == CheckpointFormat::LegacyDenseV1 && length != maximum)
             || (manifest.format == CheckpointFormat::SparseV2 && length < 56)
         {
             return Err(failed("checkpoint_image_invalid"));
         }
-        let binding = serde_json::to_vec(&(
-            &manifest.checkpoint_id,
-            previous,
-            manifest.plaintext_bytes,
-            manifest.filesystem_flushed,
-            &manifest.workspace,
-        ))
-        .map_err(|_| failed("checkpoint_context_invalid"))?;
+        let binding = Self::manifest_binding(&manifest)?;
         match manifest.format {
             CheckpointFormat::LegacyDenseV1 => crypto::decrypt(
                 &mut image,

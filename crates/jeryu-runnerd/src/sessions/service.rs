@@ -2,6 +2,7 @@ mod fencing;
 mod handle;
 mod registry;
 mod shutdown;
+mod startup;
 use super::{
     RunnerResult,
     control::ControllerLease,
@@ -88,17 +89,9 @@ impl SessionService {
             stop: stop.clone(),
             expires_at_unix_millis: lease.expires_at_unix_millis,
         });
-        session.send(&GuestRequest::Start {
-            channel: "shell".into(),
-            profile: GuestProfile::Shell,
+        startup::launch(&lease.profile_id, rebase_required, |request| {
+            session.send(request)
         })?;
-        if !rebase_required {
-            session.send(&GuestRequest::Start {
-                channel: "agent".into(),
-                profile: GuestProfile::registered(&lease.profile_id)
-                    .map_err(|_| failed("unknown_agent_profile"))?,
-            })?;
-        }
         let reading_state = state.clone();
         let reading_stop = stop.clone();
         let reader_done = Arc::new(AtomicBool::new(false));
