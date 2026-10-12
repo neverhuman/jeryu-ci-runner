@@ -112,14 +112,7 @@ impl FrozenCiSnapshot {
         failure_log_digest: impl Into<String>,
         snapshot_age_ms: u64,
     ) -> Self {
-        let allowed_paths = workcell
-            .repo_roots
-            .iter()
-            .cloned()
-            .chain(std::iter::once(workcell.workspace_root.clone()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let allowed_paths = workcell.root_paths();
         Self {
             ci_run_id: ci_run_id.into(),
             failed_run_id: failed_run_id.into(),
@@ -152,7 +145,35 @@ impl FrozenCiSnapshot {
     }
 }
 
+impl RepairSource {
+    pub(super) fn of(cell: &WorkcellLease) -> Self {
+        Self {
+            runner_id: cell.runner_id.clone(),
+            runner_epoch: cell.runner_epoch,
+            admitted_runner_epoch: cell.admitted_runner_epoch,
+            agent_id: cell.agent_id.clone(),
+            workspace_root: cell.workspace_root.clone(),
+            repo_roots: cell.repo_roots.clone(),
+            // A frozen snapshot's allowed paths are always derived from the
+            // cell's roots, so derive them the same way here.
+            allowed_paths: cell.root_paths(),
+        }
+    }
+}
+
 impl WorkcellLease {
+    /// The cell's repo roots plus its workspace root, sorted and deduplicated:
+    /// the paths a frozen snapshot of this cell allows.
+    pub(super) fn root_paths(&self) -> Vec<PathBuf> {
+        self.repo_roots
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.workspace_root.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub(super) fn ready(workcell_id: impl Into<String>) -> Self {
         let workcell_id = workcell_id.into();
         Self {

@@ -205,26 +205,43 @@ impl WorkcellManager {
         outcome.map(|()| lease)
     }
 
+    /// Mint a held repair cell from a frozen snapshot, on behalf of the
+    /// runner named in `request` (the caller's own identity, fenced like any
+    /// claim). Every check runs before a ready cell is consumed or one minted:
+    ///
+    /// - the caller is admitted at exactly its current epoch; repair is the
+    ///   one path a draining runner is admitted to, since the snapshot is
+    ///   existing in-flight work the registry lets it finish;
+    /// - the snapshot's source cell is in this ledger, still live (claimed,
+    ///   held or repairing), and its chain belongs to the caller: same runner
+    ///   and same admitted runner epoch;
+    /// - the snapshot agrees with the ledger's own record of that source cell
+    ///   (runner, per-cell token, admitted epoch, agent, workspace and repo
+    ///   roots, allowed paths), so an edited snapshot is refused;
+    /// - the source cell has not been repaired from before: repair is
+    ///   one-shot per source cell, so one snapshot mints at most one cell.
     pub fn repair_from_snapshot(
         &mut self,
-        snapshot: &FrozenCiSnapshot,
-        startup: StartupSync,
+        request: RepairFromSnapshotRequest,
     ) -> WorkcellResult<WorkcellLease> {
-        // A snapshot may only be repaired by the runner lifetime that froze it:
-        // one kept past that lifetime is fenced like any other stale claim.
-        // The fence compares the lifetime the chain was admitted at, not the
-        // snapshot's per-cell token, which a repair cell bumps. Repair is the
-        // one path a draining runner is admitted to: the snapshot is existing
-        // in-flight work, which the registry lets a draining runner finish.
-        let admitted = snapshot.admitted_runner_epoch;
-        self.require_repair_epoch(&snapshot.runner_id, admitted)?;
-        let request = WorkcellClaimRequest {
-            agent_id: snapshot.branch_policy.agent_id.clone(),
-            workspace_root: snapshot.workspace_root.clone(),
-            repo_roots: snapshot.repo_roots.clone(),
+        let RepairFromSnapshotRequest {
+            runner_id,
+            runner_epoch,
+            snapshot,
+            startup,
+        } = request;
+        self.require_repair_epoch(&runner_id, runner_epoch)?;
+        let source = self.verified_repair_source(&runner_id, runner_epoch, &snapshot)?;
+        // Record the repair before a cell is consumed, so a refused or failed
+        // startup cannot be retried into a second cell either.
+        self.repaired_sources.insert(snapshot.workcell_id.clone());
+        let claim = WorkcellClaimRequest {
+            agent_id: source.agent_id.clone(),
+            workspace_root: source.workspace_root.clone(),
+            repo_roots: source.repo_roots.clone(),
             branch_budget: snapshot.branch_policy.max_branches,
-            runner_id: snapshot.runner_id.clone(),
-            runner_epoch: snapshot.runner_epoch.saturating_add(1),
+            runner_id: source.runner_id.clone(),
+            runner_epoch: source.runner_epoch.saturating_add(1),
             git_status_summary: snapshot.git_status_summary.clone(),
             ci_snapshot_age_ms: Some(snapshot.snapshot_age_ms),
             startup,
@@ -233,7 +250,7 @@ impl WorkcellManager {
         // runner lifetime: the runner was fenced on its real epoch above, and
         // the bump must neither be checked against nor move the runner fence.
         // The repair cell keeps the chain's admitted lifetime unchanged.
-        let mut lease = self.claim_unfenced(request, admitted)?;
+        let mut lease = self.claim_unfenced(claim, source.admitted_runner_epoch)?;
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
@@ -247,10 +264,80 @@ impl WorkcellManager {
         cell.heartbeat_healthy = snapshot.heartbeat_healthy;
         cell.failed_run_id = Some(snapshot.failed_run_id.clone());
         cell.failed_receipt_id = Some(snapshot.failed_receipt_id.clone());
-        cell.allowed_paths = snapshot.allowed_paths.clone();
+        cell.allowed_paths = source.allowed_paths;
         cell.failure_log_digest = Some(snapshot.failure_log_digest.clone());
         lease = cell.clone();
         Ok(lease)
+    }
+
+    /// The ledger's own record of `snapshot`'s source cell, once the caller
+    /// owns its chain, the cell is live and unrepaired, and the snapshot
+    /// agrees with it. The returned values, not the snapshot's, seed the
+    /// repair cell.
+    fn verified_repair_source(
+        &self,
+        runner_id: &str,
+        runner_epoch: u64,
+        snapshot: &FrozenCiSnapshot,
+    ) -> WorkcellResult<RepairSource> {
+        let source_id = &snapshot.workcell_id;
+        let cell = self.cells.get(source_id).ok_or_else(|| {
+            WorkcellError::repair_state_denied(format!(
+                "snapshot source workcell {source_id} is not in this ledger"
+            ))
+        })?;
+        if cell.runner_id != runner_id || cell.admitted_runner_epoch != runner_epoch {
+            return Err(WorkcellError::epoch_fenced(format!(
+                "runner {runner_id} epoch {runner_epoch} does not own workcell {source_id}'s repair chain"
+            )));
+        }
+        if !matches!(
+            cell.state,
+            WorkcellState::Claimed | WorkcellState::Held | WorkcellState::Repairing
+        ) {
+            return Err(WorkcellError::repair_state_denied(format!(
+                "snapshot source workcell {source_id} is {} and only a claimed, held or repairing cell can be repaired from",
+                cell.state.as_str()
+            )));
+        }
+        let source = RepairSource::of(cell);
+        let mismatched: Vec<&str> = [
+            ("runner_id", snapshot.runner_id == source.runner_id),
+            ("runner_epoch", snapshot.runner_epoch == source.runner_epoch),
+            (
+                "admitted_runner_epoch",
+                snapshot.admitted_runner_epoch == source.admitted_runner_epoch,
+            ),
+            (
+                "agent_id",
+                snapshot.branch_policy.agent_id == source.agent_id,
+            ),
+            (
+                "workspace_root",
+                snapshot.workspace_root == source.workspace_root,
+            ),
+            ("repo_roots", snapshot.repo_roots == source.repo_roots),
+            (
+                "allowed_paths",
+                snapshot.allowed_paths == source.allowed_paths,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(field, same)| (!same).then_some(field))
+        .collect();
+        if !mismatched.is_empty() {
+            return Err(WorkcellError::repair_state_denied(format!(
+                "snapshot of workcell {source_id} disagrees with the ledger on {}",
+                mismatched.join(", ")
+            )));
+        }
+        if self.repaired_sources.contains(source_id) {
+            return Err(WorkcellError::repair_state_denied(format!(
+                "workcell {source_id} was already repaired from (snapshot of ci run {}, failed run {}); repair is one-shot per source cell",
+                snapshot.ci_run_id, snapshot.failed_run_id
+            )));
+        }
+        Ok(source)
     }
 
     pub fn hold_failed_tree(

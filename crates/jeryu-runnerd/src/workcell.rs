@@ -150,6 +150,17 @@ pub struct FreezeFailedCiRunRequest {
     pub snapshot_age_ms: u64,
 }
 
+/// Request to repair from a frozen snapshot. `runner_id` and `runner_epoch`
+/// are the caller's own identity, fenced against the daemon's registry; the
+/// snapshot's chain must belong to that runner lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairFromSnapshotRequest {
+    pub runner_id: String,
+    pub runner_epoch: u64,
+    pub snapshot: FrozenCiSnapshot,
+    pub startup: StartupSync,
+}
+
 /// Request to hold a failed tree for live repair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoldFailedTreeRequest {
@@ -231,6 +242,21 @@ pub struct WorkcellManager {
     /// other epoch, comes from a lifetime the daemon did not admit and is
     /// fenced; a draining runner is admitted only to repair from a snapshot.
     runner_epochs: BTreeMap<String, AdmittedRunner>,
+    /// Source cells a repair cell has already been minted from. Repair is
+    /// one-shot per source cell, so replaying a snapshot mints nothing.
+    repaired_sources: BTreeSet<String>,
+}
+
+/// The ledger's own record of a repair's source cell, from which the repair
+/// cell is seeded instead of from the caller's snapshot.
+struct RepairSource {
+    runner_id: String,
+    runner_epoch: u64,
+    admitted_runner_epoch: u64,
+    agent_id: String,
+    workspace_root: PathBuf,
+    repo_roots: Vec<PathBuf>,
+    allowed_paths: Vec<PathBuf>,
 }
 
 /// Validate incoming archive entries before extraction into a workcell repo.

@@ -191,14 +191,16 @@ fn frozen_ci_snapshot_is_immutable_and_repair_uses_it() {
         .expect("freeze succeeds");
     let frozen_before = frozen.clone();
     let repair = manager
-        .repair_from_snapshot(
-            &frozen,
-            StartupSync::Rebased {
+        .repair_from_snapshot(RepairFromSnapshotRequest {
+            runner_id: "node-0".into(),
+            runner_epoch: 7,
+            snapshot: frozen.clone(),
+            startup: StartupSync::Rebased {
                 main_ref: "origin/main".into(),
                 base_sha: "def456".into(),
                 head_sha: "fedcba".into(),
             },
-        )
+        })
         .expect("repair claim succeeds");
 
     assert_eq!(frozen, frozen_before, "frozen snapshot must stay immutable");

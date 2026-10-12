@@ -10,7 +10,7 @@ use jeryu_runner_registry::NodeState;
 use super::*;
 use crate::warm_pool::{ClaimedCell, SessionClaim, WarmPool};
 use crate::workcell::{
-    AdmittedRunner, FrozenCiSnapshot, HoldFailedTreeRequest, RunnerAdmission, StartupSync,
+    AdmittedRunner, HoldFailedTreeRequest, RepairFromSnapshotRequest, RunnerAdmission,
     WorkcellClaimRequest, WorkcellLease, WorkcellManager, WorkcellResult,
 };
 
@@ -79,17 +79,18 @@ impl RunnerFleet {
         ledger.hold_failed_tree(request)
     }
 
-    /// Repair from a frozen snapshot, fenced on the snapshot runner's current
-    /// lifetime (active or draining): a snapshot kept past that lifetime
-    /// cannot mint a repair cell.
+    /// Repair from a frozen snapshot on behalf of the runner the request
+    /// names, fenced on that runner's current lifetime (active or draining).
+    /// The snapshot's chain must belong to that lifetime, and each source
+    /// cell is repaired from at most once; see
+    /// [`WorkcellManager::repair_from_snapshot`].
     pub fn repair_workcell(
         &self,
         ledger: &mut WorkcellManager,
-        snapshot: &FrozenCiSnapshot,
-        startup: StartupSync,
+        request: RepairFromSnapshotRequest,
     ) -> WorkcellResult<WorkcellLease> {
         ledger.sync_runner_fence(self.admitted_runner_epochs());
-        ledger.repair_from_snapshot(snapshot, startup)
+        ledger.repair_from_snapshot(request)
     }
 
     /// Claim a warm container cell for one agent session, fenced like

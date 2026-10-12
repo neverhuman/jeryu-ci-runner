@@ -18,6 +18,6 @@ pub use job_file::load_job_file;
 pub use warm_pool::{ClaimedCell, SessionClaim, WarmPool};
 pub use workcell::{
     AdmittedRunner, ArchiveEntry, ArchiveEntryKind, BranchPolicy, FrozenCiSnapshot,
-    HoldFailedTreeRequest, RunnerAdmission, StartupSync, WorkcellClaimRequest, WorkcellError,
-    WorkcellLease, WorkcellManager, WorkcellState,
+    HoldFailedTreeRequest, RepairFromSnapshotRequest, RunnerAdmission, StartupSync,
+    WorkcellClaimRequest, WorkcellError, WorkcellLease, WorkcellManager, WorkcellState,
 };
