@@ -99,7 +99,8 @@ impl WarmPool {
 
     /// Replace the pool ledger's claim fence with the runner lifetimes the
     /// daemon admitted; see [`WorkcellManager::sync_runner_fence`]. A draining
-    /// runner is admitted for in-flight work only, so it claims no warm cell.
+    /// runner is admitted only to repair from a snapshot, so it claims no warm
+    /// cell.
     pub fn sync_runner_fence(
         &mut self,
         admitted: impl IntoIterator<Item = (String, crate::workcell::AdmittedRunner)>,
@@ -705,7 +706,7 @@ mod tests {
         assert_pool_matches_ledger(&pool, &fake, 1);
     }
 
-    // A draining runner is admitted for in-flight work only, so the fleet's
+    // A draining runner is admitted only to repair from a snapshot, so the fleet's
     // warm-cell path fences it at its current epoch and the pool is untouched.
     #[test]
     fn a_draining_runner_claims_no_warm_cell() {

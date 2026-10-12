@@ -51,8 +51,9 @@ impl WorkcellManager {
     /// request's own epoch is checked but never trusted. Replacing the whole
     /// table also prunes it: a runner the registry no longer admits (reaped,
     /// never registered, re-registered at a new epoch) loses its entry and is
-    /// fenced. A [`RunnerAdmission::Draining`] runner is fenced from fresh
-    /// cells but may still hold and repair its in-flight work.
+    /// fenced. A [`RunnerAdmission::Draining`] runner is fenced from every
+    /// claim, hold and warm cell; it may only repair from a snapshot of its
+    /// existing in-flight work.
     pub fn sync_runner_fence(
         &mut self,
         admitted: impl IntoIterator<Item = (String, AdmittedRunner)>,
@@ -212,10 +213,11 @@ impl WorkcellManager {
         // A snapshot may only be repaired by the runner lifetime that froze it:
         // one kept past that lifetime is fenced like any other stale claim.
         // The fence compares the lifetime the chain was admitted at, not the
-        // snapshot's per-cell token, which a repair cell bumps; a draining
-        // runner may still repair its in-flight work.
+        // snapshot's per-cell token, which a repair cell bumps. Repair is the
+        // one path a draining runner is admitted to: the snapshot is existing
+        // in-flight work, which the registry lets a draining runner finish.
         let admitted = snapshot.admitted_runner_epoch;
-        self.require_in_flight_epoch(&snapshot.runner_id, admitted)?;
+        self.require_repair_epoch(&snapshot.runner_id, admitted)?;
         let request = WorkcellClaimRequest {
             agent_id: snapshot.branch_policy.agent_id.clone(),
             workspace_root: snapshot.workspace_root.clone(),
@@ -267,11 +269,11 @@ impl WorkcellManager {
             &failure_log_digest,
             &self.forbidden_token_values,
         )?;
-        // Holding a failed tree finishes in-flight work, so a draining runner
-        // is admitted at its current epoch; a fresh claim is not.
-        self.require_in_flight_epoch(&claim.runner_id, claim.runner_epoch)?;
-        let admitted = claim.runner_epoch;
-        let mut lease = self.claim_unfenced(claim, admitted)?;
+        // Holding a failed tree takes a ready cell or mints a fresh one, so it
+        // is fenced as a fresh claim: only an active runner at its exact
+        // epoch holds, and a draining runner is refused before any cell is
+        // consumed or minted.
+        let mut lease = self.claim(claim)?;
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
@@ -453,7 +455,8 @@ impl WorkcellManager {
     }
 
     /// Refuse a fresh claim unless the runner is active at exactly the epoch
-    /// the daemon issued it. A draining runner takes no fresh cell.
+    /// the daemon issued it. A draining runner takes no fresh cell, which
+    /// covers claims, warm cells and holds of a failed tree.
     fn require_claim_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
         match self.require_admitted_epoch(runner_id, runner_epoch)? {
             RunnerAdmission::Active => Ok(()),
@@ -463,10 +466,10 @@ impl WorkcellManager {
         }
     }
 
-    /// Refuse in-flight work (holding a failed tree, repairing from a frozen
-    /// snapshot) unless the runner is active or draining at exactly the epoch
-    /// the daemon issued it.
-    fn require_in_flight_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
+    /// Refuse a repair from a frozen snapshot unless the runner is active or
+    /// draining at exactly the epoch the daemon issued it. This is the only
+    /// path a draining runner is admitted to.
+    fn require_repair_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
         self.require_admitted_epoch(runner_id, runner_epoch)
             .map(|_| ())
     }

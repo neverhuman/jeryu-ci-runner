@@ -199,8 +199,9 @@ pub struct WorkcellLease {
 pub enum RunnerAdmission {
     /// The runner takes fresh work cells and carries its in-flight work.
     Active,
-    /// The runner takes no fresh work cell, but its in-flight work may still
-    /// finish: hold a failed tree and repair from a frozen snapshot.
+    /// The runner takes no fresh work cell (claim, warm cell or failed-tree
+    /// hold); it may only repair from a frozen snapshot of its existing
+    /// in-flight work.
     Draining,
 }
 
@@ -228,7 +229,7 @@ pub struct WorkcellManager {
     /// Current epoch and admission per admitted runner, as issued by the
     /// daemon's registry. A runner not listed here, or a request carrying any
     /// other epoch, comes from a lifetime the daemon did not admit and is
-    /// fenced; a draining runner is admitted for in-flight work only.
+    /// fenced; a draining runner is admitted only to repair from a snapshot.
     runner_epochs: BTreeMap<String, AdmittedRunner>,
 }
 

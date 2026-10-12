@@ -297,35 +297,31 @@ fn freeze_repair_cell(
         .expect("freeze the repair cell's failed run")
 }
 
-// Draining stops fresh work but lets in-flight work finish: a draining runner
-// at its current epoch still holds a failed tree and repairs from its
-// snapshot, while a fresh claim or warm cell is refused.
+// Draining stops every fresh cell: a draining runner's claim and failed-tree
+// hold are both fenced before a ready cell is consumed or a cell minted. The
+// one thing it may still do is repair from a snapshot of in-flight work it
+// froze while active.
 #[test]
-fn a_draining_runner_holds_and_repairs_in_flight_work_but_claims_no_fresh_cell() {
+fn a_draining_runner_repairs_existing_in_flight_work_but_holds_and_claims_nothing() {
     let (mut fleet, epoch) = fleet();
     let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-30", epoch))
+        .expect("the active runner holds its failed tree");
+    let snapshot = held.frozen_snapshot.expect("held tree is frozen");
+
     assert!(fleet.drain(RUNNER));
     let admitted = fleet.admitted_runner_epochs();
     assert_eq!(admitted[RUNNER].epoch, epoch);
     assert_eq!(admitted[RUNNER].admission, RunnerAdmission::Draining);
     assert!(fleet.claimable_runner_epochs().is_empty());
 
-    let held = fleet
-        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-30", epoch))
-        .expect("a draining runner holds its in-flight failed tree");
-    assert_eq!(held.state, WorkcellState::Held);
-    assert_eq!(held.admitted_runner_epoch, epoch);
-    let snapshot = held.frozen_snapshot.expect("held tree is frozen");
-    let repair = fleet
-        .repair_workcell(&mut ledger, &snapshot, rebased())
-        .expect("a draining runner repairs its in-flight snapshot");
-    assert_eq!(repair.state, WorkcellState::Held);
-
     let ready_before = ledger.ready_count();
+    assert_eq!(ready_before, 1, "the warm pool has a ready cell to lose");
     let cells_before = ledger.workcells().len();
     let fenced = fleet
-        .claim_workcell(&mut ledger, claim_request("agent-anvil-31", epoch))
-        .expect_err("a draining runner takes no fresh cell");
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-31", epoch))
+        .expect_err("a draining runner holds no new failed tree");
     assert_eq!(fenced.reason, "workcell_epoch_fenced");
     assert!(
         fenced.message().contains("draining"),
@@ -335,10 +331,25 @@ fn a_draining_runner_holds_and_repairs_in_flight_work_but_claims_no_fresh_cell()
     assert_eq!(ledger.ready_count(), ready_before, "no warm cell consumed");
     assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
 
-    let stale = fleet
-        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-32", epoch - 1))
+    let fenced = fleet
+        .claim_workcell(&mut ledger, claim_request("agent-anvil-32", epoch))
+        .expect_err("a draining runner takes no fresh cell");
+    assert_eq!(fenced.reason, "workcell_epoch_fenced");
+    assert_eq!(ledger.ready_count(), ready_before, "no warm cell consumed");
+    assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
+
+    let repair = fleet
+        .repair_workcell(&mut ledger, &snapshot, rebased())
+        .expect("a draining runner repairs its existing in-flight snapshot");
+    assert_eq!(repair.state, WorkcellState::Held);
+    assert_eq!(repair.admitted_runner_epoch, epoch);
+
+    let mut stale = snapshot.clone();
+    stale.admitted_runner_epoch = epoch - 1;
+    let fenced = fleet
+        .repair_workcell(&mut ledger, &stale, rebased())
         .expect_err("draining admits only the runner's current epoch");
-    assert_eq!(stale.reason, "workcell_epoch_fenced");
+    assert_eq!(fenced.reason, "workcell_epoch_fenced");
 }
 
 // A reaped runner is dead: it neither holds a failed tree nor repairs a
