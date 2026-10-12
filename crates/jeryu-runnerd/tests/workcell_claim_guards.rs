@@ -7,8 +7,9 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use jeryu_ci_ir::RunnerClass;
+use jeryu_runnerd::workcell::FreezeFailedCiRunRequest;
 use jeryu_runnerd::{
-    DispatchMode, HoldFailedTreeRequest, RunnerDaemon, RunnerFleet, StartupSync,
+    DispatchMode, HoldFailedTreeRequest, RunnerAdmission, RunnerDaemon, RunnerFleet, StartupSync,
     WorkcellClaimRequest, WorkcellManager, WorkcellState,
 };
 use std::path::PathBuf;
@@ -262,6 +263,156 @@ fn drained_and_reaped_runners_are_pruned_from_the_fence() {
         .claim_workcell(&mut ledger, claim_request("agent-anvil-26", epoch))
         .expect_err("a reaped runner is fenced");
     assert_eq!(fenced.reason, "workcell_epoch_fenced");
+}
+
+fn hold_request(agent_id: &str, runner_epoch: u64) -> HoldFailedTreeRequest {
+    HoldFailedTreeRequest {
+        claim: claim_request(agent_id, runner_epoch),
+        ci_run_id: format!("ci-{agent_id}"),
+        failed_run_id: format!("run-{agent_id}"),
+        failed_receipt_id: format!("receipt-{agent_id}"),
+        failure_log_digest: "sha256:0badc0de".into(),
+    }
+}
+
+/// Freeze the failed CI run a repair cell produced, presenting the cell's own
+/// per-cell token as every per-cell operation must.
+fn freeze_repair_cell(
+    ledger: &WorkcellManager,
+    workcell_id: &str,
+    cell_token: u64,
+) -> jeryu_runnerd::FrozenCiSnapshot {
+    ledger
+        .freeze_failed_ci_run(
+            workcell_id,
+            cell_token,
+            FreezeFailedCiRunRequest {
+                ci_run_id: format!("ci-{workcell_id}"),
+                failed_run_id: format!("run-{workcell_id}"),
+                failed_receipt_id: format!("receipt-{workcell_id}"),
+                failure_log_digest: "sha256:0badc0de".into(),
+                snapshot_age_ms: 0,
+            },
+        )
+        .expect("freeze the repair cell's failed run")
+}
+
+// Draining stops fresh work but lets in-flight work finish: a draining runner
+// at its current epoch still holds a failed tree and repairs from its
+// snapshot, while a fresh claim or warm cell is refused.
+#[test]
+fn a_draining_runner_holds_and_repairs_in_flight_work_but_claims_no_fresh_cell() {
+    let (mut fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    assert!(fleet.drain(RUNNER));
+    let admitted = fleet.admitted_runner_epochs();
+    assert_eq!(admitted[RUNNER].epoch, epoch);
+    assert_eq!(admitted[RUNNER].admission, RunnerAdmission::Draining);
+    assert!(fleet.claimable_runner_epochs().is_empty());
+
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-30", epoch))
+        .expect("a draining runner holds its in-flight failed tree");
+    assert_eq!(held.state, WorkcellState::Held);
+    assert_eq!(held.admitted_runner_epoch, epoch);
+    let snapshot = held.frozen_snapshot.expect("held tree is frozen");
+    let repair = fleet
+        .repair_workcell(&mut ledger, &snapshot, rebased())
+        .expect("a draining runner repairs its in-flight snapshot");
+    assert_eq!(repair.state, WorkcellState::Held);
+
+    let ready_before = ledger.ready_count();
+    let cells_before = ledger.workcells().len();
+    let fenced = fleet
+        .claim_workcell(&mut ledger, claim_request("agent-anvil-31", epoch))
+        .expect_err("a draining runner takes no fresh cell");
+    assert_eq!(fenced.reason, "workcell_epoch_fenced");
+    assert!(
+        fenced.message().contains("draining"),
+        "{}",
+        fenced.message()
+    );
+    assert_eq!(ledger.ready_count(), ready_before, "no warm cell consumed");
+    assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
+
+    let stale = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-32", epoch - 1))
+        .expect_err("draining admits only the runner's current epoch");
+    assert_eq!(stale.reason, "workcell_epoch_fenced");
+}
+
+// A reaped runner is dead: it neither holds a failed tree nor repairs a
+// snapshot frozen before it died, and no cell is minted for it.
+#[test]
+fn a_dead_runner_can_neither_hold_nor_repair() {
+    let (mut fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-33", epoch))
+        .expect("the live runner holds a failed tree");
+    let snapshot = held.frozen_snapshot.expect("held tree is frozen");
+
+    assert_eq!(fleet.reap(1_000).len(), 1, "the silent runner is reaped");
+    assert!(fleet.admitted_runner_epochs().is_empty());
+    let cells_before = ledger.workcells().len();
+
+    let fenced = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-34", epoch))
+        .expect_err("a dead runner holds nothing");
+    assert_eq!(fenced.reason, "workcell_epoch_fenced");
+    let fenced = fleet
+        .repair_workcell(&mut ledger, &snapshot, rebased())
+        .expect_err("a dead runner repairs nothing");
+    assert_eq!(fenced.reason, "workcell_epoch_fenced");
+    assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
+}
+
+// Each repair cell bumps its own per-cell token, but the chain stays fenced on
+// the runner's real epoch: hold -> repair -> CI fails -> freeze -> repair
+// succeeds, and the second-generation snapshot is still refused once the
+// runner re-registers.
+#[test]
+fn a_snapshot_frozen_from_a_repair_cell_can_be_repaired_again() {
+    let (mut fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-35", epoch))
+        .expect("hold the failed tree");
+    let first = fleet
+        .repair_workcell(
+            &mut ledger,
+            held.frozen_snapshot.as_ref().expect("frozen"),
+            rebased(),
+        )
+        .expect("first-generation repair");
+    assert_eq!(first.runner_epoch, epoch + 1, "per-cell token bumped");
+    assert_eq!(first.admitted_runner_epoch, epoch, "lifetime unchanged");
+
+    ledger
+        .begin_live_repair(&first.workcell_id, first.runner_epoch)
+        .expect("repair starts on the cell's own token");
+    let second_snapshot = freeze_repair_cell(&ledger, &first.workcell_id, first.runner_epoch);
+    assert_eq!(second_snapshot.runner_epoch, epoch + 1);
+    assert_eq!(second_snapshot.admitted_runner_epoch, epoch);
+
+    let second = fleet
+        .repair_workcell(&mut ledger, &second_snapshot, rebased())
+        .expect("second-generation repair at the runner's real epoch");
+    assert_eq!(second.state, WorkcellState::Held);
+    assert_eq!(second.runner_epoch, epoch + 2);
+    assert_eq!(second.admitted_runner_epoch, epoch);
+
+    fleet.register(daemon(), 1);
+    let cells_before = ledger.workcells().len();
+    let fenced = fleet
+        .repair_workcell(&mut ledger, &second_snapshot, rebased())
+        .expect_err("a re-registered runner's old chain is fenced");
+    assert_eq!(fenced.reason, "workcell_epoch_fenced");
+    assert_eq!(
+        ledger.workcells().len(),
+        cells_before,
+        "no repair cell minted"
+    );
 }
 
 /// Hold a failed tree and repair from its snapshot, both through the fleet.

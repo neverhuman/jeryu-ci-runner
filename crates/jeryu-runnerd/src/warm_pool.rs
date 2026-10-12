@@ -97,6 +97,16 @@ impl WarmPool {
         self.manager.sync_runner_epochs(issued);
     }
 
+    /// Replace the pool ledger's claim fence with the runner lifetimes the
+    /// daemon admitted; see [`WorkcellManager::sync_runner_fence`]. A draining
+    /// runner is admitted for in-flight work only, so it claims no warm cell.
+    pub fn sync_runner_fence(
+        &mut self,
+        admitted: impl IntoIterator<Item = (String, crate::workcell::AdmittedRunner)>,
+    ) {
+        self.manager.sync_runner_fence(admitted);
+    }
+
     /// Number of warm containers currently idling in the pool.
     pub fn warm_depth(&self) -> usize {
         self.warm.len()
@@ -693,6 +703,25 @@ mod tests {
             .expect("the issued epoch claims");
         assert_eq!(claimed.lease.runner_epoch, issued);
         assert_pool_matches_ledger(&pool, &fake, 1);
+    }
+
+    // A draining runner is admitted for in-flight work only, so the fleet's
+    // warm-cell path fences it at its current epoch and the pool is untouched.
+    #[test]
+    fn a_draining_runner_claims_no_warm_cell() {
+        let mut fleet = crate::RunnerFleet::deterministic_fixture();
+        let issued = fleet.claimable_runner_epochs()["node-0"];
+        assert!(fleet.drain("node-0"));
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = WarmPool::new(fake.clone(), 2).expect("warm the pool");
+        let warm_before = pool.warm_container_ids();
+
+        let err = fleet
+            .claim_warm_cell(&mut pool, session_claim("agent-16", "run-16", issued))
+            .expect_err("a draining runner takes no fresh warm cell");
+        assert_eq!(err.code(), "workcell_epoch_fenced");
+        assert_eq!(pool.warm_container_ids(), warm_before);
+        assert_pool_matches_ledger(&pool, &fake, 0);
     }
 
     // A denial that is not a fence (here: the popped cell is already claimed

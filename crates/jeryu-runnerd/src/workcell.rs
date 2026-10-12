@@ -95,7 +95,11 @@ pub struct FrozenCiSnapshot {
     pub failed_receipt_id: String,
     pub workcell_id: String,
     pub runner_id: String,
+    /// The frozen cell's own fencing token (a repair cell's is bumped).
     pub runner_epoch: u64,
+    /// The runner lifetime the registry admitted when the frozen cell's chain
+    /// was first claimed. Repair is fenced on this, never on the token above.
+    pub admitted_runner_epoch: u64,
     pub workspace_root: PathBuf,
     pub repo_roots: Vec<PathBuf>,
     pub allowed_paths: Vec<PathBuf>,
@@ -169,7 +173,13 @@ pub struct WorkcellLease {
     pub git_status_summary: String,
     pub ci_snapshot_age_ms: Option<u64>,
     pub runner_id: String,
+    /// This cell's own fencing token: per-cell operations must present it.
+    /// A repair cell carries its snapshot's token plus one.
     pub runner_epoch: u64,
+    /// The runner lifetime the registry admitted for this cell's claim chain.
+    /// It is never bumped, so a repair of a repair is still fenced on the
+    /// runner's real epoch.
+    pub admitted_runner_epoch: u64,
     pub heartbeat_healthy: bool,
     pub startup_rebased: bool,
     pub startup_main_ref: Option<String>,
@@ -180,6 +190,26 @@ pub struct WorkcellLease {
     pub failure_log_digest: Option<String>,
     pub frozen_snapshot: Option<FrozenCiSnapshot>,
     pub blocked_reason: Option<String>,
+}
+
+/// How far the daemon's registry admits a runner lifetime past the
+/// work-cell fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerAdmission {
+    /// The runner takes fresh work cells and carries its in-flight work.
+    Active,
+    /// The runner takes no fresh work cell, but its in-flight work may still
+    /// finish: hold a failed tree and repair from a frozen snapshot.
+    Draining,
+}
+
+/// One runner lifetime on the work-cell fence: the epoch the registry issued
+/// it and how far that lifetime is admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedRunner {
+    pub epoch: u64,
+    pub admission: RunnerAdmission,
 }
 
 /// In-memory workcell warm-pool and claim ledger.
@@ -195,10 +225,11 @@ pub struct WorkcellManager {
     next_id: u64,
     ready_queue: VecDeque<String>,
     cells: BTreeMap<String, WorkcellLease>,
-    /// Current epoch per active runner, as issued by the daemon's registry. A
-    /// claim from a runner not listed here, or carrying any other epoch, comes
-    /// from a runner lifetime the daemon did not issue and is fenced.
-    runner_epochs: BTreeMap<String, u64>,
+    /// Current epoch and admission per admitted runner, as issued by the
+    /// daemon's registry. A runner not listed here, or a request carrying any
+    /// other epoch, comes from a lifetime the daemon did not admit and is
+    /// fenced; a draining runner is admitted for in-flight work only.
+    runner_epochs: BTreeMap<String, AdmittedRunner>,
 }
 
 /// Validate incoming archive entries before extraction into a workcell repo.

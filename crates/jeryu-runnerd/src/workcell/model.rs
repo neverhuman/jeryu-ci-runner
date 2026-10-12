@@ -127,6 +127,7 @@ impl FrozenCiSnapshot {
             workcell_id: workcell.workcell_id.clone(),
             runner_id: workcell.runner_id.clone(),
             runner_epoch: workcell.runner_epoch,
+            admitted_runner_epoch: workcell.admitted_runner_epoch,
             workspace_root: workcell.workspace_root.clone(),
             repo_roots: workcell.repo_roots.clone(),
             allowed_paths,
@@ -166,6 +167,7 @@ impl WorkcellLease {
             ci_snapshot_age_ms: None,
             runner_id: String::new(),
             runner_epoch: 0,
+            admitted_runner_epoch: 0,
             heartbeat_healthy: false,
             startup_rebased: false,
             startup_main_ref: None,
@@ -179,7 +181,14 @@ impl WorkcellLease {
         }
     }
 
-    pub(super) fn apply_claim(&mut self, request: &WorkcellClaimRequest) {
+    /// Hand this cell to `request`. `admitted_runner_epoch` is the runner
+    /// lifetime the fence admitted for the claim, which for a repair differs
+    /// from the request's per-cell token.
+    pub(super) fn apply_claim(
+        &mut self,
+        request: &WorkcellClaimRequest,
+        admitted_runner_epoch: u64,
+    ) {
         self.state = WorkcellState::Claimed;
         self.agent_id = request.agent_id.clone();
         self.workspace_root = request.workspace_root.clone();
@@ -193,6 +202,7 @@ impl WorkcellLease {
         self.ci_snapshot_age_ms = request.ci_snapshot_age_ms;
         self.runner_id = request.runner_id.clone();
         self.runner_epoch = request.runner_epoch;
+        self.admitted_runner_epoch = admitted_runner_epoch;
         self.heartbeat_healthy = true;
         self.startup_rebased = false;
         self.startup_main_ref = None;

@@ -45,27 +45,51 @@ impl WorkcellManager {
         leases
     }
 
-    /// Replace the claim fence with the runner epochs the daemon issued. This
-    /// is the fence's only writer: the fleet calls it from its registry (see
-    /// [`crate::RunnerFleet::claim_workcell`]) before every claim, so a claim's
-    /// own `runner_epoch` is checked but never trusted. Replacing the whole
-    /// table also prunes it: a runner the registry no longer lists as active
-    /// (reaped, draining, never registered) loses its entry and is fenced.
+    /// Replace the claim fence with the runner lifetimes the daemon admitted.
+    /// This is the fence's only writer: the fleet calls it from its registry
+    /// (see [`crate::RunnerFleet::claim_workcell`]) before every claim, so a
+    /// request's own epoch is checked but never trusted. Replacing the whole
+    /// table also prunes it: a runner the registry no longer admits (reaped,
+    /// never registered, re-registered at a new epoch) loses its entry and is
+    /// fenced. A [`RunnerAdmission::Draining`] runner is fenced from fresh
+    /// cells but may still hold and repair its in-flight work.
+    pub fn sync_runner_fence(
+        &mut self,
+        admitted: impl IntoIterator<Item = (String, AdmittedRunner)>,
+    ) {
+        self.runner_epochs = admitted.into_iter().collect();
+    }
+
+    /// [`Self::sync_runner_fence`] with every listed runner active.
     pub fn sync_runner_epochs(&mut self, issued: impl IntoIterator<Item = (String, u64)>) {
-        self.runner_epochs = issued.into_iter().collect();
+        self.sync_runner_fence(issued.into_iter().map(|(runner_id, epoch)| {
+            (
+                runner_id,
+                AdmittedRunner {
+                    epoch,
+                    admission: RunnerAdmission::Active,
+                },
+            )
+        }));
     }
 
     pub fn claim(&mut self, request: WorkcellClaimRequest) -> WorkcellResult<WorkcellLease> {
         // Fence a stale runner lifetime before a cell is consumed, so a late
         // claim from a previous epoch neither takes a warm cell nor mints one.
         self.require_claim_epoch(&request.runner_id, request.runner_epoch)?;
-        self.claim_unfenced(request)
+        let admitted = request.runner_epoch;
+        self.claim_unfenced(request, admitted)
     }
 
-    /// Hand one cell to `request` without checking the runner-level claim
-    /// fence. Private: [`Self::claim`] and [`Self::repair_from_snapshot`] each
-    /// fence the runner's real epoch before calling it.
-    fn claim_unfenced(&mut self, request: WorkcellClaimRequest) -> WorkcellResult<WorkcellLease> {
+    /// Hand one cell to `request` without checking the runner-level fence.
+    /// Private: [`Self::claim`], [`Self::hold_failed_tree`] and
+    /// [`Self::repair_from_snapshot`] each fence the runner's real epoch
+    /// (`admitted_runner_epoch`) before calling it.
+    fn claim_unfenced(
+        &mut self,
+        request: WorkcellClaimRequest,
+        admitted_runner_epoch: u64,
+    ) -> WorkcellResult<WorkcellLease> {
         let warm_hit = !self.ready_queue.is_empty();
         let workcell_id = match self.ready_queue.pop_front() {
             Some(workcell_id) => workcell_id,
@@ -76,7 +100,7 @@ impl WorkcellManager {
                 .cells
                 .get_mut(&workcell_id)
                 .expect("ready queue and lease table stay in sync");
-            lease.apply_claim(&request);
+            lease.apply_claim(&request, admitted_runner_epoch);
             lease.apply_startup(&request.startup);
             match &request.startup {
                 StartupSync::Rebased { .. } => Ok(()),
@@ -166,7 +190,7 @@ impl WorkcellManager {
             .cells
             .get_mut(workcell_id)
             .expect("ready queue and lease table stay in sync");
-        cell.apply_claim(&request);
+        cell.apply_claim(&request, request.runner_epoch);
         cell.apply_startup(&request.startup);
         let outcome = match &request.startup {
             StartupSync::Rebased { .. } => Ok(()),
@@ -187,7 +211,11 @@ impl WorkcellManager {
     ) -> WorkcellResult<WorkcellLease> {
         // A snapshot may only be repaired by the runner lifetime that froze it:
         // one kept past that lifetime is fenced like any other stale claim.
-        self.require_claim_epoch(&snapshot.runner_id, snapshot.runner_epoch)?;
+        // The fence compares the lifetime the chain was admitted at, not the
+        // snapshot's per-cell token, which a repair cell bumps; a draining
+        // runner may still repair its in-flight work.
+        let admitted = snapshot.admitted_runner_epoch;
+        self.require_in_flight_epoch(&snapshot.runner_id, admitted)?;
         let request = WorkcellClaimRequest {
             agent_id: snapshot.branch_policy.agent_id.clone(),
             workspace_root: snapshot.workspace_root.clone(),
@@ -202,7 +230,8 @@ impl WorkcellManager {
         // The bumped epoch is this repair cell's own fencing token, not a new
         // runner lifetime: the runner was fenced on its real epoch above, and
         // the bump must neither be checked against nor move the runner fence.
-        let mut lease = self.claim_unfenced(request)?;
+        // The repair cell keeps the chain's admitted lifetime unchanged.
+        let mut lease = self.claim_unfenced(request, admitted)?;
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
@@ -238,7 +267,11 @@ impl WorkcellManager {
             &failure_log_digest,
             &self.forbidden_token_values,
         )?;
-        let mut lease = self.claim(claim)?;
+        // Holding a failed tree finishes in-flight work, so a draining runner
+        // is admitted at its current epoch; a fresh claim is not.
+        self.require_in_flight_epoch(&claim.runner_id, claim.runner_epoch)?;
+        let admitted = claim.runner_epoch;
+        let mut lease = self.claim_unfenced(claim, admitted)?;
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
@@ -419,15 +452,40 @@ impl WorkcellManager {
         workcell_id
     }
 
-    /// Refuse a claim whose epoch is not the one the daemon issued for this
-    /// runner. Like the registry's `is_current_owner`, this fails closed and
-    /// matches exactly: a runner with no issued epoch is fenced, a lower epoch
-    /// is a lifetime the daemon moved past, and a higher one it never issued.
+    /// Refuse a fresh claim unless the runner is active at exactly the epoch
+    /// the daemon issued it. A draining runner takes no fresh cell.
     fn require_claim_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
+        match self.require_admitted_epoch(runner_id, runner_epoch)? {
+            RunnerAdmission::Active => Ok(()),
+            RunnerAdmission::Draining => Err(WorkcellError::epoch_fenced(format!(
+                "runner {runner_id} claim fenced: epoch {runner_epoch} is draining and takes no new work cell"
+            ))),
+        }
+    }
+
+    /// Refuse in-flight work (holding a failed tree, repairing from a frozen
+    /// snapshot) unless the runner is active or draining at exactly the epoch
+    /// the daemon issued it.
+    fn require_in_flight_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
+        self.require_admitted_epoch(runner_id, runner_epoch)
+            .map(|_| ())
+    }
+
+    /// The admission of `runner_id` at `runner_epoch`. Like the registry's
+    /// `is_current_owner`, this fails closed and matches exactly: a runner
+    /// with no admitted epoch (never registered, reaped dead) is fenced, a
+    /// lower epoch is a lifetime the daemon moved past, and a higher one it
+    /// never issued.
+    fn require_admitted_epoch(
+        &self,
+        runner_id: &str,
+        runner_epoch: u64,
+    ) -> WorkcellResult<RunnerAdmission> {
         match self.runner_epochs.get(runner_id) {
-            Some(&active) if runner_epoch == active => Ok(()),
-            Some(&active) => Err(WorkcellError::epoch_fenced(format!(
-                "runner {runner_id} claim fenced: epoch {runner_epoch} != active {active}"
+            Some(admitted) if runner_epoch == admitted.epoch => Ok(admitted.admission),
+            Some(admitted) => Err(WorkcellError::epoch_fenced(format!(
+                "runner {runner_id} claim fenced: epoch {runner_epoch} != active {}",
+                admitted.epoch
             ))),
             None => Err(WorkcellError::epoch_fenced(format!(
                 "runner {runner_id} claim fenced: the daemon issued it no active epoch"
