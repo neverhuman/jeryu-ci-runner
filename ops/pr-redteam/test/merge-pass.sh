@@ -85,8 +85,22 @@ case "$url" in
   # The detail route nests the row under .summary, beside the passport (live forge shape).
   */pulls/107) row | jq -c '{summary: ., merge_passport:{blockers:[]}, passport_hash, reviews: []}'; printf '\n200' ;;
   */pulls/107/checks) checks ;;
+  # The merge queue: a queue request is recorded; the forge-wide list shows the entry as failed on
+  # the base in queue-failed, when that file exists.
+  */pulls/107/queue)
+    printf 'queued\n' >> "$MERGE_FIXTURE/queue-posts"
+    printf '{"queue_ref":"refs/queue/main/107","queue_sha":"%s","state":"building"}\n200' "$(cat "$MERGE_FIXTURE/head")" ;;
+  */api/v1/merge-queue\?state=failed*)
+    if [[ -e "$MERGE_FIXTURE/queue-failed" ]]; then
+      jq -nc --arg sha "$(cat "$MERGE_FIXTURE/head")" --arg b "$(cat "$MERGE_FIXTURE/queue-failed")" \
+        '{entries:[{repo:"jeryu/fixture",number:107,pr_head_sha:$sha,base_sha:$b,state:"failed",
+          reason:"the gate failed on the replay"}],page:{has_more:false}}'
+    else printf '{"entries":[],"page":{"has_more":false}}'; fi
+    printf '\n200' ;;
+  */api/v1/merge-queue\?state=dequeued*) printf '{"entries":[],"page":{"has_more":false}}\n200' ;;
   */pulls/107/merge)
     if [[ -e "$MERGE_FIXTURE/required-failing" ]]; then printf '{"message":"required contexts are not green"}\n409'; exit 0; fi
+    if [[ -e "$MERGE_FIXTURE/linear" ]]; then printf '{"message":"linear history: the head is behind main"}\n409'; exit 0; fi
     if [[ "$(jq -r .expected_head_sha <<< "$data")" != "$(cat "$MERGE_FIXTURE/head")" ]]; then printf '{"message":"head changed"}\n409'; exit 0; fi
     jq -c . <<< "$data" >> "$MERGE_FIXTURE/merges"; printf '{"merged":true}\n200' ;;
   */reviews)
@@ -178,4 +192,28 @@ grep -q 'merge pass skipped: the merger credential was rejected' "$t/controller.
 [[ "$(count "$t/merges")" == "$merges_before" && ! -e "$t/danger" ]]
 chmod 600 "$t/merge-token"
 echo 'ok merger credential custody enforced'
+
+# An approved head behind main goes to the merge queue, whose replay then fails. The failed entry is
+# retried once on the base it failed on, said out loud after that, and retried again only once main
+# has moved; then it lands. It is never skipped in silence.
+advance
+touch "$t/linear"
+pass
+[[ "$(count "$t/queue-posts")" == 1 ]]
+jq -e --arg sha "$(cat "$t/head")" '.queued_sha == $sha' "$(receipt)" > /dev/null
+printf 'base-one\n' > "$t/queue-failed"
+pass
+grep -q 'merge queue entry failed on base base-one (the gate failed on the replay); trying again' "$t/controller.log"
+[[ "$(count "$t/queue-posts")" == 2 ]]
+jq -e '.queue_retried_base == "base-one"' "$(receipt)" > /dev/null
+pass
+[[ "$(count "$t/queue-posts")" == 2 ]]
+grep -q 'approved, waiting to merge: merge queue entry failed on base base-one after a retry' "$t/controller.log"
+merges_before="$(count "$t/merges")"
+rm "$t/linear"; printf 'base-two\n' > "$t/queue-failed"
+pass
+[[ "$(count "$t/merges")" == "$((merges_before + 1))" && "$(count "$t/queue-posts")" == 2 ]]
+jq -e '.merged_by == "jain-merge-bot"' "$(receipt)" > /dev/null
+[[ ! -e "$t/danger" ]]
+echo 'ok failed merge-queue entry retried once per base, then landed'
 echo 'MERGE PASS'

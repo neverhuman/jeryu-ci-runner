@@ -1011,8 +1011,13 @@ merge_pass() { # dry
     fi
     receipt="$(merge_receipt "$repo" "$number" "$sha")" || continue
     # Already handed to the forge's merge queue at this head: the queue replays, gates and lands it.
-    if jq -e --arg sha "$sha" '.queued_sha == $sha or .queue_refused_sha == $sha' "$receipt" >/dev/null 2>&1; then
+    # A queue entry that failed or was dequeued lands nothing, though, so it is retried once per base
+    # it failed on (the base moving is what can change the replay's outcome), and said out loud.
+    if jq -e --arg sha "$sha" '.queue_refused_sha == $sha' "$receipt" >/dev/null 2>&1; then
       continue
+    fi
+    if jq -e --arg sha "$sha" '.queued_sha == $sha' "$receipt" >/dev/null 2>&1; then
+      queue_retry_due "$repo" "$number" "$sha" "$receipt" || continue
     fi
     reason="$(merge_hold_reason "$repo" "$number")"
     if [ -n "$reason" ]; then
@@ -1043,11 +1048,39 @@ merge_pass() { # dry
   done < <(open_prs)
 }
 
+# Whether an approved head the receipt records as queued should be tried again: only when its queue
+# entry for this head ended without landing (failed or dequeued) on a base this tool has not already
+# retried. The failed base is kept in the receipt, so one failure is retried once, never in a loop.
+queue_retry_due() { # owner/name number head-sha receipt
+  local repo="$1" number="$2" sha="$3" receipt="$4" entry='' state_now failed_base why page
+  # Only the forge-wide list filters by state; ended entries are few, but it is paged all the same.
+  for state_now in failed dequeued; do
+    for page in 1 2 3 4 5; do
+      api GET "/api/v1/merge-queue?state=$state_now&per_page=100&page=$page"
+      [ "$code" = 200 ] || break
+      entry="$(jq -c --arg r "$repo" --argjson n "$number" --arg sha "$sha" \
+        '[(.entries // [])[] | select(.repo == $r and .number == $n and .pr_head_sha == $sha)]
+         | first // empty' <<<"$body")"
+      [ -z "$entry" ] || break 2
+      jq -e '.page.has_more == true' <<<"$body" >/dev/null 2>&1 || break
+    done
+  done
+  [ -n "$entry" ] || return 1
+  failed_base="$(jq -r '.base_sha // ""' <<<"$entry")"
+  why="$(jq -r '.reason // "no reason given"' <<<"$entry" | head -c 200)"
+  if jq -e --arg b "$failed_base" '.queue_retried_base == $b' "$receipt" >/dev/null 2>&1; then
+    say "$repo#$number: approved, waiting to merge: merge queue entry $state_now on base ${failed_base:0:12} after a retry ($why); needs a fix or a cherry-pick replacement"
+    return 1
+  fi
+  say "$repo#$number: merge queue entry $state_now on base ${failed_base:0:12} ($why); trying again"
+  jq --arg b "$failed_base" '.queue_retried_base = $b' "$receipt" | store_receipt "$receipt"
+}
+
 # An approved PR behind its linear-history base goes to the forge's merge queue: the forge replays it
 # onto the base tip into refs/queue/<base>/<n>, the gate runner gates that exact commit, and the forge
-# lands it by fast-forward. Nobody's branch is rewritten. The head is recorded once in the receipt, so
-# a queue entry that later fails or conflicts is reported, never re-queued in a loop; a new push is a
-# new head, reviewed and queued afresh.
+# lands it by fast-forward. Nobody's branch is rewritten. The head is recorded in the receipt, so a
+# queue entry that later fails is retried once per failed base (queue_retry_due), never in a loop; a
+# new push is a new head, reviewed and queued afresh.
 enqueue_pr() { # owner/name number reviewed-sha receipt merger
   local repo="$1" number="$2" sha="$3" receipt="$4" merger="$5" state_now
   as_token="$merge_token_file" api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/queue"
