@@ -157,6 +157,8 @@ impl RepairSource {
             // A frozen snapshot's allowed paths are always derived from the
             // cell's roots, so derive them the same way here.
             allowed_paths: cell.root_paths(),
+            git_status_summary: cell.git_status_summary.clone(),
+            branch_policy: cell.branch_policy.clone(),
         }
     }
 }

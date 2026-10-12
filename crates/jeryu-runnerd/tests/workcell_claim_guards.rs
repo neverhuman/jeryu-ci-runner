@@ -520,7 +520,7 @@ fn an_edited_snapshot_is_refused() {
     let cells_before = ledger.workcells().len();
 
     type Edit = fn(&mut FrozenCiSnapshot);
-    let edits: [(&str, Edit); 8] = [
+    let edits: [(&str, Edit); 14] = [
         ("admitted epoch", |s| s.admitted_runner_epoch += 1),
         ("per-cell token", |s| s.runner_epoch += 1),
         ("runner id", |s| s.runner_id = "runner-anvil-4".into()),
@@ -531,6 +531,18 @@ fn an_edited_snapshot_is_refused() {
         }),
         ("agent", |s| s.branch_policy.agent_id = "agent-other".into()),
         ("source cell", |s| s.workcell_id = "wc-not-minted".into()),
+        ("git status", |s| s.git_status_summary = "dirty".into()),
+        ("merge allowed", |s| s.branch_policy.merge_allowed = true),
+        ("delete allowed", |s| s.branch_policy.delete_allowed = true),
+        ("branch budget", |s| s.branch_policy.max_branches = u32::MAX),
+        ("open branches", |s| {
+            s.branch_policy
+                .open_branches
+                .insert("agents/x/workcells/y/z".into());
+        }),
+        ("branch namespace", |s| {
+            s.branch_policy.workcell_id = "wc-other".into()
+        }),
     ];
     for (field, edit) in edits {
         let mut edited = snapshot.clone();
@@ -596,6 +608,119 @@ fn another_runner_cannot_repair_someone_elses_snapshot() {
     fleet
         .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
         .expect("the owning runner still repairs");
+}
+
+// A repair cell's branch policy comes from the ledger: merge and delete stay
+// denied, the budget is enforced, new branches are namespaced under the
+// repair cell, and the source's open branches carry over so a chain shares
+// one budget.
+#[test]
+fn a_repair_cell_denies_merge_and_delete_and_enforces_the_branch_budget() {
+    let (fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-50", epoch))
+        .expect("hold the failed tree");
+    let snapshot = held.frozen_snapshot.as_ref().expect("frozen");
+    let repair = fleet
+        .repair_workcell(&mut ledger, repair_as(snapshot, epoch))
+        .expect("repair");
+    let policy = &repair.branch_policy;
+    assert!(policy.allow_merge().is_err(), "merge stays denied");
+    assert!(policy.allow_delete().is_err(), "delete stays denied");
+    assert_eq!(policy.max_branches, 1, "the source's budget");
+    assert_eq!(policy.workcell_id, repair.workcell_id);
+    let branch = ledger
+        .export_repair_branch(&repair.workcell_id, repair.runner_epoch, "fix-1")
+        .expect("one branch within budget");
+    assert!(branch.contains(&repair.workcell_id), "{branch}");
+    let denied = ledger
+        .export_repair_branch(&repair.workcell_id, repair.runner_epoch, "fix-2")
+        .expect_err("the budget is enforced");
+    assert_eq!(denied.reason, "workcell_branch_budget_denied");
+
+    // A source that already spent its budget hands a spent budget on.
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-51", epoch))
+        .expect("hold another failed tree");
+    ledger
+        .export_repair_branch(&held.workcell_id, held.runner_epoch, "fix-0")
+        .expect("the source opens its one branch");
+    let spent = freeze_repair_cell(&ledger, &held.workcell_id, held.runner_epoch);
+    let repair = fleet
+        .repair_workcell(&mut ledger, repair_as(&spent, epoch))
+        .expect("repair of a source with an open branch");
+    assert_eq!(repair.branch_policy.open_branches.len(), 1);
+    let denied = ledger
+        .export_repair_branch(&repair.workcell_id, repair.runner_epoch, "fix-1")
+        .expect_err("a repair cannot reset the chain's budget");
+    assert_eq!(denied.reason, "workcell_branch_budget_denied");
+}
+
+// The repair capsule is screened like a hold's: a snapshot carrying a
+// configured token value is refused and consumes nothing.
+#[test]
+fn a_repair_capsule_carrying_a_token_value_is_refused() {
+    let (fleet, epoch) = fleet();
+    let invented = "jrt-invented-value-4c2a";
+    let mut ledger =
+        WorkcellManager::with_warm_pool(1).with_forbidden_token_values(vec![invented.into()]);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-52", epoch))
+        .expect("hold the failed tree");
+    let snapshot = held.frozen_snapshot.expect("frozen");
+    let ready_before = ledger.ready_count();
+    let cells_before = ledger.workcells().len();
+
+    let mut leaky = snapshot.clone();
+    leaky.failure_log_digest = format!("auth failed with {invented}");
+    let refused = fleet
+        .repair_workcell(&mut ledger, repair_as(&leaky, epoch))
+        .expect_err("a capsule carrying a configured token value is refused");
+    assert_eq!(refused.reason, "workcell_capture_token_denied");
+    assert!(
+        !refused.message().contains(invented),
+        "the token value is not echoed"
+    );
+    assert_eq!(ledger.ready_count(), ready_before, "no warm cell consumed");
+    assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
+
+    fleet
+        .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
+        .expect("the clean snapshot still repairs");
+}
+
+// A repair whose startup fails blocks the cell it took but does not use up
+// the source's one repair: a retry succeeds once, and a further one is
+// refused.
+#[test]
+fn a_failed_repair_startup_leaves_the_source_repairable_once() {
+    let (fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-53", epoch))
+        .expect("hold the failed tree");
+    let snapshot = held.frozen_snapshot.expect("frozen");
+
+    let mut conflicted = repair_as(&snapshot, epoch);
+    conflicted.startup = StartupSync::Failed {
+        main_ref: "origin/main".into(),
+        base_sha: "cc33dd44".into(),
+        head_sha: "ee55ff66".into(),
+        reason: "rebase conflict".into(),
+    };
+    let failed = fleet
+        .repair_workcell(&mut ledger, conflicted)
+        .expect_err("the repair cell's startup fails");
+    assert_eq!(failed.reason, "workcell_startup_rebase_failed");
+
+    fleet
+        .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
+        .expect("the source is still repairable after a failed startup");
+    let replayed = fleet
+        .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
+        .expect_err("and only once");
+    assert_eq!(replayed.reason, "workcell_repair_state_denied");
 }
 
 fn rebased() -> StartupSync {

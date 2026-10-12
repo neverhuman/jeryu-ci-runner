@@ -217,9 +217,20 @@ impl WorkcellManager {
     ///   and same admitted runner epoch;
     /// - the snapshot agrees with the ledger's own record of that source cell
     ///   (runner, per-cell token, admitted epoch, agent, workspace and repo
-    ///   roots, allowed paths), so an edited snapshot is refused;
+    ///   roots, allowed paths, git status summary, branch policy), so an
+    ///   edited snapshot is refused;
+    /// - the snapshot's capsule carries no forbidden token value, screened
+    ///   like a hold's;
     /// - the source cell has not been repaired from before: repair is
-    ///   one-shot per source cell, so one snapshot mints at most one cell.
+    ///   one-shot per source cell, so one snapshot mints at most one live
+    ///   repair cell. The repair is recorded once the repair cell's startup
+    ///   succeeds; a failed startup leaves the source repairable.
+    ///
+    /// The repair cell is seeded from the ledger's record, never the
+    /// snapshot. Its branch policy is built by `BranchPolicy::new` (budget
+    /// clamped, merge and delete denied, new branches namespaced under the
+    /// repair cell) and inherits the source's open branches, so a chain
+    /// shares one branch budget.
     pub fn repair_from_snapshot(
         &mut self,
         request: RepairFromSnapshotRequest,
@@ -232,17 +243,20 @@ impl WorkcellManager {
         } = request;
         self.require_repair_epoch(&runner_id, runner_epoch)?;
         let source = self.verified_repair_source(&runner_id, runner_epoch, &snapshot)?;
-        // Record the repair before a cell is consumed, so a refused or failed
-        // startup cannot be retried into a second cell either.
-        self.repaired_sources.insert(snapshot.workcell_id.clone());
+        // The capsule a repair cell carries is screened exactly like a hold's.
+        Self::guard_capsule(
+            &snapshot.git_status_summary,
+            &snapshot.failure_log_digest,
+            &self.forbidden_token_values,
+        )?;
         let claim = WorkcellClaimRequest {
             agent_id: source.agent_id.clone(),
             workspace_root: source.workspace_root.clone(),
             repo_roots: source.repo_roots.clone(),
-            branch_budget: snapshot.branch_policy.max_branches,
+            branch_budget: source.branch_policy.max_branches,
             runner_id: source.runner_id.clone(),
             runner_epoch: source.runner_epoch.saturating_add(1),
-            git_status_summary: snapshot.git_status_summary.clone(),
+            git_status_summary: source.git_status_summary.clone(),
             ci_snapshot_age_ms: Some(snapshot.snapshot_age_ms),
             startup,
         };
@@ -251,6 +265,11 @@ impl WorkcellManager {
         // the bump must neither be checked against nor move the runner fence.
         // The repair cell keeps the chain's admitted lifetime unchanged.
         let mut lease = self.claim_unfenced(claim, source.admitted_runner_epoch)?;
+        // Record the repair only once the repair cell is claimed and rebased.
+        // A failed startup blocks the cell it took and leaves the source
+        // repairable; the ledger is `&mut`, so no second repair can interleave
+        // between the checks above and this record.
+        self.repaired_sources.insert(snapshot.workcell_id.clone());
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
@@ -258,8 +277,14 @@ impl WorkcellManager {
             .expect("claimed workcell must stay live");
         cell.state = WorkcellState::Held;
         cell.frozen_snapshot = Some(snapshot.clone());
-        cell.branch_policy = snapshot.branch_policy.clone();
-        cell.git_status_summary = snapshot.git_status_summary.clone();
+        // The branch policy comes from the ledger, never the snapshot. The
+        // claim above built it with `BranchPolicy::new`: the source's budget,
+        // clamped again, merge and delete denied, and new branches namespaced
+        // under this repair cell's own id. The source's open branches carry
+        // over unchanged (still namespaced under the cell that opened them),
+        // so the whole chain shares one branch budget and a repair cannot
+        // reset it.
+        cell.branch_policy.open_branches = source.branch_policy.open_branches.clone();
         cell.ci_snapshot_age_ms = Some(snapshot.snapshot_age_ms);
         cell.heartbeat_healthy = snapshot.heartbeat_healthy;
         cell.failed_run_id = Some(snapshot.failed_run_id.clone());
@@ -317,6 +342,14 @@ impl WorkcellManager {
                 snapshot.workspace_root == source.workspace_root,
             ),
             ("repo_roots", snapshot.repo_roots == source.repo_roots),
+            (
+                "git_status_summary",
+                snapshot.git_status_summary == source.git_status_summary,
+            ),
+            (
+                "branch_policy",
+                snapshot.branch_policy == source.branch_policy,
+            ),
             (
                 "allowed_paths",
                 snapshot.allowed_paths == source.allowed_paths,
@@ -481,6 +514,9 @@ impl WorkcellManager {
         Self::require_epoch(cell, runner_epoch)?;
         cell.state = WorkcellState::Released;
         cell.heartbeat_healthy = false;
+        // A released cell is no longer a live repair source, so the state
+        // check refuses any later repair from it; its one-shot record can go.
+        self.repaired_sources.remove(workcell_id);
         Ok(())
     }
 

@@ -243,7 +243,9 @@ pub struct WorkcellManager {
     /// fenced; a draining runner is admitted only to repair from a snapshot.
     runner_epochs: BTreeMap<String, AdmittedRunner>,
     /// Source cells a repair cell has already been minted from. Repair is
-    /// one-shot per source cell, so replaying a snapshot mints nothing.
+    /// one-shot per source cell, so replaying a snapshot mints nothing. An
+    /// entry is dropped when its source cell is released, since a released
+    /// cell is no longer a live repair source.
     repaired_sources: BTreeSet<String>,
 }
 
@@ -257,6 +259,8 @@ struct RepairSource {
     workspace_root: PathBuf,
     repo_roots: Vec<PathBuf>,
     allowed_paths: Vec<PathBuf>,
+    git_status_summary: String,
+    branch_policy: BranchPolicy,
 }
 
 /// Validate incoming archive entries before extraction into a workcell repo.
