@@ -108,8 +108,9 @@ case "$method $url" in
     fi
     count=0
     [[ ! -f "$FAKE_FORGE/statuses.jsonl" ]] || count=$(wc -l <"$FAKE_FORGE/statuses.jsonl")
+    # The forge records the token's identity as the creator, as jeryu does (commit_status creator).
     result=$(jq -c --arg id "status-$count" --argjson clock "$count" --arg sha "${url##*/statuses/}" \
-      '. + {id:$id,updated_at:$clock,sha:$sha}' <<<"$payload")
+      '. + {id:$id,updated_at:$clock,sha:$sha,creator:{login:"runner-bot"}}' <<<"$payload")
     printf '%s\n' "$result" >>"$FAKE_FORGE/statuses.jsonl"
     printf '%s\n201' "$result";;
   'POST '*'/check-runs')
@@ -174,6 +175,23 @@ invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 expect_count 1
 printf 'PASS complete runner: negative-test log is success; identical receipt reuses\n'
+
+# A second gate host: its own state directory (no receipts at all), its tools installed somewhere else,
+# its own credential path, and a site file with other comments and order. Same runner code, tools,
+# sources and verdict-changing settings, so it reuses the first host's published success from the forge
+# and neither runs the recipe nor posts anything.
+cp -R "$fixture/tools" "$fixture/tools-b"
+cp -p "$fixture/token" "$fixture/token-b"
+{ printf '# the second host\n'; grep -v '^JERYU_TOKEN_FILE=' "$fixture/pr-gate.env" | tac
+  printf 'JERYU_TOKEN_FILE=%s\n' "$fixture/token-b"; } >"$fixture/pr-gate-b.env"
+published=$(wc -l <"$fixture/statuses.jsonl")
+PR_GATE_CONFIG="$fixture/pr-gate-b.env" GATE_RUNNER_HOME="$fixture/runner-b" GATE_RUNNER_TOOLS="$fixture/tools-b" invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count 1
+grep -q 'reuse acme/fixture@.*from the forge result' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$published" ]] || { printf 'the second host posted a status\n' >&2; exit 1; }
+jq -se 'last | .state=="success" and (.description | test("; inputs [0-9a-f]{64}$"))' "$fixture/statuses.jsonl" >/dev/null
+printf 'PASS a second host with the same runner, tools, sources and settings reuses the forge result\n'
 
 touch "$fixture/change-head"
 rm -f "$fixture/head-reads"

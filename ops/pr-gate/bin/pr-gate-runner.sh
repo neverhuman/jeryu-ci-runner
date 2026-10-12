@@ -66,12 +66,14 @@ pr_gate_load_config
 # shellcheck source=ops/pr-gate/bin/pr-gate-state.sh
 source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-state.sh"
 # Hash the code that is running now, and the site configuration it read; gate inputs use this, not
-# the files on disk later (see gate_inputs).
-GATE_SELF_SHA256="$(sha256sum "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-config.sh" \
-  "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-state.sh" "$GATE_RUNNER_SCRIPT")"
-if [[ -f "$PR_GATE_CONFIG_FILE" && -r "$PR_GATE_CONFIG_FILE" ]]; then
-  GATE_SELF_SHA256+=$'\n'"$(sha256sum <"$PR_GATE_CONFIG_FILE" | cut -c1-64)  site-config"
-fi
+# the files on disk later (see gate_inputs). Each script is named by its file name, not where this host
+# installed it, and the configuration by the settings that can change a verdict
+# (gate_site_config_digest), so the same runner configured alike hashes the same on every host.
+GATE_SELF_SHA256="$(gate_tool_line pr-gate-config.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-config.sh")
+$(gate_tool_line pr-gate-state.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-state.sh")
+$(gate_tool_line "$(basename -- "$GATE_RUNNER_SCRIPT")" "$GATE_RUNNER_SCRIPT")"
+GATE_SITE_CONFIG_SHA256="$(gate_site_config_digest "$PR_GATE_CONFIG_FILE")"
+[[ -z "$GATE_SITE_CONFIG_SHA256" ]] || GATE_SELF_SHA256+=$'\n'"$GATE_SITE_CONFIG_SHA256  site-config"
 
 not_configured() { printf 'pr-gate-runner: %s is not configured (set it in %s)\n' "$1" "$PR_GATE_CONFIG_FILE" >&2; exit 2; }
 BASE="${JERYU_BASE:-${PR_GATE_FORGE_URL:-}}"
@@ -843,7 +845,7 @@ fi
 gate_decision "$identity" "$retry" "$status_snapshot"
 case "${gate_action:?}" in
   reuse|hold)
-    say "$gate_action $owner/$repo@$sha: identical verified inputs (a failure re-runs only with --repo <o>/<r> --pr <n>, or changed inputs)"
+    say "$gate_action $owner/$repo@$sha: identical verified inputs, from the ${gate_action_source:-local} result (a failure re-runs only with --repo <o>/<r> --pr <n>, or changed inputs)"
     rm -f -- "$identity" "$status_snapshot"
     exec 6>&-; exec 7>&-
     continue;;

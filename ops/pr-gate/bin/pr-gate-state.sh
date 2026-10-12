@@ -84,12 +84,25 @@ gate_evidence_for() { # tree-owner
   return 0
 }
 
-# True when the newest status of this gate's required context on a status snapshot is a success this
-# runner posted ($MARKER). A re-verification of such a head does not post `pending` over it.
-gate_newest_is_own_success() { # status-snapshot
-  jq -e --arg context "$(gate_required_context "$owner" "$repo")" --arg marker "$MARKER " '
+# Every pr-gate runner's status description starts "pr-gate-runner@<host> ". Which host posted it is
+# for people reading the PR; it is not part of what a result proves, so nothing below compares it.
+GATE_RUNNER_NAME=pr-gate-runner
+
+# The newest status of this gate's required context on a status snapshot, when a pr-gate runner posted
+# it as this gate identity on any host; else nothing. A snapshot row without a creator still counts
+# here when its description is a runner's (forges older than the creator field), but never for reuse.
+gate_newest_runner_status() { # status-snapshot
+  jq -ec --arg context "$(gate_required_context "$owner" "$repo")" --arg prefix "$GATE_RUNNER_NAME@" \
+    --arg identity "${IDENTITY:-}" '
     [.statuses[]? | select(.context == $context)] | sort_by(.updated_at // .created_at) | last
-    | . != null and .state == "success" and ((.description // "") | startswith($marker))' "$1" >/dev/null
+    | select(. != null and ((.description // "") | startswith($prefix))
+             and ((.creator.login // null) == null or .creator.login == $identity))' "$1" 2>/dev/null
+}
+
+# True when the newest status of this gate's required context is a pr-gate runner's success. A
+# re-verification of such a head does not post `pending` over it, whichever host posted it.
+gate_newest_is_own_success() { # status-snapshot
+  gate_newest_runner_status "$1" | jq -e '.state == "success"' >/dev/null 2>&1
 }
 
 gate_lock() {
@@ -136,11 +149,59 @@ gate_begin() {
 # find and hash. Live scratch is not an input, so .build directories and *.tmp files are excluded, and
 # a file that disappears anyway is recorded as vanished instead of ending the gate. The identity stays
 # honest: a vanished path is named in the record, so it cannot silently match a later run.
-hash_fixture_tree() {
-  local root=$1 file
+# Each line names the file relative to the tree, under the tree's label: where a host keeps the tree
+# is not an input, so the same tree hashes the same on every host.
+hash_fixture_tree() { # root [label]
+  local root=${1%/} label=${2:-.} file digest
   while IFS= read -r -d '' file; do
-    sha256sum "$file" 2>/dev/null || printf 'vanished-during-hash  %s\n' "$file"
+    if digest=$(sha256sum <"$file" 2>/dev/null); then
+      printf '%s  %s/%s\n' "${digest:0:64}" "$label" "${file#"$root"/}"
+    else
+      printf 'vanished-during-hash  %s/%s\n' "$label" "${file#"$root"/}"
+    fi
   done < <(find -L "$root" -type f -not -path '*/.build/*' -not -name '*.tmp' -print0 | sort -z)
+}
+
+# One executable's line in the input identity: its content hash and the name the gate calls it by.
+# The path it resolved to is a property of the host, not of what runs.
+gate_tool_line() { # name path
+  local digest
+  digest=$(sha256sum <"$2") || return
+  printf '%s  %s\n' "${digest:0:64}" "$1"
+}
+
+# The site configuration as an input: the SHA-256 of the settings that can change a gate's verdict.
+# Settings that only say where this host keeps things, which credential it reads, which heads it
+# chooses, or when it wakes are left out -- two hosts configured alike for those differ only in them,
+# and a result proved on one must be reusable on the other. What they point at is bound where it
+# matters: tools, runtime tools and the vendor tree by content, the sources by commit, the sandbox
+# by command. Every other key is bound, so a setting added later re-gates until it is listed here.
+GATE_HOST_LOCAL_SETTINGS='JERYU_TOKEN_FILE GATE_RUNNER_HOME GATE_RUNNER_TOOLS GATE_RUNNER_RUNTIME_TOOLS
+  GATE_RUNNER_NATIVE_VENDOR GATE_RUNNER_SCCACHE GATE_RUNNER_SCCACHE_DIR GATE_RUNNER_SCCACHE_SIZE
+  GATE_RUNNER_SLOT GATE_RUNNER_OWNERS GATE_RUNNER_REPOS GATE_RUNNER_REGATE_SETTLE GATE_RUNNER_WAKE_*
+  GATE_INSTALL_* PR_GATE_CHECKOUT_ROOTS PR_GATE_CHECKOUT_ROOT_PATTERN PR_GATE_CODE_REPO PR_GATE_SOURCE_*
+  PR_GATE_GOVERNED_JANKURAI PR_GATE_LOG_URL_TEMPLATE PR_GATE_OK_TO_TEST_* PR_GATE_CONTRIBUTED_LABEL'
+
+# Prints the digest, or nothing for a missing or unreadable file. Lines are parsed as
+# pr_gate_load_config parses them, so a comment, blank line or reordering changes nothing.
+gate_site_config_digest() { # file
+  local file=$1 line key value
+  [[ -f "$file" && -r "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}"
+    [[ "$key" =~ ^(PR_GATE_|GATE_RUNNER_|GATE_INSTALL_|JERYU_) ]] || continue
+    ! pr_gate_listed "$GATE_HOST_LOCAL_SETTINGS" "$key" || continue
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then value="${BASH_REMATCH[1]}"; fi
+    printf '%s=%s\n' "$key" "$value"
+  done <"$file" | LC_ALL=C sort | sha256sum | cut -c1-64
+}
+
+# The digest a published result carries for its input identity. Anything that reads the inputs back
+# (another host deciding whether to reuse, a person comparing receipts) recomputes it the same way.
+gate_inputs_digest() { # inputs-json
+  jq -cS . "$1" | sha256sum | cut -c1-64
 }
 
 gate_inputs() {
@@ -177,21 +238,18 @@ gate_inputs() {
   else
     for tool in bash git just jq rustc cargo rustup cc c++ ld node npm pnpm timeout; do
       resolved=$(command -v "$tool" || true)
-      if [[ -n "$resolved" ]]; then sha256sum "$(readlink -f "$resolved")" >>"$inputs" || return; fi
+      if [[ -n "$resolved" ]]; then gate_tool_line "$tool" "$(readlink -f "$resolved")" >>"$inputs" || return; fi
     done
     for tool in rustc cargo; do
       resolved=$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup which "$tool") || return
-      sha256sum "$resolved" >>"$inputs" || return
+      gate_tool_line "toolchain/$tool" "$resolved" >>"$inputs" || return
       "$resolved" --version >>"$versions" || return
     done
     # No mtime-only cache: a changed fixture or governed executable is a new input.
-    for directory in "$TOOLS" "$RUNTIME_TOOLS"; do
-      if [[ -d "$directory" ]]; then
-        hash_fixture_tree "$directory" >>"$inputs" || return
-      fi
-    done
+    if [[ -d "$TOOLS" ]]; then hash_fixture_tree "$TOOLS" tools >>"$inputs" || return; fi
+    if [[ -d "$RUNTIME_TOOLS" ]]; then hash_fixture_tree "$RUNTIME_TOOLS" runtime-tools >>"$inputs" || return; fi
     if [[ -n "${VENDOR:-}" && -d "$VENDOR" ]] && pr_gate_listed "${VENDOR_INPUT_REPOS:-}" "$repo" "$owner/$repo"; then
-      hash_fixture_tree "$VENDOR" >>"$inputs" || return
+      hash_fixture_tree "$VENDOR" vendor >>"$inputs" || return
     fi
   fi
   # The runner's own code, as hashed when this process started (GATE_SELF_SHA256): that is what runs. A
@@ -201,18 +259,45 @@ gate_inputs() {
   if [[ -n "${GATE_SELF_SHA256:-}" ]]; then
     printf '%s\n' "$GATE_SELF_SHA256" >>"$inputs" || return
   else
-    sha256sum "${BASH_SOURCE[0]}" "$GATE_RUNNER_SCRIPT" >>"$inputs" || return
+    gate_tool_line "$(basename -- "${BASH_SOURCE[0]}")" "${BASH_SOURCE[0]}" >>"$inputs" || return
+    gate_tool_line "$(basename -- "$GATE_RUNNER_SCRIPT")" "$GATE_RUNNER_SCRIPT" >>"$inputs" || return
   fi
-  if [[ -n "$SCCACHE" && "${GATE_SANDBOX:-0}" != 1 ]]; then sha256sum "$SCCACHE" >>"$inputs" || return; fi
+  if [[ -n "$SCCACHE" && "${GATE_SANDBOX:-0}" != 1 ]]; then gate_tool_line sccache "$SCCACHE" >>"$inputs" || return; fi
+  # `runner` names the runner, not the host it ran on: the exact runner code is bound in `tools`, and a
+  # result is reusable on any host whose runner, tools, sources and settings are the same.
   jq -nS --slurpfile sources "$rows" --rawfile tools "$inputs" --rawfile versions "$versions" \
-    --arg recipe "$recipe_name" --arg base "$BASE" --arg runner "$MARKER" \
+    --arg recipe "$recipe_name" --arg base "$BASE" --arg runner "$GATE_RUNNER_NAME" \
     --arg context "$(gate_required_context "$owner" "$repo")" --arg kind "$(gate_execution_kind)" \
     '{schema:"jeryu.pr-gate-inputs/v1",sources:($sources|sort_by(.repository)),tools:$tools,
       versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:$kind}' >"$output" || return
   rm -f -- "$rows" "$inputs" "$versions"
 }
 
+# run, reuse, hold or republish, in gate_action; gate_action_source says whether the evidence was this
+# host's receipt (local) or the forge's newest status (forge). This host's own receipt decides first.
+# When it has none for these inputs -- another host gated this head, or this host is new -- the
+# forge's newest required status decides, if this gate identity posted it from a pr-gate runner and
+# it names exactly these inputs: a success is reused and a failure held, as a local one would be.
+# There is no log here to re-verify, and none is needed: nothing is published, and the status is the
+# gate's verdict wherever it was computed. A retry (--repo/--pr, a re-gate request) still runs.
 gate_decision() {
+  local identity=$1 retry=$2 statuses=$3
+  export gate_action_source=local
+  gate_decision_local "$identity" "$retry" "$statuses"
+  [[ "$gate_action" == run && "$retry" == 0 ]] || return 0
+  local newest digest
+  newest=$(gate_newest_runner_status "$statuses") || return 0
+  jq -e '(.creator.login // "") != ""' <<<"$newest" >/dev/null || return 0
+  digest=$(gate_inputs_digest "$identity") || return 0
+  # The digest is its own `; inputs <hex>` field, so a longer or shorter hex string cannot match.
+  jq -e --arg field "; inputs $digest" '(.description + ";") | contains($field + ";")' <<<"$newest" >/dev/null || return 0
+  case "$(jq -r '.state' <<<"$newest")" in
+    success) gate_action=reuse gate_action_source=forge;;
+    failure) gate_action=hold gate_action_source=forge;;
+  esac
+}
+
+gate_decision_local() {
   local identity=$1 retry=$2 statuses=$3 previous="$gate_key_dir/last-result.json" actual
   # Output consumed by the sourcing runner after this function returns.
   export gate_action=run
@@ -310,7 +395,7 @@ gate_self_modification_note() { # receipt
 }
 
 gate_publish() {
-  local state outcome id digest exit_code context cause="" log note="" kind review=""
+  local state outcome id digest exit_code context cause="" log note="" kind review="" inputs
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -329,9 +414,15 @@ gate_publish() {
     review="; gate inputs changed: extra review required"
   fi
   if [[ "$state" != success && -f "$log" ]]; then cause=$(gate_failure_cause "$log"); fi
+  # The input identity's digest goes on the status, so a runner on any host can tell that a result
+  # proves exactly the inputs it would gate (see gate_decision). A receipt without inputs names none.
+  inputs=""
+  if jq -e '.inputs | objects' "$gate_receipt" >/dev/null 2>&1; then
+    inputs=$(jq '.inputs' "$gate_receipt" | gate_inputs_digest /dev/stdin) || return
+  fi
   if ! jq -e '.publication.required_status' "$gate_receipt" >/dev/null; then
     api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -nc --arg state "$state" --arg context "$context" \
-      --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${cause:+; cause: $cause}" \
+      --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${inputs:+; inputs $inputs}${cause:+; cause: $cause}" \
       '{state:$state,context:$context,description:$description}')"
     : "${code:?}" "${body:?}"
     if [[ "$code" != 201 ]] || ! jq -e '.id != null' <<<"$body" >/dev/null; then

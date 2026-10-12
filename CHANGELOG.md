@@ -15,6 +15,16 @@
   setting reappears.
 
 ## Unreleased
+- A PR gate result is reusable on any gate host with the same runner, tools, sources and settings.
+  The input identity no longer names the host (`runner` is `pr-gate-runner`) or the paths a host
+  installed its tools, runtime fixtures and runner scripts at -- each is bound by content and name --
+  and the site file is bound by the settings that can change a verdict, not by where a host keeps
+  things or which credential it reads. The required status now carries the inputs' digest
+  (`; inputs <sha256>`), and a runner with no receipt of its own for those inputs reuses (success) or
+  holds (failure) the forge's newest required status when this gate identity's runner posted it for
+  exactly those inputs; a retry still runs. A success another host posted is no longer covered by
+  `pending` while a head is re-verified. Moving an owner between gate hosts no longer re-gates its
+  open heads. Installing it re-gates every open head once, as any runner change does. pr-gate 2.0.0.
 - `gate.log` events name the whole log and the slot that ran the gate. The tail is cut at a line
   boundary, so it no longer starts mid-token, and `detail.runner` carries `<host>/slot<N>` instead of
   leaving the runner readable only inside `summary`. Where a host's attempt logs are served,

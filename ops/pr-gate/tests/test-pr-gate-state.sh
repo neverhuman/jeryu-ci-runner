@@ -436,3 +436,123 @@ many=$(jq -nc '{gate_definition_paths:[range(0;13) | "ops/ci/step-\(.).sh"]}')
 note=$(note_of "$many")
 [[ "$note" == *'ops/ci/step-9.sh and 3 more).'* ]] || { printf 'annotation: %q\n' "$note" >&2; exit 1; }
 printf 'PASS the self-modification annotation names a bounded, recognised-shape path list\n'
+
+# Portable input identity: the same tree, tools and runner hash the same wherever a host keeps them.
+# The two "hosts" below differ only in where their tools, runtime tools and state live.
+for host in a b; do
+  mkdir -p "$scratch/host-$host/tools/bin" "$scratch/host-$host/runtime" "$scratch/host-$host/home"
+  printf 'governed tool\n' >"$scratch/host-$host/tools/bin/auditor"
+  printf 'fixture\n' >"$scratch/host-$host/runtime/data"
+  run="$inputs_probe/tree" repo=real recipe_name="just required" TOOLS="$scratch/host-$host/tools" \
+    RUNTIME_TOOLS="$scratch/host-$host/runtime" VENDOR="" HOME_DIR="$scratch/host-$host/home" \
+    SLOT=0 SCCACHE="" GATE_RUNNER_SCRIPT="$script_dir/pr-gate-runner.sh" \
+    gate_inputs "$scratch/host-$host/inputs.json"
+done
+cmp -s "$scratch/host-a/inputs.json" "$scratch/host-b/inputs.json" \
+  || { printf 'two hosts disagree about identical inputs\n' >&2; diff "$scratch/host-a/inputs.json" "$scratch/host-b/inputs.json" >&2; exit 1; }
+jq -e '.runner == "pr-gate-runner"' "$scratch/host-a/inputs.json" >/dev/null
+if jq -r .tools "$scratch/host-a/inputs.json" | grep -qF -e "$scratch" -e "$HOME/"; then
+  printf 'a host path reached the input identity\n' >&2; exit 1; fi
+jq -r .tools "$scratch/host-a/inputs.json" | grep -q '  tools/bin/auditor$'
+jq -r .tools "$scratch/host-a/inputs.json" | grep -q '  runtime-tools/data$'
+printf 'changed\n' >"$scratch/host-b/tools/bin/auditor"
+run="$inputs_probe/tree" repo=real recipe_name="just required" TOOLS="$scratch/host-b/tools" \
+  RUNTIME_TOOLS="$scratch/host-b/runtime" VENDOR="" HOME_DIR="$scratch/host-b/home" \
+  SLOT=0 SCCACHE="" GATE_RUNNER_SCRIPT="$script_dir/pr-gate-runner.sh" \
+  gate_inputs "$scratch/host-b/changed.json"
+[[ "$(gate_inputs_digest "$scratch/host-a/inputs.json")" != "$(gate_inputs_digest "$scratch/host-b/changed.json")" ]] \
+  || { printf 'a changed governed tool kept the same identity\n' >&2; exit 1; }
+printf 'PASS portable inputs: no host or path in the identity, content still bound\n'
+
+# The site configuration binds the settings that can change a verdict, not where a host keeps things.
+site="$scratch/site"; mkdir -p "$site"
+cat >"$site/a.env" <<'ENV'
+# host a
+PR_GATE_FORGE_URL=https://forge.example.test
+GATE_RUNNER_IDENTITY=runner-bot
+JERYU_TOKEN_FILE=~/.config/a/token
+PR_GATE_CHECKOUT_ROOTS="acme=src/acme"
+PR_GATE_LOCK_SOURCES=git+https://forge.example.test/
+GATE_RUNNER_OWNERS=acme
+PATH=/ignored
+ENV
+cat >"$site/b.env" <<'ENV'
+PR_GATE_LOCK_SOURCES='git+https://forge.example.test/'
+GATE_RUNNER_OWNERS="acme globex"
+PR_GATE_CHECKOUT_ROOT_PATTERN=gate-roots/{owner}
+JERYU_TOKEN_FILE=/srv/b/token
+  GATE_RUNNER_IDENTITY=runner-bot
+
+PR_GATE_FORGE_URL=https://forge.example.test
+GATE_RUNNER_WAKE_WAIT=30
+ENV
+a=$(gate_site_config_digest "$site/a.env")
+[[ "$a" =~ ^[0-9a-f]{64}$ && "$a" == "$(gate_site_config_digest "$site/b.env")" ]] \
+  || { printf 'host-local settings changed the site digest\n' >&2; exit 1; }
+for change in 'PR_GATE_LOCK_SOURCES=git+https://other.example.test/' 'PR_GATE_CONTEXT_OVERRIDES=acme/x=y/required' \
+    'PR_GATE_SOME_FUTURE_SETTING=1'; do
+  { cat "$site/a.env"; printf '%s\n' "$change"; } >"$site/changed.env"
+  [[ "$(gate_site_config_digest "$site/changed.env")" != "$a" ]] \
+    || { printf 'site digest ignored %s\n' "$change" >&2; exit 1; }
+done
+[[ -z "$(gate_site_config_digest "$site/missing.env")" ]]
+printf 'PASS site digest: host-local settings, comments and order are not inputs; any other setting is\n'
+
+# The published required status names the inputs' digest, so another host can match it.
+owner=acme repo=fixture
+exec 6>&-
+gate_lock "acme-fixture-$sha"
+gate_begin "$scratch/host-a/inputs.json"
+printf 'passed\n' >"$gate_attempt_dir/build.log"
+gate_finish success 0 "$gate_attempt_dir/build.log"
+gate_publish
+digest=$(gate_inputs_digest "$scratch/host-a/inputs.json")
+jq -s -e --arg d "$digest" '[.[] | select(has("context"))] | last.description | endswith("; inputs " + $d)' \
+  "$scratch/published.jsonl" >/dev/null || { tail -2 "$scratch/published.jsonl" >&2; exit 1; }
+exec 6>&-
+printf 'PASS publication: the required status carries the input digest\n'
+
+# Another host's result, read from the forge: reused or held only when this gate identity posted it from a
+# pr-gate runner for exactly these inputs, and never for a retry. This host has no receipt for the head.
+IDENTITY=runner-bot
+forge_status() { # state description [creator]
+  jq -nc --arg s "$1" --arg d "$2" --arg c "${3-runner-bot}" '{statuses:[{context:"fixture/required",state:$s,
+    description:$d,created_at:"2026-10-12T00:00:00Z"} + (if $c == "" then {} else {creator:{login:$c}} end)]}' >"$scratch/forge.json"
+}
+expect_forge() { # want-action retry
+  gate_decision "$scratch/host-a/inputs.json" "$2" "$scratch/forge.json"
+  [[ "$gate_action" == "$1" ]] || { printf 'forge decision: got %s, expected %s\n' "$gate_action" "$1" >&2; cat "$scratch/forge.json" >&2; exit 1; }
+}
+gate_lock "acme-fixture-1111111111111111111111111111111111111111"
+other="pr-gate-runner@node-b operator-unsealed"
+forge_status success "$other success; exit 0; attempt x; log y; inputs $digest"
+expect_forge reuse 0
+[[ "$gate_action_source" == forge ]]
+expect_forge run 1
+forge_status failure "$other failure; exit 1; attempt x; log y; inputs $digest; cause: tests failed"
+expect_forge hold 0
+forge_status error "$other interrupted; exit unknown; attempt x; log none; inputs $digest"
+expect_forge run 0
+forge_status success "$other success; exit 0; attempt x; log y; inputs ${digest}0"
+expect_forge run 0
+forge_status success "$other success; exit 0; attempt x; log y; inputs $(gate_inputs_digest "$scratch/host-b/changed.json")"
+expect_forge run 0
+forge_status success "$other success; exit 0; attempt x; log y"
+expect_forge run 0
+forge_status success "$other success; exit 0; attempt x; log y; inputs $digest" ''
+expect_forge run 0
+forge_status success "$other success; exit 0; attempt x; log y; inputs $digest" someone-else
+expect_forge run 0
+forge_status success "manual: inputs $digest"
+expect_forge run 0
+exec 6>&-
+printf 'PASS forge reuse: only this identity'"'"'s runner status for exactly these inputs, never for a retry\n'
+
+# Keep green holds for a success any host's runner posted as this identity, not for another poster's.
+owner=jeryu repo=jeryu-web
+own_success '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-b operator-unsealed success","creator":{"login":"runner-bot"},"created_at":"2026-09-18T14:00:00Z"}' \
+  || { printf 'another host'"'"'s success was not kept green\n' >&2; exit 1; }
+if own_success '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-b forged","creator":{"login":"mallory"},"created_at":"2026-09-18T14:00:00Z"}'; then
+  printf 'a runner-shaped status from another identity was kept green\n' >&2; exit 1; fi
+unset IDENTITY
+printf 'PASS keep green across hosts, for this gate identity only\n'

@@ -130,8 +130,34 @@ as `KEY=VALUE` lines. The file is data: it is never `source`d, only `PR_GATE_*`,
 unit's `Environment=` line or a per-slot drop-in still overrides it. A required setting that is
 missing stops the script with `<KEY> is not configured`. `pr-gate.env.example` lists every key.
 
-The runner hashes the site file into each gate's input identity, as it does its own code: changing
-the configuration re-gates open heads once, exactly like installing a new runner.
+The runner hashes the site file into each gate's input identity, as it does its own code: changing a
+setting that can change a verdict re-gates open heads once, exactly like installing a new runner.
+Settings that only say where this host keeps things, which credential it reads, which heads it
+chooses or when it wakes (`GATE_HOST_LOCAL_SETTINGS` in `bin/pr-gate-state.sh`) are left out, and so
+are comments and order; every other key is bound, including ones added later.
+
+## Results across hosts
+
+A result proves its inputs, not the host that computed them. The input identity names the runner
+(`runner: "pr-gate-runner"`), never the host, and every executable, governed tool, runtime fixture and
+runner script by its content and the name the gate calls it by, never by the path a host installed it
+at. So two gate hosts with the same runner code, tools, sources and verdict-changing settings compute
+the same identity for a head.
+
+The required status carries that identity's digest (`; inputs <sha256>`, the SHA-256 of the compact,
+key-sorted inputs JSON; `gate_inputs_digest`). A runner decides from its own receipt first. When it
+has none for these inputs -- another host gated the head, or the host is new -- it reads the forge's
+newest required status: if this gate identity posted it (`creator.login == GATE_RUNNER_IDENTITY`)
+from a pr-gate runner (description `pr-gate-runner@<host> ...`) and it names exactly these inputs, a
+success is reused and a failure held, as a local result would be; anything else runs. A retry
+(`--repo/--pr`, a re-gate request) always runs. Nothing is published on such a reuse, and no log is
+re-verified: the evidence stays on the host that produced it, named by the attempt id and log digest
+in the same description. A runner also leaves a success posted by another host's runner in place
+instead of posting `pending` over it while it re-verifies.
+
+Claims are still local, so two hosts must not gate the same owners at once; failover is moving an
+owner from one host's `GATE_RUNNER_OWNERS` to the other's, and the moved heads are then reused, not
+re-gated.
 
 ## Version
 
