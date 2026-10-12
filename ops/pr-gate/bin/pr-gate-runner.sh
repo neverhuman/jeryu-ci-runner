@@ -460,12 +460,15 @@ done
 # it gates a PR head -- same recipe, tree, context and identity -- fetched through queue_ref. Entries go
 # first: each is one gate from landing. A candidate's fifth field is its queue ref, "-" for a PR head.
 queued=()
+# Every entry this tick saw, admitted or refused, by queue sha: gate_queue_arrived looks only past it.
+declare -A queue_seen=()
 gated=" $(for q in $REPOS; do qualify "$q"; printf ' '; done)"
 if [[ -z "$only_pr" ]]; then
   api GET "/api/v1/merge-queue?state=building"
   if [[ "$code" == 200 ]]; then
     queue_rows="$body"
     while IFS=$'\t' read -r qrepo number sha qref; do
+      queue_seen["$sha"]=1
       if ! [[ "$qrepo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$number" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
           && "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ && "$qref" != *..* ]]; then
         say "ignoring a malformed merge-queue entry: $qrepo#$number"; continue
@@ -499,6 +502,27 @@ if [[ -z "$only_pr" ]]; then
     say "merge queue answered $code; gating PR heads only this tick"
   fi
 fi
+
+# A queue entry that arrived after this tick listed the queue, for a gated repository, that no slot
+# has claimed yet. Entries go first only at the start of a tick, and a tick can spend minutes deciding
+# PR heads that end in reuse: on 2026-10-12 an entry waited 2m48s while one slot walked such a list,
+# and was taken only when an unrelated gate ended elsewhere. Ending the tick hands the entry to the
+# next one, which starts within the timer's pause and puts it first. Entries the tick already saw are
+# never counted, so one this runner refuses (its own work, an unreadable origin) cannot end every tick.
+gate_queue_arrived() {
+  local qrepo qsha
+  api GET "/api/v1/merge-queue?state=building"
+  [[ "$code" == 200 ]] || return 1
+  while IFS=$'\t' read -r qrepo qsha; do
+    [[ "$qrepo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$qsha" =~ ^[0-9a-f]{40}$ ]] || continue
+    [[ -z "${queue_seen["$qsha"]:-}" && "$gated" == *" $qrepo "* ]] || continue
+    [[ -z "$only_repo" || "$qrepo" == "$only_repo" ]] || continue
+    [[ -d "$HOME_DIR/attempts/${qrepo%%/*}-${qrepo#*/}-$qsha" ]] && continue
+    say "merge-queue entry $qrepo at $qsha arrived during this tick; ending it so the next tick gates it first"
+    return 0
+  done < <(jq -r '.entries[]? | [.repo, .queue_sha] | @tsv' <<<"$body")
+  return 1
+}
 # Re-gate requests from the forge (jeryu-deploy: POST /api/v1/repos/:id/pulls/:n/regate, read here as
 # GET /api/v1/gate-regate?state=pending). A gate result is reused while its inputs are identical and
 # a failure is held, which is right for a head that failed on its own sources and wrong for one that
@@ -569,6 +593,10 @@ read -r owner repo number sha qref contributed <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
    && ( "$qref" == - || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) && "$contributed" =~ ^[01]$ ]] \
   || die "invalid repository or head in dispatch"
+if [[ "$qref" == - && -z "$only_pr" ]] && gate_queue_arrived; then
+  heartbeat
+  exit 0
+fi
 # A contribution is executed in the site's sandbox, and nowhere else. GATE_SANDBOX is read by
 # gate_inputs and gate_begin, so what ran is part of the result's identity and of its receipt.
 sandbox="$contributed"

@@ -15,6 +15,11 @@
   setting reappears.
 
 ## Unreleased
+- A merge-queue entry that arrives while a slot is deciding PR heads ends that slot's tick before its
+  next head, so the next tick (within the timer's ~20s pause) gates the entry first. Entries were put
+  first only when a tick started, and a tick can spend minutes walking heads that end in reuse: on
+  2026-10-12 an entry waited 2m48s behind one such walk. Entries the tick already saw, admitted or
+  refused, never end it, and neither does one another slot has claimed. pr-gate 1.8.0.
 - `gate.log` events name the whole log and the slot that ran the gate. The tail is cut at a line
   boundary, so it no longer starts mid-token, and `detail.runner` carries `<host>/slot<N>` instead of
   leaving the runner readable only inside `summary`. Where a host's attempt logs are served,

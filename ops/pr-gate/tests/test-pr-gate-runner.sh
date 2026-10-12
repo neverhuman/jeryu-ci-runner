@@ -97,7 +97,13 @@ case "$method $url" in
     if [[ -f "$FAKE_FORGE/regate.json" ]]; then cat "$FAKE_FORGE/regate.json"; else printf '{"requests":[]}'; fi
     printf '\n200';;
   'GET '*'/merge-queue?state=building')
-    if [[ -f "$FAKE_FORGE/queue.json" ]]; then cat "$FAKE_FORGE/queue.json"; else printf '{"entries":[]}'; fi
+    # queue-arrives.json: empty for a tick's first read, then the entry -- one that arrives mid-tick.
+    if [[ -f "$FAKE_FORGE/queue-arrives.json" ]]; then
+      reads=0
+      [[ ! -f "$FAKE_FORGE/queue-reads" ]] || read -r reads <"$FAKE_FORGE/queue-reads"
+      printf '%s\n' "$((reads + 1))" >"$FAKE_FORGE/queue-reads"
+      if ((reads == 0)); then printf '{"entries":[]}'; else cat "$FAKE_FORGE/queue-arrives.json"; fi
+    elif [[ -f "$FAKE_FORGE/queue.json" ]]; then cat "$FAKE_FORGE/queue.json"; else printf '{"entries":[]}'; fi
     printf '\n200';;
   'GET '*'/status')
     # Statuses are per commit, as on the forge; a hand-written row without a sha applies to any.
@@ -513,6 +519,44 @@ expect_count "$before_count"
 grep -q 'ignoring a malformed merge-queue entry' "$fixture/runner.log"
 rm -f "$fixture/queue.json"
 printf 'PASS merge queue: a rebuilt entry and a ref outside refs/queue/ are never gated\n'
+
+# An entry that arrives while a tick is deciding PR heads ends that tick before the next head, so the
+# next tick gates it first instead of after a slot frees elsewhere.
+printf 'new head while the queue is empty\n' >>"$fixture/source/marker"
+"$real_git" -C "$fixture/source" add marker
+"$real_git" -C "$fixture/source" commit -qm head-before-queue
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+"$real_git" -C "$fixture/source" checkout -q -B queue-build-2 main
+printf 'replayed mid-tick\n' >"$fixture/source/queued"
+"$real_git" -C "$fixture/source" add queued
+"$real_git" -C "$fixture/source" commit -qm queue-replay-2
+qsha2=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" "+HEAD:refs/queue/main/1"
+"$real_git" -C "$fixture/source" checkout -q main
+queue_entry "$qsha2" refs/queue/main/1
+mv "$fixture/queue.json" "$fixture/queue-arrives.json"
+rm -f "$fixture/queue-reads"
+before_count=$(count)
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$before_count"
+grep -q "merge-queue entry acme/fixture at $qsha2 arrived during this tick" "$fixture/runner.log" \
+  || { printf 'a mid-tick queue entry did not end the tick\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+! grep -q "preparing acme/fixture#1 at $(cat "$fixture/head")" "$fixture/runner.log" \
+  || { printf 'the PR head was prepared ahead of a waiting queue entry\n' >&2; exit 1; }
+mv "$fixture/queue-arrives.json" "$fixture/queue.json"
+invoke
+expect_count "$((before_count + 1))"
+grep -q "preparing acme/fixture#1 at $qsha2 (merge queue refs/queue/main/1)" "$fixture/runner.log" \
+  || { printf 'the next tick did not gate the arrived entry first\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+# Seen at the start of a tick and already claimed, the same entry never ends a tick again.
+invoke
+expect_count "$((before_count + 2))"
+! grep -q 'arrived during this tick' "$fixture/runner.log" \
+  || { printf 'a claimed entry ended a tick\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/queue.json" "$fixture/queue-reads"
+printf 'PASS merge queue: an entry arriving mid-tick ends the tick and is gated first by the next\n'
 
 # A sibling's main moving re-gates open heads automatically, but a burst is coalesced: the runner
 # records the family's mains after each mirror fetch, and while they moved within the settle window an
