@@ -30,6 +30,35 @@ On a gate host the scripts live in `~/gate-runner/bin`, the units in `~/.config/
 the state under `~/gate-runner` (`installed-main.json`, `tools.json`, `attempts/`, `cache/`,
 `regate/`, mirrors and trees). The units run `%h/gate-runner/bin/<script>`.
 
+## Deciding reuse before a tree is prepared
+
+Most of what a tick looks at is a head nobody has touched since it was gated. Finding that out used
+to cost a full preparation -- a mirror checkout of every sibling, a reset, a clean, a tracked-file
+stamp and a tree-wide fingerprint, about six seconds a head. In a 24h sample on the gate host
+(2026-10-09/10) two slots spent some 35 slot-hours preparing about 40 unchanged heads, roughly 310
+times each, against about 8 hours of actual gating, and a new head waited behind that sweep.
+
+So after the mirrors are refreshed, and before anything is checked out, the runner derives the
+head's input identity a second way (`gate_input_cheap`): the siblings straight out of those
+mirrors' `refs/heads/main`, the gated head's own source row and recipe off the receipt that pins
+that exact commit, and every tool, fixture and runner hash computed there and then. That is the
+same document `gate_inputs` writes from a prepared tree, so the usual decision applies to it
+unchanged, and an identical head is left alone without a tree.
+
+Nothing is taken on trust. A commit determines its tree and its `Cargo.lock`, so a receipt whose
+`sha` is this head is authority for that one row and for nothing else; the recipe and the toolchain
+`rustup` resolves follow from that tree and from the `just` and `rustup` binaries, whose hashes are
+recomputed, and the resolved compilers are re-hashed at the paths the receipt names. A sibling main
+that moved, a governed tool that was reinstalled, a runner that was upgraded -- each is a changed
+input here exactly as it is after a full preparation. Anything this cannot derive counts as changed
+too, and the tree is prepared as before.
+
+Only `reuse` and `hold` end a head this early: both run nothing and publish nothing, so neither
+needs a tree. A retry of the head -- an explicit `--repo/--pr`, a re-gate the forge asked for -- is
+precisely what must re-run a held failure, so it is never answered from the receipt and still
+refreshes the head before it dispatches. The head is already inside its claim lock by then, so
+deciding here takes no claim of its own and a slot that dies leaves nothing behind.
+
 ## Re-gating a head on request
 
 A result is reused while its inputs are identical and a failure is held, so a head that failed on

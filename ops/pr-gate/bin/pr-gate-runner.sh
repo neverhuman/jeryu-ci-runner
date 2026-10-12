@@ -12,12 +12,15 @@
 #   2. pick the oldest head that has no <repo>/required status posted BY THIS
 #      RUNNER (manual statuses are re-proved here, because they were produced
 #      on another host's toolchain);
-#   3. build a clean tree: every family repo at origin/main from local mirrors,
+#   3. refresh the local mirrors of that family's canonical mains;
+#   4. decide reuse from the head's input identity, derived from those mirrors and from this host's
+#      tools without preparing anything, and leave an unchanged head alone;
+#   5. otherwise build a clean tree: every family repo at origin/main from the mirrors,
 #      the PR's repo at exactly its head, the configured native vendor tree linked;
-#   4. post `pending`, run `just required` there with the governed security
+#   6. post `pending`, run `just required` there with the governed security
 #      tools and the system npm first on PATH, then post success or failure
 #      with the log's SHA-256 in the description;
-#   5. retain terminal receipts and logs for verified reuse or publication recovery.
+#   7. retain terminal receipts and logs for verified reuse or publication recovery.
 # At most one gate per tick. A PR whose head moves gets gated again because the
 # status is keyed by commit.
 #
@@ -202,7 +205,7 @@ flock -n 9 || { say "a gate is already running; nothing to do"; exit 0; }
 # The lock lives on fd 9, and anything the gate starts inherits it unless told otherwise. A build
 # daemon (sccache) spawned by `just required` detached with fd 9 open and held the lock after the
 # gate had finished, so every later tick said "already running" and gated nothing. The recipe runs
-# with fd 9 closed (see step 4).
+# with fd 9 closed (see step 6).
 
 # The token reaches curl through a 0600 config file, never through argv: anyone with a shell on
 # this host can read /proc/<pid>/cmdline while a gate runs, and `-H "Authorization: Bearer $(cat
@@ -632,9 +635,8 @@ if ! gate_recover; then
   exec 6>&-; exec 7>&-
   continue
 fi
-say "preparing $owner/$repo#$number at $sha${qref:+$([[ "$qref" == - ]] || printf ' (merge queue %s)' "$qref")}"
 
-# 3. clean tree
+# 3. the family's canonical mains
 family="$FAMILY"
 if [[ -z "$family" ]]; then
   root="$(split_root "$owner")" || die "cannot discover the $owner family"
@@ -676,8 +678,8 @@ for n in $family $repo; do
       continue 2
     fi
     # Drop the mirror as well. A repository whose main was deleted upstream would otherwise keep an
-    # older main here, and step 3 would check the sibling out from it: a phantom main in the tree
-    # while this line says the tree lacks it. With no mirror, step 3 skips the sibling.
+    # older main here, and step 5 would check the sibling out from it: a phantom main in the tree
+    # while this line says the tree lacks it. With no mirror, step 5 skips the sibling.
     # Check the current owner's persistent tree below, after selecting its path.
     # An inherited or previous candidate's $run is not cleanup authority.
     rm -rf -- "$m"
@@ -689,6 +691,58 @@ done
 exec 8>&-
 gate_record_mains "$HOME_DIR/cache/mains-$owner" "$mirrors" $family $repo || say "could not record $owner mains"
 
+# 4. reuse an identical result before preparing a tree
+# Most of what a tick examines is a head nobody has touched since it was gated, and the only way to
+# find that out used to be a full preparation: mirror checkout, reset, clean, stamp and a tree-wide
+# fingerprint of every sibling, ~6s a head. In a 24h sample on the gate host (2026-10-09/10) two
+# slots spent ~35 slot-hours preparing ~40 unchanged heads some 310 times each, against ~8h of real
+# gating, and a new head queued behind that sweep. gate_input_cheap derives the very same identity
+# from the mirrors just fetched and from the tools and runner hashes computed now, so a sibling main
+# that moved, a reinstalled governed tool or an upgraded runner is a changed input exactly as before
+# and the tree is prepared after all; anything it cannot derive is a changed input too.
+# Only `reuse` and `hold` end a head here: both run nothing and publish nothing, so no tree is
+# needed for either. `republish` and `run` fall through, and the full preparation decides again.
+# A retry of this head -- an explicit --repo/--pr, a re-gate the forge asked for -- is exactly what
+# must re-run a held failure, so it never stops here.
+retry_wanted=0
+[[ -z "$only_repo" && -z "$only_pr" ]] || retry_wanted=1
+! gate_regate_wanted "$owner" "$repo" "$number" "$sha" || retry_wanted=1
+# A slot tree that needs recovery is not a tree whose result is reused: a sibling checkout left
+# behind after its canonical main vanished is refused aloud by the preparation below, and reusing
+# past it would silence that for as long as the head stayed open. Only the path of the tree is read
+# here; the tree itself is still not prepared. (The owner's tree path is only chosen now, after its
+# mirrors, so no inherited $run can be mistaken for it.)
+run="$(tree_dir "$owner")"
+for n in $family; do
+  [[ "$n" != "$repo" && ! -d "$mirrors/$n.git" ]] || continue
+  [[ -e "$run/$n" || -L "$run/$n" ]] || continue
+  retry_wanted=1
+done
+if ((retry_wanted == 0)); then
+  cheap_identity=$(mktemp "$HOME_DIR/cache/cheap-inputs-$SLOT.XXXXXXXX")
+  cheap_statuses=$(mktemp "$HOME_DIR/cache/cheap-status-$SLOT.XXXXXXXX")
+  cheap_action=""
+  if PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+      gate_input_cheap "$cheap_identity" "$gate_key_dir/last-result.json"; then
+    api GET "/repos/$owner/$repo/commits/$sha/status"
+    if [[ "$code" == 200 ]]; then
+      printf '%s\n' "$body" >"$cheap_statuses"
+      gate_decision "$cheap_identity" 0 "$cheap_statuses"
+      case "${gate_action:?}" in reuse|hold) cheap_action="$gate_action";; esac
+    else
+      say "cannot read the current status of $owner/$repo@$sha ($code); preparing its tree to decide"
+    fi
+  fi
+  rm -f -- "$cheap_identity" "$cheap_statuses"
+  if [[ -n "$cheap_action" ]]; then
+    say "$cheap_action $owner/$repo@$sha: identical verified inputs, read without preparing a tree (a failure re-runs only with --repo <o>/<r> --pr <n>, or changed inputs)"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
+fi
+say "preparing $owner/$repo#$number at $sha${qref:+$([[ "$qref" == - ]] || printf ' (merge queue %s)' "$qref")}"
+
+# 5. clean tree
 # One persistent family tree, reset to exact commits for every gate. Build output is the only
 # thing kept between gates: every repo is detached at its commit, hard-reset, and cleaned of all
 # untracked and ignored files EXCEPT target/ and node_modules/. Sources are therefore exactly the
@@ -696,8 +750,7 @@ gate_record_mains "$HOME_DIR/cache/mains-$owner" "$mirrors" $family $repo || say
 # the sources. A fresh clone per gate made every run a cold build -- one web repository took ~25
 # minutes rebuilding a 16 GB target/ that the previous gate had already produced.
 # One gate at a time holds the lock, so one tree is enough. A red gate's diagnostics stay in the
-# tree until the next gate starts; its log is kept regardless.
-run="$(tree_dir "$owner")"
+# tree until the next gate starts; its log is kept regardless. Its path was chosen in step 4.
 mkdir -p "$run"
 sync_repo() { # name commit-ish
   local dir="$run/$1"
@@ -734,7 +787,7 @@ sync_repo() { # name commit-ish
   git -C "$dir" checkout --quiet --force --detach "$2"
   git -C "$dir" reset --quiet --hard "$2"
   git -C "$dir" clean --quiet -ffdx -e target/ -e node_modules/
-  # Every slot's checkout of a repo builds into one shared target directory (step 3), and cargo
+  # Every slot's checkout of a repo builds into one shared target directory (step 5), and cargo
   # decides freshness from mtimes. A tracked file this checkout left untouched can be older than
   # another tree's build of different content, and cargo then reuses that build: the gate would
   # test a commit other than the one it reports (seen on a data repository, 2026-09-17). Stamp
@@ -872,7 +925,7 @@ elif [[ -n "$VENDOR" && -d "$VENDOR" ]] && pr_gate_listed "$VENDOR_REPOS" "$repo
   mkdir -p "$run/$repo/target" && ln -sfn "$VENDOR" "$run/$repo/target/native-vendor"
 fi
 
-# 4. gate
+# 6. gate
 # Shared targets retain each repository's expected <repo>/target path. The
 # repository lock serializes writers across slots, while unrelated repos build
 # independently. A shared sccache can additionally reuse compiler outputs.

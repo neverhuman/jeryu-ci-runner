@@ -15,6 +15,16 @@
   setting reappears.
 
 ## Unreleased
+- The PR gate decides reuse before it prepares anything. After refreshing the family's mirrors it
+  derives the head's input identity without a checkout -- siblings from the mirrors' `refs/heads/main`,
+  the gated head's own source row and recipe off the receipt that pins that exact commit, every tool,
+  fixture and runner hash computed on the spot -- and leaves an unchanged head alone. In a 24h sample
+  on the gate host two slots spent ~35 slot-hours re-preparing ~40 unchanged heads (~310 times each)
+  only to find them identical, against ~8h of gating, with new heads queued behind that sweep. A
+  sibling main that moved, a reinstalled governed tool or an upgraded runner is still a changed input,
+  and anything the identity cannot be derived from counts as changed; only `reuse` and `hold` end a
+  head this early, an explicit `--repo/--pr` and a re-gate the forge asked for never do, and the
+  decision takes no claim of its own beyond the claim lock the head already holds. pr-gate 1.9.0.
 - A merge-queue entry that arrives while a slot is deciding PR heads ends that slot's tick before its
   next head, so the next tick (within the timer's ~20s pause) gates the entry first. Entries were put
   first only when a tick started, and a tick can spend minutes walking heads that end in reuse: on

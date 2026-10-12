@@ -44,7 +44,7 @@ gate_atomic() {
 }
 
 # Move every checkout in a slot tree that is not one of the named repositories into a detached
-# directory (replacing an older copy there), printing each name moved. See the runner's step 3.
+# directory (replacing an older copy there), printing each name moved. See the runner's step 5.
 gate_detach_strays() { # tree detached-dir name...
   local tree=$1 detached=$2 d n; shift 2
   for d in "$tree"/*/; do
@@ -147,7 +147,7 @@ gate_inputs() {
   : "${run:?}" "${recipe_name:?}"
   # Bind all actual family sources, locks, executable tools and external fixtures.
   # The full identity is retained, so cache invalidation can be independently read.
-  local output=$1 directory tool resolved lock_digest head tree origin clean
+  local output=$1 directory lock_digest head tree origin clean
   local rows="$output.rows" inputs="$output.inputs" versions="$output.versions"
   : >"$rows" || return
   : >"$inputs" || return
@@ -169,9 +169,27 @@ gate_inputs() {
       --arg tree "$tree" --arg lock "$lock_digest" --arg origin "$origin" \
       '{repository:$name,head:$head,tree:$tree,cargo_lock_sha256:$lock,origin:$origin}' >>"$rows" || return
   done
+  gate_input_tools "$inputs" "$versions" || return
+  gate_input_render "$output" "$rows" "$inputs" "$versions" "$recipe_name" || return
+  rm -f -- "$rows" "$inputs" "$versions"
+}
+
+# Everything in the input identity that is not a family source: the executables on PATH, the
+# toolchain rustup resolves for the head, the governed tools, the runtime and vendor fixtures, this
+# runner's own code and the compiler cache. Appends "sha256  path" lines to $1 and tool versions to
+# $2, in a fixed order, because the identity is compared byte for byte.
+#
+# $3, when given, is the tools field of a previous identity for this exact head, used when there is
+# no checkout to ask which toolchain the head pins (gate_input_cheap). The PATH block is recomputed
+# either way and must equal that identity's, so the two lines after it are its resolved rustc and
+# cargo; those paths are re-hashed here and their versions re-read, never copied, so a toolchain
+# reinstalled in place is a changed input.
+gate_input_tools() { # inputs versions [previous-tools]
+  local inputs=$1 versions=$2 previous=${3:-} tool resolved directory lines
+  local -a toolchain=()
   if [[ "${GATE_SANDBOX:-0}" == 1 ]]; then
     # A sandboxed contribution gets none of the host's toolchain, governed tools, runtime fixtures or
-    # vendor tree (see the runner's step 4), so none of them is an input of its result. What it
+    # vendor tree (see the runner's step 6), so none of them is an input of its result. What it
     # evaluates with is the sandbox the site configured, so that is what is bound here.
     printf 'sandbox-command  %s\n' "${SANDBOX_COMMAND:-}" >>"$inputs" || return
   else
@@ -179,8 +197,20 @@ gate_inputs() {
       resolved=$(command -v "$tool" || true)
       if [[ -n "$resolved" ]]; then sha256sum "$(readlink -f "$resolved")" >>"$inputs" || return; fi
     done
-    for tool in rustc cargo; do
-      resolved=$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup which "$tool") || return
+    if [[ -z "$previous" ]]; then
+      for tool in rustc cargo; do
+        resolved=$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup which "$tool") || return
+        toolchain+=("$resolved")
+      done
+    else
+      lines=$(wc -l <"$inputs") || return
+      [[ "$(head -n "$lines" <<<"$previous")" == "$(cat "$inputs")" ]] || return 1
+      mapfile -t toolchain < <(sed -n "$((lines + 1)),$((lines + 2))p" <<<"$previous" \
+        | sed -E 's/^[0-9a-f]{64}  //')
+      ((${#toolchain[@]} == 2)) || return 1
+      [[ "$(basename -- "${toolchain[0]}")" == rustc && "$(basename -- "${toolchain[1]}")" == cargo ]] || return 1
+    fi
+    for resolved in "${toolchain[@]}"; do
       sha256sum "$resolved" >>"$inputs" || return
       "$resolved" --version >>"$versions" || return
     done
@@ -204,11 +234,65 @@ gate_inputs() {
     sha256sum "${BASH_SOURCE[0]}" "$GATE_RUNNER_SCRIPT" >>"$inputs" || return
   fi
   if [[ -n "$SCCACHE" && "${GATE_SANDBOX:-0}" != 1 ]]; then sha256sum "$SCCACHE" >>"$inputs" || return; fi
-  jq -nS --slurpfile sources "$rows" --rawfile tools "$inputs" --rawfile versions "$versions" \
-    --arg recipe "$recipe_name" --arg base "$BASE" --arg runner "$MARKER" \
+}
+
+# The identity document itself, from the source rows, the tool lines and the recipe.
+gate_input_render() { # output rows inputs versions recipe
+  jq -nS --slurpfile sources "$2" --rawfile tools "$3" --rawfile versions "$4" \
+    --arg recipe "$5" --arg base "$BASE" --arg runner "$MARKER" \
     --arg context "$(gate_required_context "$owner" "$repo")" --arg kind "$(gate_execution_kind)" \
     '{schema:"jeryu.pr-gate-inputs/v1",sources:($sources|sort_by(.repository)),tools:$tools,
-      versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:$kind}' >"$output" || return
+      versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:$kind}' >"$1"
+}
+
+# The same input identity, derived without preparing a tree: the siblings read out of the mirrors
+# this tick fetched, the gated head's own source row and recipe read off the receipt that pins this
+# exact commit, and every tool, fixture and runner hash computed now. Written to $1 from the previous
+# terminal result $2, so gate_decision can answer `reuse` or `hold` for an unchanged head without a
+# checkout -- ~40 open heads were re-prepared every tick on the gate host only to be found identical.
+#
+# Nothing is taken on trust. A commit determines its tree and its Cargo.lock, so a receipt whose sha
+# is this head is authority for that one row and for nothing else; the recipe and the toolchain
+# rustup resolves are functions of that tree and of the just and rustup binaries, whose hashes are
+# recomputed here, and the resolved compilers are re-hashed at the paths the receipt names. Every
+# other field is computed from the mirrors and the host as it is now, so a sibling main that moved, a
+# governed tool that was reinstalled or a runner that was upgraded is a changed input exactly as it is
+# after a full preparation. Any difference at all, and anything this cannot derive, returns non-zero:
+# the tree is then prepared and the identity computed from the sources themselves, as before.
+gate_input_cheap() { # output previous-result
+  : "${owner:?}" "${repo:?}" "${sha:?}" "${mirrors:?}" "${family?}"
+  local output=$1 previous=$2 n head tree lock_digest row recipe mirror previous_tools
+  local rows="$output.rows" inputs="$output.inputs" versions="$output.versions"
+  [[ -f "$previous" ]] || return 1
+  jq -e --arg owner "$owner" --arg repo "$repo" --arg sha "$sha" --arg kind "$(gate_execution_kind)" \
+    '.terminal and .owner == $owner and .repo == $repo and .sha == $sha
+     and (.inputs.execution_kind // "") == $kind' "$previous" >/dev/null 2>&1 || return 1
+  row=$(jq -ce --arg repo "$repo" --arg sha "$sha" --arg origin "$BASE/git/$owner/$repo.git" \
+    'first(.inputs.sources[]? | select(.repository == $repo and .head == $sha and .origin == $origin))' \
+    "$previous") || return 1
+  recipe=$(jq -re '.inputs.recipe' "$previous") || return 1
+  previous_tools=$(jq -re '.inputs.tools' "$previous") || return 1
+  : >"$rows" || return
+  : >"$inputs" || return
+  : >"$versions" || return
+  printf '%s\n' "$row" >>"$rows" || return
+  for n in $family; do
+    [[ "$n" != "$repo" ]] || continue
+    mirror="$mirrors/$n.git"
+    # No mirror, or no canonical main in it, is exactly the sibling the preparation would leave out.
+    [[ -d "$mirror" ]] || continue
+    head=$(git -C "$mirror" rev-parse refs/heads/main 2>/dev/null) || continue
+    tree=$(git -C "$mirror" rev-parse 'refs/heads/main^{tree}' 2>/dev/null) || continue
+    lock_digest=absent
+    if git -C "$mirror" cat-file -e refs/heads/main:Cargo.lock 2>/dev/null; then
+      lock_digest=$(git -C "$mirror" cat-file blob refs/heads/main:Cargo.lock | sha256sum | cut -c1-64) || return
+    fi
+    jq -nc --arg name "$n" --arg head "$head" --arg tree "$tree" --arg lock "$lock_digest" \
+      --arg origin "$BASE/git/$owner/$n.git" \
+      '{repository:$name,head:$head,tree:$tree,cargo_lock_sha256:$lock,origin:$origin}' >>"$rows" || return
+  done
+  gate_input_tools "$inputs" "$versions" "$previous_tools" || return
+  gate_input_render "$output" "$rows" "$inputs" "$versions" "$recipe" || return
   rm -f -- "$rows" "$inputs" "$versions"
 }
 
