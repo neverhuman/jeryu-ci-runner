@@ -69,9 +69,11 @@ source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-state.sh"
 # the files on disk later (see gate_inputs). Each script is named by its file name, not where this host
 # installed it, and the configuration by the settings that can change a verdict
 # (gate_site_config_digest), so the same runner configured alike hashes the same on every host.
-GATE_SELF_SHA256="$(gate_tool_line pr-gate-config.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-config.sh")
-$(gate_tool_line pr-gate-state.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-state.sh")
-$(gate_tool_line "$(basename -- "$GATE_RUNNER_SCRIPT")" "$GATE_RUNNER_SCRIPT")"
+# Each step is checked on its own: one assignment of several substitutions would check only the last.
+gate_self_part() { gate_tool_line "$@" || { printf 'pr-gate-runner: cannot hash %s\n' "$2" >&2; exit 2; }; }
+GATE_SELF_SHA256="$(gate_self_part pr-gate-config.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-config.sh")"
+GATE_SELF_SHA256+=$'\n'"$(gate_self_part pr-gate-state.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-state.sh")"
+GATE_SELF_SHA256+=$'\n'"$(gate_self_part "$(basename -- "$GATE_RUNNER_SCRIPT")" "$GATE_RUNNER_SCRIPT")"
 GATE_SITE_CONFIG_SHA256="$(gate_site_config_digest "$PR_GATE_CONFIG_FILE")"
 [[ -z "$GATE_SITE_CONFIG_SHA256" ]] || GATE_SELF_SHA256+=$'\n'"$GATE_SITE_CONFIG_SHA256  site-config"
 
@@ -92,6 +94,9 @@ SLOT="${GATE_RUNNER_SLOT:-0}"
 [[ "$SLOT" =~ ^[0-9]+$ ]] || { printf 'GATE_RUNNER_SLOT must be a number, not %s\n' "$SLOT" >&2; exit 2; }
 FAMILY="${GATE_RUNNER_FAMILY:-}"   # space-separated sibling repos to mirror; default: every repo of the PR's owner under its checkout root
 TOOLS="${GATE_RUNNER_TOOLS:-$HOME_DIR/governed-tools/bin}"
+# The one PATH a recipe (and its locked-crate prefetch) runs with. gate_inputs binds every directory on
+# it (gate_host_environment), so a result names everything the recipe could have executed.
+RECIPE_PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 # A native vendor tree (prebuilt third-party sources) linked at <repo>/target/native-vendor for the
 # repositories in PR_GATE_NATIVE_VENDOR_REPOS, and hashed into the inputs of those in
 # PR_GATE_NATIVE_VENDOR_INPUT_REPOS. Unset: no repository gets one.
@@ -530,6 +535,13 @@ if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # FD9 protects this slot's source tree. The timeout supervisor retains all three
 # through parent death; the recipe closes them before it can start cache daemons.
 # The slot's cache daemon is started by the worker itself, after it has closed all three.
+#
+# A head whose result was adopted from the forge (another host's, see gate_decision) is skipped while
+# anything else needs this slot, and remembered. A tick that ends with nothing executed re-proves the
+# first one with forge reuse off, so this host's own receipt replaces the adoption one head per idle tick.
+forge_adopted=()
+GATE_FORGE_REUSE=1
+while :; do
 for candidate in "${candidates[@]}"; do
 read -r owner repo number sha qref contributed <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
@@ -830,7 +842,7 @@ else
 fi
 identity=$(mktemp "$HOME_DIR/cache/inputs-$SLOT.XXXXXXXX")
 status_snapshot=$(mktemp "$HOME_DIR/cache/status-$SLOT.XXXXXXXX")
-PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" gate_inputs "$identity"
+PATH="$RECIPE_PATH" gate_inputs "$identity"
 api GET "/repos/$owner/$repo/commits/$sha/status"
 [[ "$code" == 200 ]] || die "cannot verify current status for $owner/$repo@$sha ($code)"
 printf '%s\n' "$body" >"$status_snapshot"
@@ -846,6 +858,7 @@ gate_decision "$identity" "$retry" "$status_snapshot"
 case "${gate_action:?}" in
   reuse|hold)
     say "$gate_action $owner/$repo@$sha: identical verified inputs, from the ${gate_action_source:-local} result (a failure re-runs only with --repo <o>/<r> --pr <n>, or changed inputs)"
+    [[ "${gate_action_source:-local}" != forge ]] || forge_adopted+=("$candidate")
     rm -f -- "$identity" "$status_snapshot"
     exec 6>&-; exec 7>&-
     continue;;
@@ -1009,7 +1022,7 @@ if ((sandbox)); then
   say "$owner/$repo#$number skips the locked-crate prefetch: a contribution shares no registry"
 else
   "${enter[@]}" env -i -C "$worker_root" HOME="$HOME" USER="$(id -un)" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-    PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" GIT_LFS_SKIP_SMUDGE=1 \
+    PATH="$RECIPE_PATH" GIT_LFS_SKIP_SMUDGE=1 \
     ionice -c 3 timeout 30m bash -c "$prefetch" pr-gate-prefetch "$worker_root" "$repo" "$LOCK_SOURCES_ERE" \
     6>&- 7>&- 9>&- >"$gate_attempt_dir/prefetch.log" 2>&1 \
     || say "locked-crate prefetch for $owner/$repo ended $?; the recipe reports any real gap"
@@ -1043,7 +1056,7 @@ else
 (
   cd "$run/$repo"
   exec setsid "${enter[@]}" env -i -C "$worker_root/$repo" HOME="$HOME" USER="$(id -un)" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-    PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+    PATH="$RECIPE_PATH" \
     GIT_LFS_SKIP_SMUDGE=1 "${root_env[@]}" \
     JERYU_PLAYWRIGHT_WEB_PORT="$PLAYWRIGHT_WEB_PORT" \
     "${cache_env[@]}" ionice -c 3 \
@@ -1059,7 +1072,7 @@ state=success
 ((worker_exit == 0)) || state=failure
 ((worker_exit != 124 && worker_exit != 137)) || state=timed_out
 after_inputs="$gate_attempt_dir/after-inputs.json"
-if ! PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" gate_inputs "$after_inputs" \
+if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" \
   || ! jq -e --slurpfile after "$after_inputs" '.inputs == $after[0]' "$gate_receipt" >/dev/null; then
   state=inputs_changed
 fi
@@ -1078,6 +1091,15 @@ say "recorded $owner/$repo $(gate_required_context "$owner" "$repo")=$state; exi
 # A recorded red result is the runner doing its job, not a fault: exit 0 so systemd does
 # not show a healthy slot as failed. Runner faults still die non-zero.
 exit 0
+done
+if ((GATE_FORGE_REUSE == 1 && ${#forge_adopted[@]})); then
+  read -r owner repo number sha _ <<<"${forge_adopted[0]}"
+  say "idle: re-proving $owner/$repo#$number at $sha here, whose result came from another host"
+  candidates=("${forge_adopted[0]}")
+  GATE_FORGE_REUSE=0
+  continue
+fi
+break
 done
 heartbeat
 say "no admitted head needs a new execution"

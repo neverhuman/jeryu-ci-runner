@@ -489,14 +489,30 @@ ENV
 a=$(gate_site_config_digest "$site/a.env")
 [[ "$a" =~ ^[0-9a-f]{64}$ && "$a" == "$(gate_site_config_digest "$site/b.env")" ]] \
   || { printf 'host-local settings changed the site digest\n' >&2; exit 1; }
+# A changed setting is put first: of repeated keys the loader keeps the first, and so does the digest.
 for change in 'PR_GATE_LOCK_SOURCES=git+https://other.example.test/' 'PR_GATE_CONTEXT_OVERRIDES=acme/x=y/required' \
-    'PR_GATE_SOME_FUTURE_SETTING=1'; do
-  { cat "$site/a.env"; printf '%s\n' "$change"; } >"$site/changed.env"
+    'PR_GATE_SOME_FUTURE_SETTING=1' 'PR_GATE_OK_TO_TEST_MAINTAINERS=*' 'PR_GATE_CONTRIBUTED_LABEL=outside'; do
+  { printf '%s\n' "$change"; cat "$site/a.env"; } >"$site/changed.env"
   [[ "$(gate_site_config_digest "$site/changed.env")" != "$a" ]] \
     || { printf 'site digest ignored %s\n' "$change" >&2; exit 1; }
 done
+# ... and a repeat after the first is not in effect, so it is not an input either.
+{ cat "$site/a.env"; printf 'PR_GATE_LOCK_SOURCES=git+https://other.example.test/\n'; } >"$site/repeat.env"
+[[ "$(gate_site_config_digest "$site/repeat.env")" == "$a" ]] || { printf 'a shadowed repeat changed the digest\n' >&2; exit 1; }
+printf 'PR_GATE_LOCK_SOURCES=x\nPR_GATE_LOCK_SOURCES=y\n' >"$site/xy.env"
+printf 'PR_GATE_LOCK_SOURCES=y\nPR_GATE_LOCK_SOURCES=x\n' >"$site/yx.env"
+[[ "$(gate_site_config_digest "$site/xy.env")" != "$(gate_site_config_digest "$site/yx.env")" ]] \
+  || { printf 'repeated keys in another order kept the digest though the loader keeps another value\n' >&2; exit 1; }
+# A setting overridden in the environment (a unit's Environment= line) is what is in effect.
+[[ "$(PR_GATE_LOCK_SOURCES=git+https://other.example.test/ gate_site_config_digest "$site/a.env")" != "$a" ]] \
+  || { printf 'an environment override was not an input\n' >&2; exit 1; }
+[[ "$(PR_GATE_LOCK_SOURCES=git+https://forge.example.test/ gate_site_config_digest "$site/a.env")" == "$a" ]]
+[[ "$(JERYU_TOKEN_FILE=/elsewhere GATE_RUNNER_SLOT=3 gate_site_config_digest "$site/a.env")" == "$a" ]]
+# shellcheck disable=SC2088  # a literal "~/" value, as a site file may carry it
+[[ "$(PR_GATE_SANDBOX_COMMAND="$HOME/bin/vm" gate_site_config_digest "$site/a.env")" \
+   == "$(PR_GATE_SANDBOX_COMMAND="~/bin/vm" gate_site_config_digest "$site/a.env")" ]]
 [[ -z "$(gate_site_config_digest "$site/missing.env")" ]]
-printf 'PASS site digest: host-local settings, comments and order are not inputs; any other setting is\n'
+printf 'PASS site digest: the effective settings that can change a verdict, not host-local ones, comments or order\n'
 
 # The published required status names the inputs' digest, so another host can match it.
 owner=acme repo=fixture
@@ -556,3 +572,73 @@ if own_success '{"context":"jeryu-web/required","state":"success","description":
   printf 'a runner-shaped status from another identity was kept green\n' >&2; exit 1; fi
 unset IDENTITY
 printf 'PASS keep green across hosts, for this gate identity only\n'
+
+# Everything on the recipe's PATH is an input: a user directory by content (spelled under ~/), a
+# system directory by its listing plus the installed package set, and the OS, architecture and kernel.
+envprobe="$HOME/.cache/pr-gate-test-$$"
+mkdir -p "$envprobe/bin"
+trap 'rm -rf -- "$scratch" "$envprobe"' EXIT
+printf '#!/bin/sh\nexit 0\n' >"$envprobe/bin/helper"
+recipe_inputs() { # output
+  run="$inputs_probe/tree" repo=real recipe_name="just required" TOOLS="$scratch/host-a/tools" \
+    RUNTIME_TOOLS="$scratch/host-a/runtime" VENDOR="" HOME_DIR="$scratch/host-a/home" \
+    RECIPE_PATH="$scratch/host-a/tools:$envprobe/bin:/usr/bin" \
+    SLOT=0 SCCACHE="" GATE_RUNNER_SCRIPT="$script_dir/pr-gate-runner.sh" gate_inputs "$1"
+}
+recipe_inputs "$scratch/env-1.json"
+tools=$(jq -r .tools "$scratch/env-1.json")
+grep -q "  path:~/.cache/pr-gate-test-$$/bin/helper$" <<<"$tools" \
+  || { printf 'a user PATH directory was not bound by content under ~/\n' >&2; printf '%s\n' "$tools" >&2; exit 1; }
+for line in '  path:/usr/bin \(listing\)$' '  system-packages$' '^os  ' '^arch  ' '^kernel  '; do
+  grep -qE "$line" <<<"$tools" || { printf 'missing identity line %s\n' "$line" >&2; exit 1; }
+done
+! grep -qF -e "$HOME/" -e "$envprobe" <<<"$tools" || { printf 'a home path reached the identity\n' >&2; exit 1; }
+printf '#!/bin/sh\nexit 1\n' >"$envprobe/bin/helper"
+recipe_inputs "$scratch/env-2.json"
+[[ "$(gate_inputs_digest "$scratch/env-1.json")" != "$(gate_inputs_digest "$scratch/env-2.json")" ]] \
+  || { printf 'a changed executable on the recipe PATH kept the same identity\n' >&2; exit 1; }
+if gate_inputs_digest "$scratch/no-such-inputs.json" 2>/dev/null; then printf 'digest of nothing\n' >&2; exit 1; fi
+printf '[]\n' >"$scratch/not-inputs.json"
+if gate_inputs_digest "$scratch/not-inputs.json" 2>/dev/null; then printf 'digest of a non-object\n' >&2; exit 1; fi
+printf 'PASS recipe PATH: every directory the recipe can execute from is an input; no digest of nothing\n'
+
+# Re-proving an adopted head turns forge reuse off; a newer success of this identity for the same inputs
+# confirms this host's own verified receipt instead of superseding it.
+owner=acme repo=fixture IDENTITY=runner-bot MARKER=pr-gate-runner@node-a
+gate_lock "acme-fixture-2222222222222222222222222222222222222222"
+forge_status success "pr-gate-runner@node-b operator-unsealed success; exit 0; attempt x; log y; inputs $digest"
+GATE_FORGE_REUSE=0 gate_decision "$scratch/host-a/inputs.json" 0 "$scratch/forge.json"
+[[ "$gate_action" == run ]] || { printf 'forge reuse ran while switched off\n' >&2; exit 1; }
+gate_begin "$scratch/host-a/inputs.json"
+printf 'passed\n' >"$gate_attempt_dir/build.log"
+gate_finish success 0 "$gate_attempt_dir/build.log"
+gate_publish
+gate_decision "$scratch/host-a/inputs.json" 0 "$scratch/forge.json"
+[[ "$gate_action" == reuse && "$gate_action_source" == local ]] \
+  || { printf 'an agreeing newer success superseded verified local evidence: %s/%s\n' "$gate_action" "$gate_action_source" >&2; exit 1; }
+forge_status success "pr-gate-runner@node-b operator-unsealed success; exit 0; attempt x; log y; inputs ${digest%?}0"
+gate_decision "$scratch/host-a/inputs.json" 0 "$scratch/forge.json"
+[[ "$gate_action" == run ]] || { printf 'a newer success for other inputs did not supersede\n' >&2; exit 1; }
+exec 6>&-
+printf 'PASS adopted heads are re-proved with forge reuse off; an agreeing newer success keeps local reuse\n'
+
+# A status without a creator is trusted for keep-green only when it is this host's own marker.
+owner=jeryu repo=jeryu-web
+own_success '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-a operator-unsealed success","created_at":"2026-09-18T14:00:00Z"}' \
+  || { printf 'own creator-less success not recognised\n' >&2; exit 1; }
+if own_success '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-b operator-unsealed success","created_at":"2026-09-18T14:00:00Z"}'; then
+  printf 'a creator-less success naming another host was kept green\n' >&2; exit 1; fi
+printf 'PASS keep green without a creator: this host'"'"'s own marker only\n'
+
+# A forge that shortens the description drops the digest; the runner says so instead of failing silently.
+owner=acme repo=fixture
+gate_lock "acme-fixture-3333333333333333333333333333333333333333"
+api() { code=201; export body='{"id":"short","description":"pr-gate-runner@node-a operator-unsealed success; exit 0; attempt"}'; }
+gate_begin "$scratch/host-a/inputs.json"
+printf 'passed\n' >"$gate_attempt_dir/build.log"
+gate_finish success 0 "$gate_attempt_dir/build.log"
+gate_publish 2>"$scratch/short.err"
+grep -q 'did not keep the inputs digest' "$scratch/short.err" || { printf 'a dropped digest was silent\n' >&2; exit 1; }
+exec 6>&-
+unset IDENTITY
+printf 'PASS a forge that drops the inputs digest is reported\n'

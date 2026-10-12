@@ -55,7 +55,9 @@ expected_mirror="$fixture_root/runner/mirror/fixture.git"
   || { printf 'worker fetch origin is not canonical\n' >&2; exit 31; }
 [[ "$("$worker_git" remote get-url --push origin)" == "https://forge.invalid/git/$expected_repository.git" ]] \
   || { printf 'worker push origin is not canonical\n' >&2; exit 32; }
-[[ "$("$worker_git" remote get-url cache-mirror)" == "$expected_mirror" ]] \
+# A second gate host (runner-b) keeps its mirrors in its own state directory.
+[[ "$("$worker_git" remote get-url cache-mirror)" == "$expected_mirror" \
+   || "$("$worker_git" remote get-url cache-mirror)" == "${expected_mirror/\/runner\//\/runner-b\/}" ]] \
   || { printf 'worker cache mirror is not separately named\n' >&2; exit 33; }
 mkdir -p target
 # The counter lives beside the fake forge, not in target/: a repository that does not share the build
@@ -178,8 +180,9 @@ printf 'PASS complete runner: negative-test log is success; identical receipt re
 
 # A second gate host: its own state directory (no receipts at all), its tools installed somewhere else,
 # its own credential path, and a site file with other comments and order. Same runner code, tools,
-# sources and verdict-changing settings, so it reuses the first host's published success from the forge
-# and neither runs the recipe nor posts anything.
+# sources and verdict-changing settings, so it computes the same inputs and adopts the first host's
+# success from the forge -- as a deferral: with nothing else to run, the same tick re-proves the head
+# here (without posting `pending` over the first host's green), so a wrong forge status cannot stand.
 cp -R "$fixture/tools" "$fixture/tools-b"
 cp -p "$fixture/token" "$fixture/token-b"
 { printf '# the second host\n'; grep -v '^JERYU_TOKEN_FILE=' "$fixture/pr-gate.env" | tac
@@ -187,11 +190,21 @@ cp -p "$fixture/token" "$fixture/token-b"
 published=$(wc -l <"$fixture/statuses.jsonl")
 PR_GATE_CONFIG="$fixture/pr-gate-b.env" GATE_RUNNER_HOME="$fixture/runner-b" GATE_RUNNER_TOOLS="$fixture/tools-b" invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
-expect_count 1
 grep -q 'reuse acme/fixture@.*from the forge result' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
-[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$published" ]] || { printf 'the second host posted a status\n' >&2; exit 1; }
-jq -se 'last | .state=="success" and (.description | test("; inputs [0-9a-f]{64}$"))' "$fixture/statuses.jsonl" >/dev/null
-printf 'PASS a second host with the same runner, tools, sources and settings reuses the forge result\n'
+grep -q 'idle: re-proving acme/fixture#1' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
+expect_count 2
+jq -se --argjson n "$published" '.[$n:] | length == 1 and (.[0].state == "success")
+  and (.[0].description | test("; inputs [0-9a-f]{64}$"))' "$fixture/statuses.jsonl" >/dev/null \
+  || { printf 'the second host should post exactly its own success, and no pending\n' >&2; tail -3 "$fixture/statuses.jsonl" >&2; exit 1; }
+# Back on the first host: the newer success is another host's for exactly these inputs, and its own
+# verified receipt still stands, so it neither re-runs nor adopts (no bouncing between hosts).
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count 2
+grep -q 'reuse acme/fixture@.*from the local result' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
+! grep -q 'idle: re-proving' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
+printf '1\n' >"$fixture/executions"   # the counts below are the first host's own
+printf 'PASS a second host adopts the forge result, re-proves it when idle, and the first host keeps its own\n'
 
 touch "$fixture/change-head"
 rm -f "$fixture/head-reads"
@@ -443,6 +456,17 @@ unset GATE_RUNNER_SHARED_TARGETS
   || { printf 'an opted-in repository did not get the shared build directory\n' >&2; exit 1; }
 [[ "$(readlink "$fixture/runner/tree/fixture/target")" == "$fixture/runner/targets/acme/fixture" ]]
 printf 'PASS complete runner: sharing a build directory is opt in, and the opt-in works\n'
+
+# That result was computed with GATE_RUNNER_SHARED_TARGETS set in the environment (as a unit's
+# Environment= line would): the effective setting is an input, so with it gone the head is re-gated
+# once, and then reused.
+before_count=$(count)
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+invoke
+expect_count "$((before_count + 1))"
+printf 'PASS complete runner: an environment override is part of the inputs, not only the site file\n'
 
 # A hub repository's protected context follows its manifest name (PR_GATE_CONTEXT_OVERRIDES), not its forge slug.
 # Exercise the real worker and durable publication/reuse paths, with no manual green status.

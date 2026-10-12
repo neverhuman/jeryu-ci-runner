@@ -15,16 +15,20 @@
   setting reappears.
 
 ## Unreleased
-- A PR gate result is reusable on any gate host with the same runner, tools, sources and settings.
-  The input identity no longer names the host (`runner` is `pr-gate-runner`) or the paths a host
-  installed its tools, runtime fixtures and runner scripts at -- each is bound by content and name --
-  and the site file is bound by the settings that can change a verdict, not by where a host keeps
-  things or which credential it reads. The required status now carries the inputs' digest
-  (`; inputs <sha256>`), and a runner with no receipt of its own for those inputs reuses (success) or
-  holds (failure) the forge's newest required status when this gate identity's runner posted it for
-  exactly those inputs; a retry still runs. A success another host posted is no longer covered by
-  `pending` while a head is re-verified. Moving an owner between gate hosts no longer re-gates its
-  open heads. Installing it re-gates every open head once, as any runner change does. pr-gate 2.0.0.
+- A PR gate result is reusable on any gate host whose runner, tools, sources, settings and recipe
+  environment are byte-for-byte the same. The input identity no longer names the host (`runner` is
+  `pr-gate-runner`) or the paths a host installed things at; instead it binds every directory on the
+  recipe's PATH (system directories by listing plus the installed package set, others by content),
+  the OS, architecture and kernel, the whole toolchain bin directory and components, and Python
+  distributions outside the package manager. The site configuration is bound as it is in effect
+  (environment overrides included, first of repeated keys), minus host-local settings. The required
+  status carries the inputs' digest (`; inputs <sha256>`). A runner with no receipt for those inputs
+  adopts (success) or holds (failure) the forge's newest required status when this gate identity's
+  runner (`creator.login`) posted it for exactly those inputs -- as a deferral: adopted heads are
+  re-proved here as soon as a tick has nothing else to run, so a wrong status cannot stand. A newer
+  agreeing success no longer supersedes a host's own verified receipt, and a success another host
+  posted is not covered by `pending` while it is re-proved. Installing it re-gates every open head
+  once, as any runner change does. pr-gate 2.0.0.
 - `gate.log` events name the whole log and the slot that ran the gate. The tail is cut at a line
   boundary, so it no longer starts mid-token, and `detail.runner` carries `<host>/slot<N>` instead of
   leaving the runner readable only inside `summary`. Where a host's attempt logs are served,

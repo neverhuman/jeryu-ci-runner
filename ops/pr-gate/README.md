@@ -130,34 +130,54 @@ as `KEY=VALUE` lines. The file is data: it is never `source`d, only `PR_GATE_*`,
 unit's `Environment=` line or a per-slot drop-in still overrides it. A required setting that is
 missing stops the script with `<KEY> is not configured`. `pr-gate.env.example` lists every key.
 
-The runner hashes the site file into each gate's input identity, as it does its own code: changing a
-setting that can change a verdict re-gates open heads once, exactly like installing a new runner.
-Settings that only say where this host keeps things, which credential it reads, which heads it
-chooses or when it wakes (`GATE_HOST_LOCAL_SETTINGS` in `bin/pr-gate-state.sh`) are left out, and so
-are comments and order; every other key is bound, including ones added later.
+The runner hashes the site configuration into each gate's input identity, as it does its own code:
+changing a setting that can change a verdict re-gates open heads once, exactly like installing a new
+runner. What is hashed is the configuration in effect -- a value set in the environment (a unit's
+`Environment=` line, a per-slot drop-in) wins over the file, and of repeated keys the first wins, as
+the loader decides. Settings that only say where this host keeps things, which credential it reads,
+which repositories it gates or when it wakes (`GATE_HOST_LOCAL_SETTINGS` in `bin/pr-gate-state.sh`)
+are left out, and so are comments and order; every other key is bound, including ones added later.
+The ok-to-test and contributed-label settings are bound: they decide whether outside code may run.
 
 ## Results across hosts
 
 A result proves its inputs, not the host that computed them. The input identity names the runner
-(`runner: "pr-gate-runner"`), never the host, and every executable, governed tool, runtime fixture and
-runner script by its content and the name the gate calls it by, never by the path a host installed it
-at. So two gate hosts with the same runner code, tools, sources and verdict-changing settings compute
-the same identity for a head.
+(`runner: "pr-gate-runner"`), never the host, and binds what the recipe can execute by content and
+name, never by the path a host installed it at:
 
-The required status carries that identity's digest (`; inputs <sha256>`, the SHA-256 of the compact,
-key-sorted inputs JSON; `gate_inputs_digest`). A runner decides from its own receipt first. When it
-has none for these inputs -- another host gated the head, or the host is new -- it reads the forge's
-newest required status: if this gate identity posted it (`creator.login == GATE_RUNNER_IDENTITY`)
-from a pr-gate runner (description `pr-gate-runner@<host> ...`) and it names exactly these inputs, a
-success is reused and a failure held, as a local result would be; anything else runs. A retry
-(`--repo/--pr`, a re-gate request) always runs. Nothing is published on such a reuse, and no log is
-re-verified: the evidence stays on the host that produced it, named by the attempt id and log digest
-in the same description. A runner also leaves a success posted by another host's runner in place
-instead of posting `pending` over it while it re-verifies.
+- the named tools, governed tools, runtime fixtures, vendor tree and runner scripts;
+- every directory on the recipe's `PATH` (`RECIPE_PATH`, the only PATH a recipe and its prefetch get):
+  a system directory (under `/usr`, not `/usr/local`; `/bin`, `/sbin`) by its listing plus the
+  installed package set, which also covers `/usr/lib`; any other directory (`~/.local/bin`,
+  `~/.cargo/bin`, `/usr/local/bin`, ...) by the content of every file in it;
+- the OS release, architecture and kernel release, the active Rust toolchain's whole bin directory
+  and installed components, and Python distributions installed outside the package manager.
+
+A host whose package set cannot be read binds a value unique to itself and so never shares a
+result. Two hosts share an identity only when everything above is byte-for-byte the same; in practice
+that means hosts kept on the same packages and toolchains.
+
+The required status carries the identity's digest (`; inputs <sha256>`, the SHA-256 of the compact,
+key-sorted inputs JSON; `gate_inputs_digest`). Who posted a status is the forge's `creator.login` on
+the combined status, never its description. A runner decides from its own receipt first; a newer
+success this gate identity posted for exactly the same inputs confirms that receipt rather than
+superseding it, so hosts do not bounce a head between them. When it has no receipt for these inputs
+-- another host gated the head, or the host is new -- it reads the forge's newest required status: if
+this gate identity posted it (`creator.login == GATE_RUNNER_IDENTITY`) from a pr-gate runner and it
+names exactly these inputs, a success is adopted and a failure held. A retry (`--repo/--pr`, a re-gate
+request) always runs.
+
+Adopting is a deferral, not a verdict. Nothing is published, and the head is skipped only while other
+heads need the slot: a tick that ends with nothing executed re-proves the first adopted head with
+forge reuse off (`idle: re-proving ...`), and this host's own receipt decides from then on. So a wrong
+or forged status -- anything able to post as the gate identity could write one -- is overwritten by
+the first idle tick, as it was before results crossed hosts, while a failover does not have to
+re-prove every moved head before gating new work. A runner also leaves a success another host's runner
+posted in place instead of posting `pending` over it while it re-proves. A forge that shortened the
+description would drop the digest; the runner reports that, and other hosts then simply re-gate.
 
 Claims are still local, so two hosts must not gate the same owners at once; failover is moving an
-owner from one host's `GATE_RUNNER_OWNERS` to the other's, and the moved heads are then reused, not
-re-gated.
+owner from one host's `GATE_RUNNER_OWNERS` to the other's.
 
 ## Version
 

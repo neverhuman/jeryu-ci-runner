@@ -89,14 +89,18 @@ gate_evidence_for() { # tree-owner
 GATE_RUNNER_NAME=pr-gate-runner
 
 # The newest status of this gate's required context on a status snapshot, when a pr-gate runner posted
-# it as this gate identity on any host; else nothing. A snapshot row without a creator still counts
-# here when its description is a runner's (forges older than the creator field), but never for reuse.
+# it as this gate identity; else nothing. Who posted a status is the forge's `creator.login` (jeryu
+# returns it on the combined status, GET /repos/:o/:r/commits/:sha/status; jeryu-deploy
+# crates/jeryu-api/src/github/commit_status.rs), never the description, which anyone allowed to post a
+# status can write. A row without a creator counts only when its description is this host's own marker,
+# which is what keep-green trusted before; it is never reused (see gate_decision).
 gate_newest_runner_status() { # status-snapshot
   jq -ec --arg context "$(gate_required_context "$owner" "$repo")" --arg prefix "$GATE_RUNNER_NAME@" \
-    --arg identity "${IDENTITY:-}" '
+    --arg own "${MARKER:-} " --arg identity "${IDENTITY:-}" '
     [.statuses[]? | select(.context == $context)] | sort_by(.updated_at // .created_at) | last
-    | select(. != null and ((.description // "") | startswith($prefix))
-             and ((.creator.login // null) == null or .creator.login == $identity))' "$1" 2>/dev/null
+    | select(. != null and ((.description // "") | startswith($prefix)))
+    | select(if (.creator.login // "") == "" then (.description | startswith($own))
+             else $identity != "" and .creator.login == $identity end)' "$1" 2>/dev/null
 }
 
 # True when the newest status of this gate's required context is a pr-gate runner's success. A
@@ -167,7 +171,69 @@ hash_fixture_tree() { # root [label]
 gate_tool_line() { # name path
   local digest
   digest=$(sha256sum <"$2") || return
+  [[ "$digest" =~ ^[0-9a-f]{64} ]] || return 1
   printf '%s  %s\n' "${digest:0:64}" "$1"
+}
+
+# A path as the identity spells it: under the running user's home it is written "~/...", so the same
+# layout in two homes is the same input.
+gate_portable_path() { # path
+  if [[ "$1" == "$HOME" || "$1" == "$HOME/"* ]]; then printf '~%s' "${1#"$HOME"}"; else printf '%s' "$1"; fi
+}
+
+# Everything the recipe can execute that is not already bound by name, as identity lines. A result is
+# reused on another host only when that host computes the same identity, so the identity must change
+# whenever the recipe could see different bytes -- not only the named tools, but every directory on the
+# recipe's PATH ($RECIPE_PATH, the one PATH the runner gives the recipe and its prefetch) and the
+# libraries they load:
+#   - a system directory (under /usr but not /usr/local, or /bin, /sbin) is the package manager's: its
+#     listing (names, sizes, link targets) plus the installed package set, which also binds /usr/lib;
+#   - any other directory (the user's ~/.local/bin, ~/.cargo/bin, /usr/local/bin, ...) by content;
+#   - the operating system release, architecture and kernel release;
+#   - the active Rust toolchain's whole bin directory and its installed components;
+#   - Python distributions installed outside the package manager (user and /usr/local site packages).
+# A host whose package set cannot be read binds a value unique to it, so it never shares results.
+gate_host_environment() {
+  local directory system=0 packages machine
+  local -a directories=()
+  printf 'os  %s\n' "$( . /etc/os-release 2>/dev/null; printf '%s %s' "${ID:-unknown}" "${VERSION_ID:-unknown}")"
+  printf 'arch  %s\n' "$(uname -m)"
+  printf 'kernel  %s\n' "$(uname -r)"
+  IFS=: read -r -a directories <<<"${RECIPE_PATH:-}"
+  for directory in "${directories[@]}"; do
+    [[ -n "$directory" && -d "$directory" ]] || continue
+    [[ "$directory" != "${TOOLS:-}" ]] || continue
+    case "$directory" in
+      /usr/local|/usr/local/*) hash_fixture_tree "$directory" "path:$(gate_portable_path "$directory")" || return;;
+      /usr/*|/bin|/sbin)
+        system=1
+        printf '%s  path:%s (listing)\n' \
+          "$(find "$directory" -maxdepth 1 -mindepth 1 -printf '%f %s %l\n' | LC_ALL=C sort | sha256sum | cut -c1-64)" "$directory";;
+      *) hash_fixture_tree "$directory" "path:$(gate_portable_path "$directory")" || return;;
+    esac
+  done
+  if ((system)); then
+    if command -v dpkg-query >/dev/null; then
+      packages=$(dpkg-query -W -f '${Package}:${Architecture}=${Version}\n' | LC_ALL=C sort | sha256sum | cut -c1-64) || return
+    elif command -v rpm >/dev/null; then
+      packages=$(rpm -qa --qf '%{NAME}.%{ARCH}=%{EPOCH}:%{VERSION}-%{RELEASE}\n' | LC_ALL=C sort | sha256sum | cut -c1-64) || return
+    elif command -v apk >/dev/null; then
+      packages=$(apk info -v 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-64) || return
+    else
+      machine=$(cat /etc/machine-id 2>/dev/null || hostname)
+      packages="unbound-$(printf '%s' "$machine" | sha256sum | cut -c1-64)"
+    fi
+    printf '%s  system-packages\n' "$packages"
+  fi
+  local toolchain
+  # shellcheck disable=SC2154  # run and repo are the sourcing runner's, as in gate_inputs
+  if toolchain=$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup which rustc 2>/dev/null); then
+    hash_fixture_tree "$(dirname -- "$toolchain")" toolchain-bin || return
+    printf '%s  toolchain-components\n' \
+      "$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup component list --installed 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-64)"
+  fi
+  printf '%s  python-distributions\n' "$(find "$HOME"/.local/lib/python3* /usr/local/lib/python3* -maxdepth 2 \
+    -name '*.dist-info' -printf '%f\n' 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-64)"
 }
 
 # The site configuration as an input: the SHA-256 of the settings that can change a gate's verdict.
@@ -176,32 +242,54 @@ gate_tool_line() { # name path
 # and a result proved on one must be reusable on the other. What they point at is bound where it
 # matters: tools, runtime tools and the vendor tree by content, the sources by commit, the sandbox
 # by command. Every other key is bound, so a setting added later re-gates until it is listed here.
-GATE_HOST_LOCAL_SETTINGS='JERYU_TOKEN_FILE GATE_RUNNER_HOME GATE_RUNNER_TOOLS GATE_RUNNER_RUNTIME_TOOLS
+# GATE_RUNNER_FAMILY and the checkout roots only choose which sibling checkouts form the tree; the
+# sources rows bind exactly which repositories at which commits were there.
+GATE_HOST_LOCAL_SETTINGS='JERYU_TOKEN_FILE GATE_RUNNER_HOME GATE_RUNNER_TOOLS GATE_RUNNER_RUNTIME_TOOLS GATE_RUNNER_FAMILY
   GATE_RUNNER_NATIVE_VENDOR GATE_RUNNER_SCCACHE GATE_RUNNER_SCCACHE_DIR GATE_RUNNER_SCCACHE_SIZE
   GATE_RUNNER_SLOT GATE_RUNNER_OWNERS GATE_RUNNER_REPOS GATE_RUNNER_REGATE_SETTLE GATE_RUNNER_WAKE_*
   GATE_INSTALL_* PR_GATE_CHECKOUT_ROOTS PR_GATE_CHECKOUT_ROOT_PATTERN PR_GATE_CODE_REPO PR_GATE_SOURCE_*
-  PR_GATE_GOVERNED_JANKURAI PR_GATE_LOG_URL_TEMPLATE PR_GATE_OK_TO_TEST_* PR_GATE_CONTRIBUTED_LABEL'
+  PR_GATE_GOVERNED_JANKURAI PR_GATE_LOG_URL_TEMPLATE'
+# Not host-local, though they choose heads rather than judge them: PR_GATE_OK_TO_TEST_* and
+# PR_GATE_CONTRIBUTED_LABEL decide whether outside code may run at all, and a host that would not have
+# admitted a head must not adopt a result another host's wider allowlist produced.
 
-# Prints the digest, or nothing for a missing or unreadable file. Lines are parsed as
-# pr_gate_load_config parses them, so a comment, blank line or reordering changes nothing.
+# The effective site configuration as an input, or nothing when no file is readable: what
+# pr_gate_load_config leaves in effect, not the file's text. A value set in the environment (a
+# systemd Environment= line, a per-slot drop-in) wins over the file, and of repeated keys in the file
+# the first wins, exactly as the loader decides. Comments, blank lines and order change nothing; a
+# value under the running user's home is spelled "~/..." either way.
 gate_site_config_digest() { # file
   local file=$1 line key value
+  local -A effective=()
   [[ -f "$file" && -r "$file" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
     key="${BASH_REMATCH[1]}" value="${BASH_REMATCH[2]}"
     [[ "$key" =~ ^(PR_GATE_|GATE_RUNNER_|GATE_INSTALL_|JERYU_) ]] || continue
-    ! pr_gate_listed "$GATE_HOST_LOCAL_SETTINGS" "$key" || continue
+    [[ "$key" != PR_GATE_CONFIG && "$key" != PR_GATE_CONFIG_FILE && -z "${effective[$key]+set}" ]] || continue
     value="${value%"${value##*[![:space:]]}"}"
     if [[ "$value" =~ ^\"(.*)\"$ || "$value" =~ ^\'(.*)\'$ ]]; then value="${BASH_REMATCH[1]}"; fi
-    printf '%s=%s\n' "$key" "$value"
-  done <"$file" | LC_ALL=C sort | sha256sum | cut -c1-64
+    # shellcheck disable=SC2088  # a literal "~/" in the data, as the loader reads it
+    [[ "$value" != "~/"* ]] || value="$HOME/${value#"~/"}"
+    effective[$key]=$value
+  done <"$file"
+  while IFS= read -r key; do
+    [[ "$key" != PR_GATE_CONFIG && "$key" != PR_GATE_CONFIG_FILE ]] || continue
+    effective[$key]=${!key}
+  done < <(compgen -e | grep -E '^(PR_GATE_|GATE_RUNNER_|GATE_INSTALL_|JERYU_)' || true)
+  for key in "${!effective[@]}"; do
+    ! pr_gate_listed "$GATE_HOST_LOCAL_SETTINGS" "$key" || continue
+    printf '%s=%s\n' "$key" "$(gate_portable_path "${effective[$key]}")"
+  done | LC_ALL=C sort | sha256sum | cut -c1-64
 }
 
 # The digest a published result carries for its input identity. Anything that reads the inputs back
 # (another host deciding whether to reuse, a person comparing receipts) recomputes it the same way.
+# Fails, rather than printing the digest of nothing, when the inputs cannot be read.
 gate_inputs_digest() { # inputs-json
-  jq -cS . "$1" | sha256sum | cut -c1-64
+  local canonical
+  canonical=$(jq -ceS 'objects' "$1") || return
+  printf '%s\n' "$canonical" | sha256sum | cut -c1-64
 }
 
 gate_inputs() {
@@ -251,6 +339,7 @@ gate_inputs() {
     if [[ -n "${VENDOR:-}" && -d "$VENDOR" ]] && pr_gate_listed "${VENDOR_INPUT_REPOS:-}" "$repo" "$owner/$repo"; then
       hash_fixture_tree "$VENDOR" vendor >>"$inputs" || return
     fi
+    gate_host_environment >>"$inputs" || return
   fi
   # The runner's own code, as hashed when this process started (GATE_SELF_SHA256): that is what runs. A
   # runner installed mid-gate replaces the files on disk but not the running copy, and hashing the disk
@@ -280,21 +369,33 @@ gate_inputs() {
 # it names exactly these inputs: a success is reused and a failure held, as a local one would be.
 # There is no log here to re-verify, and none is needed: nothing is published, and the status is the
 # gate's verdict wherever it was computed. A retry (--repo/--pr, a re-gate request) still runs.
+#
+# Adopting a forge result is a deferral, not a verdict: the runner skips such a head while other heads
+# need a slot, and re-proves it (GATE_FORGE_REUSE=0, see the runner's dispatch) as soon as a tick has
+# nothing else to run. Its own receipt then decides. A wrong or forged status is therefore overwritten
+# by the first idle tick, as it was when only local receipts counted, instead of being adopted forever.
 gate_decision() {
   local identity=$1 retry=$2 statuses=$3
   export gate_action_source=local
   gate_decision_local "$identity" "$retry" "$statuses"
-  [[ "$gate_action" == run && "$retry" == 0 ]] || return 0
+  [[ "$gate_action" == run && "$retry" == 0 && "${GATE_FORGE_REUSE:-1}" == 1 ]] || return 0
+  if gate_newest_names_inputs "$statuses" "$identity" success; then
+    gate_action=reuse gate_action_source=forge
+  elif gate_newest_names_inputs "$statuses" "$identity" failure; then
+    gate_action=hold gate_action_source=forge
+  fi
+}
+
+# True when the newest required status is this identity's runner status in the given state and names
+# exactly these inputs. Only a status with a creator counts: the description is not an identity.
+gate_newest_names_inputs() { # status-snapshot inputs-json state
   local newest digest
-  newest=$(gate_newest_runner_status "$statuses") || return 0
-  jq -e '(.creator.login // "") != ""' <<<"$newest" >/dev/null || return 0
-  digest=$(gate_inputs_digest "$identity") || return 0
+  newest=$(gate_newest_runner_status "$1") || return 1
+  digest=$(gate_inputs_digest "$2") || return 1
   # The digest is its own `; inputs <hex>` field, so a longer or shorter hex string cannot match.
-  jq -e --arg field "; inputs $digest" '(.description + ";") | contains($field + ";")' <<<"$newest" >/dev/null || return 0
-  case "$(jq -r '.state' <<<"$newest")" in
-    success) gate_action=reuse gate_action_source=forge;;
-    failure) gate_action=hold gate_action_source=forge;;
-  esac
+  jq -e --arg state "$3" --arg field "; inputs $digest" '
+    (.creator.login // "") != "" and .state == $state
+    and ((.description + ";") | contains($field + ";"))' <<<"$newest" >/dev/null
 }
 
 gate_decision_local() {
@@ -314,10 +415,15 @@ gate_decision_local() {
   if ! jq -e '.publication.required_status and .publication.check_run' "$previous" >/dev/null; then
     gate_action=republish
   elif jq -e '.outcome == "success" and .exit_code == 0' "$previous" >/dev/null; then
-    # Do not reuse if a later required-context status superseded our publication.
+    # Do not reuse if a later required-context status superseded our publication -- unless that later
+    # status is this identity's runner success for exactly these inputs (another host proved the same
+    # thing): this host's own verified evidence still stands, and re-proving it would only bounce the
+    # head between hosts.
     if jq -e --slurpfile previous "$previous" --arg context "$(gate_required_context "$owner" "$repo")" '
       [.statuses[]? | select(.context == $context)] | sort_by(.updated_at // .created_at)
       | last | .state == "success" and .id == $previous[0].publication.status_id' "$statuses" >/dev/null; then
+      gate_action=reuse
+    elif gate_newest_names_inputs "$statuses" "$identity" success; then
       gate_action=reuse
     fi
   else
@@ -418,7 +524,7 @@ gate_publish() {
   # proves exactly the inputs it would gate (see gate_decision). A receipt without inputs names none.
   inputs=""
   if jq -e '.inputs | objects' "$gate_receipt" >/dev/null 2>&1; then
-    inputs=$(jq '.inputs' "$gate_receipt" | gate_inputs_digest /dev/stdin) || return
+    inputs=$(gate_inputs_digest <(jq -c '.inputs' "$gate_receipt")) || return
   fi
   if ! jq -e '.publication.required_status' "$gate_receipt" >/dev/null; then
     api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -nc --arg state "$state" --arg context "$context" \
@@ -430,6 +536,12 @@ gate_publish() {
       return 1
     fi
     gate_update --argjson response "$body" '.publication.required_status=true | .publication.status_id=$response.id | .publication.http_status=201' || return
+    # The forge stores the description whole (jeryu: no length limit). One that shortened it would drop
+    # the digest, and with it every other host's reuse of this result -- safe, but say so.
+    if [[ -n "$inputs" ]] && jq -e 'has("description")' <<<"$body" >/dev/null 2>&1 \
+        && ! jq -e --arg field "; inputs $inputs" '(.description + ";") | contains($field + ";")' <<<"$body" >/dev/null; then
+      printf 'the forge did not keep the inputs digest in %s/%s@%s'"'"'s status; other hosts will re-gate it\n' "$owner" "$repo" "$sha" >&2
+    fi
   fi
   if ! jq -e '.publication.check_run' "$gate_receipt" >/dev/null; then
     # A head that changes its own gate is annotated here, on the check run, and never on the required
