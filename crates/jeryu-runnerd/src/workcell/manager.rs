@@ -224,7 +224,14 @@ impl WorkcellManager {
     /// - the source cell has not been repaired from before: repair is
     ///   one-shot per source cell, so one snapshot mints at most one live
     ///   repair cell. The repair is recorded once the repair cell's startup
-    ///   succeeds; a failed startup leaves the source repairable.
+    ///   succeeds;
+    /// - the source has not used up its
+    ///   [`WORKCELL_MAX_FAILED_REPAIR_STARTUPS`] failed startups.
+    ///
+    /// A failed startup (`StartupSync::Failed`) is known before any cell is
+    /// taken, so it takes none: the ready queue and the cell table are left
+    /// as they were, the attempt is counted against the source, and the
+    /// source stays repairable until the cap is reached.
     ///
     /// The repair cell is seeded from the ledger's record, never the
     /// snapshot. Its branch policy is built by `BranchPolicy::new` (budget
@@ -249,6 +256,20 @@ impl WorkcellManager {
             &snapshot.failure_log_digest,
             &self.forbidden_token_values,
         )?;
+        if let StartupSync::Failed {
+            main_ref, reason, ..
+        } = &startup
+        {
+            let attempts = self
+                .failed_repair_startups
+                .entry(snapshot.workcell_id.clone())
+                .or_insert(0);
+            *attempts = attempts.saturating_add(1);
+            return Err(WorkcellError::startup_rebase_failed(format!(
+                "repair of workcell {} could not rebase onto {main_ref}: {reason} (failed repair startup {attempts} of {WORKCELL_MAX_FAILED_REPAIR_STARTUPS}; no cell was taken)",
+                snapshot.workcell_id
+            )));
+        }
         let claim = WorkcellClaimRequest {
             agent_id: source.agent_id.clone(),
             workspace_root: source.workspace_root.clone(),
@@ -265,11 +286,12 @@ impl WorkcellManager {
         // the bump must neither be checked against nor move the runner fence.
         // The repair cell keeps the chain's admitted lifetime unchanged.
         let mut lease = self.claim_unfenced(claim, source.admitted_runner_epoch)?;
-        // Record the repair only once the repair cell is claimed and rebased.
-        // A failed startup blocks the cell it took and leaves the source
-        // repairable; the ledger is `&mut`, so no second repair can interleave
-        // between the checks above and this record.
+        // Record the repair once the repair cell is claimed and rebased (a
+        // failed startup returned above without taking a cell). The ledger is
+        // `&mut`, so no second repair can interleave between the checks above
+        // and this record.
         self.repaired_sources.insert(snapshot.workcell_id.clone());
+        self.failed_repair_startups.remove(&snapshot.workcell_id);
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
@@ -368,6 +390,16 @@ impl WorkcellManager {
             return Err(WorkcellError::repair_state_denied(format!(
                 "workcell {source_id} was already repaired from (snapshot of ci run {}, failed run {}); repair is one-shot per source cell",
                 snapshot.ci_run_id, snapshot.failed_run_id
+            )));
+        }
+        let failed = self
+            .failed_repair_startups
+            .get(source_id)
+            .copied()
+            .unwrap_or(0);
+        if failed >= WORKCELL_MAX_FAILED_REPAIR_STARTUPS {
+            return Err(WorkcellError::repair_state_denied(format!(
+                "workcell {source_id} reported {failed} failed repair startups, the cap of {WORKCELL_MAX_FAILED_REPAIR_STARTUPS}; it is no longer a repair source"
             )));
         }
         Ok(source)
@@ -517,6 +549,7 @@ impl WorkcellManager {
         // A released cell is no longer a live repair source, so the state
         // check refuses any later repair from it; its one-shot record can go.
         self.repaired_sources.remove(workcell_id);
+        self.failed_repair_startups.remove(workcell_id);
         Ok(())
     }
 

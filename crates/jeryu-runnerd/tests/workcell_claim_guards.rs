@@ -7,7 +7,7 @@ use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
 use jeryu_ci_ir::RunnerClass;
-use jeryu_runnerd::workcell::FreezeFailedCiRunRequest;
+use jeryu_runnerd::workcell::{FreezeFailedCiRunRequest, WORKCELL_MAX_FAILED_REPAIR_STARTUPS};
 use jeryu_runnerd::{
     DispatchMode, FrozenCiSnapshot, HoldFailedTreeRequest, RepairFromSnapshotRequest,
     RunnerAdmission, RunnerDaemon, RunnerFleet, StartupSync, WorkcellClaimRequest, WorkcellManager,
@@ -690,9 +690,20 @@ fn a_repair_capsule_carrying_a_token_value_is_refused() {
         .expect("the clean snapshot still repairs");
 }
 
-// A repair whose startup fails blocks the cell it took but does not use up
-// the source's one repair: a retry succeeds once, and a further one is
-// refused.
+fn failed_startup(snapshot: &FrozenCiSnapshot, runner_epoch: u64) -> RepairFromSnapshotRequest {
+    let mut request = repair_as(snapshot, runner_epoch);
+    request.startup = StartupSync::Failed {
+        main_ref: "origin/main".into(),
+        base_sha: "cc33dd44".into(),
+        head_sha: "ee55ff66".into(),
+        reason: "rebase conflict".into(),
+    };
+    request
+}
+
+// A failed repair startup takes no cell (the ready queue and cell table are
+// unchanged) and does not use up the source's one repair: a retry succeeds
+// once, and a further one is refused.
 #[test]
 fn a_failed_repair_startup_leaves_the_source_repairable_once() {
     let (fleet, epoch) = fleet();
@@ -701,18 +712,16 @@ fn a_failed_repair_startup_leaves_the_source_repairable_once() {
         .hold_failed_tree(&mut ledger, hold_request("agent-anvil-53", epoch))
         .expect("hold the failed tree");
     let snapshot = held.frozen_snapshot.expect("frozen");
+    let ready_before = ledger.ready_count();
+    assert_eq!(ready_before, 1, "the warm pool has a ready cell to lose");
+    let cells_before = ledger.workcells().len();
 
-    let mut conflicted = repair_as(&snapshot, epoch);
-    conflicted.startup = StartupSync::Failed {
-        main_ref: "origin/main".into(),
-        base_sha: "cc33dd44".into(),
-        head_sha: "ee55ff66".into(),
-        reason: "rebase conflict".into(),
-    };
     let failed = fleet
-        .repair_workcell(&mut ledger, conflicted)
+        .repair_workcell(&mut ledger, failed_startup(&snapshot, epoch))
         .expect_err("the repair cell's startup fails");
     assert_eq!(failed.reason, "workcell_startup_rebase_failed");
+    assert_eq!(ledger.ready_count(), ready_before, "no warm cell consumed");
+    assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
 
     fleet
         .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
@@ -721,6 +730,64 @@ fn a_failed_repair_startup_leaves_the_source_repairable_once() {
         .repair_workcell(&mut ledger, repair_as(&snapshot, epoch))
         .expect_err("and only once");
     assert_eq!(replayed.reason, "workcell_repair_state_denied");
+}
+
+// Failed repair startups are capped per source cell: repeated failures
+// neither grow the cell table nor drain the ready queue, and once the cap is
+// reached the source is refused, even with a good startup.
+#[test]
+fn failed_repair_startups_are_capped_and_take_no_cells() {
+    let (fleet, epoch) = fleet();
+    let mut ledger = WorkcellManager::with_warm_pool(1);
+    let held = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-54", epoch))
+        .expect("hold the failed tree");
+    let snapshot = held.frozen_snapshot.expect("frozen");
+    let ready_before = ledger.ready_count();
+    let cells_before = ledger.workcells().len();
+
+    for attempt in 1..=WORKCELL_MAX_FAILED_REPAIR_STARTUPS {
+        let failed = fleet
+            .repair_workcell(&mut ledger, failed_startup(&snapshot, epoch))
+            .expect_err("the startup fails");
+        assert_eq!(
+            failed.reason, "workcell_startup_rebase_failed",
+            "attempt {attempt}"
+        );
+        assert_eq!(
+            ledger.ready_count(),
+            ready_before,
+            "attempt {attempt}: queue"
+        );
+        assert_eq!(
+            ledger.workcells().len(),
+            cells_before,
+            "attempt {attempt}: cells"
+        );
+    }
+    for request in [
+        failed_startup(&snapshot, epoch),
+        repair_as(&snapshot, epoch),
+    ] {
+        let refused = fleet
+            .repair_workcell(&mut ledger, request)
+            .expect_err("the capped source is refused");
+        assert_eq!(refused.reason, "workcell_repair_state_denied");
+        assert!(refused.message().contains("cap"), "{}", refused.message());
+    }
+    assert_eq!(ledger.ready_count(), ready_before, "no warm cell consumed");
+    assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
+
+    // A different source's budget is its own.
+    let other = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-55", epoch))
+        .expect("hold another failed tree");
+    fleet
+        .repair_workcell(
+            &mut ledger,
+            repair_as(other.frozen_snapshot.as_ref().expect("frozen"), epoch),
+        )
+        .expect("another source still repairs");
 }
 
 fn rebased() -> StartupSync {

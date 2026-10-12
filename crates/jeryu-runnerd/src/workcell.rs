@@ -224,6 +224,11 @@ pub struct AdmittedRunner {
     pub admission: RunnerAdmission,
 }
 
+/// Failed repair startups a source cell may report before it is refused as a
+/// repair source. A failed startup takes no cell, so this bounds retries
+/// rather than cell consumption.
+pub const WORKCELL_MAX_FAILED_REPAIR_STARTUPS: u32 = 3;
+
 /// In-memory workcell warm-pool and claim ledger.
 #[derive(Debug, Default, Clone)]
 pub struct WorkcellManager {
@@ -247,6 +252,10 @@ pub struct WorkcellManager {
     /// entry is dropped when its source cell is released, since a released
     /// cell is no longer a live repair source.
     repaired_sources: BTreeSet<String>,
+    /// Failed repair startups per source cell, capped at
+    /// [`WORKCELL_MAX_FAILED_REPAIR_STARTUPS`]. Dropped on a successful
+    /// repair and when the source cell is released.
+    failed_repair_startups: BTreeMap<String, u32>,
 }
 
 /// The ledger's own record of a repair's source cell, from which the repair
