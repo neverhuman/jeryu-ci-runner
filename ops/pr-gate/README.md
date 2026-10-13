@@ -355,3 +355,7 @@ Forge-status adoption leaves an authenticated gate-account status in place for o
 status from that account can therefore survive that visit until local re-proof; operator-unsealed
 recipes already run as that account and can read its credential. This is an accepted operator-host
 assumption, not a sealed execution claim. Contributed sandbox recipes receive no credential helper.
+
+System-directory listings, installed toolchain components and Python distribution enumeration also
+fail identity computation on command errors. Missing Python installation directories represent an
+empty distribution set; unreadable existing directories and failed rustup/find commands do not.

@@ -229,7 +229,7 @@ gate_portable_path() { # path
 #   - Python distributions installed outside the package manager (user and /usr/local site packages).
 # A host whose package set cannot be read binds a value unique to it, so it never shares results.
 gate_host_environment() {
-  local directory system=0 packages machine
+  local directory system=0 packages machine digest
   local -a directories=()
   printf 'os  %s\n' "$( . /etc/os-release 2>/dev/null; printf '%s %s' "${ID:-unknown}" "${VERSION_ID:-unknown}")"
   printf 'arch  %s\n' "$(uname -m)"
@@ -242,8 +242,10 @@ gate_host_environment() {
       /usr/local|/usr/local/*) hash_fixture_tree "$directory" "path:$(gate_portable_path "$directory")" all || return;;
       /usr/*|/bin|/sbin)
         system=1
-        printf '%s  path:%s (listing)\n' \
-          "$(find "$directory" -maxdepth 1 -mindepth 1 -printf '%f %s %l\n' | LC_ALL=C sort | sha256sum | cut -c1-64)" "$directory";;
+        digest=$(set -o pipefail; find "$directory" -maxdepth 1 -mindepth 1 -printf '%f %s %l\n' \
+          | LC_ALL=C sort | sha256sum | cut -c1-64) \
+          || { printf 'cannot enumerate system PATH directory: %s\n' "$directory" >&2; return 1; }
+        printf '%s  path:%s (listing)\n' "$digest" "$directory";;
       *) hash_fixture_tree "$directory" "path:$(gate_portable_path "$directory")" all || return;;
     esac
   done
@@ -265,11 +267,26 @@ gate_host_environment() {
   local toolchain=${GATE_BOUND_RUSTC:-}
   if [[ -n "$toolchain" ]]; then
     hash_fixture_tree "$(dirname -- "$toolchain")" toolchain-bin all || return
-    printf '%s  toolchain-components\n' \
-      "$(env -u RUSTUP_TOOLCHAIN rustup component list --toolchain "$(basename -- "$(dirname -- "$(dirname -- "$toolchain")")")" --installed 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-64)"
+    digest=$(set -o pipefail; env -u RUSTUP_TOOLCHAIN rustup component list \
+      --toolchain "$(basename -- "$(dirname -- "$(dirname -- "$toolchain")")")" --installed \
+      | LC_ALL=C sort | sha256sum | cut -c1-64) \
+      || { printf 'cannot enumerate installed toolchain components\n' >&2; return 1; }
+    printf '%s  toolchain-components\n' "$digest"
   fi
-  printf '%s  python-distributions\n' "$(find "$HOME"/.local/lib/python3* /usr/local/lib/python3* -maxdepth 2 \
-    -name '*.dist-info' -printf '%f\n' 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-64)"
+  digest=$(gate_python_distribution_digest "$HOME"/.local/lib/python3* /usr/local/lib/python3*) || return
+  printf '%s  python-distributions\n' "$digest"
+}
+
+# Missing Python roots are an empty set. An existing root that cannot be walked is not.
+gate_python_distribution_digest() { # root...
+  local digest directory
+  digest=$(set -o pipefail
+    for directory in "$@"; do
+      [[ -d "$directory" ]] || continue
+      find -L "$directory" -maxdepth 2 -name '*.dist-info' -printf '%f\n' || exit 1
+    done | LC_ALL=C sort | sha256sum | cut -c1-64) \
+    || { printf 'cannot enumerate Python distributions\n' >&2; return 1; }
+  printf '%s' "$digest"
 }
 
 # The site configuration as an input: the SHA-256 of the settings that can change a gate's verdict.

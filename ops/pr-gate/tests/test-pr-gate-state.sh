@@ -654,6 +654,48 @@ printf '[]\n' >"$scratch/not-inputs.json"
 if gate_inputs_digest "$scratch/not-inputs.json" 2>/dev/null; then printf 'digest of a non-object\n' >&2; exit 1; fi
 printf 'PASS recipe PATH: every directory the recipe can execute from is an input; no digest of nothing\n'
 
+# Host enumeration errors must not become an empty digest that other hosts can reuse.
+(
+  find() { [[ "$1" != /usr/bin ]] || return 7; command find "$@"; }
+  if RECIPE_PATH=/usr/bin TOOLS="" GATE_BOUND_RUSTC="" gate_host_environment >"$scratch/system-enum.txt" 2>"$scratch/system-enum.err"; then
+    printf 'a failed system enumeration was accepted\n' >&2; exit 1
+  fi
+  ! grep -q 'path:/usr/bin' "$scratch/system-enum.txt"
+  grep -q 'cannot enumerate system PATH' "$scratch/system-enum.err"
+)
+mkdir -p "$envprobe/toolchain/bin"
+printf '#!/bin/sh\n' >"$envprobe/toolchain/bin/rustc"
+(
+  env() { [[ " $* " != *' component list '* ]] || return 7; command env "$@"; }
+  if RECIPE_PATH="" GATE_BOUND_RUSTC="$envprobe/toolchain/bin/rustc" gate_host_environment >"$scratch/components-enum.txt" 2>"$scratch/components-enum.err"; then
+    printf 'a failed component enumeration was accepted\n' >&2; exit 1
+  fi
+  ! grep -q 'toolchain-components' "$scratch/components-enum.txt"
+  grep -q 'cannot enumerate installed toolchain' "$scratch/components-enum.err"
+)
+[[ "$(gate_python_distribution_digest "$scratch/missing-python" "$scratch/also-missing-python")" == "$(sha256sum </dev/null | cut -c1-64)" ]]
+mkdir -p "$scratch/python-probe/site-packages/present-1.dist-info"
+before_python=$(gate_python_distribution_digest "$scratch/python-probe")
+[[ "$before_python" != "$(sha256sum </dev/null | cut -c1-64)" ]]
+(
+  find() { return 7; }
+  if gate_python_distribution_digest "$scratch/python-probe" >"$scratch/python-enum.txt" 2>"$scratch/python-enum.err"; then
+    printf 'a failed Python enumeration was accepted\n' >&2; exit 1
+  fi
+  [[ ! -s "$scratch/python-enum.txt" ]]
+  grep -q 'cannot enumerate Python' "$scratch/python-enum.err"
+)
+if (( $(id -u) != 0 )); then
+  mkdir -p "$scratch/python-hidden"
+  chmod 0111 "$scratch/python-hidden"
+  if gate_python_distribution_digest "$scratch/python-hidden" >"$scratch/python-hidden.txt" 2>/dev/null; then
+    printf 'an unreadable Python root was accepted\n' >&2; exit 1
+  fi
+  [[ ! -s "$scratch/python-hidden.txt" ]]
+  chmod 0755 "$scratch/python-hidden"
+fi
+printf 'PASS system/component/Python enumeration errors fail closed; absent Python roots are an empty set\n'
+
 # A contribution binds sandbox implementation bytes and host custody, including in cheap input reuse.
 printf '#!/bin/sh\nexit 0\n' >"$envprobe/sandbox"
 GATE_SANDBOX=1 SANDBOX_COMMAND="$envprobe/sandbox" recipe_inputs "$scratch/sandbox-1.json"
