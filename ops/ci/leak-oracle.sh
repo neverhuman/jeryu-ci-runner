@@ -23,6 +23,7 @@ Exit 0 when every scan path lacks the canary and every probe file contains
 LEAK_ORACLE_PROBE=absent and no LEAK_ORACLE_PROBE=present.
 Exit 1 when the canary or a present probe is found. The canary value is not printed.
 Exit 2 on usage errors. The canary must be one line of at least 24 bytes.
+Exit 5 when file reads or directory enumeration cannot complete; no absent verdict.
 EOF
 }
 
@@ -71,15 +72,43 @@ if [[ $SELF_TEST -eq 1 ]]; then
       echo "self-test failed: $label printed the canary" >&2
       fail=1
     fi
-    printf '%s' "$out"
   }
-  out=$(check 0 "clean scan" bash "$0" --canary-file "$tmp/canary" --scan "$tmp/clean")
+  # Run checks in this shell so exit-code failures update the parent verdict.
+  check 0 "clean scan" bash "$0" --canary-file "$tmp/canary" --scan "$tmp/clean"
   grep -F -q "leak-oracle: absent" <<<"$out" || { echo "self-test failed: clean scan text" >&2; fail=1; }
-  out=$(check 1 "dirty scan" bash "$0" --canary-file "$tmp/canary" --scan "$tmp/dirty")
+  check 1 "dirty scan" bash "$0" --canary-file "$tmp/canary" --scan "$tmp/dirty"
   grep -F -q "leak-oracle: present" <<<"$out" || { echo "self-test failed: dirty scan text" >&2; fail=1; }
   check 0 "probe absent" bash "$0" --canary-file "$tmp/canary" --require-probe "$tmp/frames/ok.txt" >/dev/null
   check 1 "probe present" bash "$0" --canary-file "$tmp/canary" --require-probe "$tmp/frames/bad.txt" >/dev/null
   check 1 "probe leaked canary" bash "$0" --canary-file "$tmp/canary" --require-probe "$tmp/frames/leaked.txt" >/dev/null
+  # A scan that cannot finish is exit 5, never "absent": a file that cannot be
+  # read (a grep standing in for a read error, so it holds under any user)
+  # and a directory walk that fails (a find standing in for it).
+  real_grep=$(command -v grep)
+  mkdir -p "$tmp/unreadable-bin" "$tmp/broken-walk-bin"
+  cat > "$tmp/unreadable-bin/grep" <<GREP
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  [[ \$arg == -q ]] && { echo "grep: simulated read error" >&2; exit 2; }
+done
+exec "$real_grep" "\$@"
+GREP
+  cat > "$tmp/broken-walk-bin/find" <<'FIND'
+#!/usr/bin/env bash
+echo "find: simulated walk error" >&2
+exit 1
+FIND
+  chmod 0755 "$tmp/unreadable-bin/grep" "$tmp/broken-walk-bin/find"
+  check 5 "unreadable file" env PATH="$tmp/unreadable-bin:$PATH" bash "$0" --canary-file "$tmp/canary" --scan "$tmp/clean"
+  check 5 "directory walk error" env PATH="$tmp/broken-walk-bin:$PATH" bash "$0" --canary-file "$tmp/canary" --scan "$tmp/clean"
+  # And a really unreadable file, where this user can be denied one.
+  if [[ $(id -u) -ne 0 ]]; then
+    mkdir -p "$tmp/sealed"
+    printf 'hello\n' > "$tmp/sealed/log.txt"
+    chmod 0000 "$tmp/sealed/log.txt"
+    check 5 "permission-denied file" bash "$0" --canary-file "$tmp/canary" --scan "$tmp/sealed"
+    chmod 0600 "$tmp/sealed/log.txt"
+  fi
   printf 'short\n' > "$tmp/short"
   set +e
   bash "$0" --canary-file "$tmp/short" --scan "$tmp/clean" >/dev/null 2>&1
@@ -124,15 +153,24 @@ found=0
 
 scan_file() {
   local file=$1
-  [[ -f $file ]] || { echo "leak-oracle: not a file: $file" >&2; exit 2; }
+  [[ -f $file ]] || { echo "leak-oracle: admitted file scan incomplete" >&2; exit 5; }
   local id
-  id=$(stat -c '%d:%i' "$file")
+  if ! id=$(stat -c '%d:%i' -- "$file" 2>"$work/stat-errors"); then
+    echo "leak-oracle: file metadata incomplete" >&2
+    exit 5
+  fi
   if [[ $id == "$canary_dev_ino" ]]; then
     return 0
   fi
-  if grep -a -F -q -f "$work/pattern" -- "$file"; then
+  if grep -a -F -q -f "$work/pattern" -- "$file" 2>"$work/grep-errors"; then
     echo "leak-oracle: present $file"
     found=1
+  else
+    local status=$?
+    if [[ $status -ne 1 ]]; then
+      echo "leak-oracle: file scan incomplete" >&2
+      exit 5
+    fi
   fi
 }
 
@@ -146,21 +184,35 @@ scan_path() {
     echo "leak-oracle: scan path missing: $path" >&2
     exit 2
   fi
-  local file
+  local file listing="$work/scan-files"
+  if ! find -P "$path" -type f -print0 >"$listing" 2>"$work/find-errors"; then
+    echo "leak-oracle: directory scan incomplete" >&2
+    exit 5
+  fi
   while IFS= read -r -d '' file; do
     scan_file "$file"
-  done < <(find -P "$path" -type f -print0)
+  done < "$listing"
 }
 
 for path in "${SCAN_PATHS[@]}"; do
   scan_path "$path"
 done
 
+count_probe_verdicts() {
+  local pattern=$1 probe=$2 count status=0
+  count=$(grep -c -E "$pattern" "$probe" 2>"$work/grep-errors") || status=$?
+  if [[ $status -gt 1 ]]; then
+    echo "leak-oracle: probe scan incomplete" >&2
+    return 5
+  fi
+  printf '%s' "$count"
+}
+
 for probe in "${PROBE_FILES[@]}"; do
   [[ -f $probe ]] || { echo "leak-oracle: probe file missing: $probe" >&2; exit 2; }
   scan_file "$probe"
-  present=$(grep -c -E '^LEAK_ORACLE_PROBE=present$' "$probe" || true)
-  absent=$(grep -c -E '^LEAK_ORACLE_PROBE=absent$' "$probe" || true)
+  present=$(count_probe_verdicts '^LEAK_ORACLE_PROBE=present$' "$probe")
+  absent=$(count_probe_verdicts '^LEAK_ORACLE_PROBE=absent$' "$probe")
   if [[ $present -ne 0 || $absent -lt 1 ]]; then
     echo "leak-oracle: probe failed $probe"
     found=1
