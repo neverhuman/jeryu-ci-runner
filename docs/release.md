@@ -4,7 +4,8 @@ This split member publishes source changes through pinned tags; `jeryu-deploy` r
 
 Version source is `VERSION` plus its immutable split tag. Authority-manifest
 binding is owned by the family control plane; this product repository must not
-carry a `repos.manifest.toml`. Release notes are recorded in `CHANGELOG.md`.
+carry a `repos.manifest.toml`. Release notes are generated at release time from
+the commits since the last release and written to `CHANGELOG.md`.
 
 ## Release Gate
 

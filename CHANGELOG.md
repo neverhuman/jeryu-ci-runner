@@ -1,5 +1,7 @@
 # Changelog
 
+This file is written when a release is cut: its notes are generated from the commits since the previous release. Do not add entries by hand; write a commit subject that says what changed.
+
 ## jeryu-ci-runner-v5.0.0-split.2
 - Give the sandbox cgroup capability probe a unique leaf per probe and verify
   cgroup admission before job cgroups are created. Parallel probes in one

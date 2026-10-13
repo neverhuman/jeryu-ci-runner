@@ -22,6 +22,8 @@ The public runner wire mirror is `schemas/jeryu.runner.v1.schema.json`. Rust
 serde plus `ValidateWire` remain authoritative; run `just contract-drift` whenever
 wire source or schema bytes change.
 
+Do not edit CHANGELOG.md in a change: release notes are generated at release time from commit subjects and Todo: trailers.
+
 ## Test placement
 
 One rule for this repository: a test lives in the crate that owns the code it
