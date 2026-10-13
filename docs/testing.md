@@ -20,6 +20,10 @@ The security lane runs networked dependency checks by default through
 `ops/ci/dependency-sources.sh` proves the active Git transport policy, hosted
 tag/support-ref binding, Cargo Deny allowlist, and `git.neverhuman.org`
 destination. Its evidence includes the exact lock hash and CycloneDX SBOM hash.
+It hands the forge token only to a reviewed credential helper: the hosted gate
+accepts exactly its own pinned helper, and an operator host running the gate by
+hand opts in with `JERYU_CI_OPERATOR_HELPER=1` to also accept a reviewed
+operator helper. The evidence records which one ran (`credential_helper_scope`).
 
 The contract lane compares `schemas/jeryu.runner.v1.schema.json` directly with
 the authoritative Rust wire sources and includes hostile drift cases. The

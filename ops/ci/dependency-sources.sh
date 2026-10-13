@@ -11,15 +11,33 @@ overlay="${ROOT}/.cargo/hosted-gitconfig"
 pin_policy="${ROOT}/.cargo/hosted-pin-refs.tsv"
 active_global="${GIT_CONFIG_GLOBAL}"
 credential_helper="/home/ubuntu/.config/jeryu/bin/git-credential-neverhuman-org"
-# Every reviewed build of the credential helper. Each host's copy names that host's own
-# forge login and token file, so one hash cannot fit every host that runs this gate;
-# add a host's hash here, in a reviewed change, after reading its helper.
-helper_binary_sha256_allowed=(
-  # the hosted gate runner's helper: its login, the legacy forge name only
-  'c87ebbe3af617f34de169ec35e21e02afb3f9ee37f637bbcab075224c700ddb1'
-  # an operator host's helper: its own login, the canonical and the legacy forge names
+# The reviewed credential helper the gate may hand the forge token to. The hosted gate
+# runner runs this under `env -i` with a fixed environment, so it only ever accepts its
+# own helper: the gate pin below, exactly one hash. Each host's helper names that host's
+# own forge login and token file, so an operator host running this gate by hand has a
+# different one; it opts in with JERYU_CI_OPERATOR_HELPER=1 to also accept the reviewed
+# operator helpers below. Such a run publishes no required result. Adding a hash stays
+# a reviewed change.
+helper_binary_sha256_gate='c87ebbe3af617f34de169ec35e21e02afb3f9ee37f637bbcab075224c700ddb1'
+helper_binary_sha256_operator=(
+  # its own login, the canonical and the legacy forge names
   'b58154de088d352c0cf55e37edb5bb18c7625ed7c06e165c17f16b9c2166a668'
 )
+# helper_scope SHA: prints `gate` or `operator` for an accepted helper, nothing otherwise.
+helper_scope() {
+  local sha="$1" allowed
+  [[ "${sha}" =~ ^[0-9a-f]{64}$ ]] || return 1
+  if [[ "${sha}" == "${helper_binary_sha256_gate}" ]]; then
+    echo gate; return 0
+  fi
+  [[ "${JERYU_CI_OPERATOR_HELPER:-0}" == 1 ]] || return 1
+  for allowed in "${helper_binary_sha256_operator[@]}"; do
+    if [[ "${sha}" == "${allowed}" ]]; then
+      echo operator; return 0
+    fi
+  done
+  return 1
+}
 for path in "${overlay}" "${pin_policy}" "${ROOT}/Cargo.lock" "${ROOT}/deny.toml" \
   "${active_global}"; do
   if [[ ! -f "${path}" || -L "${path}" || "$(stat -c '%h' -- "${path}")" != 1 ]]; then
@@ -96,12 +114,16 @@ if [[ ! -f "${credential_helper}" || -L "${credential_helper}" ||
       ! -x "${credential_helper}" ||
       "$(stat -c '%u:%g:%a:%h' -- "${credential_helper}")" != \
         "$(id -u):$(id -g):700:1" ||
-      " ${helper_binary_sha256_allowed[*]} " != \
-        *" $(sha256sum "${credential_helper}" | awk '{print $1}') "* ]]; then
+      -z "$(helper_scope "$(sha256sum "${credential_helper}" | awk '{print $1}')")" ]]; then
   printf 'hosted credential helper must match the reviewed owner/mode/hash: %s\n' \
     "${credential_helper}" >&2
+  if [[ "${JERYU_CI_OPERATOR_HELPER:-0}" != 1 ]]; then
+    printf 'on an operator host with a reviewed helper, run with JERYU_CI_OPERATOR_HELPER=1\n' >&2
+  fi
   exit 1
 fi
+helper_sha256="$(sha256sum "${credential_helper}" | awk '{print $1}')"
+helper_scope_used="$(helper_scope "${helper_sha256}")"
 
 # The quoted program is intentionally expanded by the child shell.
 # shellcheck disable=SC2016
@@ -216,12 +238,14 @@ jq -n \
   --arg deny_sha256 "$(sha256sum deny.toml | awk '{print $1}')" \
   --arg pin_policy_sha256 "$(sha256sum "${pin_policy}" | awk '{print $1}')" \
   --arg active_git_config_sha256 "${active_global_sha256}" \
-  --arg credential_helper_sha256 "$(sha256sum "${credential_helper}" | awk '{print $1}')" \
+  --arg credential_helper_sha256 "${helper_sha256}" \
+  --arg credential_helper_scope "${helper_scope_used}" \
   '{schema_version:"jeryu.dependency-sources/v1",git_head:$head,
     overlay_sha256:$overlay_sha256,lock_sha256:$lock_sha256,
     deny_policy_sha256:$deny_sha256,pin_policy_sha256:$pin_policy_sha256,
     active_git_config_sha256:$active_git_config_sha256,
     credential_helper_sha256:$credential_helper_sha256,
+    credential_helper_scope:$credential_helper_scope,
     lock_sources:1,hosted_mappings:1,hosted_pin_refs:1,
     unknown_git:"deny",conclusion:"success"}' \
   > target/security/dependency-sources.json
