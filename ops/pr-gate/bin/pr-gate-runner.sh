@@ -78,6 +78,7 @@ gate_self_part() { gate_tool_line "$@" || { printf 'pr-gate-runner: cannot hash 
 GATE_SELF_SHA256="$(gate_self_part pr-gate-config.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-config.sh")"
 GATE_SELF_SHA256+=$'\n'"$(gate_self_part pr-gate-state.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-state.sh")"
 GATE_SELF_SHA256+=$'\n'"$(gate_self_part "$(basename -- "$GATE_RUNNER_SCRIPT")" "$GATE_RUNNER_SCRIPT")"
+GATE_SELF_SHA256+=$'\n'"$(gate_self_part pr-gate-backoff.sh "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-backoff.sh")"
 GATE_SITE_CONFIG_SHA256="$(gate_site_config_digest "$PR_GATE_CONFIG_FILE")"
 GATE_SELF_SHA256+=$'\n'"$GATE_SITE_CONFIG_SHA256  site-config"
 

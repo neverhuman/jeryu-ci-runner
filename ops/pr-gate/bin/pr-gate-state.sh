@@ -172,12 +172,17 @@ gate_begin() {
 # Each line names the file relative to the tree, under the tree's label: where a host keeps the tree
 # is not an input, so the same tree hashes the same on every host.
 hash_fixture_tree() { # root [label] [all]
-  local root=${1%/} label=${2:-.} file digest name prefix walk_pid
+  local root=${1%/} label=${2:-.} file digest name prefix walk_list
   local -a filters=() files=()
   [[ "${3:-}" == all ]] || filters=(-not -path '*/.build/*' -not -name '*.tmp')
-  mapfile -d '' -t files < <(set -o pipefail; find -L "$root" -ignore_readdir_race -type f "${filters[@]}" -print0 | LC_ALL=C sort -z)
-  walk_pid=$!
-  wait "$walk_pid" || { printf 'cannot walk input tree: %s\n' "$label" >&2; return 1; }
+  walk_list=$(mktemp "${TMPDIR:-/tmp}/pr-gate-walk.XXXXXXXX") || return
+  if ! (set -o pipefail; find -L "$root" -ignore_readdir_race -type f "${filters[@]}" -print0 | LC_ALL=C sort -z) >"$walk_list"; then
+    rm -f -- "$walk_list"
+    printf 'cannot walk input tree: %s\n' "$label" >&2
+    return 1
+  fi
+  if ! mapfile -d '' -t files <"$walk_list"; then rm -f -- "$walk_list"; return 1; fi
+  rm -f -- "$walk_list"
   for file in "${files[@]}"; do
     name="$label/${file#"$root"/}" prefix=""
     if [[ "$name" == *$'\n'* || "$name" == *'\'* ]]; then

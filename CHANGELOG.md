@@ -76,7 +76,9 @@
   once, as any runner change does. Missing site files still bind effective settings; sandbox
   results bind implementation bytes and host custody; escaped tree names and one inputs field
   avoid ambiguous identity records. Cheap identities keep local compiler paths outside the portable
-  input document and fall back to preparation for old receipts. pr-gate 2.0.0.
+  input document and fall back to preparation for old receipts. Every sourced runner library,
+  including backoff, is hashed and drained before replacement. Executable tree walks and read
+  failures stop identity computation; directory-walk status is captured explicitly. pr-gate 2.0.0.
 - `gate.log` events name the whole log and the slot that ran the gate. The tail is cut at a line
   boundary, so it no longer starts mid-token, and `detail.runner` carries `<host>/slot<N>` instead of
   leaving the runner readable only inside `summary`. Where a host's attempt logs are served,

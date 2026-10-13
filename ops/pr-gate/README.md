@@ -232,7 +232,7 @@ An operator-run result names its inputs independently of the host that computed 
 (`runner: "pr-gate-runner"`), never the host, and binds what the recipe can execute by content and
 name, never by the path a host installed it at:
 
-- the named tools, governed tools, runtime fixtures, vendor tree and runner scripts;
+- the named tools, governed tools, runtime fixtures, vendor tree and every sourced runner/config/state/backoff script;
 - every directory on the recipe's `PATH` (`RECIPE_PATH`, the only PATH a recipe and its prefetch get):
   a system directory (under `/usr`, not `/usr/local`; `/bin`, `/sbin`) by its listing plus the
   installed package set, which also covers `/usr/lib`; any other directory (`~/.local/bin`,
@@ -343,3 +343,15 @@ mount-namespace selection, lock inheritance, heartbeat and event projection, wak
 retention, the locked-crate prefetch's source allowlist, the installer and the database refreshers.
 Every fixture uses invented names (`acme`, `gate-a`, `example.test`); none reads the host's own site
 file. The repository's `ops/ci/pr-ci.sh` runs it.
+
+Executable input trees must be readable by the gate identity. `cannot bind executable input` or
+`cannot walk input tree` stops identity computation and names the affected tree/file. Operators
+restore tool-tree readability or relocate execute-only tools before retrying; the runner never
+adopts an identity assembled from unreadable executable contents. Directory enumeration captures
+and checks the find/sort pipeline status explicitly rather than depending on process-substitution
+PID behavior.
+
+Forge-status adoption leaves an authenticated gate-account status in place for one visit. A forged
+status from that account can therefore survive that visit until local re-proof; operator-unsealed
+recipes already run as that account and can read its credential. This is an accepted operator-host
+assumption, not a sealed execution claim. Contributed sandbox recipes receive no credential helper.

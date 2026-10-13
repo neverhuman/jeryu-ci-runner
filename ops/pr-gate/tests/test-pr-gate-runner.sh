@@ -1112,3 +1112,21 @@ receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
 jq -e '.terminal and .outcome == "inputs_changed" and .exit_code == 0' "$receipt" >/dev/null
 jq -se 'last.state == "error"' "$fixture/statuses.jsonl" >/dev/null
 printf 'PASS recipe input drift records inputs_changed despite a passing process exit\n'
+
+# Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.
+rm -f "$fixture/mutate-tool"
+mkdir -p "$fixture/code"
+cp "$script_dir/"pr-gate-*.sh "$fixture/code/"
+original_script_dir=$script_dir
+script_dir="$fixture/code"
+before_count=$(count)
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+printf '# backoff-only installation change\n' >>"$script_dir/pr-gate-backoff.sh"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 2))"
+jq -r .inputs.tools "$fixture/runner/attempts/acme-fixture-$head/last-result.json" | grep -q '  pr-gate-backoff.sh$'
+script_dir=$original_script_dir
+printf 'PASS a backoff-only code change invalidates reuse and executes a new gate\n'

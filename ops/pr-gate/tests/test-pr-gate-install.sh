@@ -19,6 +19,7 @@ put $c/bin/pr-gate-runner.sh '#!/usr/bin/env bash
 echo runner v1'
 put $c/bin/pr-gate-state.sh 'state() { :; }'
 put $c/bin/pr-gate-config.sh 'pr_gate_load_config() { :; }'
+put $c/bin/pr-gate-backoff.sh 'backoff_wait() { :; }'
 put $c/bin/notes.txt 'not a managed file'
 put $c/systemd/pr-gate-runner@.timer '[Timer]'
 put $c/VERSION '1.0.0'
@@ -238,3 +239,13 @@ must 'branch installed' grep -q 'stable heartbeat' "$bin/pr-gate-heartbeat.sh"
 must 'branch commit recorded' test "$(jq -r .commit "$state")" == "$(git -C "$fx/src" rev-parse gate-stable)"
 must 'branch version recorded' jq -e '.version=="pr-gate 1.1.0"' "$state" >/dev/null
 printf 'PASS PR_GATE_SOURCE_BRANCH selects the branch the installer follows\n'
+
+# A backoff-only code change also drains, since the library runs inside each gate process.
+git -C "$fx/src" checkout -q gate-stable
+put $c/bin/pr-gate-backoff.sh 'backoff_wait() { return 0; }'
+commit backoff-library
+run >"$fx/out"
+must 'backoff library change drains' called 'stop pr-gate-runner@0.timer'
+must 'backoff library change resumes' called 'start pr-gate-runner@1.timer'
+must 'backoff library installed' grep -q 'return 0' "$bin/pr-gate-backoff.sh"
+printf 'PASS a backoff-only library change drains the slots before installing\n'
