@@ -15,6 +15,11 @@
   setting reappears.
 
 ## Unreleased
+- pr-redteam lands an exact-head approval through a separate scoped systemd unit
+  while other reviews continue. Merge locks preserve the run lock and serialize
+  with each PR's rereview. Poke keeps its restricted credential environment,
+  retries failed starts and reports age from the completed review timestamp;
+  installation stages the managed unit inactive and refuses active instances.
 - Failed or dequeued redteam merge-queue entries can be retried once per failed base, at most
   three acknowledged retries per reviewed head. Dry runs and transient failures do not consume
   retry state; accepted dispatch and bookkeeping share one receipt write. A bounded paged queue

@@ -112,6 +112,9 @@ case "$url" in
     else printf '{"entries":[],"page":{"has_more":false}}'; fi
     printf '\n200' ;;
   */pulls/107/merge)
+    if [[ -e "$MERGE_FIXTURE/check-run-lock" ]] && flock -n "$REDTEAM_STATE/run.lock" true; then
+      echo 'merge released the parent run lock' >> "$MERGE_FIXTURE/danger"; exit 99
+    fi
     if [[ -e "$MERGE_FIXTURE/required-failing" ]]; then printf '{"message":"required contexts are not green"}\n409'; exit 0; fi
     if [[ -e "$MERGE_FIXTURE/linear" ]]; then printf '{"message":"linear history: the head is behind main"}\n409'; exit 0; fi
     if [[ "$(jq -r .expected_head_sha <<< "$data")" != "$(cat "$MERGE_FIXTURE/head")" ]]; then printf '{"message":"head changed"}\n409'; exit 0; fi
@@ -158,7 +161,9 @@ echo 'ok approved head waits for its required context, without re-reviewing'
 # The gate runner's second attempt goes green. The next pass merges the approved head at the exact
 # sha and passport it reviewed, as the merger identity, and asks for no second review.
 rm "$t/required-failing"
+touch "$t/check-run-lock"
 pass
+rm "$t/check-run-lock"
 [[ "$(count "$t/model-calls")" == 1 && "$(count "$t/merges")" == 1 ]]
 jq -e --arg sha "$(cat "$t/head")" '.expected_head_sha == $sha and .passport_hash == "fixture-passport"' \
   <<< "$(tail -1 "$t/merges")" > /dev/null
@@ -206,6 +211,21 @@ grep -q 'merge pass skipped: the merger credential was rejected' "$t/controller.
 chmod 600 "$t/merge-token"
 echo 'ok merger credential custody enforced'
 
+# A forced rereview holds this lock before replacing a cached approval.
+receipt_file="$(receipt)"
+jq 'del(.merged_at, .merged_by)' "$receipt_file" > "$t/receipt"
+mv "$t/receipt" "$receipt_file"
+merges_before="$(count "$t/merges")"
+exec 9>"$t/state/locks/jeryu_fixture-107.lock"; flock -n 9
+"$here/pr-redteam" _merge --repo jeryu/fixture --pr 107 >> "$t/controller.log" 2>&1
+[[ "$(count "$t/merges")" == "$merges_before" ]]
+grep -q 'review in progress; merge deferred' "$t/controller.log"
+jq '.decision="block" | .posted=true' "$receipt_file" > "$t/receipt"
+mv "$t/receipt" "$receipt_file"
+exec 9>&-
+"$here/pr-redteam" _merge --repo jeryu/fixture --pr 107 >> "$t/controller.log" 2>&1
+[[ "$(count "$t/merges")" == "$merges_before" && ! -e "$t/danger" ]]
+echo 'ok merge retains run lock and rechecks approval under the review lock'
 # A queued failure's retry is consumed only by an accepted dispatch, never by observation.
 advance
 touch "$t/linear"

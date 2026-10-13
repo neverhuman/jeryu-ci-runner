@@ -23,6 +23,7 @@ required_environment_files() {
 for source_unit in \
   "$here/systemd/pr-redteam.service" \
   "$here/systemd/pr-redteam-heartbeat.service" \
+  "$here/systemd/pr-redteam-merge@.service" \
   "$here/systemd/pr-redteam-poke.service"; do
   while IFS= read -r env_file; do
     [ -f "$env_file" ] || {
@@ -55,7 +56,7 @@ esac
 # Replacing an active or enabled unit would change its next execution. Require the
 # service owner to stop/disable it explicitly before staging replacement source.
 for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-redteam-heartbeat.timer \
-  pr-redteam-poke.service pr-redteam-poke.timer pr-redteam-notify@.service; do
+  pr-redteam-poke.service pr-redteam-poke.timer pr-redteam-notify@.service pr-redteam-merge@.service; do
   # `is-enabled` also succeeds for a static unit (no [Install] section, as every
   # pr-redteam service is), so only states that start the unit on their own count.
   enabled_state="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
@@ -65,6 +66,15 @@ for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-
     exit 1
   fi
 done
+# Templates can have running instances even when the template itself is inactive.
+instances="$(systemctl --user list-units --all --type=service --no-legend --plain 'pr-redteam-merge@*.service')"
+while read -r instance _; do
+  [ -n "$instance" ] || continue
+  if systemctl --user is-active --quiet "$instance"; then
+    echo "$instance is active; its service owner must stop it before installation" >&2
+    exit 1
+  fi
+done <<<"$instances"
 [[ "$here" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "unit source path contains unsupported characters" >&2; exit 1; }
 mkdir -p "$units"
 # The review unit is written with this directory's path; replacing a symlink from an older install is fine.
@@ -77,6 +87,8 @@ cp "$here/systemd/pr-redteam-heartbeat.timer" "$units/pr-redteam-heartbeat.timer
 rm -f "$units/pr-redteam-poke.service" "$units/pr-redteam-poke.timer"
 sed "s#@REDTEAM_DIR@#$here#g" "$here/systemd/pr-redteam-poke.service" >"$units/pr-redteam-poke.service"
 cp "$here/systemd/pr-redteam-poke.timer" "$units/pr-redteam-poke.timer"
+rm -f "$units/pr-redteam-merge@.service"
+sed "s#@REDTEAM_DIR@#$here#g" "$here/systemd/pr-redteam-merge@.service" >"$units/pr-redteam-merge@.service"
 rm -f "$units/pr-redteam-notify@.service"
 sed "s#@REDTEAM_DIR@#$here#g" "$here/systemd/pr-redteam-notify@.service" >"$units/pr-redteam-notify@.service"
 systemctl --user daemon-reload

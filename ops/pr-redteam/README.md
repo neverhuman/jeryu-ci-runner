@@ -112,9 +112,17 @@ activation approval.
 `heartbeat` sends one beat per reviewer slot: a review takes a numbered slot for
 as long as it runs, so `/runners` shows `REDTEAM_JOBS` rows (`<id>`, `<id>-2` …)
 instead of one row for the whole pass. `poke` runs every 30 seconds from
-`pr-redteam-poke.timer` and starts `pr-redteam.service` early when a head nobody
-has reviewed appears or an approval becomes landable, once per head; it never
-reviews or merges itself, and the five-minute timer stays as the fallback.
+`pr-redteam-poke.timer`. Unreviewed heads start `pr-redteam.service` early.
+Landable approvals start `pr-redteam-merge@owner:repo:PR:head.service`, even while
+other reviews are running. The instance scopes landing to that repository, PR
+and exact reviewed head; operator `--repo`/`--pr` filters therefore remain in
+effect. Poke has no merger environment and starts no detached process. The
+managed merge unit loads the site's optional `merge.env`, logs to the journal,
+and holds both the merge-pass lock and the PR's review lock through publication.
+An active rereview defers landing. A failed unit-start request is retried by the
+next poke; an accepted start is recorded once per head. Execution failures still
+retry through the five-minute review/merge timer. Dry runs consume no poke key.
+The merge log reports seconds since the receipt's ISO `reviewed_at` timestamp.
 
 The reviewer skips its own authored PRs, contributed PRs whose review spend is
 used up, drafts unless explicitly included, and
@@ -200,11 +208,13 @@ The units reference this source directory by absolute path. Treat any later
 source update as a service change requiring its owner's custody and qualification.
 The timer invokes a review pass and then a merge pass. `install.sh` enables no
 unit. The merger credential's path comes from the site's
-`~/.config/pr-redteam/merge.env`, read by the unit; `install.sh` writes no
+`~/.config/pr-redteam/merge.env`, read by review and scoped merge units; `install.sh` writes no
 credential. Heartbeats report liveness through Jeryu's existing runner-reporting
 allowlist and include the latest poke result, so a failed poke appears in the
 runner's last activity on `/runners` and can be surfaced in Needs you. An
-authorization refusal is logged, not bypassed.
+authorization refusal is logged, not bypassed. Installation also refuses to
+replace the merge template while any of its instances is active. No scoped unit
+is enabled or started by installation; activation belongs to the service owner.
 
 ## Review isolation
 

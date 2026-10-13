@@ -1,6 +1,7 @@
 # React to events instead of waiting for the five-minute pass: every ~30s, if a PR head nobody has
 # reviewed yet appeared, or an approved head became landable, start pr-redteam.service now. Each
-# head triggers at most once. It never reviews or merges by itself.
+# head triggers at most once. Landable approvals start a separate scoped merge unit;
+# poke itself has no merger environment and owns no detached merge process.
 [Unit]
 Description=pr-redteam: start a pass early when a PR needs it
 After=network-online.target

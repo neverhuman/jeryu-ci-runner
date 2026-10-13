@@ -1,0 +1,16 @@
+# Poke requests one exact reviewed head; this unit owns the process and merger credential.
+# Installation stages it inactive. Its service owner qualifies and authorizes activation.
+[Unit]
+Description=pr-redteam: land scoped approval %i
+After=network-online.target
+Wants=network-online.target
+OnFailure=pr-redteam-notify@%n.service
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/.config/pr-redteam/site.env
+EnvironmentFile=-%h/.config/pr-redteam/merge.env
+ExecStart=@REDTEAM_DIR@/pr-redteam _merge_scoped %i
+Nice=10
+TimeoutStartSec=30min

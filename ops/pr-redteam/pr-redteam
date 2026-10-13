@@ -1002,13 +1002,12 @@ merge_hold_reason() { # owner/name number
 }
 
 # Merge every open PR this tool approved at its current head, once the forge says it can merge.
-merge_pass() { # dry
+merge_pass() ( # dry; child owns merge/review locks, preserving the caller's run.lock
   local dry="$1" merger row repo number sha receipt reason passport retry_base queue_retry_base
   local queue_cache_state=0 queue_cache_entries='[]'
-  # Review passes and pokes can both reach this function. Serialize the scan, but keep
-  # it independent of run.lock so an active review pass cannot hold up landing.
-  exec 8>"$state/merge.lock"
-  flock -n 8 || { say "merge pass already running; another pass owns the merge lock"; return 0; }
+  # Serialize merges independently of the review-pass run lock.
+  exec 6>"$state/merge.lock"
+  flock -n 6 || { say "merge pass already running; another pass owns the merge lock"; return 0; }
   if [ -z "$merge_token_file" ]; then
     say "merge pass skipped: set REDTEAM_MERGE_TOKEN_FILE to the merger credential"; return 0
   fi
@@ -1022,6 +1021,7 @@ merge_pass() { # dry
     sha="$(jq -r .head_sha <<<"$row")"
     [ -z "$only_repo" ] || [ "$repo" = "$only_repo" ] || continue
     [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
+    [ -z "$only_sha" ] || [ "$sha" = "$only_sha" ] || continue
     [ "$(jq -r .draft <<<"$row")" != true ] || continue
     # Nothing contributed is landed from here, approved or not. The forge holds it for a
     # maintainer's approval on the exact head, and that maintainer merges it.
@@ -1029,6 +1029,10 @@ merge_pass() { # dry
       say "$repo#$number: contributed — not landed from here; a maintainer approves and merges it"
       continue
     fi
+    # A forced rereview owns this same lock before replacing a cached approval.
+    # Hold it through the exact-head forge write so a stale receipt cannot race that review.
+    exec 9>"$state/locks/${repo/\//_}-$number.lock"
+    flock -n 9 || { say "$repo#$number: review in progress; merge deferred"; continue; }
     receipt="$(merge_receipt "$repo" "$number" "$sha")" || continue
     # Already handed to the forge's merge queue at this head: the queue replays, gates and lands it.
     # A queue entry that failed or was dequeued lands nothing, though, so it is retried once per base
@@ -1072,7 +1076,7 @@ merge_pass() { # dry
       say "$repo#$number: merge answered $code, retry next run: $(jq -c '(.error // .) | {code, message, details}' <<<"$body" 2>/dev/null | head -c 400)"
     fi
   done < <(open_prs)
-}
+)
 
 # One read-only, bounded snapshot per merge pass. The live forge's QueueEntry contract is
 # repo/base/number/pr_head_sha/base_sha/state/enqueued_at/attempts; page.has_more is authoritative
@@ -1212,10 +1216,9 @@ rebase_pr() { # owner/name number reviewed-sha head_ref base_ref receipt merger 
 # something new — a PR head no pass has reviewed yet, or an approved head that the forge would now
 # land. Each head triggers at most once (state/poke-seen), so a review that keeps failing cannot turn
 # this into a pass every 30 seconds; the five-minute timer still retries it. It never reviews or
-# merges by itself, except that a landable approval can launch the independent merge pass.
+# merges by itself. Landable approvals start an exact-head scoped, separately managed merge unit.
 poke() { # dry
-  local dry="$1" me row repo number sha key why="" seen="$state/poke-seen" age=unknown receipt started
-  touch "$seen"
+  local dry="$1" me row repo number sha key why="" seen="$state/poke-seen" age=unknown receipt reviewed epoch unit
   me="$(whoami_login)"
   while IFS= read -r row; do
     repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
@@ -1227,35 +1230,44 @@ poke() { # dry
     elif merge_receipt "$repo" "$number" "$sha" >/dev/null && [ -z "$(merge_hold_reason "$repo" "$number")" ]; then
       key="merge $repo#$number $sha"
       receipt="$(merge_receipt "$repo" "$number" "$sha")"
-      started="$(jq -r '.started_at // empty' "$receipt")"
-      [[ "$started" =~ ^[0-9]+$ ]] && age="$(( $(date +%s) - started ))"
+      reviewed="$(jq -r '.reviewed_at // empty' "$receipt")"
+      epoch=""; [ -z "$reviewed" ] || epoch="$(date -u -d "$reviewed" +%s 2>/dev/null || true)"
+      [[ "$epoch" =~ ^[0-9]+$ ]] && age="$(( $(date +%s) - epoch ))"
+      [[ "$age" == unknown || "$age" -ge 0 ]] || age=0
     else
       continue
     fi
-    grep -qxF "$key" "$seen" && continue
-    echo "$key" >>"$seen"
+    [ ! -f "$seen" ] || ! grep -qxF "$key" "$seen" || continue
     why="$key"; break
   done < <(open_prs)
   [ -n "$why" ] || return 0
   if [ "$dry" = 1 ]; then say "poke: would start a pass ($why)"; return 0; fi
-  if systemctl --user is-active --quiet pr-redteam.service; then
-    case "$why" in
-      merge\ *)
-        say "poke: review pass active; launching independent merge pass ($why; review_age_seconds=$age)"
-        "$self" _merge >>"$state/merge.log" 2>&1 </dev/null &
-        ;;
-      *) say "poke: pass already running ($why)" ;;
-    esac
+  if [[ "$why" == merge\ * ]]; then
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$number" =~ ^[1-9][0-9]*$ && "$sha" =~ ^[0-9a-f]{40}$ ]] \
+      || { say "poke: invalid merge scope; not starting a unit"; return 0; }
+    unit="pr-redteam-merge@${repo/\//:}:$number:$sha.service"
+    if systemctl --user start --no-block "$unit"; then
+      echo "$why" >>"$seen"
+      say "poke: started scoped merge unit ($why; review_age_seconds=$age)"
+    else
+      say "poke: scoped merge unit start failed; retry next poke ($why)"
+    fi
+  elif systemctl --user is-active --quiet pr-redteam.service; then
+    say "poke: pass already running ($why)"
   else
-    say "poke: starting a pass now ($why)"
-    systemctl --user start --no-block pr-redteam.service
+    if systemctl --user start --no-block pr-redteam.service; then
+      echo "$why" >>"$seen"
+      say "poke: starting a pass now ($why)"
+    else
+      say "poke: review unit start failed; retry next poke ($why)"
+    fi
   fi
 }
 
 # --- commands ------------------------------------------------------------------------------------
 
 cmd="${1:-}"; shift || true
-dry=0 force=0 drafts=0 only_repo="" only_pr=""
+dry=0 force=0 drafts=0 only_repo="" only_pr="" only_sha=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) dry=1 ;;
@@ -1264,7 +1276,7 @@ while [ $# -gt 0 ]; do
     --jobs) jobs="$2"; shift ;;
     --repo) only_repo="$2"; shift ;;
     --pr) only_pr="$2"; shift ;;
-    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
   esac
   shift
 done
@@ -1311,6 +1323,11 @@ case "$cmd" in
   poke) # start a pass now if there is a new head to review or a newly landable approval
     poke "$dry" ;;
   _merge) # internal/testing: the merge pass alone, with no review pass before it
+    merge_pass "$dry" ;;
+  _merge_scoped) # managed template instance: owner:name:number:reviewed-head
+    [ $# = 1 ] || die "expected one merge scope"
+    [[ "$1" =~ ^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([1-9][0-9]*):([0-9a-f]{40})$ ]] || die "invalid merge scope"
+    only_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; only_pr="${BASH_REMATCH[3]}"; only_sha="${BASH_REMATCH[4]}"
     merge_pass "$dry" ;;
   _gate) # internal/testing: pr-detail.json checks.json -> "hold|wait<TAB>reason" (no forge calls)
     reason="$(jankurai_gate_reason "$(cat "$1")" "$(cat "$2")")"

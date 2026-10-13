@@ -111,6 +111,7 @@ cat > "$t/bin/systemctl" <<'FIXTURE'
 printf '%s\n' "$*" >> "$MERGE_FIXTURE/systemctl"
 case "$*" in
   *is-active*) [[ -e "$MERGE_FIXTURE/pass-active" ]] && exit 0 || exit 3 ;;
+  '--user start --no-block pr-redteam-merge@'*) [[ ! -e "$MERGE_FIXTURE/start-failed" ]] ;;
   '--user start --no-block pr-redteam.service') exit 0 ;;
   *) echo "unexpected systemctl $*" >> "$MERGE_FIXTURE/danger"; exit 97 ;;
 esac
@@ -119,11 +120,13 @@ chmod +x "$t/bin/systemctl"
 poke() { "$here/pr-redteam" poke "$@" >> "$t/controller.log" 2>&1; }
 pass() { "$here/pr-redteam" run --repo jeryu/fixture --pr 107 >> "$t/controller.log" 2>&1; }
 starts() { if [[ -f "$t/systemctl" ]]; then grep -c '^--user start --no-block pr-redteam.service$' "$t/systemctl" || true; else echo 0; fi; }
+merge_starts() { if [[ -f "$t/systemctl" ]]; then grep -c '^--user start --no-block pr-redteam-merge@' "$t/systemctl" || true; else echo 0; fi; }
 
 # A dry run says what it would do and starts nothing, and does not use up the head.
 poke --dry-run
 grep -q 'poke: would start a pass (review jeryu/fixture#107' "$t/controller.log"
 [[ "$(starts)" == 0 ]]
+[[ ! -e "$t/state/poke-seen" ]]
 echo 'ok dry run starts nothing'
 
 # A head nobody has reviewed starts a pass, once.
@@ -143,23 +146,30 @@ poke
 [[ "$(starts)" == 1 ]]
 echo 'ok an approval waiting on its gate starts nothing'
 
-# The context goes green on a retry: the approval is landable now, so one pass starts to merge it.
+# A failed managed start does not consume the poke. Poke has no merger credential.
 rm "$t/required-failing"
-poke
-[[ "$(starts)" == 2 ]]
-grep -q 'poke: starting a pass now (merge jeryu/fixture#107' "$t/controller.log"
-poke
-[[ "$(starts)" == 2 ]]
-echo 'ok a newly landable approval starts one pass'
-
-# While a review pass is active, a newly landable approval launches the independent _merge mode.
-# Remove its seen key to model a newly green required context, then wait for the detached worker.
-grep -v '^merge jeryu/fixture#107 ' "$t/state/poke-seen" > "$t/poke-seen"
-mv "$t/poke-seen" "$t/state/poke-seen"
+touch "$t/start-failed"
+REDTEAM_MERGE_TOKEN_FILE= poke --repo jeryu/fixture --pr 107
+! grep -q '^merge ' "$t/state/poke-seen"
+rm "$t/start-failed"
+receipt="$t/state/receipts/jeryu/fixture/107-$(cat "$t/head").json"
+jq --arg at "$(date -u -d '2 minutes ago' +%FT%TZ)" '.reviewed_at=$at' "$receipt" > "$t/receipt"
+mv "$t/receipt" "$receipt"
 touch "$t/pass-active"
-poke
-grep -q 'poke: review pass active; launching independent merge pass (merge jeryu/fixture#107' "$t/controller.log"
-for _ in {1..100}; do [[ "$(count "$t/merges")" == 1 ]] && break; sleep 0.05; done
+REDTEAM_MERGE_TOKEN_FILE= poke --repo jeryu/fixture --pr 107
+[[ "$(starts)" == 1 && "$(merge_starts)" == 2 && "$(count "$t/merges")" == 0 ]]
+instance="jeryu:fixture:107:$(cat "$t/head")"
+grep -qxF -- "--user start --no-block pr-redteam-merge@$instance.service" "$t/systemctl"
+grep -Eq 'started scoped merge unit .*review_age_seconds=1[2-9][0-9]' "$t/controller.log"
+REDTEAM_MERGE_TOKEN_FILE= poke
+[[ "$(merge_starts)" == 2 ]]
+# Invoke the managed entrypoint synchronously; other repository/PR/head scopes cannot write.
+"$here/pr-redteam" _merge_scoped "other:fixture:107:$(cat "$t/head")" >> "$t/controller.log" 2>&1
+"$here/pr-redteam" _merge_scoped "jeryu:fixture:108:$(cat "$t/head")" >> "$t/controller.log" 2>&1
+"$here/pr-redteam" _merge_scoped 'jeryu:fixture:107:1111111111111111111111111111111111111111' >> "$t/controller.log" 2>&1
+[[ "$(count "$t/merges")" == 0 ]]
+"$here/pr-redteam" _merge_scoped "$instance" >> "$t/controller.log" 2>&1
 [[ "$(count "$t/model-calls")" == 1 && "$(count "$t/merges")" == 1 && ! -e "$t/danger" ]]
-echo 'ok landable approval merges while another review pass is active'
+[[ ! -e "$t/state/merge.log" ]]
+echo 'ok managed merge retries failed start, preserves scope and reports numeric age without background workers'
 echo 'POKE PASS'
