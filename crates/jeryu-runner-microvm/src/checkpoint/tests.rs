@@ -137,12 +137,12 @@ fn manifest_reads_reject_wrong_checkpoint_identity_and_growth_beyond_the_bound()
     );
 }
 
-/// Resume isolation: a checkpoint opens only into its own session's next
-/// generation. Another owner, repository or session, a generation that is
+/// Resume isolation: a non-owner is forbidden to resume a checkpoint, and so
+/// is any session but its own next generation. Another owner, repository or session, a generation that is
 /// not the next, another runtime, another workspace size or an expired
 /// checkpoint is refused before any key or image is read.
 #[test]
-fn a_checkpoint_resumes_only_into_its_own_sessions_next_generation() {
+fn a_non_owner_is_forbidden_to_resume_a_checkpoint_and_only_its_successor_may() {
     let mut saved = manifest();
     saved.plaintext_bytes = 1024 * 1024 * 1024;
     let mut next = saved.context.clone();
@@ -158,7 +158,7 @@ fn a_checkpoint_resumes_only_into_its_own_sessions_next_generation() {
     };
     for (what, change) in [
         (
-            "another owner",
+            "a non-owner is forbidden",
             (|c: &mut SessionContext| c.owner_id = "user/mallory".into())
                 as fn(&mut SessionContext),
         ),
