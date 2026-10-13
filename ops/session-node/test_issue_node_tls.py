@@ -65,6 +65,8 @@ class IssueNodeTlsTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+                # Bounded: a run that blocks (on a FIFO, say) fails, not hangs.
+                timeout=60,
             )
         finally:
             if previous is not None:
@@ -74,6 +76,9 @@ class IssueNodeTlsTest(unittest.TestCase):
         # any key file that exists now.
         self.assertNotIn("PRIVATE KEY", output)
         for key in self.root.rglob("*.key"):
+            # Only regular files: reading a FIFO a test planted would block.
+            if not key.is_file():
+                continue
             for line in key.read_text().splitlines():
                 if not line.startswith("-----"):
                     self.assertNotIn(line, output)
@@ -300,6 +305,17 @@ class IssueNodeTlsTest(unittest.TestCase):
         refused = self.issue_leaf("node", expect=1)
         self.assertIn("ca.key does not belong to ca.pem", refused.stderr)
         (ca / "ca.key").write_bytes(original)
+        # A FIFO in place of the key or the certificate is refused at once,
+        # never waited on for a writer.
+        for name in ("ca.key", "ca.pem"):
+            kept = (ca / name).read_bytes()
+            (ca / name).unlink()
+            os.mkfifo(ca / name, 0o600)
+            refused = self.issue_leaf("node", expect=1)
+            self.assertIn("not a regular file", refused.stderr)
+            (ca / name).unlink()
+            (ca / name).write_bytes(kept)
+            os.chmod(ca / name, 0o600 if name == "ca.key" else 0o644)
         # With its own key back, the same CA issues: the refusals were custody.
         self.issue_leaf("node")
 

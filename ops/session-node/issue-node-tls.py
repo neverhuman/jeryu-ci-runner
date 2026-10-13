@@ -142,7 +142,11 @@ def read_bounded(fd, label):
 def read_private_key(dir_fd, directory, name):
     label = os.path.join(directory, name)
     try:
-        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        # O_NONBLOCK: a FIFO here must be refused by fstat below, not block the
+        # open waiting for a writer. It changes nothing for a regular file.
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd
+        )
     except OSError as error:
         fail(f"{label}: cannot open the key without following a link: {error.strerror}")
     try:
@@ -169,10 +173,12 @@ def read_private_key(dir_fd, directory, name):
 
 def read_certificate(path, label, dir_fd=None):
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC, dir_fd=dir_fd)
+        fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK, dir_fd=dir_fd)
     except OSError as error:
         fail(f"{label}: cannot open: {error.strerror}")
     try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            fail(f"{label}: not a regular file")
         data = read_bounded(fd, label)
     finally:
         os.close(fd)
