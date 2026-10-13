@@ -15,14 +15,24 @@
   setting reappears.
 
 ## Unreleased
+- pr-gate 1.10.0 adds protected-main health gates (`<repo>/main-health`), a release-guard
+  setting and nightly template units. Activation is explicit and documented; main-health
+  uses separate runner state/checkouts so its pass does not contend with a PR slot.
+  Wake deduplication names the repository, PR and head in the current look; an earlier
+  pushed SHA never suppresses a later PR opening. Current contribution, backoff and
+  identity-before-checkout controls remain in place.
+- Poke failures are separate heartbeat metadata and preserve the last real review;
+  older heartbeat schemas receive the established fields. Failure notifiers retain
+  their body environment variable with the screened, bounded body, and screening
+  covers the full capture before truncation. Quoted pinned CLI paths install correctly.
 - A PR gate starts on the pull request, not on the next timer slot. jeryu-deploy#267 (a two-line pin
   bump) was opened at 18:26:18 and its gate started 5m22s later, while the gate itself took 6m37s:
   the forge signals a push, not a pull request being opened, so the push for that branch was
   signalled before the pull request existed and nothing pointed a slot at it afterwards. The gate
   identity cannot read the pipeline event log (`GET /api/v1/events` is admin-only on the forge), so
   `pr-gate-wake.sh` now keeps reading the open-PR view alongside the signal, at most every
-  `GATE_RUNNER_WAKE_HEADS_EVERY` seconds (default 10), skipping heads the signal already woke a slot
-  for. Each slot it starts is handed the head it was started for in `cache/wake-dispatch`, and the
+  `GATE_RUNNER_WAKE_HEADS_EVERY` seconds (default 10), skipping only the exact PR/head a signal
+  names during that look. Each slot it starts is handed the head it was started for in `cache/wake-dispatch`, and the
   runner takes one line per tick and gates that head first of the pull-request heads its pass found,
   so a new head goes to whichever slot is idle instead of waiting behind a slot's own pass.
   Merge-queue entries still come first, the line decides nothing else, and a line nobody took or one
@@ -35,6 +45,38 @@
   `pr-updated`); clocks that disagree record an unknown wait with both times rather than a negative
   one. Gate latency is now measurable from the event log instead of inferred from two pages.
   pr-gate 1.6.0.
+- The PR gate decides reuse before it prepares anything. After refreshing the family's mirrors it
+  derives the head's input identity without a checkout -- siblings from the mirrors' `refs/heads/main`,
+  the gated head's own source row and recipe off the receipt that pins that exact commit, every tool,
+  fixture and runner hash computed on the spot -- and leaves an unchanged head alone. In a 24h sample
+  on the gate host two slots spent ~35 slot-hours re-preparing ~40 unchanged heads (~310 times each)
+  only to find them identical, against ~8h of gating, with new heads queued behind that sweep. A
+  sibling main that moved, a reinstalled governed tool or an upgraded runner is still a changed input,
+  and anything the identity cannot be derived from counts as changed; only `reuse` and `hold` end a
+  head this early, an explicit `--repo/--pr` and a re-gate the forge asked for never do, and the
+  decision takes no claim of its own beyond the claim lock the head already holds. pr-gate 1.9.0.
+- A merge-queue entry that arrives while a slot is deciding PR heads ends that slot's tick before its
+  next head, so the next tick (within the timer's ~20s pause) gates the entry first. Entries were put
+  first only when a tick started, and a tick can spend minutes walking heads that end in reuse: on
+  2026-10-12 an entry waited 2m48s behind one such walk. Entries the tick already saw, admitted or
+  refused, never end it, and neither does one another slot has claimed. pr-gate 1.8.0.
+- `gate.log` events name the whole log and the slot that ran the gate. The tail is cut at a line
+  boundary, so it no longer starts mid-token, and `detail.runner` carries `<host>/slot<N>` instead of
+  leaving the runner readable only inside `summary`. Where a host's attempt logs are served,
+  `PR_GATE_LOG_URL_TEMPLATE` (`{attempt}`, `{host}`, `{slot}`, `{repo}`, `{sha}`) becomes the event's
+  `log_url`, so Activity's "Full log" link opens `build.log`; unset, no link is sent rather than one
+  that 404s. pr-gate 1.6.0.
+- The PR gate holds a contributed pull request until a maintainer allows it, and then runs it in a
+  sandbox. A PR marked `PR_GATE_CONTRIBUTED_LABEL` (default `origin:contributed`, read from
+  jeryu's own pull request row, as jeryu-deploy's importer marks it) executes nothing -- no recipe, no prefetch, no
+  checkout -- until an `ok-to-test` from a login in `PR_GATE_OK_TO_TEST_MAINTAINERS` names its exact
+  head (`GET /api/v1/gate-allowances?state=active`); a push moves the head and spends the allowance.
+  An allowed head is gated through `PR_GATE_SANDBOX_COMMAND` with no forge token, no gate identity,
+  no host home, no governed tools and no shared writable cache, and its result is published as the
+  usual `<repo>/required` status, recorded as `sandboxed-contribution` in the status, the receipt and
+  the input identity. A contribution that changes gate inputs (`PR_GATE_GATE_INPUT_PATHS`) is
+  recorded in its receipt and named on its check run for extra review. Internal PRs are unchanged.
+  pr-gate 1.5.0.
 - A lane of the protected `jeryu-ci-runner/required` check passes only if it
   actually ran: `ops/ci/required-lane.sh` refuses a skipped, degraded, not-run,
   pending or tool-missing lane result and a run that collected zero tests. The

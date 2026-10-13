@@ -74,6 +74,10 @@ while (($#)); do
   case "$1" in -X) method=$2; shift 2;; --data) payload=$2; shift 2;; *) url=$1; shift;; esac
 done
 head=$(cat "$FAKE_FORGE/head")
+if [[ -f "$FAKE_FORGE/rate-limit" && "$method" == GET ]]; then
+  printf '%s\n' "$url" >>"$FAKE_FORGE/rate-limited.log"
+  printf '{"message":"rate limited"}\n429'; exit
+fi
 case "$method $url" in
   'GET '*'/pulls?state=open')
     # A second open pull request while $FAKE_FORGE/head2 names its head, for the order the tick gates in.
@@ -112,7 +116,13 @@ case "$method $url" in
     if [[ -f "$FAKE_FORGE/regate.json" ]]; then cat "$FAKE_FORGE/regate.json"; else printf '{"requests":[]}'; fi
     printf '\n200';;
   'GET '*'/merge-queue?state=building')
-    if [[ -f "$FAKE_FORGE/queue.json" ]]; then cat "$FAKE_FORGE/queue.json"; else printf '{"entries":[]}'; fi
+    # queue-arrives.json: empty for a tick's first read, then the entry -- one that arrives mid-tick.
+    if [[ -f "$FAKE_FORGE/queue-arrives.json" ]]; then
+      reads=0
+      [[ ! -f "$FAKE_FORGE/queue-reads" ]] || read -r reads <"$FAKE_FORGE/queue-reads"
+      printf '%s\n' "$((reads + 1))" >"$FAKE_FORGE/queue-reads"
+      if ((reads == 0)); then printf '{"entries":[]}'; else cat "$FAKE_FORGE/queue-arrives.json"; fi
+    elif [[ -f "$FAKE_FORGE/queue.json" ]]; then cat "$FAKE_FORGE/queue.json"; else printf '{"entries":[]}'; fi
     printf '\n200';;
   'GET '*'/status')
     # Statuses are per commit, as on the forge; a hand-written row without a sha applies to any.
@@ -386,7 +396,7 @@ export GATE_RUNNER_FAMILY=fixture
 grep -q 'has no canonical main' "$fixture/runner.log"
 [[ ! -d "$fixture/runner/mirror/nomain.git" ]] || { printf 'a mirror was left behind for a repository with no main\n' >&2; exit 1; }
 # The same holds when a mirror already exists and main disappears upstream: no stale mirror may remain
-# for step 3 to check out.
+# for step 5 to check out.
 git clone -q --bare --no-local "$fixture/nomain-src" "$fixture/runner/mirror/nomain.git"
 git -C "$fixture/runner/mirror/nomain.git" branch -q main scaffold
 export GATE_RUNNER_FAMILY="fixture nomain"
@@ -529,6 +539,44 @@ grep -q 'ignoring a malformed merge-queue entry' "$fixture/runner.log"
 rm -f "$fixture/queue.json"
 printf 'PASS merge queue: a rebuilt entry and a ref outside refs/queue/ are never gated\n'
 
+# An entry that arrives while a tick is deciding PR heads ends that tick before the next head, so the
+# next tick gates it first instead of after a slot frees elsewhere.
+printf 'new head while the queue is empty\n' >>"$fixture/source/marker"
+"$real_git" -C "$fixture/source" add marker
+"$real_git" -C "$fixture/source" commit -qm head-before-queue
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+"$real_git" -C "$fixture/source" checkout -q -B queue-build-2 main
+printf 'replayed mid-tick\n' >"$fixture/source/queued"
+"$real_git" -C "$fixture/source" add queued
+"$real_git" -C "$fixture/source" commit -qm queue-replay-2
+qsha2=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" "+HEAD:refs/queue/main/1"
+"$real_git" -C "$fixture/source" checkout -q main
+queue_entry "$qsha2" refs/queue/main/1
+mv "$fixture/queue.json" "$fixture/queue-arrives.json"
+rm -f "$fixture/queue-reads"
+before_count=$(count)
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$before_count"
+grep -q "merge-queue entry acme/fixture at $qsha2 arrived during this tick" "$fixture/runner.log" \
+  || { printf 'a mid-tick queue entry did not end the tick\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+! grep -q "preparing acme/fixture#1 at $(cat "$fixture/head")" "$fixture/runner.log" \
+  || { printf 'the PR head was prepared ahead of a waiting queue entry\n' >&2; exit 1; }
+mv "$fixture/queue-arrives.json" "$fixture/queue.json"
+invoke
+expect_count "$((before_count + 1))"
+grep -q "preparing acme/fixture#1 at $qsha2 (merge queue refs/queue/main/1)" "$fixture/runner.log" \
+  || { printf 'the next tick did not gate the arrived entry first\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+# Seen at the start of a tick and already claimed, the same entry never ends a tick again.
+invoke
+expect_count "$((before_count + 2))"
+! grep -q 'arrived during this tick' "$fixture/runner.log" \
+  || { printf 'a claimed entry ended a tick\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/queue.json" "$fixture/queue-reads"
+printf 'PASS merge queue: an entry arriving mid-tick ends the tick and is gated first by the next\n'
+
 # A sibling's main moving re-gates open heads automatically, but a burst is coalesced: the runner
 # records the family's mains after each mirror fetch, and while they moved within the settle window an
 # already-gated head waits. An explicit --repo/--pr is never deferred.
@@ -557,9 +605,12 @@ touch -d '-2 hours' "$mains"
 GATE_RUNNER_REGATE_SETTLE=3600 invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 ! grep -q 'deferring re-gate' "$fixture/runner.log"
-grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
-  || { printf 'a settled head was not re-gated\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
-printf 'PASS re-gate on a moved main: a burst is coalesced, explicit retry is not deferred, a settled head re-gates\n'
+# Settled, so the head is decided on its inputs again instead of waiting. This fixture's family is
+# the gated repository itself, so its own main moving past the head changes none of that head's
+# inputs and the decision is reuse; a sibling's main really moving is exercised below.
+grep -q 'reuse acme/fixture@' "$fixture/runner.log" \
+  || { printf 'a settled head was not decided again\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+printf 'PASS re-gate on a moved main: a burst is coalesced, explicit retry is not deferred, a settled head is decided again\n'
 
 # A re-gate asked for on the forge (jeryu-deploy: POST /api/v1/repos/:id/pulls/:n/regate) gates a
 # head again although a terminal result for it exists, and is listed as claimable even while a merge
@@ -573,7 +624,7 @@ regate() { # requested_at
 regate 2026-10-04T09:00:00Z
 touch "$mains"   # the family's mains just moved: an automatic re-gate would wait for the burst
 listed=$(GATE_RUNNER_REGATE_SETTLE=3600 bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
-grep -q "^acme fixture 1 $head - " <<<"$listed" \
+grep -q "^acme fixture 1 $head - 0 " <<<"$listed" \
   || { printf 'a requested re-gate was not claimable:\n%s\n' "$listed" >&2; exit 1; }
 before_count=$(count)
 GATE_RUNNER_REGATE_SETTLE=3600 invoke
@@ -762,13 +813,13 @@ rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOT_PATTERN="$fixture/roots/{owner}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1) || {
   printf 'discovery through the checkout-root pattern failed:\n%s\n' "$listed" >&2; exit 1; }
-[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
+[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 [[ "$(cat "$fixture/runner/cache/protected-acme")" == acme/fixture ]]
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOTS="other=/nonexistent acme=$fixture/roots/acme" PR_GATE_CHECKOUT_ROOT_PATTERN="/nonexistent/{owner}" \
   bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
-[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
+[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
 grep -q 'no checkout root for owner acme' <<<"$listed" || { printf 'a missing checkout root was silent:\n%s\n' "$listed" >&2; exit 1; }
@@ -804,8 +855,9 @@ rm -f "$fixture/runner/cache/protected-acme"
 moved=0
 new_head() {
   moved=$((moved + 1))
-  printf 'pass %s\n' "$moved" >"$fixture/source/mode"
-  "$real_git" -C "$fixture/source" add mode
+  printf 'pass\n' >"$fixture/source/mode"
+  printf 'dispatch case %s\n' "$moved" >>"$fixture/source/marker"
+  "$real_git" -C "$fixture/source" add mode marker
   "$real_git" -C "$fixture/source" commit -qm "move the head ($moved)"
   "$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
   "$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
@@ -818,7 +870,7 @@ printf '%s\n' "$(date -u -d '-90 seconds' +%FT%TZ)" >"$fixture/pr-opened"
 new_head
 invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
-jq -e '.queue_wait.source == "pr-opened" and .queue_wait.seconds >= 85 and .queue_wait.seconds <= 300' "$receipt" >/dev/null \
+jq -e '.outcome == "success" and .exit_code == 0 and .queue_wait.source == "pr-opened" and .queue_wait.seconds >= 85 and .queue_wait.seconds <= 300' "$receipt" >/dev/null \
   || { printf 'the queue wait was not measured from the pull request\n' >&2; jq -c .queue_wait "$receipt" >&2; exit 1; }
 grep -q 'queue wait .*pr-opened' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
 printf 'PASS a gate records how long its head waited, dated by the pull request itself\n'
@@ -856,8 +908,9 @@ printf 'PASS a stale or malformed wake-up line is dropped once, and an undated o
 # new pull request to whichever slot is idle instead of letting it wait behind the slot's own pass.
 new_head
 "$real_git" -C "$fixture/source" checkout -q -b second
-printf 'pass second\n' >"$fixture/source/mode"
-"$real_git" -C "$fixture/source" add mode
+printf 'pass\n' >"$fixture/source/mode"
+printf 'second dispatch head\n' >>"$fixture/source/marker"
+"$real_git" -C "$fixture/source" add mode marker
 "$real_git" -C "$fixture/source" commit -qm "a second open head"
 "$real_git" -C "$fixture/source" push -q "$fixture/source.git" second
 "$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head2"
@@ -875,3 +928,132 @@ grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
   || { printf 'without a wake-up the tick did not take the first head of its pass\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 rm -f "$fixture/head2"
 printf 'PASS a woken slot gates the head it was woken for before the rest of its pass\n'
+# A 429 on a read starts one back-off for every slot: the next tick makes no request at all, and
+# the first answer that is not a 429 ends it.
+rm -f "$fixture/runner/cache/forge-backoff" "$fixture/rate-limited.log"
+touch "$fixture/rate-limit"
+env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
+[[ -s "$fixture/runner/cache/forge-backoff" ]] || { printf 'a 429 started no back-off\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+grep -q 'answered 429' "$fixture/runner.log"
+sent=$(wc -l <"$fixture/rate-limited.log")
+env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
+[[ "$(wc -l <"$fixture/rate-limited.log")" == "$sent" ]] || { printf 'a request went out during the back-off\n' >&2; exit 1; }
+grep -q 'rate limiting this identity' "$fixture/runner.log"
+rm -f "$fixture/rate-limit" "$fixture/runner/cache/forge-backoff"
+printf 'PASS a 429 backs every slot off: no request goes out until the back-off passes\n'
+
+# Reuse is decided from the head's input identity before any tree is prepared: an unchanged head
+# costs no mirror checkout, no reset and no tree-wide fingerprint, which is what ~40 open heads spent
+# ~35 slot-hours a day on. The identity is the same one the receipt pins, so a sibling main that
+# moved and a governed tool that was reinstalled still re-gate the head, and an explicit retry or a
+# re-gate the forge asked for is never short-circuited.
+git init -q --initial-branch=main "$fixture/sibling-src"
+git -C "$fixture/sibling-src" config user.name Fixture
+git -C "$fixture/sibling-src" config user.email fixture@example.invalid
+printf 'first\n' >"$fixture/sibling-src/file"
+git -C "$fixture/sibling-src" add file
+git -C "$fixture/sibling-src" commit -qm sibling
+git clone -q --bare --no-local "$fixture/sibling-src" "$fixture/sibling.git"
+export GATE_RUNNER_FAMILY="fixture sibling"
+printf 'with a sibling\n' >>"$fixture/source/marker"
+"$real_git" -C "$fixture/source" add marker
+"$real_git" -C "$fixture/source" commit -qm cheap-identity-fixture
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+head=$(cat "$fixture/head")
+before_count=$(count)
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+jq -e '[.inputs.sources[].repository] == ["fixture","sibling"]' \
+  "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null \
+  || { printf 'the sibling was not bound into the identity\n' >&2; exit 1; }
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+grep -q "reuse acme/fixture@$head: identical verified inputs, read without preparing a tree" "$fixture/runner.log" \
+  || { printf 'an unchanged head was not reused before preparation\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+! grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
+  || { printf 'an unchanged head still prepared a tree\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+printf 'PASS cheap identity: an unchanged head is reused without preparing a tree\n'
+
+# A sibling main that moved is a changed input, read straight out of the refreshed mirror: the head is
+# prepared and gated again. Exact-source authority -- trusting the receipt and the forge status alone --
+# would have missed this.
+printf 'moved\n' >"$fixture/sibling-src/file"
+git -C "$fixture/sibling-src" add file
+git -C "$fixture/sibling-src" commit -qm sibling-moves
+git -C "$fixture/sibling-src" push -q "$fixture/sibling.git" main
+sibling_main=$(git -C "$fixture/sibling-src" rev-parse HEAD)
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 2))"
+grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
+  || { printf 'a moved sibling main did not re-gate the head\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+jq -e --arg s "$sibling_main" 'any(.inputs.sources[]; .repository=="sibling" and .head==$s)' \
+  "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null \
+  || { printf 'the re-gate did not bind the moved sibling main\n' >&2; exit 1; }
+invoke
+expect_count "$((before_count + 2))"
+# ... and so is a governed tool that was installed since: what the gate evaluates with is hashed on
+# every tick, never read from the receipt.
+printf 'a governed tool arrived\n' >"$fixture/tools/governed-marker"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 3))"
+grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
+  || { printf 'a reinstalled governed tool did not re-gate the head\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+printf 'PASS cheap identity: a moved sibling main and a reinstalled governed tool re-gate the head\n'
+
+# An explicit retry and a re-gate the forge asked for are retries of this head, so neither is ever
+# answered from a reusable receipt -- and an explicit retry still refreshes the head before it
+# dispatches, so a head that moved under it runs nothing at all.
+invoke
+expect_count "$((before_count + 3))"
+grep -q 'read without preparing a tree' "$fixture/runner.log"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 4))"
+! grep -q 'read without preparing a tree' "$fixture/runner.log" \
+  || { printf 'an explicit retry was answered from the receipt\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+jq -nc --arg s "$head" '{requests:[{repo:"acme/fixture",number:1,head_sha:$s,
+  requested_at:"2026-10-10T07:00:00Z",requested_by:"dana"}]}' >"$fixture/regate.json"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 5))"
+! grep -q 'read without preparing a tree' "$fixture/runner.log" \
+  || { printf 'a requested re-gate was answered from the receipt\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+grep -q "re-gate requested for acme/fixture#1 at $head" "$fixture/runner.log"
+rm -f "$fixture/regate.json"
+touch "$fixture/change-head"
+rm -f "$fixture/head-reads"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 5))"
+grep -q 'head changed or PR closed' "$fixture/runner.log" \
+  || { printf 'an explicit retry dispatched without refreshing the head\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/change-head"
+printf 'PASS cheap identity: an explicit retry and a requested re-gate are never short-circuited\n'
+
+# Deciding reuse this early takes no claim of its own: the head is already inside its claim lock, and
+# flock is released by the kernel when a slot dies. Nothing is left behind for a killed slot to park
+# the head on -- a claim directory would leave it "recovery required" for as long as it stayed open.
+rm -rf "$fixture/runner/claims"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q 'read without preparing a tree' "$fixture/runner.log"
+[[ -f "$fixture/runner/claim-locks/acme-fixture-$head.lock" ]] \
+  || { printf 'the head was not serialised by its claim lock\n' >&2; exit 1; }
+[[ -z "$(ls -A "$fixture/runner/claims" 2>/dev/null)" ]] \
+  || { printf 'reuse before preparation left a claim behind: %s\n' "$(ls -A "$fixture/runner/claims")" >&2; exit 1; }
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+if grep -q 'recovery required' "$fixture/runner.log"; then
+  printf 'reuse before preparation parked the head in recovery\n' >&2
+  cat "$fixture/runner.log" >&2
+  exit 1
+fi
+grep -q 'read without preparing a tree' "$fixture/runner.log"
+rm -f "$fixture/tools/governed-marker"
+export GATE_RUNNER_FAMILY=fixture
+printf 'PASS cheap identity: reuse before preparation claims nothing and never parks the head in recovery\n'

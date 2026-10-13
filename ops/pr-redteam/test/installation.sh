@@ -68,7 +68,7 @@ NOTIFY_COMMAND='cat > "$INSTALL_FIXTURE/notification"' INSTALL_FIXTURE="$t" PATH
   "$here/notify-failure" pr-redteam-heartbeat.service > "$t/notify-command-out" 2>&1
 grep -q 'pr-redteam unit failed: pr-redteam-heartbeat.service' "$t/notification"
 grep -q 'journal for --user -u pr-redteam-heartbeat.service' "$t/notification"
-NOTIFY_COMMAND='test -n "$PR_REDTEAM_NOTIFY_BODY_FILE" && test ! -n "${PR_REDTEAM_NOTIFY_BODY:-}" && cat > "$INSTALL_FIXTURE/notification-file-ok" && cmp "$PR_REDTEAM_NOTIFY_BODY_FILE" "$INSTALL_FIXTURE/notification-file-ok"' \
+NOTIFY_COMMAND='test -n "$PR_REDTEAM_NOTIFY_BODY_FILE" && test -n "$PR_REDTEAM_NOTIFY_BODY" && cat > "$INSTALL_FIXTURE/notification-file-ok" && cmp "$PR_REDTEAM_NOTIFY_BODY_FILE" "$INSTALL_FIXTURE/notification-file-ok" && test "$PR_REDTEAM_NOTIFY_BODY" = "$(cat "$PR_REDTEAM_NOTIFY_BODY_FILE")"' \
   INSTALL_FIXTURE="$t" PATH="$t/bin:$PATH" \
   "$here/notify-failure" pr-redteam-poke.service > "$t/notify-file-out" 2>&1
 grep -q 'pr-redteam unit failed: pr-redteam-poke.service' "$t/notification-file-ok"
@@ -91,4 +91,19 @@ chmod +x "$t/bin/journalctl"
 NOTIFY_COMMAND='cat > "$INSTALL_FIXTURE/notification-capped"' INSTALL_FIXTURE="$t" PATH="$t/bin:$PATH" \
   NOTIFY_MAX_BODY_BYTES=64 "$here/notify-failure" pr-redteam.service > "$t/notify-capped-out" 2>&1
 [[ "$(wc -c < "$t/notification-capped")" -le 64 ]]
+# A secret after the body cap still suppresses the entire captured journal.
+cat >"$t/bin/journalctl" <<'FIXTURE'
+#!/usr/bin/env bash
+printf '%200s\nREVIEW-TOKEN-7f3a\n' x
+FIXTURE
+NOTIFY_COMMAND='cat > "$INSTALL_FIXTURE/notification-after-cap"' INSTALL_FIXTURE="$t" PATH="$t/bin:$PATH" \
+  JERYU_TOKEN_FILE="$t/token" NOTIFY_MAX_BODY_BYTES=100 "$here/notify-failure" pr-redteam.service >"$t/notify-after-cap-out" 2>&1
+grep -q 'journal omitted' "$t/notification-after-cap"
+! grep -q 'REVIEW-TOKEN-7f3a' "$t/notification-after-cap"
+# Both ordinary EnvironmentFile quote forms name the same installed executable.
+for quote in '"' "'"; do
+  printf 'JERYU_BASE=https://forge.invalid\nJERYU_TOKEN_FILE=%s/token\nREDTEAM_CLAUDE=%s%s/bin/claude%s\nREDTEAM_CLAUDE_VERSION=9.9.9\n' \
+    "$t" "$quote" "$t" "$quote" >"$t/home/.config/pr-redteam/site.env"
+  run 0
+done
 echo 'INACTIVE INSTALLATION PASS'

@@ -23,6 +23,8 @@
 # same reason as above. It reads receipts and logs and writes only its own markers under
 # cache/events-posted; attempt evidence is never touched. Events are admin-read on the forge, and the
 # log is the recipe's own output: the recipe runs under env -i and never sees the credential.
+# The tail is cut at a line boundary, so it never starts mid-token, and the event names the whole
+# log with log_url when PR_GATE_LOG_URL_TEMPLATE says where this host's attempt logs are served.
 # Each event carries event_id pr-gate:<attempt id>, which the forge deduplicates, so a post whose
 # answer was lost is safe to repeat. GATE_RUNNER_EVENTS=0 turns it off.
 # ---------------------------------------------------------------------------
@@ -45,6 +47,15 @@ TOKEN_FILE="$(pr_gate_path "${JERYU_TOKEN_FILE:-}")"
 [[ -n "$TOKEN_FILE" ]] || { printf 'heartbeat: JERYU_TOKEN_FILE is not configured (set it in %s)\n' "$PR_GATE_CONFIG_FILE" >&2; exit 2; }
 HOME_DIR="${GATE_RUNNER_HOME:-$HOME/gate-runner}"
 HOST="$(hostname -s)"
+# Where this host's attempt logs are served, if they are served at all: a URL template whose
+# {attempt}, {host}, {slot}, {repo} and {sha} name the attempt, so a gate.log event can carry
+# log_url and the pull request page can open the whole build.log instead of only its tail. Nothing
+# here serves the logs; unset (the default) sends no log_url rather than a link that 404s.
+LOG_URL_TEMPLATE="${PR_GATE_LOG_URL_TEMPLATE:-}"
+if [[ -n "$LOG_URL_TEMPLATE" ]] && ! [[ "$LOG_URL_TEMPLATE" =~ ^https?://[^[:space:][:cntrl:]]{1,500}$ ]]; then
+  printf 'heartbeat: PR_GATE_LOG_URL_TEMPLATE is not an http(s) URL; events carry no log_url\n' >&2
+  LOG_URL_TEMPLATE=""
+fi
 # Slots are whatever pr-gate-runner@N timers are active (list-unit-files shows only the template);
 # GATE_RUNNER_SLOTS overrides.
 SLOTS="${GATE_RUNNER_SLOTS:-$(systemctl --user list-units --no-legend --plain --state=active 'pr-gate-runner@*.timer' \
@@ -130,27 +141,51 @@ runner_code="" runner_tools=""
 declare -F gate_runner_code >/dev/null && runner_code=$(gate_runner_code "$HOME_DIR")
 declare -F gate_runner_tools >/dev/null && runner_tools=$(gate_runner_tools "$HOME_DIR")
 
+# The shape the forge last accepted is remembered for 30 minutes (cache/heartbeat-level: 0 full, 1 no
+# tools, 2 no code, 3 the oldest contract), so an older forge costs one request a slot, not four. After
+# that the newest shape is tried again, so an upgraded forge is noticed.
+LEVEL_FILE="$HOME_DIR/cache/heartbeat-level"
+level=0 minimal=0
+if [[ -n "$(find "$LEVEL_FILE" -mmin -30 2>/dev/null)" ]]; then level="$(cat "$LEVEL_FILE" 2>/dev/null || echo 0)"; fi
+[[ "$level" =~ ^[0-3]$ ]] || level=0
+((level < 1)) || runner_tools=""
+((level < 2)) || runner_code=""
+((level < 3)) || minimal=1
+level_seen=$level
+
 for slot in $SLOTS; do
   body=$(jq -nc --arg id "$HOST/slot$slot" --arg host "$HOST" --argjson slot "$slot" \
     --argjson current "$(current "$slot")" --argjson last "$(last "$slot")" \
     '{runnerId:$id, host:$host, slot:$slot, labels:["pr-gate"], current:$current, last:$last}')
-  if [[ -n "$runner_code$runner_tools" ]]; then
+  if ((minimal)); then
+    post_heartbeat "$(gate_heartbeat_minimal "$body")"
+  elif [[ -n "$runner_code$runner_tools" ]]; then
     post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "$runner_tools")"
   else
     post_heartbeat "$body"
   fi
   if [[ "$code" == 422 && -n "$runner_tools" ]]; then
     printf 'heartbeat tools refused (422); retrying without them\n' >&2
-    runner_tools=""
+    runner_tools="" level=1
     post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "")"
   fi
   if [[ "$code" == 422 && -n "$runner_code" ]]; then
     printf 'heartbeat code refused (422); retrying without it\n' >&2
-    runner_code=""
+    runner_code="" level=2
     post_heartbeat "$body"
+  fi
+  # Still refused: the forge predates the shape itself. Fall back to the oldest contract it accepted.
+  if [[ "$code" == 422 ]] && ((!minimal)); then
+    printf 'heartbeat shape refused (422); retrying with the oldest contract\n' >&2
+    minimal=1 level=3
+    post_heartbeat "$(gate_heartbeat_minimal "$body")"
   fi
   [[ "$code" == 200 ]] || printf 'slot %s: heartbeat answered %s: %s\n' "$slot" "$code" "${out%$'\n'*}" >&2
 done
+if ((level != level_seen)); then
+  mkdir -p "$HOME_DIR/cache"
+  printf '%s\n' "$level" >"$LEVEL_FILE"
+fi
 
 # ---- finished attempts -> pipeline events -------------------------------------------------------
 [[ "${GATE_RUNNER_EVENTS:-1}" != 0 ]] || exit 0
@@ -170,6 +205,14 @@ pr_of() { # slot repo sha -> PR number or null. The receipt has none; the slot's
       | sed -n "s|.*preparing $repo#\([0-9]\+\) at $sha.*|\1|p" | tail -1) || pr=""
   fi
   [[ "$pr" =~ ^[1-9][0-9]*$ ]] && printf '%s' "$pr" || printf 'null'
+}
+
+log_url_of() { # attempt slot repo sha -> the served URL of this attempt's build.log, or nothing
+  local url="$LOG_URL_TEMPLATE"
+  [[ -n "$url" ]] || return 0
+  url="${url//\{attempt\}/$1}" url="${url//\{slot\}/$2}" url="${url//\{repo\}/$3}"
+  url="${url//\{sha\}/$4}" url="${url//\{host\}/$HOST}"
+  printf '%s' "$url"
 }
 
 posted=0
@@ -192,9 +235,21 @@ while IFS= read -r receipt; do
     # Keep newlines and tabs; drop other control bytes (colour codes, carriage returns) and bad UTF-8.
     tail -c "$tail_bytes" "$log" | iconv -f utf-8 -t utf-8 -c 2>/dev/null \
       | sed -e 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tr -d '\000-\010\013-\037\177' >"$tail_file" || : >"$tail_file"
+    # A tail of bytes begins mid-line ("otency_headers) ... ok"), so drop that first partial line and
+    # start at a line boundary -- but only when the log really was cut, and never when the cut line is
+    # all there is (one enormous line is still better read half than not at all). The forge takes at
+    # most 16 KiB of log_tail and clips the rest, so dropping a line always stays within its limit.
+    if ((log_bytes > tail_bytes)) && (($(wc -l <"$tail_file") > 0)); then
+      trimmed=$(mktemp)
+      sed -e 1d "$tail_file" >"$trimmed"
+      [[ ! -s "$trimmed" ]] || cat "$trimmed" >"$tail_file"
+      rm -f -- "$trimmed"
+    fi
   fi
+  log_url=""
+  [[ "$log_bytes" == 0 ]] || log_url=$(log_url_of "$id" "$slot" "$repo" "$sha")
   event=$(jq -c --arg host "$HOST" --arg repo "$repo" --argjson pr "$(pr_of "$slot" "$repo" "$sha")" \
-    --rawfile tail "$tail_file" --argjson log_bytes "$log_bytes" '
+    --rawfile tail "$tail_file" --argjson log_bytes "$log_bytes" --arg log_url "$log_url" '
     (.outcome // "error") as $outcome
     | ((.finished_at // .started_at | fromdateiso8601) - (.started_at | fromdateiso8601)) as $seconds
     | {event_id: ("pr-gate:" + .id), source: "pr-gate", kind: "gate.log", actor: ($host + "/slot" + (.slot // "0")),
@@ -206,8 +261,9 @@ while IFS= read -r receipt; do
                     else " after " + (.queue_wait.seconds | tostring) + "s in the queue" end)),
        reason: (if .recovery_required == null then null else (.recovery_required | tostring | .[0:1000]) end),
        log_tail: (if $tail == "" then null else $tail end),
+       log_url: (if $log_url == "" then null else $log_url end),
        detail: {attempt: .id, sequence, exit_code, execution_kind, recipe: .inputs.recipe, log_sha256, log_bytes: $log_bytes,
-                cache: (.cache // null), queue_wait: (.queue_wait // null)}}
+                cache: (.cache // null), queue_wait: (.queue_wait // null), runner: ($host + "/slot" + (.slot // "0"))}}
     | .summary |= .[0:300]' "$receipt" 2>/dev/null) || event=""
   rm -f -- "$tail_file"
   [[ -n "$event" ]] || { printf 'attempt %s: receipt could not be projected to an event\n' "$id" >&2; continue; }

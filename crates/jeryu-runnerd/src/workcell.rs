@@ -95,7 +95,14 @@ pub struct FrozenCiSnapshot {
     pub failed_receipt_id: String,
     pub workcell_id: String,
     pub runner_id: String,
+    /// The frozen cell's own fencing token (a repair cell's is bumped).
     pub runner_epoch: u64,
+    /// The runner lifetime the registry admitted when the frozen cell's chain
+    /// was first claimed. Repair is fenced on this, never on the token above.
+    pub admitted_runner_epoch: u64,
+    /// The frozen cell's repair generation; repair checks it against the
+    /// ledger's record of the source cell rather than trusting it.
+    pub repair_generation: u32,
     pub workspace_root: PathBuf,
     pub repo_roots: Vec<PathBuf>,
     pub allowed_paths: Vec<PathBuf>,
@@ -146,6 +153,17 @@ pub struct FreezeFailedCiRunRequest {
     pub snapshot_age_ms: u64,
 }
 
+/// Request to repair from a frozen snapshot. `runner_id` and `runner_epoch`
+/// are the caller's own identity, fenced against the daemon's registry; the
+/// snapshot's chain must belong to that runner lifetime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepairFromSnapshotRequest {
+    pub runner_id: String,
+    pub runner_epoch: u64,
+    pub snapshot: FrozenCiSnapshot,
+    pub startup: StartupSync,
+}
+
 /// Request to hold a failed tree for live repair.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HoldFailedTreeRequest {
@@ -169,7 +187,17 @@ pub struct WorkcellLease {
     pub git_status_summary: String,
     pub ci_snapshot_age_ms: Option<u64>,
     pub runner_id: String,
+    /// This cell's own fencing token: per-cell operations must present it.
+    /// A repair cell carries its snapshot's token plus one.
     pub runner_epoch: u64,
+    /// The runner lifetime the registry admitted for this cell's claim chain.
+    /// It is never bumped, so a repair of a repair is still fenced on the
+    /// runner's real epoch.
+    pub admitted_runner_epoch: u64,
+    /// How many repairs deep this cell is: 0 for a claimed or held cell, its
+    /// source's generation plus one for a repair cell. Capped at
+    /// [`WORKCELL_MAX_REPAIR_GENERATIONS`].
+    pub repair_generation: u32,
     pub heartbeat_healthy: bool,
     pub startup_rebased: bool,
     pub startup_main_ref: Option<String>,
@@ -181,6 +209,32 @@ pub struct WorkcellLease {
     pub frozen_snapshot: Option<FrozenCiSnapshot>,
     pub blocked_reason: Option<String>,
 }
+
+/// How far the daemon's registry admits a runner lifetime past the
+/// work-cell fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunnerAdmission {
+    /// The runner takes fresh work cells and carries its in-flight work.
+    Active,
+    /// The runner takes no fresh work cell (claim, warm cell or failed-tree
+    /// hold); it may only repair from a frozen snapshot of its existing
+    /// in-flight work.
+    Draining,
+}
+
+/// One runner lifetime on the work-cell fence: the epoch the registry issued
+/// it and how far that lifetime is admitted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmittedRunner {
+    pub epoch: u64,
+    pub admission: RunnerAdmission,
+}
+
+/// The deepest repair generation a chain may reach. A repair cell is itself
+/// a repair source, so without this bound a runner, including a draining
+/// one, could chain repairs and keep taking cells indefinitely.
+pub const WORKCELL_MAX_REPAIR_GENERATIONS: u32 = 3;
 
 /// In-memory workcell warm-pool and claim ledger.
 #[derive(Debug, Default, Clone)]
@@ -195,6 +249,31 @@ pub struct WorkcellManager {
     next_id: u64,
     ready_queue: VecDeque<String>,
     cells: BTreeMap<String, WorkcellLease>,
+    /// Current epoch and admission per admitted runner, as issued by the
+    /// daemon's registry. A runner not listed here, or a request carrying any
+    /// other epoch, comes from a lifetime the daemon did not admit and is
+    /// fenced; a draining runner is admitted only to repair from a snapshot.
+    runner_epochs: BTreeMap<String, AdmittedRunner>,
+    /// Source cells a repair cell has already been minted from. Repair is
+    /// one-shot per source cell, so replaying a snapshot mints nothing. An
+    /// entry is dropped when its source cell is released, since a released
+    /// cell is no longer a live repair source.
+    repaired_sources: BTreeSet<String>,
+}
+
+/// The ledger's own record of a repair's source cell, from which the repair
+/// cell is seeded instead of from the caller's snapshot.
+struct RepairSource {
+    runner_id: String,
+    runner_epoch: u64,
+    admitted_runner_epoch: u64,
+    repair_generation: u32,
+    agent_id: String,
+    workspace_root: PathBuf,
+    repo_roots: Vec<PathBuf>,
+    allowed_paths: Vec<PathBuf>,
+    git_status_summary: String,
+    branch_policy: BranchPolicy,
 }
 
 /// Validate incoming archive entries before extraction into a workcell repo.

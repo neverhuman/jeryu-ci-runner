@@ -1,8 +1,11 @@
 //! Retain opaque workspace disks, never post-authentication memory or tmpfs.
 //! This transient root is excluded from ordinary backups together with its keys.
 mod crypto;
+mod destroy;
 mod restore;
+mod retain;
 mod sparse;
+mod verify;
 /// Ciphertext tags/header plus bounded manifest/key/filesystem bookkeeping.
 pub(crate) fn storage_charge(plaintext: u64) -> RunnerResult<u64> {
     plaintext
@@ -15,16 +18,16 @@ pub(crate) fn storage_charge(plaintext: u64) -> RunnerResult<u64> {
         .and_then(|n| n.checked_add(72 + 1024 * 1024))
         .ok_or_else(|| failed("checkpoint_capacity_invalid"))
 }
-use crate::artifacts::trusted_directory;
+use crate::custody::{Directory, FileRole};
 use jeryu_runner_core::{RunnerError, RunnerResult, receipt::now_ms};
 use jeryu_runner_protocol::wire::v2::{
     CheckpointFormat, CheckpointManifest, CheckpointReference, SessionContext, WorkspaceReady,
 };
 use sha2::{Digest, Sha256};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::File,
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -32,7 +35,7 @@ pub struct CheckpointStore {
     root: PathBuf,
 }
 pub(crate) struct RetainedDisk<'a> {
-    pub path: &'a Path,
+    pub image: File,
     pub uid: u32,
     pub bytes: u64,
     pub filesystem_flushed: bool,
@@ -40,144 +43,57 @@ pub(crate) struct RetainedDisk<'a> {
 }
 impl CheckpointStore {
     pub fn open(node_root: &Path) -> RunnerResult<Self> {
-        trusted_directory(node_root)?;
+        let directory = Directory::open(node_root)
+            .and_then(|node| node.child_directory(Path::new("checkpoints")))
+            .map_err(|_| failed("checkpoint_custody_denied"))?;
+        if directory.mode()? != 0o700 {
+            return Err(failed("checkpoint_custody_denied"));
+        }
         let root = node_root.join("checkpoints");
-        fs::create_dir_all(&root)?;
-        trusted_directory(&root)?;
-        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
         Ok(Self { root })
     }
-    /// The journal holds this resource's lock and proves the VMM is dead before
-    /// this method reads its private disk. It does not inspect guest file paths.
-    pub(crate) fn retain(
-        &self,
-        id: &str,
-        context: &SessionContext,
-        disk: RetainedDisk<'_>,
-    ) -> RunnerResult<CheckpointReference> {
-        let RetainedDisk {
-            path: source,
-            uid: expected_uid,
-            bytes,
-            filesystem_flushed,
-            workspace,
-        } = disk;
-        let directory = self.directory(id)?;
-        if directory.exists() {
-            let (reference, manifest) = self.read_id(id)?;
-            if manifest.context != *context || manifest.plaintext_bytes != bytes {
-                return Err(failed("checkpoint_context_mismatch"));
-            }
-            return Ok(reference);
-        }
-        let mut image = OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(source)?;
-        let metadata = image.metadata()?;
-        if !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.uid() != expected_uid
-            || metadata.len() != bytes
-        {
-            return Err(failed("checkpoint_workspace_custody_denied"));
-        }
-        let staging = self.root.join(format!("{id}.new"));
-        if staging.exists() {
-            trusted_directory(&staging)?;
-            fs::remove_dir_all(&staging)?;
-        }
-        fs::create_dir(&staging)?;
-        fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))?;
-        // Each retry gets a fresh key; partially written images are never reused.
-        let key = crypto::random_key()?;
-        let mut encrypted = create(&staging.join("image"))?;
-        context
-            .validate()
-            .map_err(|_| failed("checkpoint_context_invalid"))?;
-        let binding = serde_json::to_vec(&(id, context, bytes, filesystem_flushed, workspace))
-            .map_err(|_| failed("checkpoint_context_invalid"))?;
-        let (plaintext_digest, ciphertext_digest) =
-            sparse::encrypt(&mut image, &mut encrypted, &key, bytes, &binding)?;
-        encrypted.sync_all()?;
-        let now = u64::try_from(now_ms()).map_err(|_| failed("checkpoint_clock_invalid"))?;
-        let manifest = CheckpointManifest {
-            format: CheckpointFormat::SparseV2,
-            checkpoint_id: id.into(),
-            context: context.clone(),
-            workspace: workspace.cloned(),
-            plaintext_bytes: bytes,
-            plaintext_digest,
-            ciphertext_digest,
-            filesystem_flushed,
-            created_at_unix_millis: now,
-            expires_at_unix_millis: now
-                .checked_add(7 * 24 * 60 * 60 * 1000)
-                .ok_or_else(|| failed("checkpoint_clock_invalid"))?,
-        };
-        let encoded = manifest
-            .to_json()
-            .map_err(|_| failed("checkpoint_manifest_invalid"))?;
-        let mut key_file = create(&staging.join("key"))?;
-        key_file.write_all(key.as_ref())?;
-        key_file.sync_all()?;
-        let mut receipt = create(&staging.join("manifest.json"))?;
-        receipt.write_all(&encoded)?;
-        receipt.sync_all()?;
-        File::open(&staging)?.sync_all()?;
-        fs::rename(staging, directory)?;
-        File::open(&self.root)?.sync_all()?;
-        Ok(CheckpointReference {
-            checkpoint_id: id.into(),
-            manifest_digest: digest(&encoded),
-        })
-    }
     pub fn manifest(&self, reference: &CheckpointReference) -> RunnerResult<CheckpointManifest> {
+        self.checked_checkpoint(reference)
+            .map(|(_, manifest)| manifest)
+    }
+    /// Manifest, key and ciphertext must refer to one held directory, even if
+    /// its original name is moved or substituted while restore is in flight.
+    fn checked_checkpoint(
+        &self,
+        reference: &CheckpointReference,
+    ) -> RunnerResult<(Directory, CheckpointManifest)> {
         reference
             .validate()
             .map_err(|_| failed("checkpoint_reference_invalid"))?;
-        let (actual, manifest) = self.read_id(&reference.checkpoint_id)?;
+        let directory = self.open_directory(&reference.checkpoint_id)?;
+        let (actual, manifest) = Self::read_directory(&directory, &reference.checkpoint_id)?;
         if actual != *reference {
             return Err(failed("checkpoint_manifest_mismatch"));
         }
-        Ok(manifest)
+        Ok((directory, manifest))
     }
     pub(crate) fn reference_for_resource(
         &self,
         id: &str,
         expected: &SessionContext,
+        bytes: u64,
+        filesystem_flushed: bool,
+        workspace: Option<&WorkspaceReady>,
     ) -> RunnerResult<Option<CheckpointReference>> {
-        if !self.directory(id)?.exists() {
+        Self::validate_id(id)?;
+        let directory = self.root_directory()?;
+        if !directory.entry_exists(Path::new(id))? {
             return Ok(None);
         }
-        let (reference, manifest) = self.read_id(id)?;
-        if manifest.context != *expected {
-            return Err(failed("checkpoint_context_mismatch"));
-        }
+        let directory = directory
+            .open_directory(Path::new(id))
+            .map_err(|_| failed("checkpoint_custody_denied"))?;
+        let (reference, manifest) = Self::read_directory(&directory, id)?;
+        Self::require_retained_metadata(&manifest, expected, bytes, filesystem_flushed, workspace)?;
+        Self::authenticate_files(&directory, &manifest)?;
+        directory.sync()?;
+        self.root_directory()?.sync()?;
         Ok(Some(reference))
-    }
-    /// Trusted cleanup uses an exact recorded reference and context. User or
-    /// guest-provided paths never authorize deletion. Destroy the key first.
-    pub fn destroy(
-        &self,
-        reference: &CheckpointReference,
-        expected: &SessionContext,
-    ) -> RunnerResult<()> {
-        let directory = self.directory(&reference.checkpoint_id)?;
-        if !directory.exists() {
-            return Ok(());
-        }
-        if self.manifest(reference)?.context != *expected {
-            return Err(failed("checkpoint_cleanup_fenced"));
-        }
-        match fs::remove_file(directory.join("key")) {
-            Ok(()) => File::open(&directory)?.sync_all()?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
-        }
-        fs::remove_dir_all(directory)?;
-        File::open(&self.root)?.sync_all()?;
-        Ok(())
     }
     pub(crate) fn retained_bytes(&self) -> RunnerResult<u64> {
         self.manifests()?
@@ -197,21 +113,68 @@ impl CheckpointStore {
     }
     fn manifests(&self) -> RunnerResult<Vec<(CheckpointReference, CheckpointManifest)>> {
         let mut manifests = vec![];
-        for entry in fs::read_dir(&self.root)? {
-            let name = entry?.file_name().to_string_lossy().into_owned();
+        let directory = self.root_directory()?;
+        for entry in directory.entries()? {
+            let name = entry
+                .to_str()
+                .ok_or_else(|| failed("checkpoint_custody_denied"))?;
             if name.ends_with(".new") {
-                continue;
+                return Err(failed("checkpoint_staging_incomplete"));
             }
-            manifests.push(self.read_id(&name)?);
+            Self::validate_id(name)?;
+            let checkpoint = directory
+                .open_directory(&entry)
+                .map_err(|_| failed("checkpoint_custody_denied"))?;
+            manifests.push(Self::read_directory(&checkpoint, name)?);
         }
         Ok(manifests)
     }
-    fn read_id(&self, id: &str) -> RunnerResult<(CheckpointReference, CheckpointManifest)> {
-        let directory = self.directory(id)?;
-        trusted_directory(&directory)?;
-        let file = self.file(&directory.join("manifest.json"), 32 * 1024)?;
+    fn open_directory(&self, id: &str) -> RunnerResult<Directory> {
+        Self::validate_id(id)?;
+        self.root_directory()
+            .and_then(|root| root.open_directory(Path::new(id)))
+            .map_err(|_| failed("checkpoint_custody_denied"))
+    }
+    fn root_directory(&self) -> RunnerResult<Directory> {
+        let directory =
+            Directory::open(&self.root).map_err(|_| failed("checkpoint_custody_denied"))?;
+        if directory.mode()? != 0o700 {
+            return Err(failed("checkpoint_custody_denied"));
+        }
+        Ok(directory)
+    }
+    fn image_maximum(manifest: &CheckpointManifest) -> RunnerResult<u64> {
+        match manifest.format {
+            CheckpointFormat::LegacyDenseV1 => manifest
+                .plaintext_bytes
+                .checked_add(
+                    manifest
+                        .plaintext_bytes
+                        .div_ceil(1024 * 1024)
+                        .checked_mul(16)
+                        .ok_or_else(|| failed("checkpoint_image_invalid"))?,
+                )
+                .and_then(|size| size.checked_add(24))
+                .ok_or_else(|| failed("checkpoint_image_invalid")),
+            CheckpointFormat::SparseV2 => Ok(sparse::maximum_size(manifest.plaintext_bytes)?),
+        }
+    }
+    fn read_directory(
+        directory: &Directory,
+        id: &str,
+    ) -> RunnerResult<(CheckpointReference, CheckpointManifest)> {
+        let file = Self::file(directory, "manifest.json", 32 * 1024)?;
+        Self::read_manifest(file, id)
+    }
+    fn read_manifest(
+        file: File,
+        id: &str,
+    ) -> RunnerResult<(CheckpointReference, CheckpointManifest)> {
         let mut encoded = vec![];
         file.take(32 * 1024 + 1).read_to_end(&mut encoded)?;
+        if encoded.len() > 32 * 1024 {
+            return Err(failed("checkpoint_custody_denied"));
+        }
         let manifest = CheckpointManifest::from_json(&encoded)
             .map_err(|_| failed("checkpoint_manifest_invalid"))?;
         if manifest.checkpoint_id != id {
@@ -225,42 +188,24 @@ impl CheckpointStore {
             manifest,
         ))
     }
-    fn file(&self, path: &Path, maximum: u64) -> RunnerResult<File> {
-        trusted_directory(
-            path.parent()
-                .ok_or_else(|| failed("checkpoint_custody_denied"))?,
-        )?;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::libc::O_NOFOLLOW)
-            .open(path)?;
-        let meta = file.metadata()?;
-        if !meta.is_file()
-            || meta.uid() != 0
-            || meta.mode() & 0o077 != 0
-            || meta.nlink() != 1
-            || meta.len() > maximum
-        {
-            return Err(failed("checkpoint_custody_denied"));
-        }
-        Ok(file)
+    fn file(directory: &Directory, name: &str, maximum: u64) -> RunnerResult<File> {
+        directory
+            .open_file(
+                Path::new(name),
+                FileRole::Configuration { private: true },
+                maximum,
+            )
+            .map_err(|_| failed("checkpoint_custody_denied"))
     }
-    fn directory(&self, id: &str) -> RunnerResult<PathBuf> {
+    fn validate_id(id: &str) -> RunnerResult<()> {
         CheckpointReference {
             checkpoint_id: id.into(),
             manifest_digest: format!("sha256:{}", "0".repeat(64)),
         }
         .validate()
         .map_err(|_| failed("checkpoint_id_invalid"))?;
-        Ok(self.root.join(id))
+        Ok(())
     }
-}
-fn create(path: &Path) -> std::io::Result<File> {
-    OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
 }
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(bytes)))
@@ -268,3 +213,10 @@ fn digest(bytes: &[u8]) -> String {
 fn failed(code: &'static str) -> RunnerError {
     RunnerError::new(code, "workspace checkpoint operation failed")
 }
+
+pub(crate) fn workspace_custody_denied() -> RunnerError {
+    failed("checkpoint_workspace_custody_denied")
+}
+
+#[cfg(test)]
+mod tests;

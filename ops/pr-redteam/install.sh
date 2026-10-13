@@ -7,7 +7,6 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 [ -x "$here/pr-redteam" ] || { echo "no executable pr-redteam next to $0" >&2; exit 1; }
-command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ] || { echo "claude CLI not found" >&2; exit 1; }
 
 units="$HOME/.config/systemd/user"
 required_environment_files() {
@@ -44,6 +43,10 @@ for setting in JERYU_BASE JERYU_TOKEN_FILE REDTEAM_CLAUDE REDTEAM_CLAUDE_VERSION
   }
 done
 claude_path="$(sed -n 's/^REDTEAM_CLAUDE=//p' "$site_env" | tail -n 1)"
+case "$claude_path" in
+  \"*\") claude_path="${claude_path:1:${#claude_path}-2}" ;;
+  \'*\') claude_path="${claude_path:1:${#claude_path}-2}" ;;
+esac
 [[ "$claude_path" == /* && -x "$claude_path" ]] || {
   echo "$site_env REDTEAM_CLAUDE must name an executable absolute path" >&2
   exit 1

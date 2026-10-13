@@ -133,6 +133,9 @@ fn a_capsule_carrying_a_token_value_is_not_frozen() {
 
     // The denylist is daemon configuration, never part of the request.
     let mut manager = WorkcellManager::with_warm_pool(1).with_forbidden_token_values(forbidden);
+    // Claims are fenced on the fleet registry's epochs; admit the fixture runner's
+    // epoch as RunnerFleet would, so the token guard is what refuses below.
+    manager.sync_runner_epochs([("runner-17".to_string(), 7)]);
     let err = manager
         .hold_failed_tree(HoldFailedTreeRequest {
             claim: rebased_claim("agent-wrath-17"),
@@ -173,6 +176,9 @@ fn manager_export_enforces_path_and_destination_guards() {
 
     let mut manager =
         WorkcellManager::with_warm_pool(1).with_export_destination_roots(vec![uploads.clone()]);
+    // Claims are fenced on the fleet registry's epochs; admit the fixture runner's
+    // epoch as RunnerFleet would, so the export guards are what refuse below.
+    manager.sync_runner_epochs([("runner-17".to_string(), 7)]);
     let lease = manager
         .hold_failed_tree(HoldFailedTreeRequest {
             claim: rebased_claim("agent-wrath-21"),
@@ -213,6 +219,7 @@ fn manager_export_enforces_path_and_destination_guards() {
 
     // No configured destination root means no export at all.
     let mut bare = WorkcellManager::with_warm_pool(1);
+    bare.sync_runner_epochs([("runner-17".to_string(), 7)]);
     let lease = bare
         .hold_failed_tree(HoldFailedTreeRequest {
             claim: rebased_claim("agent-wrath-22"),

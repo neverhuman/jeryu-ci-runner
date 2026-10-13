@@ -71,7 +71,7 @@ row() {
     --arg why "$(test -e "$MERGE_FIXTURE/behind" && echo 'behind main' || echo 'required contexts are not green yet')" \
     '{repo:{owner:"jeryu",name:"fixture"},number:107,head_sha:$sha,base_sha:$base,head_ref:"topic",
       base_ref:"main",draft:false,author:"contributor",title:"fixture",body_markdown:"fixture",
-      state:"open",passport_hash:"fixture-passport",review:{changes_requested:0},
+      state:"open",labels:["origin:internal"],passport_hash:"fixture-passport",review:{changes_requested:0},
       mergeable:{can_merge:$can,reason:$why}}'
 }
 case "$url" in

@@ -4,19 +4,19 @@ mod custody;
 mod staging;
 mod verify;
 use crate::{
-    artifacts::trusted_directory,
+    custody::{Directory, FileRole},
     supervisor::{HostStorageReservation, Node},
 };
 use jeryu_runner_core::{RunnerError, RunnerResult};
 use jeryu_runner_protocol::wire::v2::{
     ArtifactIdentity, BundleRegistered, BundleUpload, PROTOCOL_VERSION,
 };
-use nix::fcntl::{Flock, FlockArg};
+use nix::fcntl::Flock;
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::Write,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    path::{Path, PathBuf},
+    os::unix::fs::PermissionsExt,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -31,8 +31,8 @@ struct Usage {
     active: usize,
 }
 pub struct SourceBundleRegistry {
-    root: PathBuf,
-    staging: PathBuf,
+    root: Directory,
+    staging: Directory,
     node: Arc<Node>,
     budget_bytes: u64,
     usage: Mutex<Usage>,
@@ -45,19 +45,19 @@ impl SourceBundleRegistry {
         if !(1..=64).contains(&budget_gib) {
             return Err(failed("bundle_registry_budget_invalid"));
         }
-        node.require_storage_filesystem(root)?;
-        let staging = root.join(".source-staging");
-        custody::private_directory(&staging)?;
-        let file = custody::private_file(&staging.join("registry.lock"), true)?;
-        let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock)
+        let root = custody::directory(root)?;
+        node.require_storage_directory(&root)?;
+        let staging = custody::staging_directory(&root)?;
+        let lock = staging
+            .lock(Path::new("registry.lock"))
             .map_err(|_| failed("bundle_registry_already_running"))?;
         let clean = staging::reconcile(&staging)?;
-        let (bytes, objects) = custody::inventory(root)?;
+        let (bytes, objects) = custody::inventory(&root)?;
         if !clean {
             eprintln!("jeryu_bundle_registry_reconciliation_required");
         }
         Ok(Arc::new(Self {
-            root: root.into(),
+            root,
             staging,
             node,
             budget_bytes: u64::from(budget_gib) << 30,
@@ -96,10 +96,9 @@ impl SourceBundleRegistry {
         let file = match staging::create(&self.staging, &id, &upload) {
             Ok(file) => file,
             Err(error) => {
-                // The journal was written before creating the data file.
-                if staging::discard(&self.staging, &id).is_err() {
-                    self.clean.store(false, Ordering::Release);
-                }
+                // Creation did not prove ownership of a data file. Preserve
+                // ambiguous entries rather than deleting a colliding leaf.
+                self.clean.store(false, Ordering::Release);
                 return Err(error);
             }
         };
@@ -139,49 +138,88 @@ impl UploadStage {
             .write_all(bytes)?;
         Ok(())
     }
-    pub fn finish(mut self) -> RunnerResult<BundleRegistered> {
+    pub fn finish(self) -> RunnerResult<BundleRegistered> {
+        self.finish_with_sync(|file, directory, staging, root| {
+            file.sync_all()?;
+            directory.sync()?;
+            staging.sync()?;
+            root.sync()
+        })
+    }
+
+    fn finish_with_sync(
+        mut self,
+        sync: impl FnOnce(&File, &Directory, &Directory, &Directory) -> RunnerResult<()>,
+    ) -> RunnerResult<BundleRegistered> {
         self.verifier.finish()?;
         let file = self
             .file
-            .take()
+            .as_mut()
             .ok_or_else(|| failed("bundle_upload_closed"))?;
         file.sync_all()?;
+        // Verify the bytes actually written through this same descriptor,
+        // rather than treating the body-stream hash as a disk receipt.
+        verify::file(file, &self.upload)?;
         file.set_permissions(std::fs::Permissions::from_mode(0o444))?;
         file.sync_all()?;
-        drop(file);
+        crate::custody::verify_file(
+            file,
+            FileRole::Immutable { executable: false },
+            self.upload.stored_bytes,
+        )
+        .map_err(|_| failed("bundle_staging_custody_denied"))?;
         let digest = &self.upload.digest[7..];
-        let directory = self.registry.root.join(digest);
-        match std::fs::create_dir(&directory) {
-            Ok(()) => std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(error.into()),
+        let directory = self
+            .registry
+            .root
+            .child_directory(Path::new(digest))
+            .map_err(|_| failed("bundle_registry_custody_denied"))?;
+        let target = Path::new("source-bundle");
+        if self
+            .registry
+            .staging
+            .promote_file(
+                Path::new(&format!("{}.bin", self.id)),
+                file,
+                &directory,
+                target,
+            )
+            .map_err(|_| failed("bundle_staging_custody_denied"))?
+        {
+            // Once renamed, keep the quota charge even if identity/sync fails.
+            self.retained = true;
+            directory.require_file_identity(target, file)?;
+            sync(
+                file,
+                &directory,
+                &self.registry.staging,
+                &self.registry.root,
+            )?;
+        } else {
+            let mut existing = directory
+                .open_file(
+                    target,
+                    FileRole::Immutable { executable: false },
+                    self.upload.stored_bytes,
+                )
+                .map_err(|_| failed("bundle_registry_collision"))?;
+            verify::file(&mut existing, &self.upload)
+                .map_err(|_| failed("bundle_registry_collision"))?;
+            // A duplicate may be retrying an earlier promotion whose parent
+            // sync failed. Do not return a registration until it is durable.
+            sync(
+                &existing,
+                &directory,
+                &self.registry.staging,
+                &self.registry.root,
+            )?;
         }
-        trusted_directory(&directory)?;
-        let target = directory.join("source-bundle");
-        match rustix::fs::renameat_with(
-            rustix::fs::CWD,
-            self.registry.staging.join(format!("{}.bin", self.id)),
-            rustix::fs::CWD,
-            &target,
-            rustix::fs::RenameFlags::NOREPLACE,
-        ) {
-            Ok(()) => {
-                // Once renamed, keep the quota charge even if fsync fails.
-                self.retained = true;
-                File::open(&directory)?.sync_all()?;
-                File::open(&self.registry.root)?.sync_all()?;
-            }
-            Err(rustix::io::Errno::EXIST) => {
-                let mut existing = crate::artifacts::trusted_file(&target, false)?;
-                if existing.metadata()?.len() != self.upload.stored_bytes
-                    || crate::artifacts::sha256_reader(&mut existing)? != self.upload.digest
-                {
-                    return Err(failed("bundle_registry_collision"));
-                }
-            }
-            Err(error) => return Err(std::io::Error::from(error).into()),
-        }
-        staging::discard(&self.registry.staging, &self.id)?;
+        staging::discard(
+            &self.registry.staging,
+            &self.id,
+            self.file.as_ref(),
+            self.retained,
+        )?;
         self.discarded = true;
         Ok(BundleRegistered {
             protocol_version: PROTOCOL_VERSION.into(),
@@ -199,8 +237,15 @@ impl UploadStage {
 }
 impl Drop for UploadStage {
     fn drop(&mut self) {
+        let clean = self.discarded
+            || staging::discard(
+                &self.registry.staging,
+                &self.id,
+                self.file.as_ref(),
+                self.retained,
+            )
+            .is_ok();
         self.file.take();
-        let clean = self.discarded || staging::discard(&self.registry.staging, &self.id).is_ok();
         if !clean {
             self.registry.clean.store(false, Ordering::Release);
             eprintln!("jeryu_bundle_registry_reconciliation_required");
@@ -221,3 +266,6 @@ impl Drop for UploadStage {
 fn failed(code: &'static str) -> RunnerError {
     RunnerError::new(code, "source bundle registration failed")
 }
+
+#[cfg(test)]
+mod tests;

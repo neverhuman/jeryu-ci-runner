@@ -167,6 +167,47 @@ must 'managed timer enabled' called 'enable --now pr-gate-install.timer'
 if called 'stop pr-gate-runner@0.timer'; then printf 'FAIL: drained for a unit-only change\n' >&2; exit 1; fi
 printf 'PASS a unit change reloads systemd and enables managed timers without draining\n'
 
+# The wake timer is enabled only when the forge serves gate-wanted, and a unit the operator masked is
+# neither overwritten nor enabled. The curl stub answers the code in $fx/forge-code.
+cat >"$fx/stub/curl" <<SH
+#!/usr/bin/env bash
+cat >/dev/null
+printf '%s\n' "\${@: -1}" >>"$fx/curl.log"
+printf '%s' "\$(cat "$fx/forge-code")"
+SH
+chmod +x "$fx/stub/curl"
+printf 'TOKEN-1234\n' >"$fx/token"; chmod 0600 "$fx/token"
+printf 'PR_GATE_FORGE_URL=https://forge.example.test\nJERYU_TOKEN_FILE=%s\n' "$fx/token" >>"$fx/pr-gate.env"
+put $c/systemd/pr-gate-wake.timer '[Timer]'
+commit wake-timer
+printf 404 >"$fx/forge-code"; : >"$fx/curl.log"
+run >"$fx/out"
+must 'the wake timer unit is installed' test -e "$fx/home/.config/systemd/user/pr-gate-wake.timer"
+must 'the forge was asked for the route' grep -q '/api/v1/gate-wanted' "$fx/curl.log"
+if called 'enable --now pr-gate-wake.timer'; then printf 'FAIL: wake timer enabled against a forge without gate-wanted\n' >&2; exit 1; fi
+must 'it says why' grep -q 'forge does not serve gate-wanted' "$fx/out"
+must 'the other singleton timers are unaffected' called 'enable --now pr-gate-install.timer'
+printf 'PASS the wake timer is not enabled against a forge that answers 404 for gate-wanted\n'
+
+printf 200 >"$fx/forge-code"
+put $c/systemd/pr-gate-wake.timer '[Timer]
+OnBootSec=2min'
+commit wake-timer-2
+run >"$fx/out"
+must 'the wake timer is enabled once the forge serves it' called 'enable --now pr-gate-wake.timer'
+printf 'PASS the wake timer is enabled when the forge serves gate-wanted\n'
+
+ln -sf /dev/null "$fx/home/.config/systemd/user/pr-gate-wake.timer"
+put $c/systemd/pr-gate-wake.timer '[Timer]
+OnBootSec=5min'
+commit wake-timer-3
+run >"$fx/out"
+must 'a masked unit is left a mask' test "$(readlink "$fx/home/.config/systemd/user/pr-gate-wake.timer")" == /dev/null
+if called 'enable --now pr-gate-wake.timer'; then printf 'FAIL: a masked timer was enabled\n' >&2; exit 1; fi
+must 'it says so' grep -q 'masked by the operator' "$fx/out"
+rm -f "$fx/home/.config/systemd/user/pr-gate-wake.timer"
+printf 'PASS an operator mask is neither overwritten nor enabled\n'
+
 # A change to the config library drains like the runner: it decides what the runner gates.
 put $c/bin/pr-gate-config.sh 'pr_gate_load_config() { return 0; }'
 commit config

@@ -12,17 +12,33 @@
 #   2. pick the oldest head that has no <repo>/required status posted BY THIS
 #      RUNNER (manual statuses are re-proved here, because they were produced
 #      on another host's toolchain);
-#   3. build a clean tree: every family repo at origin/main from local mirrors,
+#   3. refresh the local mirrors of that family's canonical mains;
+#   4. decide reuse from the head's input identity, derived from those mirrors and from this host's
+#      tools without preparing anything, and leave an unchanged head alone;
+#   5. otherwise build a clean tree: every family repo at origin/main from the mirrors,
 #      the PR's repo at exactly its head, the configured native vendor tree linked;
-#   4. post `pending`, run `just required` there with the governed security
+#   6. post `pending`, run `just required` there with the governed security
 #      tools and the system npm first on PATH, then post success or failure
 #      with the log's SHA-256 in the description;
-#   5. retain terminal receipts and logs for verified reuse or publication recovery.
+#   7. retain terminal receipts and logs for verified reuse or publication recovery.
 # At most one gate per tick. A PR whose head moves gets gated again because the
 # status is keyed by commit.
 #
 # It never approves, merges, tags or waives anything. The token is the gate identity
 # (GATE_RUNNER_IDENTITY), which must not be the author of the PRs it proves.
+#
+# Contributions: a PR the importer marked with PR_GATE_CONTRIBUTED_LABEL carries code nobody of the
+# family wrote, so it gets neither this host's credentials nor an automatic run. Nothing of it is
+# executed -- no recipe, no prefetch, no cache daemon -- until a maintainer named in
+# PR_GATE_OK_TO_TEST_MAINTAINERS has allowed exactly its current head (PR_GATE_OK_TO_TEST_LABEL, read
+# as GET /api/v1/gate-allowances?state=active). A push moves the head, which the allowance no longer
+# names, so the allowance is spent and the next head needs a new one. When it is allowed, the recipe
+# runs through PR_GATE_SANDBOX_COMMAND -- the site's ephemeral, network-restricted VM or container --
+# with no forge token, no gate identity, no host home, no governed tools and no shared writable
+# cache, and its result is posted as the usual <repo>/required status. An internal PR keeps the path
+# above unchanged. A contribution that changes what the gate itself evaluates with (ops/ci/,
+# .jeryu/ci.toml, Justfile, workflows; PR_GATE_GATE_INPUT_PATHS) is recorded in its receipt and named
+# on its check run, so it is reviewed for that as well as gated.
 #
 # Site configuration: every site specific (forge URL, credential, owners and their checkout roots,
 # per-repository exceptions) is read from ${PR_GATE_CONFIG:-~/.config/jeryu/pr-gate.env} by
@@ -68,6 +84,8 @@ BASE="${BASE%/}"
 TOKEN_FILE="$(pr_gate_path "${JERYU_TOKEN_FILE:-}")"
 [[ -n "$TOKEN_FILE" ]] || not_configured JERYU_TOKEN_FILE
 HOME_DIR="${GATE_RUNNER_HOME:-$HOME/gate-runner}"
+# shellcheck source=ops/pr-gate/bin/pr-gate-backoff.sh
+source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-backoff.sh"
 REPOS="${GATE_RUNNER_REPOS:-auto}"
 OWNERS="${GATE_RUNNER_OWNERS:-}"
 [[ "$REPOS" != auto || -n "${OWNERS// }" ]] || not_configured "GATE_RUNNER_OWNERS (or GATE_RUNNER_REPOS)"
@@ -89,6 +107,17 @@ RUNTIME_TOOLS="${GATE_RUNNER_RUNTIME_TOOLS:-$HOME_DIR/runtime-tools}"
 RUNTIME_TOOLS_OWNERS="${PR_GATE_RUNTIME_TOOLS_OWNERS:-}"
 IDENTITY="${GATE_RUNNER_IDENTITY:-}"
 [[ -n "$IDENTITY" ]] || not_configured GATE_RUNNER_IDENTITY
+# Contributions (see the head of this file). The importer's mark, the maintainer's allowance, who may
+# give it, and the sandbox every allowed contribution runs in.
+CONTRIBUTED_LABEL="${PR_GATE_CONTRIBUTED_LABEL:-origin:contributed}"
+OK_TO_TEST_LABEL="${PR_GATE_OK_TO_TEST_LABEL:-ok-to-test}"
+OK_TO_TEST_MAINTAINERS="${PR_GATE_OK_TO_TEST_MAINTAINERS:-}"
+SANDBOX_COMMAND="${PR_GATE_SANDBOX_COMMAND:-}"
+# The sandbox command's own PATH. It is the host path of the container or VM tool, never the gate's
+# governed tools: those live in the gate user's home, which no contribution may read.
+SANDBOX_PATH="${PR_GATE_SANDBOX_PATH:-/usr/local/bin:/usr/bin:/bin}"
+# Paths (globs, against the path as git reports it) whose change alters what the gate evaluates with.
+GATE_INPUT_PATHS="${PR_GATE_GATE_INPUT_PATHS:-ops/ci/* ops/ci-kit/* ops/pr-gate/* .jeryu/ci.toml Justfile justfile .github/workflows/* .forgejo/workflows/* .gitea/workflows/*}"
 # Repositories (owner/repo, globs) whose recipe must see its physical slot path, never the private
 # canonical-path mount namespace: their tests ask the host's own service manager to resolve paths.
 PHYSICAL_PATH_REPOS="${PR_GATE_PHYSICAL_PATH_REPOS:-}"
@@ -135,6 +164,22 @@ MARKER="pr-gate-runner@$(hostname -s)"
 # otherwise downloads them, and a missing LFS object aborts the whole tree.
 export GIT_LFS_SKIP_SMUDGE=1
 
+# git answers the forge as the runner, from the runner's own token file, never as whoever the host's
+# global git config names (a personal credential helper stopped answering for the forge and every
+# private mirror failed). The first entry clears inherited helpers for the forge's git URLs; the
+# second reads the token file when git asks, so the token is in no argv and no config file. These
+# variables outrank the global and system config, and the recipe and its prefetch get them too.
+# shellcheck disable=SC2016  # expanded by git's helper shell, not here
+GIT_HELPER='!f() { [ "$3" = get ] || exit 0; printf "username=%s\npassword=%s\n" "$1" "$(cat "$2")"; }; f'
+export GIT_CONFIG_COUNT=2 GIT_TERMINAL_PROMPT=0
+export GIT_CONFIG_KEY_0="credential.$BASE/git/.helper" GIT_CONFIG_VALUE_0=""
+export GIT_CONFIG_KEY_1="credential.$BASE/git/.helper"
+GIT_CONFIG_VALUE_1="$GIT_HELPER '$IDENTITY' '$TOKEN_FILE'"
+export GIT_CONFIG_VALUE_1
+git_env=(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2
+  GIT_CONFIG_KEY_0="$GIT_CONFIG_KEY_0" GIT_CONFIG_VALUE_0=""
+  GIT_CONFIG_KEY_1="$GIT_CONFIG_KEY_1" GIT_CONFIG_VALUE_1="$GIT_CONFIG_VALUE_1")
+
 only_repo=""; only_pr=""; list=0; main_health=0
 while (($#)); do case "$1" in
   --repo) only_repo="${2:?--repo needs a value}"; shift 2;;
@@ -171,7 +216,7 @@ flock -n 9 || { say "a gate is already running; nothing to do"; exit 0; }
 # The lock lives on fd 9, and anything the gate starts inherits it unless told otherwise. A build
 # daemon (sccache) spawned by `just required` detached with fd 9 open and held the lock after the
 # gate had finished, so every later tick said "already running" and gated nothing. The recipe runs
-# with fd 9 closed (see step 4).
+# with fd 9 closed (see step 6).
 
 # The token reaches curl through a 0600 config file, never through argv: anyone with a shell on
 # this host can read /proc/<pid>/cmdline while a gate runs, and `-H "Authorization: Bearer $(cat
@@ -189,14 +234,21 @@ printf 'header = "Authorization: Bearer %s"\n' "$(cat "$TOKEN_FILE")" >"$AUTH_CO
 # into pieces, and the forge then answers as if the token were bad.
 # It sets the globals $body and $code rather than printing: `x="$(api ...)"` would run it
 # in a subshell, and $code would never reach the caller.
+#
+# A 429 from any call starts the shared forge back-off (pr-gate-backoff.sh): until it passes, reads
+# answer 429 locally without a request, so every slot stands back together instead of retrying each
+# tick. Writes still go out, because a gate's verdict must not be lost to a read-side limit.
 api() { # method path [json]
-  local args=(--silent --show-error --max-time 60 -X "$1"
+  local hdr out args=(--silent --show-error --max-time 60 -X "$1"
     --config "$AUTH_CONFIG" -H 'Accept: application/json')
   [[ -z "${3:-}" ]] || args+=(-H 'Content-Type: application/json' --data "$3")
-  local out
-  out="$(curl "${args[@]}" -w '\n%{http_code}' "$BASE$2")" || out=$'\n000'
+  if [[ "$1" == GET ]] && (($(backoff_remaining) > 0)); then code=429 body=""; return 0; fi
+  hdr="$(mktemp)"
+  out="$(curl "${args[@]}" --dump-header "$hdr" -w '\n%{http_code}' "$BASE$2")" || out=$'\n000'
   code="${out##*$'\n'}"
   body="${out%$'\n'*}"
+  if [[ "$code" == 429 ]]; then backoff_note_429 "$hdr"; elif [[ "$code" =~ ^2 ]]; then backoff_clear; fi
+  rm -f -- "$hdr"
 }
 
 post_status() { # owner repo sha state description
@@ -238,6 +290,10 @@ heartbeat() { # [current-gate-json]
     say "heartbeat code refused (422); retrying without it"
     HEARTBEAT_CODE=""
     api POST "/api/v1/runners/heartbeat" "$payload"
+  fi
+  if [[ "$code" == 422 ]]; then
+    say "heartbeat shape refused (422); retrying with the oldest contract"
+    api POST "/api/v1/runners/heartbeat" "$(gate_heartbeat_minimal "$payload")"
   fi
   if ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1 && jq -e . <<<"$body" >/dev/null 2>&1; then
     say "heartbeat refused ($code): $(jq -c '.message // .' <<<"$body")"
@@ -369,6 +425,82 @@ for q in $REPOS $only_repo; do
   [[ "$q" == */* || -n "$PRIMARY_OWNER" ]] || die "repository $q has no owner and PR_GATE_PRIMARY_OWNER is not configured"
 done
 
+# While the forge is rate limiting this identity (429), look at nothing:
+# the shared back-off says when to come back, and the slot timer finds the work then.
+if (( $(backoff_remaining) > 0 )); then
+  say "the forge is rate limiting this identity; standing back for $(backoff_remaining)s"
+  exit 0
+fi
+
+# Maintainer allowances for contributed heads, read once a tick: the forge records which head a
+# maintainer applied the ok-to-test label to, as
+#   {"allowances":[{"repo":"acme/widgets","number":7,"head_sha":"<40 hex>","label":"ok-to-test",
+#                   "allowed_by":"dana","allowed_at":"2026-10-06T09:00:00Z"}]}
+# at most one per PR. The runner decides for itself: it admits a contributed head only when an
+# allowance names that exact head and a maintainer it was configured to trust gave it, so a forge
+# that reports a stale or unknown-author allowance admits nothing. Every other answer leaves
+# contributions ungated this tick, which is the fail-closed direction: a contribution not run is a
+# PR waiting, a contribution run unallowed is this host running a stranger's code.
+# Anything but 200 -- a forge without the route, one this identity cannot read it from -- leaves every
+# contribution unallowed, and is named as the reason that head is not running rather than once a tick:
+# a family with no contributions would otherwise log it forever.
+declare -A allowed_sha=() allowed_by=() allowed_label=()
+api GET "/api/v1/gate-allowances?state=active"
+ALLOWANCES_CODE="$code"
+if [[ "$code" == 200 ]]; then
+  while IFS=$'\t' read -r arepo anumber asha alabel aby; do
+    if ! [[ "$arepo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$anumber" =~ ^[0-9]+$ \
+        && "$asha" =~ ^[0-9a-f]{40}$ && "$aby" =~ ^[A-Za-z0-9._-]{1,64}$ \
+        && "$alabel" =~ ^[A-Za-z0-9._/-]{0,64}$ ]]; then
+      say "ignoring a malformed ok-to-test allowance: $arepo#$anumber"; continue
+    fi
+    allowed_sha["$arepo#$anumber"]="$asha"
+    allowed_by["$arepo#$anumber"]="$aby"
+    allowed_label["$arepo#$anumber"]="$alabel"
+  done < <(jq -r '.allowances[]? | [.repo, (.number|tostring), .head_sha, (.label // ""), (.allowed_by // "")] | @tsv' <<<"$body")
+fi
+
+# True when a PR carries a label, by exact name. The marking lives on jeryu's own pull request row
+# (GET /api/v1/repos/:id/pulls, and .../pulls/:n): jeryu-deploy labels every row `origin:internal` or
+# `origin:contributed`, set by the importer and never by the author. The GitHub-compatible v3 payload
+# carries no labels, so it is not where this is read. A label is a string there, or a {name} object
+# on a forge that spells labels the GitHub way; a row with no labels key has none.
+gate_has_label() { # row-payload name
+  [[ -n "$2" ]] || return 1
+  jq -e --arg name "$2" 'any((.labels // .summary.labels // [])[]?;
+    (if type == "string" then . else (.name // "") end) == $name)' <<<"$1" >/dev/null 2>&1
+}
+
+# Nothing, when this contributed head may be executed; else why it may not. The allowance must name
+# the PR's current head (so a push spends it), carry the configured label if the forge reports one,
+# and come from a configured maintainer.
+gate_contribution_refusal() { # owner repo number head-sha
+  local key="$1/$2#$3" granted by label
+  if [[ -z "${OK_TO_TEST_MAINTAINERS// }" ]]; then
+    printf 'PR_GATE_OK_TO_TEST_MAINTAINERS is not configured, so nobody can allow it'; return
+  fi
+  if [[ "$ALLOWANCES_CODE" != 200 ]]; then
+    printf 'the forge answered %s for its ok-to-test allowances' "$ALLOWANCES_CODE"; return
+  fi
+  granted="${allowed_sha["$key"]:-}"
+  if [[ -z "$granted" ]]; then printf 'no %s from a maintainer' "$OK_TO_TEST_LABEL"; return; fi
+  if [[ "$granted" != "$4" ]]; then
+    printf '%s names %s, not this head: a push spends it' "$OK_TO_TEST_LABEL" "${granted:0:12}"; return
+  fi
+  label="${allowed_label["$key"]:-}"
+  if [[ -n "$label" && "$label" != "$OK_TO_TEST_LABEL" ]]; then
+    printf 'allowed by %s, which is not %s' "$label" "$OK_TO_TEST_LABEL"; return
+  fi
+  by="${allowed_by["$key"]:-}"
+  if ! pr_gate_listed "$OK_TO_TEST_MAINTAINERS" "$by"; then
+    printf '%s came from %s, who is not a configured maintainer' "$OK_TO_TEST_LABEL" "${by:-nobody}"; return
+  fi
+  if [[ -z "$SANDBOX_COMMAND" ]]; then
+    printf 'PR_GATE_SANDBOX_COMMAND is not configured, and a contribution runs nowhere else'; return
+  fi
+  return 0
+}
+
 # 1-2. choose the next head
 candidates=()
 [[ -z "$only_repo" ]] || only_repo="$(qualify "$only_repo")"
@@ -402,7 +534,7 @@ for qualified in $REPOS; do
       continue
     fi
     rm -f -- "$status_snapshot"
-    candidates+=("$owner $repo 0 $main_sha refs/heads/main -")
+    candidates+=("$owner $repo 0 $main_sha refs/heads/main 0 -")
     continue
   fi
   api GET "/api/v1/repos/$owner%2F$repo/pulls?state=open"
@@ -428,9 +560,18 @@ for qualified in $REPOS; do
     # A historical marker is neither a reusable success nor a live claim. The
     # durable receipt, full input identity and current publication decide below.
     [[ "$sha" == "$(jq -r '.head.sha // ""' <<<"$body")" ]] || continue
-    # A candidate's sixth field is when this head became gateable, for the queue wait the gate.log
-    # event reports; the fifth is its queue ref, "-" for a pull-request head.
-    candidates+=("$owner $repo $number $sha - $(pr_ready_at "$body")")
+    ready="$(pr_ready_at "$body")"
+    contributed=0
+    if gate_has_label "$(jq -c --argjson n "$number" 'first(.items[]? | select(.number == $n)) // {}' <<<"$rows")" \
+        "$CONTRIBUTED_LABEL"; then
+      contributed=1
+      refusal="$(gate_contribution_refusal "$owner" "$repo" "$number" "$sha")"
+      if [[ -n "$refusal" ]]; then
+        say "not running $owner/$repo#$number (contributed): $refusal"
+        continue
+      fi
+    fi
+    candidates+=("$owner $repo $number $sha - $contributed $ready")
   done < <(jq -r '.items[]? | [.number, .head_sha] | @tsv' <<<"$rows" | sort -n)
 done
 # Merge queue (jeryu-deploy docs/merge-queue.md). The forge replays an approved PR onto its base tip as
@@ -439,12 +580,15 @@ done
 # it gates a PR head -- same recipe, tree, context and identity -- fetched through queue_ref. Entries go
 # first: each is one gate from landing. A candidate's fifth field is its queue ref, "-" for a PR head.
 queued=()
+# Every entry this tick saw, admitted or refused, by queue sha: gate_queue_arrived looks only past it.
+declare -A queue_seen=()
 gated=" $(for q in $REPOS; do qualify "$q"; printf ' '; done)"
 if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
   api GET "/api/v1/merge-queue?state=building"
   if [[ "$code" == 200 ]]; then
     queue_rows="$body"
     while IFS=$'\t' read -r qrepo number sha qref; do
+      queue_seen["$sha"]=1
       if ! [[ "$qrepo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$number" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
           && "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ && "$qref" != *..* ]]; then
         say "ignoring a malformed merge-queue entry: $qrepo#$number"; continue
@@ -458,12 +602,48 @@ if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
       if [[ "$author" == "$IDENTITY" || "$head_ref" == "$IDENTITY/"* ]]; then
         say "skipping queued $qrepo#$number: $IDENTITY's own work, which this runner must not prove"; continue
       fi
-      queued+=("$owner $repo $number $sha $qref $(pr_ready_at "$body")")
+      queued_ready="$(pr_ready_at "$body")"
+      # A queue commit is the forge's replay of the PR's head onto its base, so the maintainer's
+      # allowance for that head is what admits it; the sandbox gates the replay exactly as the head.
+      # The origin marking is on jeryu's own row, read here; one that cannot be read is skipped.
+      queued_head="$(jq -r '.head.sha // ""' <<<"$body")"
+      api GET "/api/v1/repos/$owner%2F$repo/pulls/$number"
+      [[ "$code" == 200 ]] || { say "cannot read queued $qrepo#$number's origin ($code); skipping"; continue; }
+      contributed=0
+      if gate_has_label "$body" "$CONTRIBUTED_LABEL"; then
+        contributed=1
+        refusal="$(gate_contribution_refusal "$owner" "$repo" "$number" "$queued_head")"
+        if [[ -n "$refusal" ]]; then
+          say "not running queued $qrepo#$number (contributed): $refusal"; continue
+        fi
+      fi
+      queued+=("$owner $repo $number $sha $qref $contributed $queued_ready")
     done < <(jq -r '.entries[]? | [.repo, (.number|tostring), .queue_sha, .queue_ref] | @tsv' <<<"$queue_rows")
   else
     say "merge queue answered $code; gating PR heads only this tick"
   fi
 fi
+
+# A queue entry that arrived after this tick listed the queue, for a gated repository, that no slot
+# has claimed yet. Entries go first only at the start of a tick, and a tick can spend minutes deciding
+# PR heads that end in reuse: on 2026-10-12 an entry waited 2m48s while one slot walked such a list,
+# and was taken only when an unrelated gate ended elsewhere. Ending the tick hands the entry to the
+# next one, which starts within the timer's pause and puts it first. Entries the tick already saw are
+# never counted, so one this runner refuses (its own work, an unreadable origin) cannot end every tick.
+gate_queue_arrived() {
+  local qrepo qsha
+  api GET "/api/v1/merge-queue?state=building"
+  [[ "$code" == 200 ]] || return 1
+  while IFS=$'\t' read -r qrepo qsha; do
+    [[ "$qrepo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$qsha" =~ ^[0-9a-f]{40}$ ]] || continue
+    [[ -z "${queue_seen["$qsha"]:-}" && "$gated" == *" $qrepo "* ]] || continue
+    [[ -z "$only_repo" || "$qrepo" == "$only_repo" ]] || continue
+    [[ -d "$HOME_DIR/attempts/${qrepo%%/*}-${qrepo#*/}-$qsha" ]] && continue
+    say "merge-queue entry $qrepo at $qsha arrived during this tick; ending it so the next tick gates it first"
+    return 0
+  done < <(jq -r '.entries[]? | [.repo, .queue_sha] | @tsv' <<<"$body")
+  return 1
+}
 # Re-gate requests from the forge (jeryu-deploy: POST /api/v1/repos/:id/pulls/:n/regate, read here as
 # GET /api/v1/gate-regate?state=pending). A gate result is reused while its inputs are identical and
 # a failure is held, which is right for a head that failed on its own sources and wrong for one that
@@ -508,7 +688,7 @@ gate_regate_wanted() { # owner repo number sha
 # burst to end. --repo/--pr is never deferred.
 fresh=() seen_before=()
 for candidate in "${candidates[@]}"; do
-  read -r owner repo number sha qref ready <<<"$candidate"
+  read -r owner repo number sha qref contributed ready <<<"$candidate"
   if [[ ! -d "$HOME_DIR/attempts/$owner-$repo-$sha" ]]; then fresh+=("$candidate"); continue; fi
   # Somebody asked for this head: it is as urgent as a new one, and coalescing a burst of merges is
   # not a reason to make them wait for it.
@@ -527,7 +707,7 @@ done
 # is exactly what it was.
 woken=() rest=()
 for candidate in "${fresh[@]}" "${seen_before[@]}"; do
-  read -r owner repo number sha qref ready <<<"$candidate"
+  read -r owner repo number sha qref contributed ready <<<"$candidate"
   if dispatch_names "$owner" "$repo" "$number" "$sha"; then woken+=("$candidate"); else rest+=("$candidate"); fi
 done
 candidates=("${queued[@]}" "${woken[@]}" "${rest[@]}")
@@ -539,11 +719,19 @@ if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # through parent death; the recipe closes them before it can start cache daemons.
 # The slot's cache daemon is started by the worker itself, after it has closed all three.
 for candidate in "${candidates[@]}"; do
-read -r owner repo number sha qref ready <<<"$candidate"
+read -r owner repo number sha qref contributed ready <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
    && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) \
-   && ( "$ready" == - || "$ready" =~ ^[^[:space:]]+\|[a-z-]+$ ) ]] \
+   && "$contributed" =~ ^[01]$ && ( "$ready" == - || "$ready" =~ ^[^[:space:]]+\|[a-z-]+$ ) ]] \
   || die "invalid repository or head in dispatch"
+if [[ "$qref" == - && -z "$only_pr" ]] && gate_queue_arrived; then
+  heartbeat
+  exit 0
+fi
+# A contribution is executed in the site's sandbox, and nowhere else. GATE_SANDBOX is read by
+# gate_inputs and gate_begin, so what ran is part of the result's identity and of its receipt.
+sandbox="$contributed"
+GATE_SANDBOX="$sandbox"
 if [[ -d "$HOME_DIR/claims/$owner-$repo-$sha" ]]; then
   say "recovery required: retained legacy claim for $owner/$repo@$sha; reconcile its worker before admission"
   continue
@@ -552,7 +740,9 @@ fi
 # its own slot tree (every one not in GATE_RUNNER_SHARED_TARGETS) has nothing to protect, and taking
 # the lock anyway ran two PRs of one repository strictly one after the other.
 shares_target=0
-for pattern in ${GATE_RUNNER_SHARED_TARGETS:-}; do
+# A contribution never writes a cache anything else reads, so it shares no build directory and takes
+# no repository lock for one.
+for pattern in $( ((sandbox)) || printf '%s' "${GATE_RUNNER_SHARED_TARGETS:-}" ); do
   # shellcheck disable=SC2053
   if [[ "$owner/$repo" == $pattern || "$repo" == $pattern ]]; then shares_target=1; break; fi
 done
@@ -573,9 +763,8 @@ if ! gate_recover; then
   exec 6>&-; exec 7>&-
   continue
 fi
-say "preparing $owner/$repo$([[ "$main_health" == 1 ]] && printf ' main-health' || printf '#%s' "$number") at $sha${qref:+$([[ "$qref" == - ]] || printf ' (merge queue %s)' "$qref")}"
 
-# 3. clean tree
+# 3. the family's canonical mains
 family="$FAMILY"
 if [[ -z "$family" ]]; then
   root="$(split_root "$owner")" || die "cannot discover the $owner family"
@@ -617,8 +806,8 @@ for n in $family $repo; do
       continue 2
     fi
     # Drop the mirror as well. A repository whose main was deleted upstream would otherwise keep an
-    # older main here, and step 3 would check the sibling out from it: a phantom main in the tree
-    # while this line says the tree lacks it. With no mirror, step 3 skips the sibling.
+    # older main here, and step 5 would check the sibling out from it: a phantom main in the tree
+    # while this line says the tree lacks it. With no mirror, step 5 skips the sibling.
     # Check the current owner's persistent tree below, after selecting its path.
     # An inherited or previous candidate's $run is not cleanup authority.
     rm -rf -- "$m"
@@ -630,6 +819,58 @@ done
 exec 8>&-
 gate_record_mains "$HOME_DIR/cache/mains-$owner" "$mirrors" $family $repo || say "could not record $owner mains"
 
+# 4. reuse an identical result before preparing a tree
+# Most of what a tick examines is a head nobody has touched since it was gated, and the only way to
+# find that out used to be a full preparation: mirror checkout, reset, clean, stamp and a tree-wide
+# fingerprint of every sibling, ~6s a head. In a 24h sample on the gate host (2026-10-09/10) two
+# slots spent ~35 slot-hours preparing ~40 unchanged heads some 310 times each, against ~8h of real
+# gating, and a new head queued behind that sweep. gate_input_cheap derives the very same identity
+# from the mirrors just fetched and from the tools and runner hashes computed now, so a sibling main
+# that moved, a reinstalled governed tool or an upgraded runner is a changed input exactly as before
+# and the tree is prepared after all; anything it cannot derive is a changed input too.
+# Only `reuse` and `hold` end a head here: both run nothing and publish nothing, so no tree is
+# needed for either. `republish` and `run` fall through, and the full preparation decides again.
+# A retry of this head -- an explicit --repo/--pr, a re-gate the forge asked for -- is exactly what
+# must re-run a held failure, so it never stops here.
+retry_wanted=0
+[[ -z "$only_repo" && -z "$only_pr" ]] || retry_wanted=1
+! gate_regate_wanted "$owner" "$repo" "$number" "$sha" || retry_wanted=1
+# A slot tree that needs recovery is not a tree whose result is reused: a sibling checkout left
+# behind after its canonical main vanished is refused aloud by the preparation below, and reusing
+# past it would silence that for as long as the head stayed open. Only the path of the tree is read
+# here; the tree itself is still not prepared. (The owner's tree path is only chosen now, after its
+# mirrors, so no inherited $run can be mistaken for it.)
+run="$(tree_dir "$owner")"
+for n in $family; do
+  [[ "$n" != "$repo" && ! -d "$mirrors/$n.git" ]] || continue
+  [[ -e "$run/$n" || -L "$run/$n" ]] || continue
+  retry_wanted=1
+done
+if ((retry_wanted == 0)); then
+  cheap_identity=$(mktemp "$HOME_DIR/cache/cheap-inputs-$SLOT.XXXXXXXX")
+  cheap_statuses=$(mktemp "$HOME_DIR/cache/cheap-status-$SLOT.XXXXXXXX")
+  cheap_action=""
+  if PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+      gate_input_cheap "$cheap_identity" "$gate_key_dir/last-result.json"; then
+    api GET "/repos/$owner/$repo/commits/$sha/status"
+    if [[ "$code" == 200 ]]; then
+      printf '%s\n' "$body" >"$cheap_statuses"
+      gate_decision "$cheap_identity" 0 "$cheap_statuses"
+      case "${gate_action:?}" in reuse|hold) cheap_action="$gate_action";; esac
+    else
+      say "cannot read the current status of $owner/$repo@$sha ($code); preparing its tree to decide"
+    fi
+  fi
+  rm -f -- "$cheap_identity" "$cheap_statuses"
+  if [[ -n "$cheap_action" ]]; then
+    say "$cheap_action $owner/$repo@$sha: identical verified inputs, read without preparing a tree (a failure re-runs only with --repo <o>/<r> --pr <n>, or changed inputs)"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
+fi
+say "preparing $owner/$repo#$number at $sha${qref:+$([[ "$qref" == - ]] || printf ' (merge queue %s)' "$qref")}"
+
+# 5. clean tree
 # One persistent family tree, reset to exact commits for every gate. Build output is the only
 # thing kept between gates: every repo is detached at its commit, hard-reset, and cleaned of all
 # untracked and ignored files EXCEPT target/ and node_modules/. Sources are therefore exactly the
@@ -637,8 +878,7 @@ gate_record_mains "$HOME_DIR/cache/mains-$owner" "$mirrors" $family $repo || say
 # the sources. A fresh clone per gate made every run a cold build -- one web repository took ~25
 # minutes rebuilding a 16 GB target/ that the previous gate had already produced.
 # One gate at a time holds the lock, so one tree is enough. A red gate's diagnostics stay in the
-# tree until the next gate starts; its log is kept regardless.
-run="$(tree_dir "$owner")"
+# tree until the next gate starts; its log is kept regardless. Its path was chosen in step 4.
 mkdir -p "$run"
 sync_repo() { # name commit-ish
   local dir="$run/$1"
@@ -675,7 +915,7 @@ sync_repo() { # name commit-ish
   git -C "$dir" checkout --quiet --force --detach "$2"
   git -C "$dir" reset --quiet --hard "$2"
   git -C "$dir" clean --quiet -ffdx -e target/ -e node_modules/
-  # Every slot's checkout of a repo builds into one shared target directory (step 3), and cargo
+  # Every slot's checkout of a repo builds into one shared target directory (step 5), and cargo
   # decides freshness from mtimes. A tracked file this checkout left untouched can be older than
   # another tree's build of different content, and cargo then reuses that build: the gate would
   # test a commit other than the one it reports (seen on a data repository, 2026-09-17). Stamp
@@ -744,10 +984,27 @@ if ((${#self_gate_paths[@]} > 0)); then
   self_gate_json=$(printf '%s\n' "${self_gate_paths[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
   say "$owner/$repo#$number changes its own gate: ${self_gate_paths[*]}"
 fi
+# What a contribution changes about the gate itself (see the head of this file). Read from the
+# checkout against the merge base with protected main, so it is the PR's own change and not main's.
+# Recorded on the attempt below and named on the check run beside the self-gate note above, never on
+# the required status (that is the gate's own verdict); it never changes whether the gate runs.
+gate_input_touched=()
+if ((sandbox)); then
+  while IFS= read -r changed; do
+    [[ -n "$changed" ]] || continue
+    if pr_gate_listed "$GATE_INPUT_PATHS" "$changed"; then gate_input_touched+=("$changed"); fi
+  done < <(git -C "$run/$repo" diff --name-only mirror/main...HEAD 2>/dev/null)
+  ((${#gate_input_touched[@]} == 0)) \
+    || say "$owner/$repo#$number changes gate inputs (${gate_input_touched[*]}): extra review required"
+fi
 # Some family integrity tests need governed runtime fixtures (a pinned typesetter, say) at the family
 # root's target/, the same shape the release host has. Without them the whole recipe fails on a
 # missing tool and says nothing about the commit under test. PR_GATE_RUNTIME_TOOLS_OWNERS names them.
-if pr_gate_listed "$RUNTIME_TOOLS_OWNERS" "$owner" && [[ -d "$RUNTIME_TOOLS" ]]; then
+if ((sandbox)); then
+  # The runtime fixtures live in the gate user's home, which the sandbox does not mount: a recipe
+  # that needs them fails in the sandbox and says so, which is the honest answer for a contribution.
+  rm -f -- "$run/target/runtime-tools"
+elif pr_gate_listed "$RUNTIME_TOOLS_OWNERS" "$owner" && [[ -d "$RUNTIME_TOOLS" ]]; then
   mkdir -p "$run/target" && ln -sfn "$RUNTIME_TOOLS" "$run/target/runtime-tools"
 fi
 # One build directory per repo, shared by every slot: <repo>/target is a symlink to
@@ -774,6 +1031,7 @@ fi
 # where its recipe tolerates a symlinked target and measures nothing from the directory. The cost of
 # the default is a colder build; the benefit is that a gate result is about the commit.
 SHARED_TARGETS="${GATE_RUNNER_SHARED_TARGETS:-}"
+((sandbox == 0)) || SHARED_TARGETS=""   # a contribution builds only in its own tree
 shared_target=""
 for pattern in $SHARED_TARGETS; do
   # shellcheck disable=SC2053
@@ -800,11 +1058,13 @@ fi
 # runner-owned output link locally; tracked source changes remain visible.
 exclude=$(git -C "$run/$repo" rev-parse --absolute-git-dir)/info/exclude
 grep -qxF /target "$exclude" || printf '/target\n' >>"$exclude"
-if [[ -n "$VENDOR" && -d "$VENDOR" ]] && pr_gate_listed "$VENDOR_REPOS" "$repo" "$owner/$repo"; then
+if ((sandbox)); then
+  rm -f -- "$run/$repo/target/native-vendor"   # a host path, and not the sandbox's to read
+elif [[ -n "$VENDOR" && -d "$VENDOR" ]] && pr_gate_listed "$VENDOR_REPOS" "$repo" "$owner/$repo"; then
   mkdir -p "$run/$repo/target" && ln -sfn "$VENDOR" "$run/$repo/target/native-vendor"
 fi
 
-# 4. gate
+# 6. gate
 # Shared targets retain each repository's expected <repo>/target path. The
 # repository lock serializes writers across slots, while unrelated repos build
 # independently. A shared sccache can additionally reuse compiler outputs.
@@ -905,6 +1165,11 @@ if [[ -n "$ready_at" ]]; then
     || say "could not record the queue wait of $owner/$repo@$sha"
   say "queue wait $([[ "$queue_wait" == null ]] && printf unknown || printf '%ss' "$queue_wait") ($ready_source $ready_at -> gate start)"
 fi
+
+if ((${#gate_input_touched[@]})); then
+  gate_update --argjson paths "$(printf '%s\n' "${gate_input_touched[@]}" | jq -Rsc 'split("\n")[:-1]')" \
+    '.gate_input_paths=$paths' || say "could not record the gate inputs $owner/$repo#$number changes"
+fi
 # The request is discharged by the attempt it started, not by the attempt's outcome: a gate that
 # dies leaves recovery to finish, and reading the request as still owed would gate the same head on
 # every tick until it moved.
@@ -921,7 +1186,7 @@ log="$gate_attempt_dir/build.log"
 if ((keep_green)); then
   say "re-verifying $owner/$repo@$sha without pending: its newest $(gate_status_context "$owner" "$repo") is this runner's success"
 else
-  post_status "$owner" "$repo" "$sha" pending "operator-unsealed $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")"
+  post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")"
 fi
 gate_update '.phase="running"'
 started_at="$(date -u +%FT%TZ)" started_s="$(date +%s)"
@@ -934,7 +1199,11 @@ heartbeat "$(jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "
 # setpriv drops back to this user before anything of the recipe runs). sudo keeps our real uid, so
 # the process-group kill in gate cleanup still reaches it and it relays the signal to the recipe.
 worker_root="$run" enter=()
-if pr_gate_listed "$PHYSICAL_PATH_REPOS" "$owner/$repo"; then
+if ((sandbox)); then
+  # The sandbox is the isolation, and it brings its own view of the filesystem: no mount namespace of
+  # ours, no shared compile cache, no prefetch into the shared registry.
+  say "$owner/$repo#$number is a contribution: running it in the configured sandbox, without this host's credentials, home, tools or caches"
+elif pr_gate_listed "$PHYSICAL_PATH_REPOS" "$owner/$repo"; then
   # Its privileged boundary tests ask the host systemd manager to resolve paths.
   # A private bind alias exists only inside this worker's mount namespace.
   say "$owner/$repo uses its physical slot path for host-managed boundary tests"
@@ -951,6 +1220,7 @@ elif ((CANONICAL_PATH)) && [[ "$run" != "$(canon_dir "$owner")" ]]; then
   fi
 fi
 sccache_env=(SCCACHE_SERVER_PORT="$SCCACHE_PORT" SCCACHE_DIR="$SCCACHE_CACHE_DIR" SCCACHE_CACHE_SIZE="$SCCACHE_CACHE_SIZE")
+((sandbox == 0)) || SCCACHE=""   # a contribution writes no cache this host or another gate reads
 if [[ -n "$SCCACHE" ]]; then
   # A fresh server per gate, started in the same view of the sources the recipe gets: an older one
   # may hold another namespace. It must not inherit the head, target or slot lock.
@@ -959,7 +1229,7 @@ if [[ -n "$SCCACHE" ]]; then
   "${enter[@]}" env -i HOME="$HOME" PATH="$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" "${sccache_env[@]}" \
     ionice -c 3 sh -c '"$0" --stop-server; "$0" --start-server' "$SCCACHE" 6>&- 7>&- 9>&- >/dev/null 2>&1 \
     || { say "sccache did not start on port $SCCACHE_PORT; $owner/$repo builds uncached"; SCCACHE=""; }
-elif ((SCCACHE_MISSING)); then
+elif ((SCCACHE_MISSING && sandbox == 0)); then
   say "sccache not found on PATH; $owner/$repo builds uncached"
 fi
 # What this attempt actually compiled with, for the receipt, the event log and the Activity feed.
@@ -1015,11 +1285,18 @@ for repo_dir in "$1"/*/; do
     fi
   done < <(git -C "$repo_dir" ls-files -z -- "${@:4}" ":!:*vendor/*" ":!:*fixtures/*" 2>/dev/null)
 done'
-"${enter[@]}" env -i -C "$worker_root" HOME="$HOME" USER="$(id -un)" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
-  PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" GIT_LFS_SKIP_SMUDGE=1 \
-  ionice -c 3 timeout 30m bash -c "$prefetch" pr-gate-prefetch "$worker_root" "$repo" "$LOCK_SOURCES_ERE" \
-  6>&- 7>&- 9>&- >"$gate_attempt_dir/prefetch.log" 2>&1 \
-  || say "locked-crate prefetch for $owner/$repo ended $?; the recipe reports any real gap"
+if ((sandbox)); then
+  # The prefetch heals the host's shared Cargo registry, which is exactly a shared writable cache: a
+  # contribution neither reads nor writes it. Its sandbox resolves dependencies on its own, within
+  # whatever network the site allows it.
+  say "$owner/$repo#$number skips the locked-crate prefetch: a contribution shares no registry"
+else
+  "${enter[@]}" env -i -C "$worker_root" HOME="$HOME" USER="$(id -un)" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+    PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" GIT_LFS_SKIP_SMUDGE=1 "${git_env[@]}" \
+    ionice -c 3 timeout 30m bash -c "$prefetch" pr-gate-prefetch "$worker_root" "$repo" "$LOCK_SOURCES_ERE" \
+    6>&- 7>&- 9>&- >"$gate_attempt_dir/prefetch.log" 2>&1 \
+    || say "locked-crate prefetch for $owner/$repo ended $?; the recipe reports any real gap"
+fi
 if [[ -s "$gate_attempt_dir/prefetch.log" ]]; then
   say "$owner/$repo prefetch: $(grep -c '^fetched ' "$gate_attempt_dir/prefetch.log") lockfile(s) healed, $(grep -c '^could not fetch ' "$gate_attempt_dir/prefetch.log") not (see prefetch.log)"
 fi
@@ -1027,15 +1304,35 @@ cache_env=()
 [[ -z "$SCCACHE" ]] || cache_env=(RUSTC_WRAPPER="$SCCACHE" CARGO_INCREMENTAL=0 "${sccache_env[@]}")
 root_env=()
 for var in $WORKER_ROOT_VARS; do root_env+=("$var=$worker_root"); done
+if ((sandbox)); then
+  # The sandbox contract: <command> <tree-root> <repo> <recipe...>. The site's command puts the tree
+  # root in an ephemeral, network-restricted VM or container at that same path, enters <repo> there
+  # and runs the recipe. What the runner guarantees on this side is the environment: `env -i` with no
+  # forge token and no path to one, no gate identity, no HOME or USER of the gate user, no governed
+  # tools on PATH, no compile-cache or registry variables, and nothing of the site configuration
+  # except that a sandbox is what this is. The tree itself is this gate's own slot tree, which the
+  # next gate resets; nothing the contribution writes outlives it.
+  read -r -a sandbox_cmd <<<"$SANDBOX_COMMAND"
+  (
+    cd "$run/$repo"
+    exec setsid env -i PATH="$SANDBOX_PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
+      GIT_LFS_SKIP_SMUDGE=1 PR_GATE_SANDBOX=1 "${root_env[@]}" \
+      JERYU_PLAYWRIGHT_WEB_PORT="$PLAYWRIGHT_WEB_PORT" \
+      ionice -c 3 timeout --kill-after=30s 3h \
+      bash -c 'exec 6>&- 7>&- 9>&-; exec "$@"' pr-gate-sandbox \
+      "${sandbox_cmd[@]}" "$run" "$repo" "${recipe[@]}"
+  ) >"$log" 2>&1 &
+else
 (
   cd "$run/$repo"
   exec setsid "${enter[@]}" env -i -C "$worker_root/$repo" HOME="$HOME" USER="$(id -un)" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
     PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
-    GIT_LFS_SKIP_SMUDGE=1 "${root_env[@]}" \
+    GIT_LFS_SKIP_SMUDGE=1 "${git_env[@]}" "${root_env[@]}" \
     JERYU_PLAYWRIGHT_WEB_PORT="$PLAYWRIGHT_WEB_PORT" \
     "${cache_env[@]}" ionice -c 3 \
     timeout --kill-after=30s 3h bash -c 'exec 6>&- 7>&- 9>&-; exec "$@"' pr-gate-worker "${recipe[@]}"
 ) >"$log" 2>&1 &
+fi
 gate_worker=$!
 gate_update --argjson worker "$gate_worker" '.worker_pid=$worker'
 worker_exit=0

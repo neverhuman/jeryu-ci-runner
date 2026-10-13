@@ -5,6 +5,8 @@ use jeryu_runner_protocol::wire::v2::RuntimeImageClass;
 use nix::unistd::Uid;
 use std::path::Path;
 
+mod closure;
+mod elf;
 mod io;
 #[cfg(test)]
 mod tests;
@@ -14,19 +16,37 @@ const MOCK_AGENT: &[u8] = include_bytes!(concat!(
     "/../../images/agent-microvm/test/mock-agent"
 ));
 
+/// Trusted producer only: write the exclusive static closure inventory.
+pub fn inventory(root: &Path) -> RunnerResult<()> {
+    if !Uid::effective().is_root() {
+        return Err(denied("image_staging_custody_denied"));
+    }
+    let root = crate::custody::Directory::open(root)
+        .map_err(|_| denied("image_staging_custody_denied"))?;
+    closure::inventory(&root)
+}
+
 /// Compose the closed production/test overlay exactly once. The trusted image
 /// producer supplies this staging path; no guest or session RPC can select it.
 pub fn compose(root: &Path, image_class: RuntimeImageClass) -> RunnerResult<()> {
     if !Uid::effective().is_root() {
         return Err(denied("image_staging_custody_denied"));
     }
-    let staging = io::trusted_root(root)?;
+    let capability = crate::custody::Directory::open(root)
+        .map_err(|_| denied("image_staging_custody_denied"))?;
+    let staging = capability.descend(Path::new(""))?.into_fd();
     if image_class == RuntimeImageClass::Production
         && let Some(parent) = io::directories(&staging, &["usr", "lib", "jeryu"], false)?
         && io::entry_exists(&parent, "mock")?
     {
         return Err(denied("production_mock_entrypoint_denied"));
     }
+    if let Some(config) = io::directories(&staging, &["etc", "jeryu"], false)?
+        && io::entry_exists(&config, "runtime-image-class")?
+    {
+        return Err(denied("image_class_already_composed"));
+    }
+    let _closure = closure::verify(&capability)?;
     let config = io::directories(&staging, &["etc", "jeryu"], true)?
         .ok_or_else(|| denied("image_staging_custody_denied"))?;
     if io::entry_exists(&config, "runtime-image-class")? {

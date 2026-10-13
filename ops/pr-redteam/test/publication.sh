@@ -57,7 +57,7 @@ done
 printf '%s %s\n' "$method" "$url" >> "$PUBLISH_FIXTURE/requests"
 row() {
   jq -nc --arg sha "$(cat "$PUBLISH_FIXTURE/head")" --arg base "$(cat "$PUBLISH_FIXTURE/base")" --arg approved "$(test ! -e "$PUBLISH_FIXTURE/forge-approved" || echo approved)" \
-    '{repo:{owner:"jeryu",name:"fixture"},number:1,head_sha:$sha,base_sha:$base,head_ref:"topic",base_ref:"main",draft:false,author:"contributor",title:"fixture",body_markdown:"fixture",state:"open",passport_hash:"fixture-passport",review:{user_review_state:$approved,changes_requested:0},mergeable:{can_merge:true}}'
+    '{repo:{owner:"jeryu",name:"fixture"},number:1,head_sha:$sha,base_sha:$base,head_ref:"topic",base_ref:"main",draft:false,author:"contributor",title:"fixture",body_markdown:"fixture",state:"open",labels:["origin:internal"],passport_hash:"fixture-passport",review:{user_review_state:$approved,changes_requested:0},mergeable:{can_merge:true}}'
 }
 case "$url" in
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;

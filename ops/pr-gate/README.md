@@ -30,6 +30,35 @@ On a gate host the scripts live in `~/gate-runner/bin`, the units in `~/.config/
 the state under `~/gate-runner` (`installed-main.json`, `tools.json`, `attempts/`, `cache/`,
 `regate/`, mirrors and trees). The units run `%h/gate-runner/bin/<script>`.
 
+## Deciding reuse before a tree is prepared
+
+Most of what a tick looks at is a head nobody has touched since it was gated. Finding that out used
+to cost a full preparation -- a mirror checkout of every sibling, a reset, a clean, a tracked-file
+stamp and a tree-wide fingerprint, about six seconds a head. In a 24h sample on the gate host
+(2026-10-09/10) two slots spent some 35 slot-hours preparing about 40 unchanged heads, roughly 310
+times each, against about 8 hours of actual gating, and a new head waited behind that sweep.
+
+So after the mirrors are refreshed, and before anything is checked out, the runner derives the
+head's input identity a second way (`gate_input_cheap`): the siblings straight out of those
+mirrors' `refs/heads/main`, the gated head's own source row and recipe off the receipt that pins
+that exact commit, and every tool, fixture and runner hash computed there and then. That is the
+same document `gate_inputs` writes from a prepared tree, so the usual decision applies to it
+unchanged, and an identical head is left alone without a tree.
+
+Nothing is taken on trust. A commit determines its tree and its `Cargo.lock`, so a receipt whose
+`sha` is this head is authority for that one row and for nothing else; the recipe and the toolchain
+`rustup` resolves follow from that tree and from the `just` and `rustup` binaries, whose hashes are
+recomputed, and the resolved compilers are re-hashed at the paths the receipt names. A sibling main
+that moved, a governed tool that was reinstalled, a runner that was upgraded -- each is a changed
+input here exactly as it is after a full preparation. Anything this cannot derive counts as changed
+too, and the tree is prepared as before.
+
+Only `reuse` and `hold` end a head this early: both run nothing and publish nothing, so neither
+needs a tree. A retry of the head -- an explicit `--repo/--pr`, a re-gate the forge asked for -- is
+precisely what must re-run a held failure, so it is never answered from the receipt and still
+refreshes the head before it dispatches. The head is already inside its claim lock by then, so
+deciding here takes no claim of its own and a slot that dies leaves nothing behind.
+
 ## Re-gating a head on request
 
 A result is reused while its inputs are identical and a failure is held, so a head that failed on
@@ -64,8 +93,8 @@ starts an idle slot the moment it learns a head can be gated, from two sources:
   without the signal. Alongside the signal it still runs, at most every
   `GATE_RUNNER_WAKE_HEADS_EVERY` seconds (default 10), because the signal cannot cover a pull request
   **opened** on a branch that was already pushed: the push was signalled before the pull request
-  existed, so nothing pointed a slot at it and it waited for a timer. A head the signal already woke
-  a slot for is not woken for twice.
+  existed, so nothing pointed a slot at it and it waited for a timer. Only an exact PR/head named
+  by a signal in the same look is skipped by the view; a pushed SHA alone cannot suppress an opening.
 
 Each started slot is handed the head it was started for, as one line of
 `~/gate-runner/cache/wake-dispatch` (`<owner/repo> <number|-> <sha|-> <source> <when|->`). The runner
@@ -89,12 +118,22 @@ times rather than a negative wait.
 ## Main health
 
 `pr-gate-runner.sh --main-health` gates each protected repository's current `main` with the same
-tree, recipe and slot environment as pull-request gates, then posts `<repo>/main-health` on that main
+recipe and governed tools as pull-request gates, then posts `<repo>/main-health` on that main
 commit. That context is deliberately distinct from `<repo>/required`, so it cannot satisfy branch
 protection for a pull request. A scheduled pass skips a repository whose main SHA already has this
 runner's latest green main-health status; `--main-health --repo owner/name` runs that repository on
 demand. If `GATE_RUNNER_RELEASE_GUARD_FILE` names an existing file, main-health exits quietly so it
 does not compete with a release.
+
+The installer stages the template units but does not activate their instances.
+To schedule the nightly pass, the service owner creates
+`~/gate-runner-main-health/pr-gate.env` with the required site settings and
+independent checkout, mirror and target paths under `~/gate-runner-main-health`.
+It may refer to the existing governed binaries and credential file. The main-health
+unit uses this separate home, so its slot lock and checkouts do not collide with PR gates.
+After configuring it, enable `pr-gate-main-health@0.timer` with
+`systemctl --user enable --now pr-gate-main-health@0.timer`.
+Installing this source does not run that activation or a live deploy.
 
 ## A head that changes its own gate
 
@@ -112,6 +151,56 @@ conclusion is unchanged: this is a flag for a person, not a veto. Running the re
 
 jeryu's attention inbox raises the matching item from the same path set, so such a pull request also
 appears on `/needs-you` (jeryu-deploy: `pr_changes_own_gate`).
+
+## Contributed pull requests
+
+The GitHub repositories are read-only mirrors; an outside contribution is imported to the forge as a
+PR the importer marks with `PR_GATE_CONTRIBUTED_LABEL` (default `origin:contributed`, read from
+jeryu's own pull request row -- `GET /api/v1/repos/:id/pulls` and `.../pulls/:n` -- where
+jeryu-deploy labels every row `origin:internal` or `origin:contributed`; the GitHub-compatible v3
+read carries no labels). A row with no marking at all is internal, so a forge older than the marking
+gates as before. Such a head carries
+code nobody of the family wrote, so the runner executes **nothing** of it -- no recipe, no
+locked-crate prefetch, no cache daemon, and it is not even checked out -- until a maintainer has
+allowed exactly that head. An internal PR is unaffected and keeps the path above.
+
+The allowance is the `PR_GATE_OK_TO_TEST_LABEL` (default `ok-to-test`) a maintainer applies on the
+forge, which the runner reads each tick from `GET /api/v1/gate-allowances?state=active` as
+
+    {"allowances":[{"repo":"acme/widgets","number":7,"head_sha":"<40 hex>","label":"ok-to-test",
+                    "allowed_by":"dana","allowed_at":"2026-10-06T09:00:00Z"}]}
+
+at most one per PR. The runner decides for itself, and fails closed: the allowance must name the
+PR's *current* head, carry the configured label, and come from a login in
+`PR_GATE_OK_TO_TEST_MAINTAINERS`. So a push moves the head, the allowance no longer names it, and
+the new head waits for a new one -- an ok-to-test is spent by the push that follows it. A forge
+without the route, one this identity cannot read it from, or an unconfigured maintainer list allows
+nothing; each is reported as the reason that head is not running, and no status is posted (the PR is
+waiting for a maintainer, not failing). jeryu-deploy does not serve this route yet, so on a jeryu
+forge today every contribution waits here: that is the fail-closed answer, not a fault.
+
+An allowed head is gated in `PR_GATE_SANDBOX_COMMAND`, the site's ephemeral, network-restricted VM
+or container, called as
+
+    <command> <tree-root> <repo> <recipe...>
+
+which mounts the tree root at that same path in the guest, enters `<repo>` and runs the repository's
+own recipe. What the runner guarantees on this side is that the execution has nothing of the gate
+host: `env -i` with no forge token and no path to one, no `GATE_RUNNER_IDENTITY`, no `HOME` or `USER`
+of the gate user, `PATH` is `PR_GATE_SANDBOX_PATH` and not the governed tools, no compile cache
+(`sccache` and `GATE_RUNNER_SHARED_TARGETS` are off, so it builds in its own tree), no prefetch into
+the shared Cargo registry, no runtime-tools or native-vendor link out of the gate home, and no mount
+namespace of ours. With no sandbox configured, an allowed contribution still runs nothing. The result
+is published as the usual exact-head `<repo>/required` status, and `sandboxed-contribution` is in its
+description, its receipt and its input identity -- so a sandboxed result is never reused as a
+host-run one, or the other way round.
+
+A contribution that changes what the gate itself evaluates with (`PR_GATE_GATE_INPUT_PATHS`:
+`ops/ci/`, `ops/ci-kit/`, `ops/pr-gate/`, `.jeryu/ci.toml`, `Justfile`, workflow directories) is
+compared against the merge base with protected `main`; the paths it changes are recorded in its
+receipt as `gate_input_paths` and its check run's summary says `gate inputs changed: extra review
+required` (beside the self-gate annotation above, never on the required status). That never changes
+whether the gate runs -- it is a green gate that still needs a human to read the change.
 
 ## Site configuration
 
@@ -162,11 +251,37 @@ and `systemd/*` to `~/.config/systemd/user`, `systemctl --user daemon-reload`, t
 `pr-gate-install.timer` (it enables the other singleton timers) and the slot timers
 `pr-gate-runner@0.timer` .. `pr-gate-runner@N.timer`.
 
+## Compatibility: a runner newer than its forge must degrade, not flood
+
+The runner is installed from its own branch and the forge is deployed separately, so a runner can run
+against a forge that lacks a route or field it knows (pr-gate 1.4.0 met a forge with no
+`gate-wanted`, and gating stopped for the whole host). Every new dependency on the forge needs a
+degraded mode that costs the forge no more than the slot timers do:
+
+- **wake**: `pr-gate-wake.sh` does nothing unless the forge serves `GET /api/v1/gate-wanted`. A 404 is
+  cached for `GATE_RUNNER_WAKE_PROBE_TTL` seconds (default 600) and any other failed look pauses the
+  signal for a minute; the slot timers carry the work. With a working signal the open-PR view is
+  also read every `GATE_RUNNER_WAKE_HEADS_EVERY` seconds. Without the signal, reading gated heads is an operator opt-in
+  (`GATE_RUNNER_WAKE_POLL_HEADS=1`) and then at most every `GATE_RUNNER_WAKE_POLL_INTERVAL` seconds
+  (default 30).
+- **429**: a 429 on any read starts one shared back-off (`cache/forge-backoff`, `pr-gate-backoff.sh`):
+  `Retry-After` is honoured, otherwise 30s doubling per consecutive 429 up to 15 minutes
+  (`GATE_RUNNER_BACKOFF_BASE`, `GATE_RUNNER_BACKOFF_CAP`). Until it passes, no slot, wake or head read
+  sends a request; the first non-429 answer clears it. Status writes still go out.
+- **heartbeat**: a 422 drops `tools`, then `code`, then falls back to the oldest contract
+  (`gate_heartbeat_minimal`), so `/runners` stays alive. The heartbeat timer remembers the level that
+  worked for 30 minutes (`cache/heartbeat-level`).
+- **installer**: `pr-gate-wake.timer` is enabled only when the forge answers `gate-wanted` with 200
+  (it is considered again on the next unit change, or enable it by hand), and a unit the operator
+  masked (a `/dev/null` link in the unit directory, or masked in the user manager) is neither
+  overwritten nor enabled.
+
 ## Qualification
 
 `bash tests/required.sh` runs the whole suite offline: the config reader, the attempt journal and
 publication recovery, the complete runner against a fixture forge and real Git (including re-gate
-requests), the mount-namespace selection, lock inheritance, heartbeat and event projection, waking,
+requests), contributed heads (no ok-to-test, a stale or outside one, the sandbox's own environment), the
+mount-namespace selection, lock inheritance, heartbeat and event projection, waking,
 retention, the locked-crate prefetch's source allowlist, the installer and the database refreshers.
 Every fixture uses invented names (`acme`, `gate-a`, `example.test`); none reads the host's own site
 file. The repository's `ops/ci/pr-ci.sh` runs it.

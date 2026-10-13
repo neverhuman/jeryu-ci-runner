@@ -22,9 +22,15 @@ fn rebased_request(agent_id: &str) -> WorkcellClaimRequest {
     }
 }
 
+/// The runner epochs these tests claim with, issued as the fleet would.
+fn issued(mut manager: WorkcellManager) -> WorkcellManager {
+    manager.sync_runner_epochs([("node-0".to_string(), 7), ("node-1".to_string(), 8)]);
+    manager
+}
+
 #[test]
 fn claims_from_an_empty_pool_hand_out_distinct_cells() {
-    let mut manager = WorkcellManager::new();
+    let mut manager = issued(WorkcellManager::new());
     assert_eq!(manager.ready_count(), 0);
 
     let first = manager
@@ -47,7 +53,7 @@ fn claims_from_an_empty_pool_hand_out_distinct_cells() {
 
 #[test]
 fn claim_replaces_warm_cell_and_assigns_branch_budget() {
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
     assert_eq!(manager.ready_count(), 1);
 
     let lease = manager
@@ -87,7 +93,7 @@ fn claim_replaces_warm_cell_and_assigns_branch_budget() {
 
 #[test]
 fn startup_rebase_failure_blocks_the_cell() {
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
     let err = manager
         .claim(WorkcellClaimRequest {
             agent_id: "agent-storm-04".into(),
@@ -113,7 +119,7 @@ fn startup_rebase_failure_blocks_the_cell() {
 
 #[test]
 fn heartbeat_fences_outdated_epochs_and_release_marks_released() {
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
     let lease = manager
         .claim(WorkcellClaimRequest {
             agent_id: "agent-wrath-17".into(),
@@ -151,7 +157,7 @@ fn heartbeat_fences_outdated_epochs_and_release_marks_released() {
 
 #[test]
 fn frozen_ci_snapshot_is_immutable_and_repair_uses_it() {
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
     let lease = manager
         .claim(WorkcellClaimRequest {
             agent_id: "agent-wrath-17".into(),
@@ -185,14 +191,16 @@ fn frozen_ci_snapshot_is_immutable_and_repair_uses_it() {
         .expect("freeze succeeds");
     let frozen_before = frozen.clone();
     let repair = manager
-        .repair_from_snapshot(
-            &frozen,
-            StartupSync::Rebased {
+        .repair_from_snapshot(RepairFromSnapshotRequest {
+            runner_id: "node-0".into(),
+            runner_epoch: 7,
+            snapshot: frozen.clone(),
+            startup: StartupSync::Rebased {
                 main_ref: "origin/main".into(),
                 base_sha: "def456".into(),
                 head_sha: "fedcba".into(),
             },
-        )
+        })
         .expect("repair claim succeeds");
 
     assert_eq!(frozen, frozen_before, "frozen snapshot must stay immutable");
@@ -208,7 +216,7 @@ fn frozen_ci_snapshot_is_immutable_and_repair_uses_it() {
 
 #[test]
 fn hold_failed_tree_preserves_distinct_ci_run_identity() {
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
     let held = manager
         .hold_failed_tree(HoldFailedTreeRequest {
             claim: WorkcellClaimRequest {
@@ -319,7 +327,7 @@ fn tar_helpers_reject_traversal_symlink_and_special_files() {
 // the third: agents cannot mint unbounded branches from a single cell.
 #[test]
 fn branch_budget_exhaustion_is_denied_through_export() {
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
     let held = manager
         .hold_failed_tree(HoldFailedTreeRequest {
             claim: WorkcellClaimRequest {
@@ -364,7 +372,7 @@ fn branch_budget_exhaustion_is_denied_through_export() {
 // still works.
 #[test]
 fn two_claims_get_distinct_cells_and_outdated_epoch_loser_is_fenced() {
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
     let base = |agent: &str, epoch: u64| WorkcellClaimRequest {
         agent_id: agent.into(),
         workspace_root: root(),
@@ -382,7 +390,11 @@ fn two_claims_get_distinct_cells_and_outdated_epoch_loser_is_fenced() {
     };
 
     let first = manager.claim(base("agent-a", 7)).expect("first claim");
-    let second = manager.claim(base("agent-b", 9)).expect("second claim");
+    let second = manager.claim(base("agent-b", 7)).expect("second claim");
+    let stale = manager
+        .claim(base("agent-c", 9))
+        .expect_err("an epoch the daemon did not issue is fenced");
+    assert_eq!(stale.reason, "workcell_epoch_fenced");
     assert_ne!(
         first.workcell_id, second.workcell_id,
         "two claims must not collide on a workcell id"
@@ -401,7 +413,7 @@ fn two_claims_get_distinct_cells_and_outdated_epoch_loser_is_fenced() {
 // un-transitioned; the live epoch then releases for real.
 #[test]
 fn release_with_outdated_epoch_is_fenced() {
-    let mut manager = WorkcellManager::with_warm_pool(1);
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
     let lease = manager
         .claim(WorkcellClaimRequest {
             agent_id: "agent-wrath-17".into(),
@@ -465,4 +477,66 @@ fn tar_import_rejects_hardlink_fifo_and_socket_entries() {
             "{label} entry must be denied by kind"
         );
     }
+}
+
+#[test]
+fn claim_ready_refuses_a_ready_cell_that_is_not_in_the_ready_queue() {
+    let mut manager = issued(WorkcellManager::new());
+    // Minted but never queued: the warm pool owns no container for this id, so
+    // no agent may be handed it even though the lease itself reads ready.
+    let workcell_id = manager.mint_cell();
+    assert_eq!(
+        manager.workcell(&workcell_id).unwrap().state,
+        WorkcellState::Ready
+    );
+
+    let denied = manager
+        .claim_ready(&workcell_id, rebased_request("agent-wrath-21"))
+        .expect_err("a cell outside the ready queue is not claimable");
+
+    assert_eq!(denied.reason, "workcell_claim_denied");
+    assert!(
+        denied.message().contains("not in the ready queue"),
+        "message names the missing queue entry: {}",
+        denied.message()
+    );
+    assert_eq!(
+        manager.workcell(&workcell_id).unwrap().state,
+        WorkcellState::Ready,
+        "a denied claim leaves the lease untouched"
+    );
+}
+
+#[test]
+fn syncing_the_issued_epochs_prunes_runners_no_longer_listed() {
+    let mut manager = issued(WorkcellManager::with_warm_pool(1));
+    manager.sync_runner_epochs([("node-1".to_string(), 8)]);
+    let pruned = manager
+        .claim(rebased_request("agent-wrath-22"))
+        .expect_err("node-0 left the issued set and is fenced");
+    assert_eq!(pruned.reason, "workcell_epoch_fenced");
+    assert!(pruned.message().contains("no active epoch"));
+    assert_eq!(
+        manager.ready_count(),
+        1,
+        "the fenced claim consumed nothing"
+    );
+}
+
+#[test]
+fn claim_ready_reports_a_fenced_runner_before_the_cell_state() {
+    let mut manager = issued(WorkcellManager::new());
+    let workcell_id = manager.warm_one();
+    manager
+        .claim_ready(&workcell_id, rebased_request("agent-wrath-23"))
+        .expect("the issued epoch claims");
+    let mut stale = rebased_request("agent-wrath-24");
+    stale.runner_epoch = 6;
+    let fenced = manager
+        .claim_ready(&workcell_id, stale)
+        .expect_err("a stale epoch against a claimed cell");
+    assert_eq!(
+        fenced.reason, "workcell_epoch_fenced",
+        "a fenced lifetime is never reported as a transient denial"
+    );
 }

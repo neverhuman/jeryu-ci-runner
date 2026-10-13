@@ -34,6 +34,13 @@ gate_status_context() {
   fi
 }
 
+# How the attempt under preparation executes: on the gate host as the operator identity, or in the
+# site's ephemeral token-free sandbox because the head is a contribution. It is part of the input
+# identity, so a sandboxed result is never reused for a host-run one or the other way round.
+gate_execution_kind() {
+  [[ "${GATE_SANDBOX:-0}" == 1 ]] && printf 'sandboxed-contribution' || printf 'operator-unsealed'
+}
+
 # Durable replace: fsync the new file, rename it, fsync the directory. `sync FILE` fsyncs that file;
 # `sync -f` would syncfs the whole filesystem, which on a gate host waited behind every slot's build output
 # (sampled 2026-09-18: ~100 of 1300 two-second samples blocked there).
@@ -49,7 +56,7 @@ gate_atomic() {
 }
 
 # Move every checkout in a slot tree that is not one of the named repositories into a detached
-# directory (replacing an older copy there), printing each name moved. See the runner's step 3.
+# directory (replacing an older copy there), printing each name moved. See the runner's step 5.
 gate_detach_strays() { # tree detached-dir name...
   local tree=$1 detached=$2 d n; shift 2
   for d in "$tree"/*/; do
@@ -127,12 +134,13 @@ gate_begin() {
   jq -n --arg id "$id" --arg owner "$owner" --arg repo "$repo" --arg sha "$sha" \
     --arg boot "$(cat /proc/sys/kernel/random/boot_id)" --arg at "$(date -u +%FT%TZ)" \
     --argjson pid "$$" --argjson sequence "$sequence" --arg slot "$SLOT" --slurpfile inputs "$identity" \
+    --arg kind "$(gate_execution_kind)" \
     '{schema:"jeryu.pr-gate-attempt/v1",id:$id,owner:$owner,repo:$repo,sha:$sha,
       boot_id:$boot,pid:$pid,slot:$slot,sequence:$sequence,started_at:$at,inputs:$inputs[0],
       terminal:false,outcome:null,exit_code:null,log:null,log_sha256:null,gate_definition_paths:[],
       queue_wait:null,
       publication:{required_status:false,check_run:false},recovery_required:null,
-      execution_kind:"operator-unsealed"}' | gate_atomic "$gate_receipt"
+      execution_kind:$kind}' | gate_atomic "$gate_receipt"
 }
 
 # Hash a fixture or vendor tree for the input identity. A native build may be running in the same
@@ -152,7 +160,7 @@ gate_inputs() {
   : "${run:?}" "${recipe_name:?}"
   # Bind all actual family sources, locks, executable tools and external fixtures.
   # The full identity is retained, so cache invalidation can be independently read.
-  local output=$1 directory tool resolved lock_digest head tree origin clean
+  local output=$1 directory lock_digest head tree origin clean
   local rows="$output.rows" inputs="$output.inputs" versions="$output.versions"
   : >"$rows" || return
   : >"$inputs" || return
@@ -174,23 +182,60 @@ gate_inputs() {
       --arg tree "$tree" --arg lock "$lock_digest" --arg origin "$origin" \
       '{repository:$name,head:$head,tree:$tree,cargo_lock_sha256:$lock,origin:$origin}' >>"$rows" || return
   done
-  for tool in bash git just jq rustc cargo rustup cc c++ ld node npm pnpm timeout; do
-    resolved=$(command -v "$tool" || true)
-    if [[ -n "$resolved" ]]; then sha256sum "$(readlink -f "$resolved")" >>"$inputs" || return; fi
-  done
-  for tool in rustc cargo; do
-    resolved=$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup which "$tool") || return
-    sha256sum "$resolved" >>"$inputs" || return
-    "$resolved" --version >>"$versions" || return
-  done
-  # No mtime-only cache: a changed fixture or governed executable is a new input.
-  for directory in "$TOOLS" "$RUNTIME_TOOLS"; do
-    if [[ -d "$directory" ]]; then
-      hash_fixture_tree "$directory" >>"$inputs" || return
+  gate_input_tools "$inputs" "$versions" || return
+  gate_input_render "$output" "$rows" "$inputs" "$versions" "$recipe_name" || return
+  rm -f -- "$rows" "$inputs" "$versions"
+}
+
+# Everything in the input identity that is not a family source: the executables on PATH, the
+# toolchain rustup resolves for the head, the governed tools, the runtime and vendor fixtures, this
+# runner's own code and the compiler cache. Appends "sha256  path" lines to $1 and tool versions to
+# $2, in a fixed order, because the identity is compared byte for byte.
+#
+# $3, when given, is the tools field of a previous identity for this exact head, used when there is
+# no checkout to ask which toolchain the head pins (gate_input_cheap). The PATH block is recomputed
+# either way and must equal that identity's, so the two lines after it are its resolved rustc and
+# cargo; those paths are re-hashed here and their versions re-read, never copied, so a toolchain
+# reinstalled in place is a changed input.
+gate_input_tools() { # inputs versions [previous-tools]
+  local inputs=$1 versions=$2 previous=${3:-} tool resolved directory lines
+  local -a toolchain=()
+  if [[ "${GATE_SANDBOX:-0}" == 1 ]]; then
+    # A sandboxed contribution gets none of the host's toolchain, governed tools, runtime fixtures or
+    # vendor tree (see the runner's step 6), so none of them is an input of its result. What it
+    # evaluates with is the sandbox the site configured, so that is what is bound here.
+    printf 'sandbox-command  %s\n' "${SANDBOX_COMMAND:-}" >>"$inputs" || return
+  else
+    for tool in bash git just jq rustc cargo rustup cc c++ ld node npm pnpm timeout; do
+      resolved=$(command -v "$tool" || true)
+      if [[ -n "$resolved" ]]; then sha256sum "$(readlink -f "$resolved")" >>"$inputs" || return; fi
+    done
+    if [[ -z "$previous" ]]; then
+      for tool in rustc cargo; do
+        resolved=$(cd "$run/$repo" && env -u RUSTUP_TOOLCHAIN rustup which "$tool") || return
+        toolchain+=("$resolved")
+      done
+    else
+      lines=$(wc -l <"$inputs") || return
+      [[ "$(head -n "$lines" <<<"$previous")" == "$(cat "$inputs")" ]] || return 1
+      mapfile -t toolchain < <(sed -n "$((lines + 1)),$((lines + 2))p" <<<"$previous" \
+        | sed -E 's/^[0-9a-f]{64}  //')
+      ((${#toolchain[@]} == 2)) || return 1
+      [[ "$(basename -- "${toolchain[0]}")" == rustc && "$(basename -- "${toolchain[1]}")" == cargo ]] || return 1
     fi
-  done
-  if [[ -n "${VENDOR:-}" && -d "$VENDOR" ]] && pr_gate_listed "${VENDOR_INPUT_REPOS:-}" "$repo" "$owner/$repo"; then
-    hash_fixture_tree "$VENDOR" >>"$inputs" || return
+    for resolved in "${toolchain[@]}"; do
+      sha256sum "$resolved" >>"$inputs" || return
+      "$resolved" --version >>"$versions" || return
+    done
+    # No mtime-only cache: a changed fixture or governed executable is a new input.
+    for directory in "$TOOLS" "$RUNTIME_TOOLS"; do
+      if [[ -d "$directory" ]]; then
+        hash_fixture_tree "$directory" >>"$inputs" || return
+      fi
+    done
+    if [[ -n "${VENDOR:-}" && -d "$VENDOR" ]] && pr_gate_listed "${VENDOR_INPUT_REPOS:-}" "$repo" "$owner/$repo"; then
+      hash_fixture_tree "$VENDOR" >>"$inputs" || return
+    fi
   fi
   # The runner's own code, as hashed when this process started (GATE_SELF_SHA256): that is what runs. A
   # runner installed mid-gate replaces the files on disk but not the running copy, and hashing the disk
@@ -201,12 +246,66 @@ gate_inputs() {
   else
     sha256sum "${BASH_SOURCE[0]}" "$GATE_RUNNER_SCRIPT" >>"$inputs" || return
   fi
-  if [[ -n "$SCCACHE" ]]; then sha256sum "$SCCACHE" >>"$inputs" || return; fi
-  jq -nS --slurpfile sources "$rows" --rawfile tools "$inputs" --rawfile versions "$versions" \
-    --arg recipe "$recipe_name" --arg base "$BASE" --arg runner "$MARKER" \
-    --arg context "$(gate_status_context "$owner" "$repo")" \
+  if [[ -n "$SCCACHE" && "${GATE_SANDBOX:-0}" != 1 ]]; then sha256sum "$SCCACHE" >>"$inputs" || return; fi
+}
+
+# The identity document itself, from the source rows, the tool lines and the recipe.
+gate_input_render() { # output rows inputs versions recipe
+  jq -nS --slurpfile sources "$2" --rawfile tools "$3" --rawfile versions "$4" \
+    --arg recipe "$5" --arg base "$BASE" --arg runner "$MARKER" \
+    --arg context "$(gate_status_context "$owner" "$repo")" --arg kind "$(gate_execution_kind)" \
     '{schema:"jeryu.pr-gate-inputs/v1",sources:($sources|sort_by(.repository)),tools:$tools,
-      versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:"operator-unsealed"}' >"$output" || return
+      versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:$kind}' >"$1"
+}
+
+# The same input identity, derived without preparing a tree: the siblings read out of the mirrors
+# this tick fetched, the gated head's own source row and recipe read off the receipt that pins this
+# exact commit, and every tool, fixture and runner hash computed now. Written to $1 from the previous
+# terminal result $2, so gate_decision can answer `reuse` or `hold` for an unchanged head without a
+# checkout -- ~40 open heads were re-prepared every tick on the gate host only to be found identical.
+#
+# Nothing is taken on trust. A commit determines its tree and its Cargo.lock, so a receipt whose sha
+# is this head is authority for that one row and for nothing else; the recipe and the toolchain
+# rustup resolves are functions of that tree and of the just and rustup binaries, whose hashes are
+# recomputed here, and the resolved compilers are re-hashed at the paths the receipt names. Every
+# other field is computed from the mirrors and the host as it is now, so a sibling main that moved, a
+# governed tool that was reinstalled or a runner that was upgraded is a changed input exactly as it is
+# after a full preparation. Any difference at all, and anything this cannot derive, returns non-zero:
+# the tree is then prepared and the identity computed from the sources themselves, as before.
+gate_input_cheap() { # output previous-result
+  : "${owner:?}" "${repo:?}" "${sha:?}" "${mirrors:?}" "${family?}"
+  local output=$1 previous=$2 n head tree lock_digest row recipe mirror previous_tools
+  local rows="$output.rows" inputs="$output.inputs" versions="$output.versions"
+  [[ -f "$previous" ]] || return 1
+  jq -e --arg owner "$owner" --arg repo "$repo" --arg sha "$sha" --arg kind "$(gate_execution_kind)" \
+    '.terminal and .owner == $owner and .repo == $repo and .sha == $sha
+     and (.inputs.execution_kind // "") == $kind' "$previous" >/dev/null 2>&1 || return 1
+  row=$(jq -ce --arg repo "$repo" --arg sha "$sha" --arg origin "$BASE/git/$owner/$repo.git" \
+    'first(.inputs.sources[]? | select(.repository == $repo and .head == $sha and .origin == $origin))' \
+    "$previous") || return 1
+  recipe=$(jq -re '.inputs.recipe' "$previous") || return 1
+  previous_tools=$(jq -re '.inputs.tools' "$previous") || return 1
+  : >"$rows" || return
+  : >"$inputs" || return
+  : >"$versions" || return
+  printf '%s\n' "$row" >>"$rows" || return
+  for n in $family; do
+    [[ "$n" != "$repo" ]] || continue
+    mirror="$mirrors/$n.git"
+    # No mirror, or no canonical main in it, is exactly the sibling the preparation would leave out.
+    [[ -d "$mirror" ]] || continue
+    head=$(git -C "$mirror" rev-parse refs/heads/main 2>/dev/null) || continue
+    tree=$(git -C "$mirror" rev-parse 'refs/heads/main^{tree}' 2>/dev/null) || continue
+    lock_digest=absent
+    if git -C "$mirror" cat-file -e refs/heads/main:Cargo.lock 2>/dev/null; then
+      lock_digest=$(git -C "$mirror" cat-file blob refs/heads/main:Cargo.lock | sha256sum | cut -c1-64) || return
+    fi
+    jq -nc --arg name "$n" --arg head "$head" --arg tree "$tree" --arg lock "$lock_digest" \
+      --arg origin "$BASE/git/$owner/$n.git" \
+      '{repository:$name,head:$head,tree:$tree,cargo_lock_sha256:$lock,origin:$origin}' >>"$rows" || return
+  done
+  gate_input_tools "$inputs" "$versions" "$previous_tools" || return
+  gate_input_render "$output" "$rows" "$inputs" "$versions" "$recipe" || return
   rm -f -- "$rows" "$inputs" "$versions"
 }
 
@@ -308,7 +407,7 @@ gate_self_modification_note() { # receipt
 }
 
 gate_publish() {
-  local state outcome id digest exit_code context cause="" log note=""
+  local state outcome id digest exit_code context cause="" log note="" kind review=""
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -318,10 +417,18 @@ gate_publish() {
   context=$(jq -er '.inputs.required_context // (.repo + "/required")' "$gate_receipt") || return
   case "$outcome" in success) state=success;; failure|timed_out) state=failure;; *) state=error;; esac
   log=$(jq -r '.log // ""' "$gate_receipt")
+  # How the attempt ran is read from its own receipt, so recovering an older one says what that one did.
+  kind=$(jq -r '.execution_kind // .inputs.execution_kind // "operator-unsealed"' "$gate_receipt")
+  # A contribution that changes what the gate itself evaluates with is named on the check run, beside
+  # the self-gate note, so a reviewer sees it needs the extra review as well as a green gate. Never on
+  # the required status: its description is the gate's own verdict.
+  if jq -e '(.gate_input_paths // []) | length > 0' "$gate_receipt" >/dev/null; then
+    review="; gate inputs changed: extra review required"
+  fi
   if [[ "$state" != success && -f "$log" ]]; then cause=$(gate_failure_cause "$log"); fi
   if ! jq -e '.publication.required_status' "$gate_receipt" >/dev/null; then
     api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -nc --arg state "$state" --arg context "$context" \
-      --arg description "$MARKER operator-unsealed $outcome; exit $exit_code; attempt $id; log $digest${cause:+; cause: $cause}" \
+      --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${cause:+; cause: $cause}" \
       '{state:$state,context:$context,description:$description}')"
     : "${code:?}" "${body:?}"
     if [[ "$code" != 201 ]] || ! jq -e '.id != null' <<<"$body" >/dev/null; then
@@ -337,7 +444,7 @@ gate_publish() {
     # matching needs_human item from the same paths, so the PR also shows up on /needs-you.
     note=$(gate_self_modification_note "$gate_receipt")
     api POST "/repos/$owner/$repo/check-runs" "$(jq -nc --arg sha "$sha" --arg state "$state" \
-      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" --arg summary "Attempt $id; log sha256 $digest; operator-unsealed${note:+; changes its own gate}" \
+      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" --arg summary "Attempt $id; log sha256 $digest; $kind${note:+; changes its own gate}$review" \
       --arg note "$note" \
       '{name:"pr-gate-runner",head_sha:$sha,status:"completed",conclusion:(if $state=="error" then "failure" else $state end),
         output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}')"
@@ -479,6 +586,14 @@ gate_runner_tools() { # gate-runner-home
 }
 
 # A heartbeat payload with the optional code and tools added (each only when non-empty).
+# The oldest heartbeat shape a forge accepted: identity, labels, and only the identifying fields of
+# `current` and `last`. The last resort when a forge refuses a newer shape with 422 even without code
+# and tools, so a newer runner against an older forge keeps its slots on /runners.
+gate_heartbeat_minimal() { # payload
+  jq -c '{runnerId, host, slot, labels,
+    current: (.current | if . == null then null else {repo, pr, sha, startedAt} end),
+    last: (.last | if . == null then null else {repo, pr, sha, finishedAt, conclusion} end)}' <<<"$1"
+}
 gate_heartbeat_with() { # payload code-json tools-json
   jq -c --arg code "$2" --arg tools "$3" \
     '. + (if $code != "" then {code: ($code | fromjson)} else {} end)

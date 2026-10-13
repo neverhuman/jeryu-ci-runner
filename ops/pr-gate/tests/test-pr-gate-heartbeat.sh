@@ -36,6 +36,9 @@ fi
 if [[ -n "${HEARTBEAT_TEST_REJECT_CODE:-}" ]] && jq -e 'has("code")' <<<"$data" >/dev/null; then
   printf 'Failed to deserialize the JSON body: unknown field `code`\n422'; exit 0
 fi
+if [[ -n "${HEARTBEAT_TEST_REJECT_SHAPE:-}" ]] && jq -e '(.current // {} | has("recipe")) or (.last // {} | has("recipe") or has("seconds"))' <<<"$data" >/dev/null; then
+  printf 'the request body is not valid JSON for this route\n422'; exit 0
+fi
 printf '{"accepted":true}\n%s' "${HEARTBEAT_TEST_HTTP:-200}"
 CURL
 cat > "$fixture/bin/journalctl" <<'JOURNAL'
@@ -49,7 +52,7 @@ printf 'PR_GATE_FORGE_URL=https://forge.example.test/\nPR_GATE_CODE_REPO="acme/g
 export PR_GATE_CONFIG="$fixture/pr-gate.env"
 export PATH="$fixture/bin:$PATH" JERYU_BASE=https://forge.example.test JERYU_TOKEN_FILE="$fixture/token"
 export GATE_RUNNER_HOME="$fixture/home" GATE_RUNNER_SLOTS=0
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 refuse() {
   local before
   before=$(wc -l < "$HEARTBEAT_TEST_CAPTURE")
@@ -122,7 +125,7 @@ HEARTBEAT_TEST_EVENT_HTTP=503 bash "$source_file" 2> "$fixture/outage.log"
 grep -q 'event log answered 503' "$fixture/outage.log"
 [[ ! -e "$fixture/home/cache/events-posted/attempt-1" ]]
 printf 'PASS a forge without the event route (200 + HTML) or in an outage leaves the attempt unreported for a later tick\n'
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 bash "$source_file"
 [[ "$(events | wc -l)" == 1 ]]
 events | jq -e '.event_id=="pr-gate:attempt-1" and .source=="pr-gate" and .kind=="gate.log" and .repo=="jeryu/jeryu-tool" and .pr==4 and .outcome=="failure"
@@ -132,10 +135,42 @@ events | jq -e '.event_id=="pr-gate:attempt-1" and .source=="pr-gate" and .kind=
   and .detail.cache=="none"
   and .detail.queue_wait.seconds==322 and .detail.queue_wait.source=="pr-opened"
   and (.summary|test("after 322s in the queue"))
+  and .detail.runner==.actor
   and (.log_tail|endswith("error: test failed\nlast line\n")) and (.log_tail|contains("early line")|not)
-  and (.log_tail|contains("root:")|not) and (.log_tail|test("\u001b|\r")|not) and ((.log_tail|utf8bytelength) <= 12288)' >/dev/null
+  and (.log_tail|contains("root:")|not) and (.log_tail|test("\u001b|\r")|not) and ((.log_tail|utf8bytelength) <= 12288)
+  and (.log_tail|startswith("error: test failed")) and (.log_tail|startswith("x")|not) and .log_url==null' >/dev/null
 [[ -e "$fixture/home/cache/events-posted/attempt-1" ]]
-printf 'PASS a finished attempt posts one gate.log event with a cleaned log tail taken from beside the receipt\n'
+printf 'PASS a finished attempt posts one gate.log event with a cleaned log tail that starts at a line boundary, the slot as detail.runner, and no log_url nobody serves\n'
+
+# One line longer than the whole tail is still reported: half a line beats no log at all.
+rm -f "$fixture/home/cache/events-posted/"*
+: > "$HEARTBEAT_TEST_CAPTURE"
+head -c 20000 /dev/zero | tr '\0' 'y' > "$attempt_dir/build.log"
+bash "$source_file"
+events | jq -se 'length==1 and (.[0].log_tail|startswith("y")) and ((.[0].log_tail|utf8bytelength) <= 12288)' >/dev/null
+printf 'PASS a log of one line longer than the tail still reports that line\n'
+{ printf 'early line that must fall outside the tail\n'; head -c 20000 /dev/zero | tr '\0' 'x'; printf '\n\033[31merror\033[0m: test failed\r\nlast line\n'; } > "$attempt_dir/build.log"
+
+# Where the logs are served, each event names this attempt's whole build.log.
+rm -f "$fixture/home/cache/events-posted/"*
+: > "$HEARTBEAT_TEST_CAPTURE"
+PR_GATE_LOG_URL_TEMPLATE='https://logs.example.test/{host}/slot{slot}/{repo}/{sha}/{attempt}/build.log' bash "$source_file"
+events | jq -se --arg host "$(hostname -s)" 'length==1 and .[0].log_url==("https://logs.example.test/" + $host
+  + "/slot0/jeryu/jeryu-tool/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/attempt-1/build.log")' >/dev/null
+rm -f "$fixture/home/cache/events-posted/"*
+: > "$HEARTBEAT_TEST_CAPTURE"
+for bad in 'ftp://logs.example.test/{attempt}' '/logs/{attempt}' $'https://logs.example.test/\033{attempt}' 'https://logs.example.test/ {attempt}'; do
+  rm -f "$fixture/home/cache/events-posted/"*
+  : > "$HEARTBEAT_TEST_CAPTURE"
+  PR_GATE_LOG_URL_TEMPLATE="$bad" bash "$source_file" 2> "$fixture/log-url.log"
+  grep -q 'PR_GATE_LOG_URL_TEMPLATE is not an http(s) URL' "$fixture/log-url.log"
+  events | jq -se 'length==1 and .[0].log_url==null' >/dev/null \
+    || { printf 'FAIL: template %s was used\n' "$bad" >&2; exit 1; }
+done
+printf 'PASS a configured log URL template becomes the event log_url; a template that is not an http(s) URL is refused and reported\n'
+rm -f "$fixture/home/cache/events-posted/"*
+: > "$HEARTBEAT_TEST_CAPTURE"
+bash "$source_file" >/dev/null
 bash "$source_file"
 [[ "$(events | wc -l)" == 1 ]]
 printf 'PASS an attempt is reported once\n'
@@ -159,7 +194,7 @@ printf 'PASS attempt evidence is unchanged by reporting\n'
 # that compiled with sccache forwards that, so the Activity feed can tell a cached gate from an
 # uncached one.
 rm -f "$fixture/home/cache/events-posted/"*
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 jq '.id="attempt-3" | .cache="sccache"' "$receipt" > "$fixture/home/attempts/key/attempt2/receipt.json"
 jq 'del(.cache) | .id="attempt-4"' "$receipt" > "$fixture/new.json"
 mv "$fixture/new.json" "$receipt"
@@ -171,48 +206,48 @@ printf 'PASS detail.cache is forwarded, and a receipt without it still reports\n
 # ---- the code each runner runs ---------------------------------------------------------------------
 heartbeats() { jq -c 'select(.url | endswith("/api/v1/runners/heartbeat")) | .body' "$HEARTBEAT_TEST_CAPTURE"; }
 installed="$fixture/home/installed-main.json"
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 bash "$source_file"
 heartbeats | jq -se 'length==1 and (.[0]|has("code")|not)' >/dev/null
 printf 'PASS no installed-main.json: the heartbeat carries no code key\n'
 for bad in '{"commit":"main"}' '{"commit":"abc123"}' 'not json' '{"verified_at":"2026-10-01T00:00:00Z"}'; do
   printf '%s\n' "$bad" > "$installed"
-  : > "$HEARTBEAT_TEST_CAPTURE"
+  : > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
   bash "$source_file"
   heartbeats | jq -se 'length==1 and (.[0]|has("code")|not)' >/dev/null
 done
 printf 'PASS an unreadable or non-hex installed commit sends no code key\n'
 commit=0123456789abcdef0123456789abcdef01234567
 jq -nc --arg c "$commit" '{commit:$c,previous:"fedcba9",installed_at:"2026-10-01T01:02:03Z",files:["scripts/pr-gate-runner.sh"]}' > "$installed"
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 bash "$source_file"
 heartbeats | jq -se --arg c "$commit" 'length==1 and .[0].code=={repo:"acme/gate-code",commit:$c,installedAt:"2026-10-01T01:02:03Z"}
   and .[0].runnerId==(.[0].host + "/slot0")' >/dev/null
 jq -nc --arg c "$commit" '{commit:$c,verified_at:"2026-10-01T04:05:06Z"}' > "$installed"
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 PR_GATE_CODE_REPO=example/runner-code bash "$source_file"
 heartbeats | jq -se --arg c "$commit" '.[0].code=={repo:"example/runner-code",commit:$c,installedAt:"2026-10-01T04:05:06Z"}' >/dev/null
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 PR_GATE_CODE_REPO='' bash "$source_file"
 heartbeats | jq -se 'length==1 and (.[0]|has("code")|not)' >/dev/null \
   || { printf 'FAIL: code was reported without a configured code repo\n' >&2; exit 1; }
 printf 'PASS installed-main.json becomes code {repo, commit, installedAt}; PR_GATE_CODE_REPO names the repo, and without one no code is sent\n'
 version="pr-gate 1.0.0"
 jq -nc --arg c "$commit" --arg v "$version" '{commit:$c,verified_at:"2026-10-01T04:05:06Z",version:$v}' > "$installed"
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 bash "$source_file"
 heartbeats | jq -se --arg c "$commit" --arg v "$version" \
   '.[0].code=={repo:"acme/gate-code",commit:$c,installedAt:"2026-10-01T04:05:06Z",version:$v}' >/dev/null
 long=$(printf 'v%.0s' {1..101})
 for bad in '""' '7' '["v1"]' '"pr-gate 1.0.0\nsecond line"' '"tab\there"' "\"$long\""; do
   jq -nc --arg c "$commit" --argjson v "$bad" '{commit:$c,installed_at:"2026-10-01T01:02:03Z",version:$v}' > "$installed"
-  : > "$HEARTBEAT_TEST_CAPTURE"
+  : > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
   bash "$source_file"
   heartbeats | jq -se --arg c "$commit" '.[0].code=={repo:"acme/gate-code",commit:$c,installedAt:"2026-10-01T01:02:03Z"}' >/dev/null \
     || { printf 'FAIL: version %s was not omitted\n' "$bad" >&2; exit 1; }
 done
 printf 'PASS a recorded version is passed through as code.version; an empty, non-string, too long or control-char one is omitted\n'
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 GATE_RUNNER_SLOTS="0 1" HEARTBEAT_TEST_REJECT_CODE=1 bash "$source_file" 2> "$fixture/code-422.log"
 heartbeats | jq -se 'length==3 and (.[0]|has("code")) and .[0].slot==0 and (.[1]|has("code")|not) and .[1].slot==0
   and (.[2]|has("code")|not) and .[2].slot==1' >/dev/null
@@ -223,12 +258,12 @@ printf 'PASS a forge that refuses code with 422 gets the same heartbeat without 
 # ---- what each runner evaluates with ---------------------------------------------------------------
 tools_file="$fixture/home/tools.json"
 sha_a=$(printf 'a%.0s' {1..64}) sha_b=$(printf 'b%.0s' {1..64})
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 bash "$source_file"
 heartbeats | jq -se 'length==1 and (.[0]|has("tools")|not)' >/dev/null
 for bad in 'not json' '{"tools":"x"}' '{"tools":[]}' '{"tools":[{"name":"Bad"}]}' '[]'; do
   printf '%s\n' "$bad" > "$tools_file"
-  : > "$HEARTBEAT_TEST_CAPTURE"
+  : > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
   bash "$source_file"
   heartbeats | jq -se 'length==1 and (.[0]|has("tools")|not)' >/dev/null || { printf 'FAIL: tools %s sent\n' "$bad" >&2; exit 1; }
 done
@@ -241,25 +276,25 @@ jq -nc --arg a "$sha_a" --arg b "$sha_b" --arg long "$long" --arg ln "$longname"
   {name:"jankurai",version:"duplicate"},
   {name:"UPPER",version:"1"}, {name:"sp ace"}, {name:""}, {name:$ln}, {name:7}, "str", null,
   {name:"badver",version:$long,sha256:"ABC"}, {name:"ctl",version:"a\nb",sha256:($a|ascii_upcase)}]}' > "$tools_file"
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 bash "$source_file"
 heartbeats | jq -se --arg a "$sha_a" --arg b "$sha_b" 'length==1 and .[0].tools==[
   {name:"jankurai",version:"1.6.11",sha256:$a}, {name:"jankurai@governed",version:"1.6.10",sha256:$b},
   {name:"gitleaks"}, {name:"badver"}, {name:"ctl"}]
   and .[0].code.commit=="'"$commit"'"' >/dev/null
 jq -nc '{tools:[range(40) | {name:("t" + tostring)}]}' > "$tools_file"
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 bash "$source_file"
 heartbeats | jq -se '.[0].tools|length==32' >/dev/null
 printf 'PASS tools.json becomes tools[]: invalid names dropped, invalid version/sha256 omitted, names unique, at most 32\n'
 printf '{"tools":[{"name":"jankurai","version":"1.6.11"}]}\n' > "$tools_file"
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 GATE_RUNNER_SLOTS="0 1" HEARTBEAT_TEST_REJECT_TOOLS=1 bash "$source_file" 2> "$fixture/tools-422.log"
 heartbeats | jq -se 'length==3 and (.[0]|has("tools") and has("code")) and (.[1]|(has("tools")|not) and has("code")) and .[1].slot==0
   and (.[2]|(has("tools")|not) and has("code")) and .[2].slot==1' >/dev/null
 [[ "$(grep -c 'heartbeat tools refused (422); retrying without them' "$fixture/tools-422.log")" == 1 ]]
 if grep -q 'heartbeat code refused\|heartbeat answered' "$fixture/tools-422.log"; then cat "$fixture/tools-422.log" >&2; exit 1; fi
-: > "$HEARTBEAT_TEST_CAPTURE"
+: > "$HEARTBEAT_TEST_CAPTURE"; rm -f "$fixture/home/cache/heartbeat-level"  # each case starts from the newest shape
 GATE_RUNNER_SLOTS="0 1" HEARTBEAT_TEST_REJECT_TOOLS=1 HEARTBEAT_TEST_REJECT_CODE=1 bash "$source_file" 2> "$fixture/both-422.log"
 heartbeats | jq -se 'length==4 and (.[0]|has("tools") and has("code")) and (.[1]|(has("tools")|not) and has("code"))
   and (.[2]|has("tools") or has("code")|not) and .[2].slot==0 and (.[3]|has("tools") or has("code")|not) and .[3].slot==1' >/dev/null
@@ -267,3 +302,25 @@ heartbeats | jq -se 'length==4 and (.[0]|has("tools") and has("code")) and (.[1]
 [[ "$(grep -c 'heartbeat code refused (422); retrying without it' "$fixture/both-422.log")" == 1 ]]
 if grep -q 'heartbeat answered' "$fixture/both-422.log"; then cat "$fixture/both-422.log" >&2; exit 1; fi
 printf 'PASS a 422 retries without tools (keeping code), then without code too; each logged once per tick\n'
+
+# A forge that refuses the newer shape itself, even without code and tools, gets the oldest contract,
+# so a newer runner keeps /runners alive; the accepted level is remembered, so the next tick costs one
+# request a slot, and forgotten after 30 minutes.
+rm -f "$fixture/home/cache/heartbeat-level"
+: > "$HEARTBEAT_TEST_CAPTURE"
+GATE_RUNNER_SLOTS="0 1" HEARTBEAT_TEST_REJECT_SHAPE=1 bash "$source_file" 2> "$fixture/shape-422.log"
+[[ "$(grep -c 'heartbeat shape refused (422); retrying with the oldest contract' "$fixture/shape-422.log")" == 1 ]]
+if grep -q 'heartbeat answered' "$fixture/shape-422.log"; then cat "$fixture/shape-422.log" >&2; exit 1; fi
+jq -e -s '[.[] | select(.url | endswith("/runners/heartbeat"))] | last | .body | (.runnerId | endswith("slot1")) and (has("tools") | not) and (has("code") | not) and (.current // {} | has("recipe") | not)' \
+  "$HEARTBEAT_TEST_CAPTURE" >/dev/null
+[[ "$(cat "$fixture/home/cache/heartbeat-level")" == 3 ]]
+: > "$HEARTBEAT_TEST_CAPTURE"
+GATE_RUNNER_SLOTS="0 1" HEARTBEAT_TEST_REJECT_SHAPE=1 bash "$source_file" 2> "$fixture/shape-again.log"
+[[ "$(jq -s '[.[] | select(.url | endswith("/runners/heartbeat"))] | length' "$HEARTBEAT_TEST_CAPTURE")" == 2 ]]
+[[ ! -s "$fixture/shape-again.log" ]]
+touch -d '2 hours ago' "$fixture/home/cache/heartbeat-level"
+: > "$HEARTBEAT_TEST_CAPTURE"
+GATE_RUNNER_SLOTS=0 bash "$source_file" 2> "$fixture/shape-recovered.log"
+jq -e -s '[.[] | select(.url | endswith("/runners/heartbeat"))] | first | .body | has("code")' "$HEARTBEAT_TEST_CAPTURE" >/dev/null
+rm -f "$fixture/home/cache/heartbeat-level"
+printf 'PASS a forge that refuses the newer shape gets the oldest contract; the level is remembered for 30 minutes\n'

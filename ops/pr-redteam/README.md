@@ -15,6 +15,32 @@ outside the gate's rollout are unaffected — their proof is reported, not
 required. `ops/ci/jankurai-gate.sh` is the same verdict, run locally before the
 pull request exists.
 
+## Contributed pull requests
+
+The GitHub repositories are read-only mirrors of the forge. An outside contributor opens a pull
+request there and an importer brings it to the forge, which records its origin on the pull request
+row — `origin:contributed`, set by the importer and never by the author. Everything else reads
+`origin:internal`.
+
+A contributed pull request is reviewed as carefully as any other and the review is advice: it is
+posted as a comment, never an approval or a changes-requested verdict, and this controller neither
+queues nor merges it. The forge holds it until a login on its configured maintainer list approves
+the exact head; that maintainer merges it. A row carrying neither label reads as contributed,
+because no origin is not a reason to approve and land somebody's change;
+`REDTEAM_UNMARKED_ORIGIN=internal` is the opt-out for a forge that does not mark origins yet.
+
+Contributed review spend is capped, well below an internal pull request's: one agent review per
+head (`--force` included — forcing a second is what the cap exists to prevent), a per-pull-request
+budget across heads, and a per-UTC-day budget across every contribution
+(`REDTEAM_CONTRIBUTED_BUDGET_USD`, `REDTEAM_CONTRIBUTED_PR_USD`, `REDTEAM_CONTRIBUTED_DAILY_USD`).
+A run that failed or produced nothing publishable still counts: it cost money, and retrying it every
+pass would cost more. Over a cap the pull request is left for a maintainer, with the cap named in
+the log. The ledger is `contributed-spend.tsv` under `REDTEAM_STATE`.
+
+The pull request's title, description, commit messages and diff are the contributor's words. They
+are evidence the reviewer reads, never instructions it follows: text that addresses the reviewer,
+claims prior sign-off or asks for an approval is itself a critical finding.
+
 pr-redteam also lands what it approved. After the review pass, every open PR
 this controller approved at its current head is merged as the merger identity,
 once the forge itself says it can merge: approval, required contexts green, no
@@ -55,12 +81,17 @@ Changing the rules changes the review identity, so existing receipts requalify.
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, verdict, binary-payload,
-credential-transport, publication/recovery, merge-pass and installation checks. The actual repository required lane
+credential-transport, publication/recovery, merge-pass, contributed-origin and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
 publication refusal, restart, duplicate dispatch, worker loss and changed heads,
 and the landing path: approve, a failing required context, that context going
-green on a retry, and the merge that follows without a second review.
+green on a retry, and the merge that follows without a second review. The
+contributed-origin suite covers the whole gate: a contribution with a clean
+review is posted as advice and stays unmerged, its head gets one agent review
+whatever is asked of it, the per-pull-request and per-day budgets each hold the
+next head for a maintainer, an unmarked row is treated as contributed, and an
+internal pull request is reviewed, approved and merged exactly as before.
 
 `test/canary.sh` is a separate paid live-model qualification for the service owner.
 It requires the exact pinned CLI and selected model. Offline source qualification
@@ -85,7 +116,8 @@ instead of one row for the whole pass. `poke` runs every 30 seconds from
 has reviewed appears or an approval becomes landable, once per head; it never
 reviews or merges itself, and the five-minute timer stays as the fallback.
 
-The reviewer skips its own authored PRs, drafts unless explicitly included, and
+The reviewer skips its own authored PRs, contributed PRs whose review spend is
+used up, drafts unless explicitly included, and
 successfully posted reviews at the current head with matching controller, prompt,
 schema, model, CLI executable and version inputs. Each changed head needs a new
 review. A PR whose base branch the forge does not have yet — the shape a new
@@ -120,12 +152,21 @@ value. The bearer travels through curl configuration
 stdin, with curlrc disabled, and is absent from curl argv. This transport guard
 is separate from model/process credential confinement.
 
+A failed poke is separate `poke` heartbeat metadata with the unit's actual exit
+timestamp. It preserves `last`, the last real review, and keeps the established
+`redteam` label. A forge rejecting the optional field receives one retry without it.
+
 Service failure notification is also site configuration. Set `NOTIFY_COMMAND`
 in `~/.config/pr-redteam/site.env` to a shell command that receives the message
-on stdin and can read the same bounded body from `PR_REDTEAM_NOTIFY_BODY_FILE`,
+on stdin and can read the same bounded body from `PR_REDTEAM_NOTIFY_BODY_FILE`
+or the retained `PR_REDTEAM_NOTIFY_BODY` environment variable,
 or set `NOTIFY_WEBHOOK_URL` to receive a JSON POST. The body is capped by
 `NOTIFY_MAX_BODY_BYTES` (default 8192) and omitted if it contains a configured
-token value. With neither configured, the notification unit logs that no target
+token value. Screening covers the full captured journal before truncation, for
+the configured token files and named provider variables in plain, base64 and hex
+forms, including whitespace-wrapped forms. It does not recognize every encoding
+or credentials under other variable names; keep secrets out of journal output.
+With neither configured, the notification unit logs that no target
 exists and exits successfully. Hosts, channels and tokens do not belong in this
 repository.
 
@@ -136,6 +177,14 @@ archives it as interrupted before retrying. Terminal attempts remain under
 `attempts/`, latest receipts under `receipts/`, and current work is removed when
 an attempt terminates normally or recovers. Failed attempts never count as an
 approval. Operators should investigate pending claims when no worker owns them.
+
+## Before the first contribution
+
+An installed reviewer runs the commit it was installed from. Until it is reinstalled (below) from a
+commit carrying the contributed-origin gate above, it treats every pull request as internal and will
+approve and merge whatever the forge hands it. Reinstall it under its owner's custody -- stop and
+disable the units, install from this source, requalify the source/model/CLI -- and set the forge's
+maintainer list before any contribution is imported.
 
 ## Installation and service ownership
 

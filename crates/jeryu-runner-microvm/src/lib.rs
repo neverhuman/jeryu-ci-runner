@@ -9,11 +9,12 @@ use jeryu_runner_core::trust::RunnerClass;
 pub mod api;
 pub mod artifacts;
 pub mod checkpoint;
+pub mod custody;
 mod diagnostics;
 pub mod image_composition;
 pub mod journal;
 pub mod lease_authority;
-pub(crate) mod runtime_authority;
+pub mod runtime_authority;
 pub mod source_registry;
 pub mod supervisor;
 pub mod transport;
@@ -227,3 +228,5 @@ mod tests {
 
 /// Independent privileged lifetime fencing for managed VMs.
 pub mod guardian;
+#[cfg(test)]
+mod test_guest;

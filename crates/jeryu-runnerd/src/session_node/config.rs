@@ -5,10 +5,9 @@ use rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier};
 use rustls_pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use serde::Deserialize;
 use std::{
-    fs::{File, OpenOptions},
+    fs::File,
     io::Read,
     net::SocketAddr,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -23,6 +22,8 @@ pub struct SessionNodeConfig {
     pub cpu_budget_vcpus: u16,
     pub memory_budget_mib: u32,
     pub disk_budget_gib: u32,
+    #[serde(default = "legacy_uid_base")]
+    pub uid_base: u32,
     pub owner_limit: usize,
     pub listen: SocketAddr,
     pub artifact_store: PathBuf,
@@ -44,8 +45,10 @@ pub struct SessionNodeConfig {
 }
 impl SessionNodeConfig {
     pub fn read(path: &Path) -> RunnerResult<Self> {
-        serde_json::from_reader(trusted_file(path, true)?)
-            .map_err(|_| failed("session_node_config_invalid"))
+        let bytes =
+            jeryu_runner_microvm::custody::read_bounded(trusted_file(path, true)?, 64 * 1024)
+                .map_err(|_| failed("session_config_custody_denied"))?;
+        serde_json::from_slice(&bytes).map_err(|_| failed("session_node_config_invalid"))
     }
     pub(super) fn runtime(&self) -> RunnerResult<VerifiedRuntime> {
         let manifest = RuntimeManifest::from_json(&trusted_bytes(&self.runtime_manifest)?)
@@ -93,6 +96,7 @@ impl SessionNodeConfig {
             cpu_budget_vcpus: self.cpu_budget_vcpus,
             memory_budget_mib: self.memory_budget_mib,
             disk_budget_gib: self.disk_budget_gib,
+            uid_base: self.uid_base,
         })
     }
     pub(super) fn tls(&self) -> RunnerResult<Arc<ServerConfig>> {
@@ -145,25 +149,15 @@ fn trusted_bytes(path: &Path) -> RunnerResult<Vec<u8>> {
     Ok(bytes)
 }
 fn trusted_file(path: &Path, private: bool) -> RunnerResult<File> {
-    jeryu_runner_microvm::artifacts::verify_trusted_directory(
-        path.parent()
-            .ok_or_else(|| failed("session_config_custody_denied"))?,
-    )?;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != 0
-        || metadata.nlink() != 1
-        || metadata.len() > 64 * 1024
-        || metadata.mode() & 0o022 != 0
-        || (private && metadata.mode() & 0o077 != 0)
-    {
-        return Err(failed("session_config_custody_denied"));
-    }
-    Ok(file)
+    jeryu_runner_microvm::custody::open_file(
+        path,
+        jeryu_runner_microvm::custody::FileRole::Configuration { private },
+        64 * 1024,
+    )
+    .map_err(|_| failed("session_config_custody_denied"))
+}
+fn legacy_uid_base() -> u32 {
+    jeryu_runner_microvm::journal::LEGACY_UID_BASE
 }
 fn failed(code: &'static str) -> RunnerError {
     RunnerError::new(code, "session node configuration rejected")
@@ -175,6 +169,23 @@ mod tests {
     use std::io;
 
     const CERT: &[u8] = b"-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn legacy_config_defaults_uid_base_and_new_config_keeps_its_explicit_range() {
+        let mut value = serde_json::json!({
+            "runner_id":"node", "runner_epoch":1, "state_dir":"/var/lib/node", "capacity":1,
+            "cpu_budget_vcpus":2, "memory_budget_mib":8192, "disk_budget_gib":32, "owner_limit":1,
+            "listen":"127.0.0.1:9876", "artifact_store":"/var/lib/artifacts", "source_bundle_budget_gib":2,
+            "runtime_manifest":"/var/lib/manifest", "runtime_signature":"/var/lib/signature", "release_public_key":"/var/lib/release-key",
+            "control_plane_lease_public_key":"/var/lib/lease-key", "server_certificate":"/var/lib/cert", "server_private_key":"/var/lib/key",
+            "control_plane_ca":"/var/lib/ca", "control_plane_certificate_sha256":"a".repeat(64)
+        });
+        let legacy: SessionNodeConfig = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(legacy.uid_base, 200000);
+        value["uid_base"] = serde_json::json!(231104);
+        let enrolled: SessionNodeConfig = serde_json::from_value(value).unwrap();
+        assert_eq!(enrolled.uid_base, 231104);
+    }
 
     // Synthetic payloads test PEM framing; TLS setup separately validates DER.
     fn pem_section(label: &str, body: &str) -> Vec<u8> {
