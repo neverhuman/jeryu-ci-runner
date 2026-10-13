@@ -91,6 +91,8 @@ TOKEN_FILE="$(pr_gate_path "${JERYU_TOKEN_FILE:-}")"
 HOME_DIR="${GATE_RUNNER_HOME:-$HOME/gate-runner}"
 # shellcheck source=ops/pr-gate/bin/pr-gate-backoff.sh
 source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-backoff.sh"
+# shellcheck source=ops/pr-gate/bin/pr-gate-progress.sh
+source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-progress.sh"
 REPOS="${GATE_RUNNER_REPOS:-auto}"
 OWNERS="${GATE_RUNNER_OWNERS:-}"
 [[ "$REPOS" != auto || -n "${OWNERS// }" ]] || not_configured "GATE_RUNNER_OWNERS (or GATE_RUNNER_REPOS)"
@@ -188,7 +190,7 @@ git_env=(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2
   GIT_CONFIG_KEY_0="$GIT_CONFIG_KEY_0" GIT_CONFIG_VALUE_0=""
   GIT_CONFIG_KEY_1="$GIT_CONFIG_KEY_1" GIT_CONFIG_VALUE_1="$GIT_CONFIG_VALUE_1")
 
-only_repo=""; only_pr=""; list=0; main_health=0
+only_repo=""; only_pr=""; list=0; main_health=0; pr_html_url=""
 while (($#)); do case "$1" in
   --repo) only_repo="${2:?--repo needs a value}"; shift 2;;
   --pr) only_pr="${2:?--pr needs a number}"; shift 2;;
@@ -259,9 +261,9 @@ api() { # method path [json]
   rm -f -- "$hdr"
 }
 
-post_status() { # owner repo sha state description
+post_status() { # owner repo sha state description [target_url]
   api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg s "$4" --arg c "$(gate_status_context "$1" "$2")" \
-    --arg d "$5" '{state: $s, context: $c, description: $d}')"
+    --arg d "$5" --arg u "${6:-}" '{state: $s, context: $c, description: $d} + (if $u == "" then {} else {target_url: $u} end)')"
   [[ "$code" == 201 ]] || die "posting $1/$2 $(gate_status_context "$1" "$2")=$4 on $3 answered $code: $body"
 }
 
@@ -555,6 +557,8 @@ for qualified in $REPOS; do
     api GET "/api/v3/repos/$owner/$repo/pulls/$number"
     author="$(jq -r '.user.login // ""' <<<"$body")"
     head_ref="$(jq -r '.head.ref // ""' <<<"$body")"
+    # The PR's own web page: the required status and the progress check link to its checks tab.
+    pr_html_url="$(jq -r '.html_url // ""' <<<"$body")"
     [[ "$code" == 200 && -n "$author" ]] \
       || { say "cannot read $owner/$repo#$number's author ($code); skipping rather than guessing"; continue; }
     # Never prove this runner's own work. A proof is only worth the independence of whoever
@@ -1199,12 +1203,16 @@ keep_green=0
 gate_newest_is_own_success "$status_snapshot" && keep_green=1
 rm -f -- "$identity" "$status_snapshot"
 log="$gate_attempt_dir/build.log"
+steps_tsv="$gate_attempt_dir/steps.tsv"
+: >"$steps_tsv"
+checks_url=""
+[[ "$main_health" == 1 || -z "${pr_html_url:-}" ]] || checks_url="${pr_html_url%/}/checks"
 if ((keep_green)); then
   say "re-verifying $owner/$repo@$sha without pending: its newest $(gate_status_context "$owner" "$repo") is this runner's success"
 else
-  post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")"
+  post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")" "$checks_url"
 fi
-gate_update '.phase="running"'
+gate_update --arg url "$checks_url" '.phase="running" | .checks_url=$url'
 started_at="$(date -u +%FT%TZ)" started_s="$(date +%s)"
 heartbeat "$(jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" \
   --arg recipe "$recipe_name" --arg at "$started_at" --arg kind "$([[ "$main_health" == 1 ]] && printf main-health || printf pr)" \
@@ -1351,9 +1359,17 @@ else
 fi
 gate_worker=$!
 gate_update --argjson worker "$gate_worker" '.worker_pid=$worker'
+# What the gate is checking, step by step, while it runs (pr-gate-progress.sh). Best effort.
+gate_progress_watch "$log" "$steps_tsv" "$gate_worker" "$owner" "$repo" "$sha" \
+  "$(gate_planned_path "$owner" "$repo")" "$checks_url" >/dev/null 2>&1 &
+progress_watcher=$!
 worker_exit=0
 wait "$gate_worker" || worker_exit=$?
 gate_worker=""
+kill "$progress_watcher" 2>/dev/null || true
+wait "$progress_watcher" 2>/dev/null || true
+gate_steps_record "$log" "$steps_tsv" || true
+date +%s >"$gate_attempt_dir/steps.end"
 state=success
 ((worker_exit == 0)) || state=failure
 ((worker_exit != 124 && worker_exit != 137)) || state=timed_out

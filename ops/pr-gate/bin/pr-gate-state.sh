@@ -655,7 +655,7 @@ gate_self_modification_note() { # receipt
 }
 
 gate_publish() {
-  local state outcome id digest exit_code context cause="" log note="" kind review="" inputs
+  local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -665,6 +665,12 @@ gate_publish() {
   context=$(jq -er '.inputs.required_context // (.repo + "/required")' "$gate_receipt") || return
   case "$outcome" in success) state=success;; failure|timed_out) state=failure;; *) state=error;; esac
   log=$(jq -r '.log // ""' "$gate_receipt")
+  checks_url=$(jq -r '.checks_url // ""' "$gate_receipt")
+  # A green attempt's step times become the repo's "usually" for the next one.
+  if [[ "$state" == success && -n "$log" && -s "$(dirname -- "$log")/steps.tsv" ]] && declare -F gate_steps_learn >/dev/null; then
+    gate_steps_learn "$(dirname -- "$log")/steps.tsv" "$(cat "$(dirname -- "$log")/steps.end" 2>/dev/null || date +%s)" \
+      "$(gate_planned_path "$owner" "$repo")" || true
+  fi
   # How the attempt ran is read from its own receipt, so recovering an older one says what that one did.
   kind=$(jq -r '.execution_kind // .inputs.execution_kind // "operator-unsealed"' "$gate_receipt")
   # A contribution that changes what the gate itself evaluates with is named on the check run, beside
@@ -683,7 +689,8 @@ gate_publish() {
   if ! jq -e '.publication.required_status' "$gate_receipt" >/dev/null; then
     api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -nc --arg state "$state" --arg context "$context" \
       --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${inputs:+; inputs $inputs}${cause:+; cause: $cause}" \
-      '{state:$state,context:$context,description:$description}')"
+      --arg url "$checks_url" \
+      '{state:$state,context:$context,description:$description} + (if $url == "" then {} else {target_url:$url} end)')"
     : "${code:?}" "${body:?}"
     if [[ "$code" != 201 ]] || ! jq -e '.id != null' <<<"$body" >/dev/null; then
       gate_update --arg code "$code" '.recovery_required="required-status publication rejected or unacknowledged" | .publication.http_status=$code' || return
@@ -703,11 +710,21 @@ gate_publish() {
     # The annotation is advisory -- it changes no conclusion. jeryu's attention inbox raises the
     # matching needs_human item from the same paths, so the PR also shows up on /needs-you.
     note=$(gate_self_modification_note "$gate_receipt")
+    # The step checklist with each step's time (pr-gate-progress.sh), then the attempt's identity.
+    steps=""
+    if [[ -n "$log" && -f "$(dirname -- "$log")/steps.tsv" ]] && declare -F gate_progress_summary >/dev/null; then
+      steps=$(gate_progress_summary "$(dirname -- "$log")/steps.tsv" "" \
+        "$( [[ "$state" == success ]] && printf success || printf failure)" \
+        "$(cat "$(dirname -- "$log")/steps.end" 2>/dev/null || date +%s)" "$cause")
+    fi
     api POST "/repos/$owner/$repo/check-runs" "$(jq -nc --arg sha "$sha" --arg state "$state" \
-      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" --arg summary "Attempt $id; log sha256 $digest; $kind${note:+; changes its own gate}$review" \
-      --arg note "$note" \
+      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" \
+      --arg summary "${steps:+$steps
+}Attempt $id; log sha256 $digest; $kind${note:+; changes its own gate}$review" \
+      --arg note "$note" --arg url "$checks_url" \
       '{name:"pr-gate-runner",head_sha:$sha,status:"completed",conclusion:(if $state=="error" then "failure" else $state end),
-        output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}')"
+        output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}
+      + (if $url == "" then {} else {details_url:$url} end)')"
     # The check run is not a required context and never gates a merge: the required status above is
     # the gate. A rejection is recorded and reported, and must not hold the attempt in recovery or
     # stop later ticks, which is what a return 1 here did.
@@ -752,6 +769,9 @@ gate_recover() {
 gate_exit() {
   local result=$?
   trap - EXIT
+  # Only the runner's own process owns the attempt. A subshell (the progress watcher, a command
+  # substitution) that reaches this handler must not finish or publish it as interrupted.
+  [[ "$BASHPID" == "$$" ]] || exit "$result"
   if [[ -n "${gate_receipt:-}" && -f "$gate_receipt" ]] \
       && ! jq -e '.terminal' "$gate_receipt" >/dev/null; then
     gate_finish interrupted null "" "runner exited $result without a verified worker result" || true
@@ -764,6 +784,9 @@ gate_exit() {
 gate_signal() {
   local signal=$1 result=$2
   trap '' TERM INT HUP
+  # A subshell stopped by the runner (the progress watcher) exits quietly: it must neither kill the
+  # recipe's process group nor run the runner's exit handler.
+  if [[ "$BASHPID" != "$$" ]]; then trap - EXIT; exit "$result"; fi
   if [[ -n "${gate_worker:-}" ]]; then
     kill -"$signal" -- "-$gate_worker" 2>/dev/null || true
     wait "$gate_worker" 2>/dev/null || true

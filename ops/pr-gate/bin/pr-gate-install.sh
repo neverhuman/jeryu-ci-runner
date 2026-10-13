@@ -165,7 +165,7 @@ for src in "${!dest[@]}"; do
       say "$(basename "$src") is masked by the operator; leaving it alone"; continue
     fi
     changed+=("$src")
-    case "$src" in "$SUBDIR/bin/pr-gate-runner.sh"|"$SUBDIR/bin/pr-gate-state.sh"|"$SUBDIR/bin/pr-gate-config.sh"|"$SUBDIR/bin/pr-gate-backoff.sh") drain=1;; esac
+    case "$src" in "$SUBDIR/bin/pr-gate-runner.sh"|"$SUBDIR/bin/pr-gate-state.sh"|"$SUBDIR/bin/pr-gate-config.sh"|"$SUBDIR/bin/pr-gate-backoff.sh"|"$SUBDIR/bin/pr-gate-progress.sh") drain=1;; esac
     [[ "$src" != "$SUBDIR/systemd/"* ]] || units_changed=1
   fi
 done

@@ -359,3 +359,24 @@ assumption, not a sealed execution claim. Contributed sandbox recipes receive no
 System-directory listings, installed toolchain components and Python distribution enumeration also
 fail identity computation on command errors. Missing Python installation directories represent an
 empty distribution set; unreadable existing directories and failed rustup/find commands do not.
+
+## What the gate is checking, and how long each step takes
+
+While a gate runs, the runner reads the step lines its recipe prints (`[pr-ci] <step>`,
+`[ci] required|fast lane: <step>`, `==> <step>`, and npm's `> <script>` banner) from the attempt's
+`build.log`, records when each first appeared in `steps.tsv` (`epoch<TAB>step`, beside the log;
+`steps.end` holds the end), and posts the list as the `pr-gate-runner` check run's summary each
+time a step starts (at least every two minutes):
+
+    ✓ jankurai pin drift check · 4s
+    ▸ cargo clippy · 1m12s so far
+    ○ cargo test · usually 3m05s
+
+`○` steps and their "usually" come from the repository's last green attempt
+(`$HOME_DIR/cache/steps-<owner>__<repo>.tsv`). The finished check run lists every step with its
+time (`✗` and the cause on the step that failed). The required status and the check run link to the
+PR's checks page (`<html_url>/checks`). Times are first-seen, polled every 2 s.
+
+`bin/pr-gate-steps-report.sh [--all] [--days N] [OWNER/REPO...]` ranks each repository's steps by
+median time over its green attempts (all with `--all`), with p90, max, share of the total and run
+count: the numbers for deciding whether a long, low-value step should leave the required gate.
