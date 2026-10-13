@@ -228,3 +228,17 @@ The CLI2.1.276 version/help readback confirms these flags; the official
 [CLI reference](https://code.claude.com/docs/en/cli-reference) documents restricted
 mode from2.1.248 and safe mode. PR text is still untrusted input to the model;
 correctness/security qualification must include the actual model and host.
+
+A queued head whose current entry failed or was dequeued may be retried once per failed base, with
+at most three acknowledged retries per reviewed head. A new head has a new receipt. The controller
+reads one bounded, paged `state=all` queue snapshot per merge pass, validates entry state/base SHA,
+selects the newest entry for the exact repo/base/PR/head, and leaves building/landed entries alone.
+Read errors or incomplete pagination are reported and defer retry. Reasons are bounded by characters
+and control characters are collapsed before logging.
+
+Observation and dry runs do not consume a retry. `queue_retry_bases` and the compatible
+`queue_retried_base` marker are saved together with an accepted exact-head queue acknowledgement
+or successful merge. Transient PR-detail, merge and queue errors leave the retry eligible on a later
+pass. A refused queue request remains author work, as before. The native wire contract is
+`QueueEntry`/`list_all` in jeryu-deploy `crates/jeryu-api/src/web/merge_queue.rs` (`base_sha`,
+`enqueued_at`, `attempts[].at`, `reason`, and `page.has_more`); the fixture uses those actual fields.

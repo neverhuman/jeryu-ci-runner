@@ -15,6 +15,10 @@
   setting reappears.
 
 ## Unreleased
+- Failed or dequeued redteam merge-queue entries can be retried once per failed base, at most
+  three acknowledged retries per reviewed head. Dry runs and transient failures do not consume
+  retry state; accepted dispatch and bookkeeping share one receipt write. A bounded paged queue
+  snapshot is read once per merge pass, with explicit state/base validation and diagnostics.
 - pr-gate 1.10.0 adds protected-main health gates (`<repo>/main-health`), a release-guard
   setting and nightly template units. Activation is explicit and documented; main-health
   uses separate runner state/checkouts so its pass does not contend with a PR slot.

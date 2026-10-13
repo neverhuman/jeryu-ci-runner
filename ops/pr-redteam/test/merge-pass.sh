@@ -83,21 +83,34 @@ case "$url" in
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"jeryu","name":"fixture"},"family":"jain","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
   # The detail route nests the row under .summary, beside the passport (live forge shape).
-  */pulls/107) row | jq -c '{summary: ., merge_passport:{blockers:[]}, passport_hash, reviews: []}'; printf '\n200' ;;
+  */pulls/107)
+    if [[ -e "$MERGE_FIXTURE/detail-unavailable" ]]; then printf '{"message":"temporary detail outage"}\n503'; exit; fi
+    row | jq -c '{summary: ., merge_passport:{blockers:[]}, passport_hash, reviews: []}'; printf '\n200' ;;
   */pulls/107/checks) checks ;;
   # The merge queue: a queue request is recorded; the forge-wide list shows the entry as failed on
   # the base in queue-failed, when that file exists.
   */pulls/107/queue)
+    printf 'attempt\n' >> "$MERGE_FIXTURE/queue-attempts"
+    if [[ -e "$MERGE_FIXTURE/queue-unavailable" ]]; then printf '{"message":"temporary queue outage"}\n503'; exit; fi
     printf 'queued\n' >> "$MERGE_FIXTURE/queue-posts"
-    printf '{"queue_ref":"refs/queue/main/107","queue_sha":"%s","state":"building"}\n200' "$(cat "$MERGE_FIXTURE/head")" ;;
-  */api/v1/merge-queue\?state=failed*)
+    jq -nc --arg sha "$(cat "$MERGE_FIXTURE/head")" \
+      '{repo:"jeryu/fixture",base:"main",number:107,pr_head_sha:$sha,queue_ref:"refs/queue/main/107",queue_sha:$sha,state:"building"}'
+    printf '\n200' ;;
+  */api/v1/merge-queue\?state=all*)
+    if [[ -e "$MERGE_FIXTURE/list-unavailable" ]]; then printf '{"message":"temporary list outage"}\n503'; exit; fi
+    if [[ -e "$MERGE_FIXTURE/queue-paged" && "$url" == *'page=1' ]]; then
+      printf '{"entries":[],"page":{"has_more":true}}\n200'; exit
+    fi
     if [[ -e "$MERGE_FIXTURE/queue-failed" ]]; then
       jq -nc --arg sha "$(cat "$MERGE_FIXTURE/head")" --arg b "$(cat "$MERGE_FIXTURE/queue-failed")" \
-        '{entries:[{repo:"jeryu/fixture",number:107,pr_head_sha:$sha,base_sha:$b,state:"failed",
-          reason:"the gate failed on the replay"}],page:{has_more:false}}'
+        --arg st "$(cat "$MERGE_FIXTURE/queue-state" 2>/dev/null || echo failed)" \
+        --arg old "$(cat "$MERGE_FIXTURE/queue-stale" 2>/dev/null || true)" '
+        {entries:((if $old != "" then [{repo:"jeryu/fixture",base:"main",number:107,pr_head_sha:$sha,
+          base_sha:$old,state:"failed",enqueued_at:"2026-10-01T00:00:00Z"}] else [] end) +
+          [{repo:"jeryu/fixture",base:"main",number:107,pr_head_sha:$sha,base_sha:$b,state:$st,
+          enqueued_at:"2026-10-13T00:00:00Z",reason:"the gate failed on the replay"}]),page:{has_more:false}}'
     else printf '{"entries":[],"page":{"has_more":false}}'; fi
     printf '\n200' ;;
-  */api/v1/merge-queue\?state=dequeued*) printf '{"entries":[],"page":{"has_more":false}}\n200' ;;
   */pulls/107/merge)
     if [[ -e "$MERGE_FIXTURE/required-failing" ]]; then printf '{"message":"required contexts are not green"}\n409'; exit 0; fi
     if [[ -e "$MERGE_FIXTURE/linear" ]]; then printf '{"message":"linear history: the head is behind main"}\n409'; exit 0; fi
@@ -122,7 +135,7 @@ export MERGE_FIXTURE="$t" FIXTURE_REAL_GIT="$real_git"
 export PATH="$t/bin:$PATH" JERYU_TOKEN_FILE="$t/token" REDTEAM_MERGE_TOKEN_FILE="$t/merge-token"
 export REDTEAM_STATE="$t/state" REDTEAM_CLAUDE="$t/bin/model" REDTEAM_CLAUDE_VERSION=9.9.9 REDTEAM_TIMEOUT=10
 export JERYU_BASE=https://forge.invalid
-pass() { "$here/pr-redteam" run --repo jeryu/fixture --pr 107 >> "$t/controller.log" 2>&1; }
+pass() { "$here/pr-redteam" run "$@" --repo jeryu/fixture --pr 107 >> "$t/controller.log" 2>&1; }
 receipt() { printf '%s/state/receipts/jeryu/fixture/107-%s.json\n' "$t" "$(cat "$t/head")"; }
 count() { if [[ -f "$1" ]]; then wc -l < "$1"; else echo 0; fi; }
 
@@ -193,27 +206,86 @@ grep -q 'merge pass skipped: the merger credential was rejected' "$t/controller.
 chmod 600 "$t/merge-token"
 echo 'ok merger credential custody enforced'
 
-# An approved head behind main goes to the merge queue, whose replay then fails. The failed entry is
-# retried once on the base it failed on, said out loud after that, and retried again only once main
-# has moved; then it lands. It is never skipped in silence.
+# A queued failure's retry is consumed only by an accepted dispatch, never by observation.
 advance
 touch "$t/linear"
 pass
 [[ "$(count "$t/queue-posts")" == 1 ]]
-jq -e --arg sha "$(cat "$t/head")" '.queued_sha == $sha' "$(receipt)" > /dev/null
-printf 'base-one\n' > "$t/queue-failed"
+jq -e --arg sha "$(cat "$t/head")" '.queued_sha == $sha' "$(receipt)" >/dev/null
+base_a=$(printf '1%.0s' {1..40}); base_b=$(printf '2%.0s' {1..40})
+printf '%s\n' "$base_a" >"$t/queue-failed"
+cp "$(receipt)" "$t/before-retry.json"
+pass --dry-run
+cmp "$(receipt)" "$t/before-retry.json"
+[[ "$(count "$t/queue-posts")" == 1 ]]
+touch "$t/detail-unavailable"
 pass
-grep -q 'merge queue entry failed on base base-one (the gate failed on the replay); trying again' "$t/controller.log"
-[[ "$(count "$t/queue-posts")" == 2 ]]
-jq -e '.queue_retried_base == "base-one"' "$(receipt)" > /dev/null
+cmp "$(receipt)" "$t/before-retry.json"
+rm "$t/detail-unavailable"
+touch "$t/queue-unavailable"
+pass
+cmp "$(receipt)" "$t/before-retry.json"
+[[ "$(count "$t/queue-posts")" == 1 ]]
+rm "$t/queue-unavailable"
+echo 'ok dry run, detail failure and rejected dispatch leave retry state unchanged'
+
+# Unknown/read-failed lists and live entries do not consume a retry, and are not silent.
+touch "$t/list-unavailable"
+pass
+cmp "$(receipt)" "$t/before-retry.json"
+grep -q 'merge queue snapshot answered 503' "$t/controller.log"
+rm "$t/list-unavailable"
+printf 'building\n' >"$t/queue-state"
+pass
+cmp "$(receipt)" "$t/before-retry.json"
+printf 'unknown\n' >"$t/queue-state"
+pass
+cmp "$(receipt)" "$t/before-retry.json"
+grep -q 'invalid merge queue state' "$t/controller.log"
+rm "$t/queue-state"
+printf '\n' >"$t/queue-failed"
+pass
+cmp "$(receipt)" "$t/before-retry.json"
+grep -q 'no valid failed base' "$t/controller.log"
+printf '%s\n' "$base_a" >"$t/queue-failed"
+
+# The live page.has_more contract leads to page two, then one accepted retry is recorded.
+touch "$t/queue-paged"
 pass
 [[ "$(count "$t/queue-posts")" == 2 ]]
-grep -q 'approved, waiting to merge: merge queue entry failed on base base-one after a retry' "$t/controller.log"
+jq -e --arg b "$base_a" '.queue_retried_base == $b and .queue_retry_bases == [$b]' "$(receipt)" >/dev/null
+grep -q 'state=all&per_page=100&page=2' "$t/requests"
+rm "$t/queue-paged"
+pass
+[[ "$(count "$t/queue-posts")" == 2 ]]
+grep -q "approved, waiting to merge: merge queue entry failed on base ${base_a:0:12} after a retry" "$t/controller.log"
+
+# A newer failure wins over an older unordered row; a changed base grants one accepted retry.
+printf '%s\n' "$base_a" >"$t/queue-stale"
 merges_before="$(count "$t/merges")"
-rm "$t/linear"; printf 'base-two\n' > "$t/queue-failed"
+rm "$t/linear"; printf '%s\n' "$base_b" >"$t/queue-failed"
 pass
 [[ "$(count "$t/merges")" == "$((merges_before + 1))" && "$(count "$t/queue-posts")" == 2 ]]
-jq -e '.merged_by == "jain-merge-bot"' "$(receipt)" > /dev/null
+jq -e --arg a "$base_a" --arg b "$base_b" '.merged_by == "jain-merge-bot" and .queue_retry_bases == [$a,$b]' "$(receipt)" >/dev/null
+rm "$t/queue-stale"
+echo 'ok failed merge-queue entry retried once per base, latest failure selected, then landed'
+
+# A permanently broken reviewed head cannot re-queue forever as main advances.
+advance
+rm "$t/queue-failed"
+touch "$t/linear"
+pass
+before_queues=$(count "$t/queue-posts")
+for digit in 3 4 5; do
+  printf '%s\n' "$(printf '%040d' "$digit")" >"$t/queue-failed"
+  pass
+done
+[[ "$(count "$t/queue-posts")" == "$((before_queues + 3))" ]]
+jq -e '.queue_retry_bases | length == 3' "$(receipt)" >/dev/null
+printf '%s\n' "$(printf '6%.0s' {1..40})" >"$t/queue-failed"
+pass
+[[ "$(count "$t/queue-posts")" == "$((before_queues + 3))" ]]
+grep -q 'merge queue retry limit 3 reached' "$t/controller.log"
 [[ ! -e "$t/danger" ]]
-echo 'ok failed merge-queue entry retried once per base, then landed'
+echo 'ok three total accepted retries cap a broken head across advancing bases'
 echo 'MERGE PASS'

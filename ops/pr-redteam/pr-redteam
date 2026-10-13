@@ -1003,7 +1003,8 @@ merge_hold_reason() { # owner/name number
 
 # Merge every open PR this tool approved at its current head, once the forge says it can merge.
 merge_pass() { # dry
-  local dry="$1" merger row repo number sha receipt reason passport
+  local dry="$1" merger row repo number sha receipt reason passport retry_base queue_retry_base
+  local queue_cache_state=0 queue_cache_entries='[]'
   if [ -z "$merge_token_file" ]; then
     say "merge pass skipped: set REDTEAM_MERGE_TOKEN_FILE to the merger credential"; return 0
   fi
@@ -1031,9 +1032,11 @@ merge_pass() { # dry
     if jq -e --arg sha "$sha" '.queue_refused_sha == $sha' "$receipt" >/dev/null 2>&1; then
       continue
     fi
+    queue_retry_base=""
     if jq -e --arg sha "$sha" '.queued_sha == $sha' "$receipt" >/dev/null 2>&1; then
-      queue_retry_due "$repo" "$number" "$sha" "$receipt" || continue
+      queue_retry_due "$repo" "$number" "$sha" "$receipt" "$(jq -r .base_ref <<<"$row")" || continue
     fi
+    retry_base="$queue_retry_base"
     reason="$(merge_hold_reason "$repo" "$number")"
     if [ -n "$reason" ]; then
       say "$repo#$number: approved, waiting to merge: $reason"; continue
@@ -1045,13 +1048,17 @@ merge_pass() { # dry
         '{expected_head_sha: $sha, passport_hash: $p, expected_passport_hash: $p}')"
     if [[ "$code" == 2* ]]; then
       say "$repo#$number: MERGED ${sha:0:12} as $merger"
-      jq --arg at "$(date -u +%FT%TZ)" --arg by "$merger" '.merged_at = $at | .merged_by = $by' \
-        "$receipt" | store_receipt "$receipt"
+      jq --arg at "$(date -u +%FT%TZ)" --arg by "$merger" --arg b "$retry_base" '
+        .merged_at = $at | .merged_by = $by |
+        if $b != "" then
+          .queue_retry_bases = ((.queue_retry_bases // (if .queue_retried_base then [.queue_retried_base] else [] end)) + [$b] | unique) |
+          .queue_retried_base = $b
+        else . end' "$receipt" | store_receipt "$receipt"
     elif [ "$code" = 409 ] && jq -e '(.error // .).message // "" | test("linear history")' <<<"$body" >/dev/null 2>&1; then
       # Rewriting an author's branch is off by default: the family's no-force rule forbids it (even
       # with a lease), and an author still pushing to that branch collides with the rewrite.
       if [ "${REDTEAM_QUEUE:-1}" = 1 ]; then
-        enqueue_pr "$repo" "$number" "$sha" "$receipt" "$merger"
+        enqueue_pr "$repo" "$number" "$sha" "$receipt" "$merger" "$retry_base"
       elif [ "${REDTEAM_REBASE:-0}" = 1 ]; then
         rebase_pr "$repo" "$number" "$sha" "$(jq -r .head_ref <<<"$row")" "$(jq -r .base_ref <<<"$row")" "$receipt" "$merger" "$dry"
       else
@@ -1063,32 +1070,58 @@ merge_pass() { # dry
   done < <(open_prs)
 }
 
-# Whether an approved head the receipt records as queued should be tried again: only when its queue
-# entry for this head ended without landing (failed or dequeued) on a base this tool has not already
-# retried. The failed base is kept in the receipt, so one failure is retried once, never in a loop.
-queue_retry_due() { # owner/name number head-sha receipt
-  local repo="$1" number="$2" sha="$3" receipt="$4" entry='' state_now failed_base why page
-  # Only the forge-wide list filters by state; ended entries are few, but it is paged all the same.
-  for state_now in failed dequeued; do
-    for page in 1 2 3 4 5; do
-      api GET "/api/v1/merge-queue?state=$state_now&per_page=100&page=$page"
-      [ "$code" = 200 ] || break
-      entry="$(jq -c --arg r "$repo" --argjson n "$number" --arg sha "$sha" \
-        '[(.entries // [])[] | select(.repo == $r and .number == $n and .pr_head_sha == $sha)]
-         | first // empty' <<<"$body")"
-      [ -z "$entry" ] || break 2
-      jq -e '.page.has_more == true' <<<"$body" >/dev/null 2>&1 || break
-    done
+# One read-only, bounded snapshot per merge pass. The live forge's QueueEntry contract is
+# repo/base/number/pr_head_sha/base_sha/state/enqueued_at/attempts; page.has_more is authoritative
+# (jeryu-deploy crates/jeryu-api/src/web/merge_queue.rs, QueueEntry/list_all).
+queue_retry_snapshot() {
+  [[ "${queue_cache_state:-0}" != 1 ]] || return 0
+  [[ "${queue_cache_state:-0}" != failed ]] || return 1
+  queue_cache_state=failed
+  local page entries
+  queue_cache_entries='[]'
+  for page in 1 2 3 4 5; do
+    api GET "/api/v1/merge-queue?state=all&per_page=100&page=$page"
+    if [ "$code" != 200 ]; then say "merge queue snapshot answered $code; retries wait for a readable list"; return 1; fi
+    if ! jq -e '(.entries|type)=="array" and (.page.has_more|type)=="boolean"' <<<"$body" >/dev/null 2>&1; then
+      say 'merge queue snapshot has invalid entries/pagination; retries wait'; return 1
+    fi
+    entries="$(jq -c '.entries' <<<"$body")" || return 1
+    queue_cache_entries="$(jq -cn --argjson a "$queue_cache_entries" --argjson b "$entries" '$a + $b')" || return 1
+    if ! jq -e '.page.has_more' <<<"$body" >/dev/null; then queue_cache_state=1; return 0; fi
   done
-  [ -n "$entry" ] || return 1
+  say 'merge queue snapshot exceeded five pages; retry state is incomplete, retries wait'
+  return 1
+}
+
+# Pure observation: set queue_retry_base, but never write the receipt or consume a retry here.
+# One accepted dispatch per failed base, at most three overall per reviewed head. New heads get
+# new receipts. Active/landed entries are never retried; old entries for another base are ignored.
+queue_retry_due() { # owner/name number head-sha receipt current-base-ref
+  local repo="$1" number="$2" sha="$3" receipt="$4" base_ref="$5" entry state_now failed_base why bases
+  queue_retry_base=""
+  if ! queue_retry_snapshot; then say "$repo#$number: approved, waiting to merge: merge queue unavailable"; return 1; fi
+  entry="$(jq -c --arg r "$repo" --argjson n "$number" --arg sha "$sha" --arg base "$base_ref" '
+    [.[] | select(.repo == $r and .number == $n and .pr_head_sha == $sha and .base == $base)] |
+    sort_by([(.attempts[-1].at // .enqueued_at // ""), (.enqueued_at // ""), (.queue_sha // "")]) | last // empty' <<<"$queue_cache_entries")" || return 1
+  if [ -z "$entry" ]; then say "$repo#$number: approved, waiting to merge: queued entry is not in the current snapshot"; return 1; fi
+  state_now="$(jq -r '.state // ""' <<<"$entry")"
+  case "$state_now" in building|landed) return 1;; failed|dequeued) ;; *) say "$repo#$number: invalid merge queue state; retries wait"; return 1;; esac
   failed_base="$(jq -r '.base_sha // ""' <<<"$entry")"
-  why="$(jq -r '.reason // "no reason given"' <<<"$entry" | head -c 200)"
-  if jq -e --arg b "$failed_base" '.queue_retried_base == $b' "$receipt" >/dev/null 2>&1; then
-    say "$repo#$number: approved, waiting to merge: merge queue entry $state_now on base ${failed_base:0:12} after a retry ($why); needs a fix or a cherry-pick replacement"
+  if [[ ! "$failed_base" =~ ^[0-9a-f]{40}$ ]]; then say "$repo#$number: merge queue entry has no valid failed base; retries wait"; return 1; fi
+  if ! bases="$(jq -ce '(.queue_retry_bases // (if .queue_retried_base then [.queue_retried_base] else [] end)) |
+      arrays | select(all(.[]; type == "string" and test("^[0-9a-f]{40}$")))' "$receipt")"; then
+    say "$repo#$number: invalid retry history; retries wait"; return 1
+  fi
+  why="$(jq -r '(.reason // "no reason given") | gsub("[[:cntrl:]]"; " ") | .[0:200]' <<<"$entry")"
+  if jq -e --arg b "$failed_base" 'index($b) != null' <<<"$bases" >/dev/null; then
+    say "$repo#$number: approved, waiting to merge: merge queue entry $state_now on base ${failed_base:0:12} after a retry ($why); needs a source fix"
     return 1
   fi
-  say "$repo#$number: merge queue entry $state_now on base ${failed_base:0:12} ($why); trying again"
-  jq --arg b "$failed_base" '.queue_retried_base = $b' "$receipt" | store_receipt "$receipt"
+  if (( $(jq 'length' <<<"$bases") >= 3 )); then
+    say "$repo#$number: approved, waiting to merge: merge queue retry limit 3 reached; needs a source fix"; return 1
+  fi
+  queue_retry_base="$failed_base"
+  say "$repo#$number: merge queue entry $state_now on base ${failed_base:0:12} ($why); eligible for one retry"
 }
 
 # An approved PR behind its linear-history base goes to the forge's merge queue: the forge replays it
@@ -1096,14 +1129,21 @@ queue_retry_due() { # owner/name number head-sha receipt
 # lands it by fast-forward. Nobody's branch is rewritten. The head is recorded in the receipt, so a
 # queue entry that later fails is retried once per failed base (queue_retry_due), never in a loop; a
 # new push is a new head, reviewed and queued afresh.
-enqueue_pr() { # owner/name number reviewed-sha receipt merger
-  local repo="$1" number="$2" sha="$3" receipt="$4" merger="$5" state_now
+enqueue_pr() { # owner/name number reviewed-sha receipt merger [retry-base]
+  local repo="$1" number="$2" sha="$3" receipt="$4" merger="$5" retry_base="${6:-}" state_now
   as_token="$merge_token_file" api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/queue"
   if [[ "$code" == 2* ]]; then
+    if ! jq -e --arg sha "$sha" '.pr_head_sha == $sha and (.state == "building" or .state == "landed")' <<<"$body" >/dev/null 2>&1; then
+      say "$repo#$number: queue acknowledgement does not match the reviewed head; receipt unchanged"; return 1
+    fi
     state_now="$(jq -r '.state // "?"' <<<"$body")"
     say "$repo#$number: approved but behind; QUEUED ${sha:0:12} as $merger → $(jq -r '.queue_ref // "?"' <<<"$body") @ $(jq -r '.queue_sha // "?" | .[0:12]' <<<"$body") ($state_now)"
-    jq --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" --arg q "$(jq -r '.queue_sha // ""' <<<"$body")" \
-      '.queued_sha = $sha | .queued_at = $at | .queue_commit = $q' "$receipt" | store_receipt "$receipt"
+    jq --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" --arg q "$(jq -r '.queue_sha // ""' <<<"$body")" --arg b "$retry_base" '
+      .queued_sha = $sha | .queued_at = $at | .queue_commit = $q |
+      if $b != "" then
+        .queue_retry_bases = ((.queue_retry_bases // (if .queue_retried_base then [.queue_retried_base] else [] end)) + [$b] | unique) |
+        .queue_retried_base = $b
+      else . end' "$receipt" | store_receipt "$receipt"
   elif [ "$code" = 409 ]; then
     say "$repo#$number: approved but behind, and the merge queue refused it: $(jq -r '(.error // .) | "\(.code): \(.message)"' <<<"$body" 2>/dev/null | head -c 300) — needs the author to rebase"
     jq --arg sha "$sha" '.queue_refused_sha = $sha' "$receipt" | store_receipt "$receipt"
