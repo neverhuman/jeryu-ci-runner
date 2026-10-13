@@ -32,56 +32,50 @@ mkdir -p target/security
 ci_kit_secret_scan
 checks+=("gitleaks-${GITLEAKS_VERSION}")
 
-if [[ -d .github/workflows ]]; then
-  actionlint .github/workflows/*.yml
-  checks+=("actionlint-${ACTIONLINT_VERSION}")
-fi
+actionlint .github/workflows/*.yml
+checks+=("actionlint-${ACTIONLINT_VERSION}")
 ci_kit_forbid_env_files
 checks+=("env-file-absence")
-if [[ -f Cargo.toml ]]; then
-  cargo metadata --locked --format-version 1 --no-deps >/dev/null
-  checks+=("cargo-metadata-locked")
-fi
+cargo metadata --locked --format-version 1 --no-deps >/dev/null
+checks+=("cargo-metadata-locked")
 
-if [[ "${JERYU_SECURITY_NETWORK:-0}" == "1" ]]; then
-  require_tool cargo-audit
-  require_tool cargo-deny
-  require_tool syft
-  if [[ "$(cargo audit --version)" != "${CARGO_AUDIT_VERSION}" ]]; then
-    printf 'cargo-audit version mismatch: expected %s, got %s\n' \
-      "${CARGO_AUDIT_VERSION}" "$(cargo audit --version 2>&1)" >&2
-    exit 1
-  fi
-  if [[ "$(cargo deny --version)" != "${CARGO_DENY_VERSION}" ]]; then
-    printf 'cargo-deny version mismatch: expected %s, got %s\n' \
-      "${CARGO_DENY_VERSION}" "$(cargo deny --version 2>&1)" >&2
-    exit 1
-  fi
-  if [[ "$(syft version -o json | jq -r '.version // empty')" != "${SYFT_VERSION}" ]]; then
-    printf 'syft version mismatch: expected %s\n' "${SYFT_VERSION}" >&2
-    exit 1
-  fi
-  cargo audit --deny warnings
-  cargo deny check advisories bans licenses sources
-  bash ops/ci/dependency-sources.sh
-  if [[ "$(<VERSION)" != "${SOURCE_VERSION}" ]]; then
-    printf 'SBOM source version differs from reviewed VERSION identity\n' >&2
-    exit 1
-  fi
-  syft scan dir:. --source-name "${SOURCE_NAME}" --source-version "${SOURCE_VERSION}" \
-    --exclude './target/**' --exclude './.git/**' \
-    --output cyclonedx-json=target/security/sbom.cdx.json
-  jq -e --arg name "${SOURCE_NAME}" --arg version "${SOURCE_VERSION}" \
-    '.bomFormat == "CycloneDX" and (.components | type == "array") and
-     .metadata.component.name == $name and .metadata.component.version == $version' \
-    target/security/sbom.cdx.json >/dev/null
-  checks+=(
-    "cargo-audit-0.22.1"
-    "cargo-deny-0.19.8"
-    "hosted-dependency-sources"
-    "syft-${SYFT_VERSION}-cyclonedx"
-  )
+require_tool cargo-audit
+require_tool cargo-deny
+require_tool syft
+if [[ "$(cargo audit --version)" != "${CARGO_AUDIT_VERSION}" ]]; then
+  printf 'cargo-audit version mismatch: expected %s, got %s\n' \
+    "${CARGO_AUDIT_VERSION}" "$(cargo audit --version 2>&1)" >&2
+  exit 1
 fi
+if [[ "$(cargo deny --version)" != "${CARGO_DENY_VERSION}" ]]; then
+  printf 'cargo-deny version mismatch: expected %s, got %s\n' \
+    "${CARGO_DENY_VERSION}" "$(cargo deny --version 2>&1)" >&2
+  exit 1
+fi
+if [[ "$(syft version -o json | jq -r '.version // empty')" != "${SYFT_VERSION}" ]]; then
+  printf 'syft version mismatch: expected %s\n' "${SYFT_VERSION}" >&2
+  exit 1
+fi
+cargo audit --deny warnings
+cargo deny check advisories bans licenses sources
+bash ops/ci/dependency-sources.sh
+if [[ "$(<VERSION)" != "${SOURCE_VERSION}" ]]; then
+  printf 'SBOM source version differs from reviewed VERSION identity\n' >&2
+  exit 1
+fi
+syft scan dir:. --source-name "${SOURCE_NAME}" --source-version "${SOURCE_VERSION}" \
+  --exclude './target/**' --exclude './.git/**' \
+  --output cyclonedx-json=target/security/sbom.cdx.json
+jq -e --arg name "${SOURCE_NAME}" --arg version "${SOURCE_VERSION}" \
+  '.bomFormat == "CycloneDX" and (.components | type == "array") and
+   .metadata.component.name == $name and .metadata.component.version == $version' \
+  target/security/sbom.cdx.json >/dev/null
+checks+=(
+  "cargo-audit-0.22.1"
+  "cargo-deny-0.19.8"
+  "hosted-dependency-sources"
+  "syft-${SYFT_VERSION}-cyclonedx"
+)
 
 checks_json="$(printf '%s\n' "${checks[@]}" | jq -R . | jq -s .)"
 jq -n \
@@ -90,7 +84,7 @@ jq -n \
   --arg sbom_sha256 "$(if [[ -f target/security/sbom.cdx.json ]]; then sha256sum target/security/sbom.cdx.json | awk '{print $1}'; else printf not-run; fi)" \
   --arg source_name "${SOURCE_NAME}" \
   --arg source_version "${SOURCE_VERSION}" \
-  --argjson network "$(if [[ "${JERYU_SECURITY_NETWORK:-0}" == "1" ]]; then printf true; else printf false; fi)" \
+  --argjson network true \
   --argjson checks "${checks_json}" \
   '{schema_version:"jeryu.split.security/v2",git_head:$head,
     cargo_lock_sha256:$lock_sha256,sbom_sha256:$sbom_sha256,

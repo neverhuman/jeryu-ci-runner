@@ -22,6 +22,11 @@ entry_scripts=(
   "${repo_root}/ops/ci/security.sh"
   "${repo_root}/ops/ci/artifact_support.sh"
   "${repo_root}/ops/ci/jankurai-gate.sh"
+  "${repo_root}/tools/security-lane.sh"
+  "${repo_root}/ops/ci/proof_evidence.sh"
+  "${repo_root}/ops/ci/dependency-sources.sh"
+  "${repo_root}/ops/ci/ensure-jankurai.sh"
+  "${repo_root}/ops/ci/lib.sh"
 )
 failures=0
 pass() { printf 'ok   %s\n' "$1"; }
@@ -30,17 +35,32 @@ flunk() { printf 'FAIL %s\n' "$1" >&2; failures=$((failures + 1)); }
 # guarded_lanes <script>: print every lane invocation (bash/just/cargo) that
 # sits inside a multi-line if/case, or behind `then`, `&&` or `||` on one line.
 guarded_lanes() {
-  awk '
-    FNR == 1 { depth = 0; generated = 0 }
+  awk -v check_sh="${check_sh}" '
+    function is_lane_command(line) {
+      return line ~ /^[[:space:]]*(bash|just|cargo|actionlint|jankurai|syft)[[:space:]]/
+    }
+    function has_guarded_lane(line) {
+      return line ~ /(then|&&|\|\|)[[:space:]]*(bash|just|cargo|actionlint|jankurai|syft)[[:space:]]/
+    }
+    FNR == 1 { depth = 0; generated = 0; full_check_depth = 0 }
     /^JERYU_TOOL_RENDER=/ { generated = 1 }
     generated { if ($0 ~ /^fi[[:space:]]*$/) generated = 0; next }
-    # check.sh gates expensive full-check commands by JERYU_SPLIT_FULL_CHECK;
-    # it still invokes its CI sub-lanes unconditionally.
-    depth > 0 && /^[[:space:]]*cargo check --locked --workspace --all-targets/ { next }
-    /(then|&&|\|\|)[[:space:]]*(bash|just|cargo)[[:space:]]/ { print FILENAME ":" FNR ":" $0; next }
-    /^[[:space:]]*(if|case)[[:space:]]/ && !/;[[:space:]]*(fi|esac)[[:space:]]*$/ { depth += 1; next }
-    /^[[:space:]]*(fi|esac)[[:space:]]*$/ { if (depth > 0) depth -= 1; next }
-    depth > 0 && /^[[:space:]]*(bash|just|cargo)[[:space:]]/ { print FILENAME ":" FNR ":" $0 }
+    # check.sh gates its expensive full-check command by JERYU_SPLIT_FULL_CHECK;
+    # that is the only conditional cargo-check exemption.
+    FILENAME == check_sh && full_check_depth > 0 &&
+      /^[[:space:]]*cargo check --locked --workspace --all-targets/ { next }
+    has_guarded_lane($0) { print FILENAME ":" FNR ":" $0; next }
+    /^[[:space:]]*(if|case)[[:space:]]/ && !/;[[:space:]]*(fi|esac)[[:space:]]*$/ {
+      depth += 1
+      if (FILENAME == check_sh && $0 ~ /JERYU_SPLIT_FULL_CHECK/) full_check_depth = depth
+      next
+    }
+    /^[[:space:]]*(fi|esac)[[:space:]]*$/ {
+      if (depth > 0 && depth == full_check_depth) full_check_depth = 0
+      if (depth > 0) depth -= 1
+      next
+    }
+    depth > 0 && is_lane_command($0) { print FILENAME ":" FNR ":" $0 }
   ' "$@"
 }
 
@@ -84,6 +104,18 @@ else
   flunk "the wiring detector catches each conditional shape and nothing else"
 fi
 
+cat >"${fixture}" <<'FIXTURE'
+if [[ "${JERYU_SPLIT_FULL_CHECK:-0}" == "1" ]]; then
+  cargo check --locked --workspace --all-targets
+fi
+FIXTURE
+mapfile -t caught < <(guarded_lanes "${fixture}")
+if (( ${#caught[@]} == 1 )); then
+  pass "cargo check exemption is scoped to check.sh"
+else
+  flunk "cargo check exemption is scoped to check.sh"
+fi
+
 grep -q 'required_lane_result "sandbox escape matrix" skipped' "${pr_ci}" &&
   pass "standing down the sandbox escape matrix fails the check" ||
   flunk "standing down the sandbox escape matrix fails the check"
@@ -96,13 +128,17 @@ grep -q 'required_lane_tests_collected "workspace test suite"' "${pr_ci}" &&
 # check.sh.
 grep -q '^bash ops/ci/tests/required.sh$' "${check_sh}" &&
   grep -q '^JERYU_SPLIT_FULL_CHECK=1 bash ops/ci/check.sh$' "${pr_ci}" &&
+  grep -q '^\./ops/ci/check.sh$' "${repo_root}/ops/ci/fast.sh" &&
   pass "the required check runs this suite" ||
   flunk "the required check runs this suite"
 
 check_count="$(
   grep -Ec '(^|[[:space:]])(bash[[:space:]]+)?(\./)?ops/ci/check\.sh([[:space:]]|$)' "${pr_ci}"
 )"
-if [[ "${check_count}" == 1 ]]; then
+fast_count="$(
+  grep -Ec '(^|[[:space:]])(bash[[:space:]]+)?(\./)?ops/ci/check\.sh([[:space:]]|$)' "${repo_root}/ops/ci/fast.sh"
+)"
+if [[ "${check_count}" == 1 && "${fast_count}" == 1 ]]; then
   pass "pr-ci runs check.sh once"
 else
   flunk "pr-ci runs check.sh once"

@@ -7,7 +7,6 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 [ -x "$here/pr-redteam" ] || { echo "no executable pr-redteam next to $0" >&2; exit 1; }
-command -v claude >/dev/null || [ -x "$HOME/.local/bin/claude" ] || { echo "claude CLI not found" >&2; exit 1; }
 
 units="$HOME/.config/systemd/user"
 required_environment_files() {
@@ -32,6 +31,26 @@ for source_unit in \
     }
   done < <(required_environment_files "$source_unit")
 done
+
+# Presence of the shared file alone is not enough: systemd treats an unset
+# EnvironmentFile variable as an empty setting, and poke needs the same inputs
+# as review to calculate the review identity.
+site_env="$HOME/.config/pr-redteam/site.env"
+for setting in JERYU_BASE JERYU_TOKEN_FILE REDTEAM_CLAUDE REDTEAM_CLAUDE_VERSION; do
+  grep -Eq "^${setting}=.+$" "$site_env" || {
+    echo "$site_env must define $setting before installation" >&2
+    exit 1
+  }
+done
+claude_path="$(sed -n 's/^REDTEAM_CLAUDE=//p' "$site_env" | tail -n 1)"
+case "$claude_path" in
+  \"*\") claude_path="${claude_path:1:${#claude_path}-2}" ;;
+  \'*\') claude_path="${claude_path:1:${#claude_path}-2}" ;;
+esac
+[[ "$claude_path" == /* && -x "$claude_path" ]] || {
+  echo "$site_env REDTEAM_CLAUDE must name an executable absolute path" >&2
+  exit 1
+}
 
 # Replacing an active or enabled unit would change its next execution. Require the
 # service owner to stop/disable it explicitly before staging replacement source.

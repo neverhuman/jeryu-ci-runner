@@ -4,7 +4,10 @@ use ed25519_dalek::{Signature, VerifyingKey};
 use jeryu_runner_core::RunnerResult;
 use jeryu_runner_protocol::wire::v2::{RuntimeImageClass, RuntimeManifest};
 
-pub(crate) fn production(
+/// The node's release check, the first step of `VerifiedRuntime::admit`: a
+/// production manifest whose `to_json()` bytes the enrolled release key signed.
+/// It admits nothing by itself; release tooling runs it before installing.
+pub fn production(
     manifest: &RuntimeManifest,
     signature: &[u8; 64],
     release_key: &[u8; 32],

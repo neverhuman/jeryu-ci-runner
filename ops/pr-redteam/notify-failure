@@ -12,26 +12,82 @@ esac
 
 lines="${NOTIFY_JOURNAL_LINES:-80}"
 [[ "$lines" =~ ^[0-9]+$ ]] || lines=80
+max_body_bytes="${NOTIFY_MAX_BODY_BYTES:-8192}"
+[[ "$max_body_bytes" =~ ^[1-9][0-9]*$ ]] || max_body_bytes=8192
 
-journal="$(journalctl --user -u "$unit" -n "$lines" --no-pager -o short-iso 2>&1 || true)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/pr-redteam-notify.XXXXXX")"
+trap 'rm -rf -- "$tmp"' EXIT
+body_file="$tmp/body.txt"
+full_body_file="$tmp/body-full.txt"
+journal_file="$tmp/journal.txt"
+payload_file="$tmp/payload.json"
+
+forbidden_token_values() {
+  local name path value
+  for name in JERYU_TOKEN_FILE REDTEAM_MERGE_TOKEN_FILE; do
+    path="${!name:-}"
+    [[ -n "$path" && -f "$path" && ! -L "$path" && -r "$path" ]] || continue
+    value="$(cat -- "$path" 2>/dev/null || true)"
+    [[ -n "$value" ]] || continue
+    printf '%s\n' "$value"
+  done
+  for name in NOTIFY_WEBHOOK_URL ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN; do
+    value="${!name:-}"
+    [[ -n "$value" ]] || continue
+    printf '%s\n' "$value"
+  done
+}
+
 subject="pr-redteam unit failed: $unit"
-body="$(printf '%s\n\nlast %s journal lines:\n%s\n' "$subject" "$lines" "$journal")"
+journalctl --user -u "$unit" -n "$lines" --no-pager -o short-iso >"$journal_file" 2>&1 || true
+{
+  printf '%s\n\nlast %s journal lines:\n' "$subject" "$lines"
+  cat "$journal_file"
+  printf '\n'
+} >"$full_body_file"
+
+validate_capture_text() {
+  local label="$1" file="$2" text token encoded hex squeezed
+  text="$(cat -- "$file")"
+  squeezed="$(printf '%s' "$text" | tr -d '[:space:]')"
+  while IFS= read -r token; do
+    [[ -n "$token" ]] || continue
+    encoded="$(printf '%s' "$token" | base64 -w0)"
+    hex="$(printf '%s' "$token" | od -An -tx1 | tr -d ' \n')"
+    if [[ "$text" == *"$token"* ||
+          "$text" == *"$encoded"* ||
+          "$text" == *"$hex"* ||
+          "$squeezed" == *"$token"* || "$squeezed" == *"$encoded"* || "$squeezed" == *"$hex"* ]]; then
+      printf 'pr-redteam notify: configured token value appeared in %s; omitting journal body\n' \
+        "$label" >&2
+      return 1
+    fi
+  done < <(forbidden_token_values)
+}
+
+if ! validate_capture_text notification "$full_body_file"; then
+  printf '%s\n\njournal omitted: configured token value appeared in captured output.\n' \
+    "$subject" >"$full_body_file"
+fi
+head -c "$max_body_bytes" "$full_body_file" >"$body_file"
 
 if [ -n "${NOTIFY_COMMAND:-}" ]; then
   export PR_REDTEAM_FAILED_UNIT="$unit"
   export PR_REDTEAM_NOTIFY_SUBJECT="$subject"
-  export PR_REDTEAM_NOTIFY_BODY="$body"
-  printf '%s' "$body" | sh -c "$NOTIFY_COMMAND"
+  export PR_REDTEAM_NOTIFY_BODY_FILE="$body_file"
+  PR_REDTEAM_NOTIFY_BODY="$(cat "$body_file")"
+  export PR_REDTEAM_NOTIFY_BODY
+  sh -c "$NOTIFY_COMMAND" <"$body_file"
   exit 0
 fi
 
 if [ -n "${NOTIFY_WEBHOOK_URL:-}" ]; then
   command -v curl >/dev/null || { echo "pr-redteam notify: curl is required for NOTIFY_WEBHOOK_URL" >&2; exit 1; }
-  payload="$(jq -n --arg unit "$unit" --arg subject "$subject" --arg body "$body" \
-    '{source:"pr-redteam", unit:$unit, subject:$subject, body:$body}')"
+  jq -n --arg unit "$unit" --arg subject "$subject" --rawfile body "$body_file" \
+    '{source:"pr-redteam", unit:$unit, subject:$subject, body:$body}' >"$payload_file"
   curl --fail --silent --show-error --request POST \
     --header 'Content-Type: application/json' \
-    --data-binary "$payload" \
+    --data-binary "@$payload_file" \
     "$NOTIFY_WEBHOOK_URL" >/dev/null
   exit 0
 fi

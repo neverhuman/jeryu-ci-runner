@@ -113,7 +113,8 @@ attempt_dir=$(dirname "$receipt")
 { printf 'early line that must fall outside the tail\n'; head -c 20000 /dev/zero | tr '\0' 'x'; printf '\n\033[31merror\033[0m: test failed\r\nlast line\n'; } > "$attempt_dir/build.log"
 jq '.terminal=true | .outcome="failure" | .exit_code=101 | .id="attempt-1" | .sequence=1 | .execution_kind="operator-unsealed" | .cache="none"
     | .log="/etc/passwd" | .recovery_required=null | .finished_at=(.started_at | fromdateiso8601 + 65 | todateiso8601)
-    | .inputs.required_context="jeryu-tool/required"' "$receipt" > "$fixture/new.json"
+    | .inputs.required_context="jeryu-tool/required"
+    | .queue_wait={ready_at:"2026-09-18T00:00:00Z",source:"pr-opened",seconds:322}' "$receipt" > "$fixture/new.json"
 mv "$fixture/new.json" "$receipt"
 jq -nc '{repo:"jeryu/jeryu-tool",pr:4,sha:"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",recipe:"ops/ci/pr-ci.sh",seconds:65,finishedAt:"2026-09-18T00:00:00Z",exit_code:101,conclusion:"failure"}' > "$fixture/home/cache/slot-0-last.json"
 sha256sum "$receipt" "$attempt_dir/build.log" > "$fixture/evidence.sha256"
@@ -132,6 +133,8 @@ events | jq -e '.event_id=="pr-gate:attempt-1" and .source=="pr-gate" and .kind=
   and (.summary|test("jeryu/jeryu-tool#4 jeryu-tool/required failure in 65s"))
   and .detail.attempt=="attempt-1" and .detail.exit_code==101 and .detail.recipe=="ops/ci/pr-ci.sh" and .detail.log_bytes>20000
   and .detail.cache=="none"
+  and .detail.queue_wait.seconds==322 and .detail.queue_wait.source=="pr-opened"
+  and (.summary|test("after 322s in the queue"))
   and .detail.runner==.actor
   and (.log_tail|endswith("error: test failed\nlast line\n")) and (.log_tail|contains("early line")|not)
   and (.log_tail|contains("root:")|not) and (.log_tail|test("\u001b|\r")|not) and ((.log_tail|utf8bytelength) <= 12288)

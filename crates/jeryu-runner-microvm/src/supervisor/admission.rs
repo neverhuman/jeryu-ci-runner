@@ -48,18 +48,10 @@ pub(super) fn new_disk_charge(lease: &SessionLease, artifact_bytes: u64) -> Runn
 
 pub(super) fn artifact_bytes(runtime: &VerifiedRuntime, lease: &SessionLease) -> RunnerResult<u64> {
     let source = runtime.workspace_bundle(&lease.workspace)?;
-    let bytes = [
-        Some(runtime.kernel()),
-        Some(runtime.rootfs()),
-        Some(runtime.firecracker()),
-        source.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .try_fold(0u64, |sum, path| {
-        sum.checked_add(std::fs::metadata(path)?.len())
-            .ok_or_else(|| failed("microvm_artifact_capacity_invalid"))
-    })?;
+    let bytes = runtime
+        .boot_artifact_bytes()?
+        .checked_add(source.as_ref().map_or(0, |artifact| artifact.len()))
+        .ok_or_else(|| failed("microvm_artifact_capacity_invalid"))?;
     if bytes > 64 * (1 << 30) {
         return Err(failed("microvm_artifact_capacity_invalid"));
     }

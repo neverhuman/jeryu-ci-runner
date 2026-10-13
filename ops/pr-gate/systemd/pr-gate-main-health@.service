@@ -1,0 +1,15 @@
+# Gate protected main and post <repo>/main-health, one slot per instance.
+[Unit]
+Description=Family main-health gate slot %i (protected main -> <repo>/main-health)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GATE_RUNNER_HOME=%h/gate-runner-main-health
+Environment=PR_GATE_CONFIG=%h/gate-runner-main-health/pr-gate.env
+Environment=GATE_RUNNER_SLOT=%i
+ExecStart=%h/gate-runner/bin/pr-gate-runner.sh --main-health
+Nice=10
+TimeoutStartSec=4h

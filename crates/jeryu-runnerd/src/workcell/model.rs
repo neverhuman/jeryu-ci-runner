@@ -19,6 +19,20 @@ impl ArchiveEntryKind {
     }
 }
 
+impl WorkcellState {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Warming => "warming",
+            Self::Ready => "ready",
+            Self::Claimed => "claimed",
+            Self::Held => "held",
+            Self::Repairing => "repairing",
+            Self::Blocked => "blocked",
+            Self::Released => "released",
+        }
+    }
+}
+
 impl ArchiveEntry {
     pub fn new(path: impl Into<PathBuf>, kind: ArchiveEntryKind) -> Self {
         Self {
@@ -98,14 +112,7 @@ impl FrozenCiSnapshot {
         failure_log_digest: impl Into<String>,
         snapshot_age_ms: u64,
     ) -> Self {
-        let allowed_paths = workcell
-            .repo_roots
-            .iter()
-            .cloned()
-            .chain(std::iter::once(workcell.workspace_root.clone()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let allowed_paths = workcell.root_paths();
         Self {
             ci_run_id: ci_run_id.into(),
             failed_run_id: failed_run_id.into(),
@@ -113,6 +120,8 @@ impl FrozenCiSnapshot {
             workcell_id: workcell.workcell_id.clone(),
             runner_id: workcell.runner_id.clone(),
             runner_epoch: workcell.runner_epoch,
+            admitted_runner_epoch: workcell.admitted_runner_epoch,
+            repair_generation: workcell.repair_generation,
             workspace_root: workcell.workspace_root.clone(),
             repo_roots: workcell.repo_roots.clone(),
             allowed_paths,
@@ -137,7 +146,38 @@ impl FrozenCiSnapshot {
     }
 }
 
+impl RepairSource {
+    pub(super) fn of(cell: &WorkcellLease) -> Self {
+        Self {
+            runner_id: cell.runner_id.clone(),
+            runner_epoch: cell.runner_epoch,
+            admitted_runner_epoch: cell.admitted_runner_epoch,
+            repair_generation: cell.repair_generation,
+            agent_id: cell.agent_id.clone(),
+            workspace_root: cell.workspace_root.clone(),
+            repo_roots: cell.repo_roots.clone(),
+            // A frozen snapshot's allowed paths are always derived from the
+            // cell's roots, so derive them the same way here.
+            allowed_paths: cell.root_paths(),
+            git_status_summary: cell.git_status_summary.clone(),
+            branch_policy: cell.branch_policy.clone(),
+        }
+    }
+}
+
 impl WorkcellLease {
+    /// The cell's repo roots plus its workspace root, sorted and deduplicated:
+    /// the paths a frozen snapshot of this cell allows.
+    pub(super) fn root_paths(&self) -> Vec<PathBuf> {
+        self.repo_roots
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.workspace_root.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    }
+
     pub(super) fn ready(workcell_id: impl Into<String>) -> Self {
         let workcell_id = workcell_id.into();
         Self {
@@ -152,6 +192,8 @@ impl WorkcellLease {
             ci_snapshot_age_ms: None,
             runner_id: String::new(),
             runner_epoch: 0,
+            admitted_runner_epoch: 0,
+            repair_generation: 0,
             heartbeat_healthy: false,
             startup_rebased: false,
             startup_main_ref: None,
@@ -165,7 +207,14 @@ impl WorkcellLease {
         }
     }
 
-    pub(super) fn apply_claim(&mut self, request: &WorkcellClaimRequest) {
+    /// Hand this cell to `request`. `admitted_runner_epoch` is the runner
+    /// lifetime the fence admitted for the claim, which for a repair differs
+    /// from the request's per-cell token.
+    pub(super) fn apply_claim(
+        &mut self,
+        request: &WorkcellClaimRequest,
+        admitted_runner_epoch: u64,
+    ) {
         self.state = WorkcellState::Claimed;
         self.agent_id = request.agent_id.clone();
         self.workspace_root = request.workspace_root.clone();
@@ -179,6 +228,8 @@ impl WorkcellLease {
         self.ci_snapshot_age_ms = request.ci_snapshot_age_ms;
         self.runner_id = request.runner_id.clone();
         self.runner_epoch = request.runner_epoch;
+        self.admitted_runner_epoch = admitted_runner_epoch;
+        self.repair_generation = 0;
         self.heartbeat_healthy = true;
         self.startup_rebased = false;
         self.startup_main_ref = None;

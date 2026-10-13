@@ -25,7 +25,12 @@ impl Writers {
     }
 }
 
-pub(super) fn run(launch: Launch, mut channel: UnixStream) -> RunnerResult<()> {
+pub(super) fn run(
+    launch: Launch,
+    mut channel: UnixStream,
+    jailer: fs::File,
+    firecracker: fs::File,
+) -> RunnerResult<()> {
     let parent = Path::new("/sys/fs/cgroup/jeryu-guardians");
     fs::create_dir_all(parent)?;
     trusted_directory(parent)?;
@@ -88,8 +93,9 @@ pub(super) fn run(launch: Launch, mut channel: UnixStream) -> RunnerResult<()> {
         if writers.forced.load(Ordering::Acquire) {
             return Err(failed("microvm_lease_expired"));
         }
-        let mut launcher = jeryu_sandbox_linux::microvm::spawn_guarded_jailer(
-            &launch.jailer,
+        let mut launcher = jeryu_sandbox_linux::microvm::spawn_guarded_jailer_files(
+            &jailer,
+            &firecracker,
             &launch.arguments,
             &writers.launcher_group.join("cgroup.procs"),
         )?;

@@ -1,5 +1,28 @@
 use super::*;
 use sha2::{Digest, Sha256};
+use std::io::{Read, Seek};
+
+pub(super) fn file(file: &mut File, upload: &BundleUpload) -> RunnerResult<()> {
+    file.rewind()?;
+    let mut verifier = Verifier::new(upload);
+    let mut buffer = [0u8; 64 * 1024];
+    let limit = upload
+        .stored_bytes
+        .checked_add(1)
+        .ok_or_else(|| failed("bundle_length_invalid"))?;
+    let mut reader = (&mut *file).take(limit);
+    loop {
+        let length = reader.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        verifier.push(&buffer[..length])?;
+    }
+    verifier.finish()?;
+    file.rewind()?;
+    Ok(())
+}
+
 pub(super) struct Verifier {
     raw: u64,
     stored: u64,
@@ -94,5 +117,28 @@ mod tests {
             verifier.push(&[0]).unwrap_err().code(),
             "bundle_length_invalid"
         );
+    }
+
+    #[test]
+    fn disk_verification_uses_the_held_file_and_refuses_modified_truncated_or_extra_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("staged");
+        let bytes = vec![42; 512];
+        let input = upload(&bytes, 512);
+        std::fs::write(&path, &bytes).unwrap();
+        let mut held = File::open(&path).unwrap();
+        std::fs::rename(&path, temp.path().join("retained")).unwrap();
+        std::fs::write(&path, vec![99; 512]).unwrap();
+        file(&mut held, &input).unwrap();
+        assert_eq!(held.stream_position().unwrap(), 0);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![99; 512]);
+        for (contents, expected) in [
+            (vec![99; 512], "bundle_digest_mismatch"),
+            (vec![42; 511], "bundle_length_invalid"),
+            (vec![42; 513], "bundle_length_invalid"),
+        ] {
+            std::fs::write(temp.path().join("retained"), contents).unwrap();
+            assert_eq!(file(&mut held, &input).unwrap_err().code(), expected);
+        }
     }
 }

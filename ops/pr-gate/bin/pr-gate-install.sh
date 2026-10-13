@@ -11,7 +11,7 @@
 #      protected branch, never another branch or a working tree;
 #   2. compare each managed file under PR_GATE_SOURCE_SUBDIR (default ops/pr-gate) there --
 #      bin/pr-gate-*.sh and systemd/pr-gate-*.{service,timer} -- with the installed copy;
-#   3. if the runner, its state library or its config library differs, drain first: stop every
+#   3. if the runner or a sourced state/config/backoff library differs, drain first: stop every
 #      pr-gate-runner@N.timer and wait until no runner process is left (at most
 #      GATE_INSTALL_DRAIN_SECONDS, default 45 minutes, else install nothing);
 #   4. install each differing file atomically, keeping the old copy as
@@ -165,7 +165,7 @@ for src in "${!dest[@]}"; do
       say "$(basename "$src") is masked by the operator; leaving it alone"; continue
     fi
     changed+=("$src")
-    case "$src" in "$SUBDIR/bin/pr-gate-runner.sh"|"$SUBDIR/bin/pr-gate-state.sh"|"$SUBDIR/bin/pr-gate-config.sh") drain=1;; esac
+    case "$src" in "$SUBDIR/bin/pr-gate-runner.sh"|"$SUBDIR/bin/pr-gate-state.sh"|"$SUBDIR/bin/pr-gate-config.sh"|"$SUBDIR/bin/pr-gate-backoff.sh") drain=1;; esac
     [[ "$src" != "$SUBDIR/systemd/"* ]] || units_changed=1
   fi
 done

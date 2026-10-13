@@ -97,6 +97,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cpu_budget_vcpus: 4,
         memory_budget_mib: 2048,
         disk_budget_gib: 16,
+        uid_base: jeryu_runner_microvm::journal::LEGACY_UID_BASE,
     }
     .open()?;
     let started = Instant::now();
