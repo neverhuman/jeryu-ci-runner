@@ -11,7 +11,15 @@ overlay="${ROOT}/.cargo/hosted-gitconfig"
 pin_policy="${ROOT}/.cargo/hosted-pin-refs.tsv"
 active_global="${GIT_CONFIG_GLOBAL}"
 credential_helper="/home/ubuntu/.config/jeryu/bin/git-credential-neverhuman-org"
-helper_binary_sha256_expected='c87ebbe3af617f34de169ec35e21e02afb3f9ee37f637bbcab075224c700ddb1'
+# Every reviewed build of the credential helper. Each host's copy names that host's own
+# forge login and token file, so one hash cannot fit every host that runs this gate;
+# add a host's hash here, in a reviewed change, after reading its helper.
+helper_binary_sha256_allowed=(
+  # the hosted gate runner's helper: its login, the legacy forge name only
+  'c87ebbe3af617f34de169ec35e21e02afb3f9ee37f637bbcab075224c700ddb1'
+  # an operator host's helper: its own login, the canonical and the legacy forge names
+  'b58154de088d352c0cf55e37edb5bb18c7625ed7c06e165c17f16b9c2166a668'
+)
 for path in "${overlay}" "${pin_policy}" "${ROOT}/Cargo.lock" "${ROOT}/deny.toml" \
   "${active_global}"; do
   if [[ ! -f "${path}" || -L "${path}" || "$(stat -c '%h' -- "${path}")" != 1 ]]; then
@@ -88,8 +96,8 @@ if [[ ! -f "${credential_helper}" || -L "${credential_helper}" ||
       ! -x "${credential_helper}" ||
       "$(stat -c '%u:%g:%a:%h' -- "${credential_helper}")" != \
         "$(id -u):$(id -g):700:1" ||
-      "$(sha256sum "${credential_helper}" | awk '{print $1}')" != \
-        "${helper_binary_sha256_expected}" ]]; then
+      " ${helper_binary_sha256_allowed[*]} " != \
+        *" $(sha256sum "${credential_helper}" | awk '{print $1}') "* ]]; then
   printf 'hosted credential helper must match the reviewed owner/mode/hash: %s\n' \
     "${credential_helper}" >&2
   exit 1
