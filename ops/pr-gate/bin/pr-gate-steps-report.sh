@@ -3,7 +3,9 @@
 # repo, across the attempts this host ran: the numbers for deciding whether a long, low-value step
 # should leave the required gate. Reads every attempt's steps.tsv (pr-gate-progress.sh): green
 # attempts only unless --all, from the last N days (default 14). Steps sort slowest first by
-# median; "share" is the step's part of the median total.
+# median; "share" is the step's part of the median total. Steps group by their key
+# (GATE_STEP_KEY_AWK): a temp path, digest or number in the line does not split one step into a row
+# per run.
 #
 #   jeryu/jeryu-web · 12 attempts
 #   step                                   median      p90      max  share  runs
@@ -11,11 +13,13 @@
 set -euo pipefail
 case "${1:-}" in -h|--help) awk 'NR > 1 && !/^#/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;; esac
 HOME_DIR="${GATE_RUNNER_HOME:-$HOME/gate-runner}"
-all=0 days=14
+# shellcheck source=ops/pr-gate/bin/pr-gate-progress.sh
+source "$(dirname -- "${BASH_SOURCE[0]}")/pr-gate-progress.sh"
+every=0 days=14
 repos=()
 while (($#)); do
   case "$1" in
-    --all) all=1 ;;
+    --all) every=1 ;;
     --days) days="${2:?--days needs a number}"; shift ;;
     -*) printf 'unknown option %s\n' "$1" >&2; exit 2 ;;
     *) repos+=("$1") ;;
@@ -31,7 +35,7 @@ while IFS= read -r steps; do
   [[ -s "$dir/receipt.json" && -s "$dir/steps.end" ]] || continue
   slug=$(jq -r '"\(.owner)/\(.repo)"' "$dir/receipt.json")
   outcome=$(jq -r '.outcome // ""' "$dir/receipt.json")
-  ((all)) || [[ "$outcome" == success ]] || continue
+  ((every)) || [[ "$outcome" == success ]] || continue
   if ((${#repos[@]})); then
     wanted=0
     for r in "${repos[@]}"; do [[ "$r" == "$slug" ]] && wanted=1; done
@@ -46,7 +50,8 @@ done < <(find "$HOME_DIR/attempts" -name steps.tsv -mtime "-$days" 2>/dev/null)
 
 [[ -s "$rows" ]] || { printf 'no attempt with step timings in the last %s days under %s/attempts\n' "$days" "$HOME_DIR"; exit 0; }
 
-sort -t$'\t' -k1,1 -k2,2 -k3,3n "$rows" | awk -F'\t' '
+LC_ALL=C awk -F'\t' -v OFS='\t' "$GATE_STEP_KEY_AWK"' { $2 = step_key($2); print }' "$rows" |
+  sort -t$'\t' -k1,1 -k2,2 -k3,3n | awk -F'\t' '
   function fmt(s) { return s >= 3600 ? sprintf("%dh%02dm", s / 3600, (s % 3600) / 60) : s >= 60 ? sprintf("%dm%02ds", s / 60, s % 60) : sprintf("%ds", s) }
   function flush() {
     if (n == 0) return

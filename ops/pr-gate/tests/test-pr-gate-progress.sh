@@ -196,3 +196,20 @@ same "$(awk 'NR > 2 && NF { print $1 }' <<<"$out" | head -3 | tr '\n' ' ')" "e2e
 must 'the slow step shows its median, p90, max, share and runs' grep -qE '^e2e +3m10s +3m26s +3m26s +76% +2$' <<<"$out"
 must '--all counts the red attempt too' grep -q '^acme/web · 3 attempts$' <<<"$(GATE_RUNNER_HOME="$fx/runner" bash "$report" --all)"
 printf 'PASS the report ranks each repo steps by median time, with p90, max, share and runs\n'
+
+same "$(printf '%s\n' 'test temp directories on /dev/shm/jeryu-pr-ci.MIIRKT' 'jankurai score=88 caps=[]' \
+  'receipt=/x/0123456789abcdef0123.json bin=/tmp/t.1fd5to/bin/j' 'jankurai audit (>= 85)' 'cargo fmt --all --check' | gate_step_keys)" \
+  'test temp directories on <tmp>
+jankurai score=<n> caps=[]
+receipt=/x/<hex>.json bin=<tmp>
+jankurai audit (>= 85)
+cargo fmt --all --check' 'a step key replaces temp paths, digests and numbers after = with placeholders; nothing else'
+printf '100\tsetup\n110\ttemp on /dev/shm/x.AAAA\n' >"$fx/vol.tsv"
+printf 'setup\t10\ntemp on /dev/shm/x.BBBB\t90\nlint\t20\n' >"$fx/vol-planned.tsv"
+same "$(gate_progress_summary "$fx/vol.tsv" "$fx/vol-planned.tsv" "$fx/vocab" running 130 | grep -c '^○')" 1 \
+  'a step with a different temp path is the same step: only the step not yet seen is still to come'
+mk 4 success '0\tlint\n10\ttemp on /dev/shm/x.AAAA\n200\tbuild\n' 260
+mk 5 success '0\tlint\n14\ttemp on /dev/shm/x.BBBB\n220\tbuild\n' 270
+out=$(GATE_RUNNER_HOME="$fx/runner" bash "$report")
+must 'one row for a step whose temp path differs per run' grep -qE '^temp on <tmp> +3m10s +3m26s +3m26s +[0-9]+% +2$' <<<"$out"
+printf 'PASS steps compare and group by key: a per-run temp path or digest is one step, not one per run\n'

@@ -36,6 +36,24 @@ GATE_STEP_NAME_MAX=80
 GATE_PROGRESS_MIN_GAP=${GATE_PROGRESS_MIN_GAP:-15}
 GATE_PROGRESS_MAX_GAP=${GATE_PROGRESS_MAX_GAP:-120}
 
+# A step line can carry run-specific text: a mktemp directory ("test temp directories on
+# /dev/shm/jeryu-pr-ci.MIIRKT"), a digest, a result ("jankurai score=88"). Compared as written, the
+# same step is a new one every attempt: it never matches its "usually" entry, and the report gives
+# each run its own row. A step's key replaces that text with a placeholder; it is what steps are
+# compared and grouped by. steps.tsv and the published names keep the text as written. Repetitions
+# are spelled out because not every awk supports {n,}.
+GATE_STEP_KEY_AWK='
+function step_key(s,    hex) {
+  hex = "[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]+"
+  gsub(/(\/dev\/shm|\/var\/tmp|\/tmp)\/[^ ]*/, "<tmp>", s)
+  gsub(hex, "<hex>", s)
+  gsub(/=[0-9]+(\.[0-9]+)?/, "=<n>", s)
+  return s
+}'
+
+# gate_step_keys — each step name on stdin, one per line, as its key (GATE_STEP_KEY_AWK).
+gate_step_keys() { LC_ALL=C awk "$GATE_STEP_KEY_AWK"' { print step_key($0) }'; }
+
 # gate_step_markers LOG — the step lines of a recipe log, in order, one per line:
 #   [pr-ci] <step>                       (jobs=N) prefixes dropped
 #   [ci] required|fast lane: <step>
@@ -136,13 +154,16 @@ gate_step_public() {
 # are listed (the latest, while running).
 gate_progress_summary() {
   local steps=$1 planned=$2 vocab=$3 state=$4 end=$5 cause=${6:-} i n first started took mark tail total=0 usual=0 room left
-  local -a at=() name=() plan_name=() plan_secs=()
+  local -a at=() name=() plan_name=() plan_secs=() plan_key=()
   local -A seen_name=()
   [[ "$end" =~ ^[0-9]+$ ]] || end=0
   if [[ -f "$steps" ]]; then
     while IFS=$'\t' read -r t s; do
-      [[ -n "$s" && "$t" =~ ^[0-9]+$ ]] && { at+=("$t"); name+=("$s"); seen_name[$s]=1; }
+      [[ -n "$s" && "$t" =~ ^[0-9]+$ ]] && { at+=("$t"); name+=("$s"); }
     done <"$steps"
+  fi
+  if ((${#name[@]})); then
+    while IFS= read -r s; do seen_name[$s]=1; done < <(printf '%s\n' "${name[@]}" | gate_step_keys)
   fi
   if [[ -f "$planned" ]]; then
     while IFS=$'\t' read -r s t; do
@@ -150,6 +171,7 @@ gate_progress_summary() {
       [[ -n "$s" ]] && { plan_name+=("$s"); plan_secs+=("$t"); usual=$((usual + 10#$t)); }
     done <"$planned"
   fi
+  if ((${#plan_name[@]})); then mapfile -t plan_key < <(printf '%s\n' "${plan_name[@]}" | gate_step_keys); fi
   n=${#name[@]}
   first=0
   ((n <= GATE_STEPS_SHOWN)) || { first=$((n - GATE_STEPS_SHOWN)); printf '… %d earlier steps\n' "$first"; }
@@ -165,7 +187,7 @@ gate_progress_summary() {
   if [[ "$state" == running ]]; then
     room=$((GATE_STEPS_SHOWN - (n - first))) left=0
     for ((i = 0; i < ${#plan_name[@]}; i++)); do
-      [[ -n "${seen_name[${plan_name[$i]}]:-}" ]] && continue
+      [[ -n "${seen_name[${plan_key[$i]}]:-}" ]] && continue
       if ((room <= 0)); then left=$((left + 1)); continue; fi
       printf '○ %s · usually %s\n' "$(gate_step_public "$vocab" $((i + 1)) "${plan_name[$i]}")" "$(gate_fmt_secs "${plan_secs[$i]}")"
       room=$((room - 1))

@@ -42,11 +42,11 @@ bash "$JERYU_TOOL_RENDER" --check --repo "$consumer_repo" \
 --repo-root "$consumer_repo=$repo_root"
 fi
 
-echo "[pr-ci] offline review-controller regression suite" >&2
-bash ops/pr-redteam/test/required.sh
-
-echo "[pr-ci] offline PR gate runner regression suite" >&2
-bash ops/pr-gate/tests/required.sh
+# One pool, so the review-controller suites run beside the long PR gate runner suite instead of
+# after it. Each suite's own time is in the log as `[suite] <file> <time>`.
+echo "[pr-ci] offline regression suites (PR gate runner + review controller)" >&2
+mapfile -t offline_suites < <(bash ops/pr-gate/tests/required.sh --list; bash ops/pr-redteam/test/required.sh --list)
+bash ops/ci/run-suites.sh "${offline_suites[@]}"
 
 echo "[pr-ci] (jobs=$JOBS) standard lanes" >&2
 JERYU_SPLIT_FULL_CHECK=1 bash ops/ci/check.sh
