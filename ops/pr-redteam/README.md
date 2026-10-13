@@ -15,6 +15,48 @@ outside the gate's rollout are unaffected — their proof is reported, not
 required. `ops/ci/jankurai-gate.sh` is the same verdict, run locally before the
 pull request exists.
 
+## Opt-in held-review handoff
+
+Held-review filing is disabled by default (`REDTEAM_FIX_TODO=0`). A service owner
+must qualify the Todoq executable and explicitly select automation author logins
+with `REDTEAM_FIX_TODO_AUTHORS` before enabling it. Unknown authors remain with
+their author. Drafts, contributions, selected humans with recent activity,
+approvals and holds without high or critical findings create no work. A held head
+also gets the configured grace period, normally two hours, for an author push.
+
+An enabled pass attempts at most `REDTEAM_FIX_TODO_MAX_PER_PASS` new filings
+(default one, maximum nine). It uses the verified Todoq `add` contract with
+explicit family, repos, title and priority, plus `--no-triage`; findings do not
+enter an extra triage model call. The ask contains bounded high/critical findings
+as fenced JSON data and says they are untrusted evidence, never instructions.
+The canonical task link comes from the forge's PR read, with an additional
+live head check before dispatch intent is recorded. Unavailable metadata, a moved
+head or a link outside the configured forge defers filing without consuming it.
+It requires the worker to authenticate the still-open PR and original head before
+editing, cherry-picking or publishing, follow repository instructions, use its
+own worktree and keep any new PR as a draft.
+
+Before dispatch, an atomic, synced `fix-todos/<repo>/<PR>-<head>.json` ledger
+records intent. Confirmed output records the id there and in the review receipt.
+A failing command, timeout or unrecognised acknowledgement is an UNKNOWN outcome:
+it may already have created work, so no automatic retry is allowed. A surviving
+prepared record after a crash has the same rule. The ledger survives rereviews.
+The owner must reconcile the Todoq queue against the saved ask before any manual
+retry. The real CLI has no idempotency key; this source does not claim exactly-once
+external delivery.
+
+When the author pushes a new head, a confirmed old task is marked stale through
+Todoq's documented `block --note` command. An uncertain annotation is retained
+for owner reconciliation rather than repeated. Confirmed ids from older receipts
+are imported for this purpose. Blocking a task does not stop a running worker;
+the ask's original-head checks remain required. `--dry-run` writes no ledger and
+calls no Todoq command; disabling filing also disables all task annotations.
+
+This controller never auto-closes a held PR or replaces its changes-requested
+review with a neutral comment. Free-text replacement messages are not closure
+proof. A maintainer decides supersession using a complete salvage bundle and
+exact repository, original head and landed replacement evidence.
+
 ## Contributed pull requests
 
 The GitHub repositories are read-only mirrors of the forge. An outside contributor opens a pull
@@ -109,7 +151,9 @@ activation approval.
 ./pr-redteam poke --dry-run
 ```
 
-`heartbeat` sends one beat per reviewer slot: a review takes a numbered slot for
+`run` reviews, then lands what it approved, then performs the disabled-by-default
+held-review handoff when the service owner has enabled it. `heartbeat` sends one
+beat per reviewer slot: a review takes a numbered slot for
 as long as it runs, so `/runners` shows `REDTEAM_JOBS` rows (`<id>`, `<id>-2` …)
 instead of one row for the whole pass. `poke` runs every 30 seconds from
 `pr-redteam-poke.timer`. Unreviewed heads start `pr-redteam.service` early.

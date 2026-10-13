@@ -110,8 +110,8 @@ case "$method $url" in
     # measures its queue wait from when nothing woke it for this head.
     opened=2026-10-09T18:26:18Z
     [[ ! -f "$FAKE_FORGE/pr-opened" ]] || read -r opened <"$FAKE_FORGE/pr-opened"
-    jq -nc --arg sha "$head" --arg opened "$opened" \
-      '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/feature"},created_at:$opened,updated_at:$opened,
+    jq -nc --arg sha "$head" --arg opened "$opened" --arg base "$(cat "$FAKE_FORGE/pr-base-ref" 2>/dev/null || echo main)" \
+      '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/feature"},base:{ref:$base},created_at:$opened,updated_at:$opened,
         html_url:"https://forge.invalid/repos/jeryu/acme/fixture/pulls/1"}'
     printf '\n200';;
   'GET '*'/branches/main/protection')
@@ -1175,3 +1175,36 @@ expect_count "$((before_count + 2))"
 jq -r .inputs.tools "$fixture/runner/attempts/acme-fixture-$head/last-result.json" | grep -q '  pr-gate-backoff.sh$'
 script_dir=$original_script_dir
 printf 'PASS a backoff-only code change invalidates reuse and executes a new gate\n'
+
+# A patch already on main still needs the real required gate, especially when the PR
+# targets a different base. A failing recipe must never become a synthetic no-op green.
+"$real_git" -C "$fixture/source" switch -q main
+"$real_git" -C "$fixture/source" branch regression-release
+"$real_git" -C "$fixture/source" switch -qc regression-already-upstream
+printf 'fail\n' > "$fixture/source/mode"
+printf 'same patch\n' > "$fixture/source/patch-proof"
+"$real_git" -C "$fixture/source" add mode patch-proof
+"$real_git" -C "$fixture/source" commit -qm 'topic patch with a failing recipe'
+head=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+printf '%s\n' "$head" > "$fixture/head"
+"$real_git" -C "$fixture/source" switch -q main
+printf 'independent main change\n' > "$fixture/source/main-only"
+"$real_git" -C "$fixture/source" add main-only
+"$real_git" -C "$fixture/source" commit -qm 'main moved independently'
+"$real_git" -C "$fixture/source" cherry-pick "$head" >/dev/null
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main regression-release regression-already-upstream
+[[ "$("$real_git" -C "$fixture/source" cherry main "$head")" == "- $head" ]]
+[[ "$("$real_git" -C "$fixture/source" merge-tree --write-tree main "$head")" == "$("$real_git" -C "$fixture/source" rev-parse main^{tree})" ]]
+printf 'regression-release\n' > "$fixture/pr-base-ref"
+before_count=$(count)
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+jq -se 'last.state == "failure"' "$fixture/statuses.jsonl" >/dev/null
+jq -e '.terminal and .exit_code == 7' "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null
+regate 2026-10-13T18:00:00Z
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 2))"
+jq -se 'last.state == "failure"' "$fixture/statuses.jsonl" >/dev/null
+printf 'PASS an already-upstream patch targeting another base runs the failing recipe and honours a requested re-gate\n'

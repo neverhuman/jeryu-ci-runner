@@ -20,6 +20,12 @@
   with each PR's rereview. Poke keeps its restricted credential environment,
   retries failed starts and reports age from the completed review timestamp;
   installation stages the managed unit inactive and refuses active instances.
+- Held-review Todoq filing defaults off, selects automation authors explicitly and caps
+  new dispatch attempts per pass. Durable intent survives rereviews and uncertain CLI
+  acknowledgement; unknown outcomes require owner reconciliation. Bounded findings are
+  quoted data, workers must verify the original head, and old tasks receive stale notes.
+  Automatic supersession closure and required-green-without-execution are removed;
+  every PR head uses the real gate, including explicit re-gate requests.
 - Failed or dequeued redteam merge-queue entries can be retried once per failed base, at most
   three acknowledged retries per reviewed head. Dry runs and transient failures do not consume
   retry state; accepted dispatch and bookkeeping share one receipt write. A bounded paged queue
