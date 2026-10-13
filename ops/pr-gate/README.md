@@ -344,6 +344,13 @@ retention, the locked-crate prefetch's source allowlist, the installer and the d
 Every fixture uses invented names (`acme`, `gate-a`, `example.test`); none reads the host's own site
 file. The repository's `ops/ci/pr-ci.sh` runs it.
 
+The required gate discovers both the PR-gate and review-controller families with
+checked `required.sh --list` calls before dispatching any suite. A failed, empty,
+invalid or repeated list fails the gate. The shared pool uses
+`JERYU_CI_SUITE_JOBS` (default 2, range 1–4), separately from Cargo's worker count.
+Each suite is named when it starts, then its combined output is printed together
+when it finishes. The pool requires Bash 5.1 or newer.
+
 Executable input trees must be readable by the gate identity. `cannot bind executable input` or
 `cannot walk input tree` stops identity computation and names the affected tree/file. Operators
 restore tool-tree readability or relocate execute-only tools before retrying; the runner never

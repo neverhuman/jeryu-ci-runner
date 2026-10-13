@@ -16,6 +16,7 @@ pr_ci="${repo_root}/ops/ci/pr-ci.sh"
 check_sh="${repo_root}/ops/ci/check.sh"
 entry_scripts=(
   "${repo_root}/ops/ci/pr-ci.sh"
+  "${repo_root}/ops/ci/run-suites.sh"
   "${repo_root}/ops/ci/fast.sh"
   "${repo_root}/ops/ci/check.sh"
   "${repo_root}/ops/ci/score.sh"
@@ -126,6 +127,10 @@ grep -q 'required_lane_tests_collected "workspace test suite"' "${pr_ci}" &&
 
 # pr-ci.sh runs check.sh exactly once, so this suite runs once per gate, from
 # check.sh.
+grep -q '^bash ops/ci/run-suites.sh --list ops/pr-gate/tests/required.sh ops/pr-redteam/test/required.sh$' "${pr_ci}" &&
+  pass "both offline families enter checked discovery unconditionally" ||
+  flunk "both offline families enter checked discovery unconditionally"
+
 grep -q '^bash ops/ci/tests/required.sh$' "${check_sh}" &&
   grep -q '^JERYU_SPLIT_FULL_CHECK=1 bash ops/ci/check.sh$' "${pr_ci}" &&
   grep -q '^\./ops/ci/check.sh$' "${repo_root}/ops/ci/fast.sh" &&
