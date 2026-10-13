@@ -1,4 +1,5 @@
 use super::*;
+use jeryu_runner_protocol::wire::v2::WorkspaceSource;
 use std::fs;
 use std::os::unix::fs::symlink;
 
@@ -133,5 +134,61 @@ fn manifest_reads_reject_wrong_checkpoint_identity_and_growth_beyond_the_bound()
             .unwrap_err()
             .code(),
         "checkpoint_manifest_invalid"
+    );
+}
+
+/// Resume isolation: a checkpoint opens only into its own session's next
+/// generation. Another owner, repository or session, a generation that is
+/// not the next, another runtime, another workspace size or an expired
+/// checkpoint is refused before any key or image is read.
+#[test]
+fn a_checkpoint_resumes_only_into_its_own_sessions_next_generation() {
+    let mut saved = manifest();
+    saved.plaintext_bytes = 1024 * 1024 * 1024;
+    let mut next = saved.context.clone();
+    next.generation = 2;
+    let now = u128::from(saved.created_at_unix_millis) + 1;
+    let empty = WorkspaceSource::EmptyFixture;
+    super::restore::resume_fence(&saved, &next, 1, &empty, now).expect("its own successor resumes");
+    let refused = |next: &SessionContext, gib: u32, now: u128| {
+        super::restore::resume_fence(&saved, next, gib, &empty, now)
+            .unwrap_err()
+            .code()
+            .to_string()
+    };
+    for (what, change) in [
+        (
+            "another owner",
+            (|c: &mut SessionContext| c.owner_id = "user/mallory".into())
+                as fn(&mut SessionContext),
+        ),
+        ("another repository", |c| c.repository = "test/other".into()),
+        ("another session", |c| c.session_id = "other-session".into()),
+        ("the same generation", |c| c.generation = 1),
+        ("a skipped generation", |c| c.generation = 3),
+        ("another runtime", |c| {
+            c.runtime_digest = format!("sha256:{}", "b".repeat(64))
+        }),
+        ("another environment", |c| {
+            c.environment_digest = format!("sha256:{}", "b".repeat(64))
+        }),
+    ] {
+        let mut other = next.clone();
+        change(&mut other);
+        assert_eq!(
+            refused(&other, 1, now),
+            "checkpoint_resume_fenced",
+            "{what}"
+        );
+    }
+    assert_eq!(
+        refused(&next, 2, now),
+        "checkpoint_resume_fenced",
+        "another workspace size"
+    );
+    assert_eq!(
+        refused(&next, 1, u128::from(saved.expires_at_unix_millis)),
+        "checkpoint_resume_fenced",
+        "an expired checkpoint"
     );
 }
