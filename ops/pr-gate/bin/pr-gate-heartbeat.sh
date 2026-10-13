@@ -22,7 +22,8 @@
 # than infer from two timestamps on two pages. Reporting stays out of the runner for the
 # same reason as above. It reads receipts and logs and writes only its own markers under
 # cache/events-posted; attempt evidence is never touched. Events are admin-read on the forge, and the
-# log is the recipe's own output: the recipe runs under env -i and never sees the credential.
+# log is the recipe's own output. Internal operator-unsealed recipes run as the gate user and
+# receive its Git helper; only contributed sandbox recipes are credential-free.
 # The tail is cut at a line boundary, so it never starts mid-token, and the event names the whole
 # log with log_url when PR_GATE_LOG_URL_TEMPLATE says where this host's attempt logs are served.
 # Each event carries event_id pr-gate:<attempt id>, which the forge deduplicates, so a post whose

@@ -474,6 +474,32 @@ grep -qF 'tools/line\nbreak' "$scratch/escaped.txt"
 grep -qF 'tools/back\\slash' "$scratch/escaped.txt"
 printf 'PASS fixture names escape newline/backslash without identity-row injection\n'
 
+# Executable input trees fail closed on unreadable entries instead of sharing a constant identity.
+mkdir -p "$scratch/exec-only"
+printf '#!/bin/sh\nexit 0\n' >"$scratch/exec-only/helper"
+chmod 0111 "$scratch/exec-only/helper"
+if (( $(id -u) != 0 )); then
+  if hash_fixture_tree "$scratch/exec-only" path all >"$scratch/exec-only.txt" 2>"$scratch/exec-only.err"; then
+    printf 'an unreadable executable produced a reusable identity\n' >&2; exit 1
+  fi
+  grep -q 'cannot bind executable input' "$scratch/exec-only.err"
+  mkdir -p "$scratch/exec-only/hidden"
+  printf different >"$scratch/exec-only/hidden/secret-helper"
+  chmod 0111 "$scratch/exec-only/hidden"
+  if hash_fixture_tree "$scratch/exec-only" path all >/dev/null 2>"$scratch/exec-only.err"; then
+    printf 'an unreadable directory produced a reusable identity\n' >&2; exit 1
+  fi
+  grep -q 'cannot walk input tree' "$scratch/exec-only.err"
+  chmod 0755 "$scratch/exec-only/hidden"
+else
+  # Root can read mode-0111 files; an injected read failure exercises the same fail-closed branch.
+  sha256sum() { return 1; }
+  if hash_fixture_tree "$scratch/exec-only" path all >/dev/null 2>/dev/null; then exit 1; fi
+  unset -f sha256sum
+fi
+chmod 0644 "$scratch/exec-only/helper"
+printf 'PASS unreadable executable inputs fail closed\n'
+
 # The site configuration binds the settings that can change a verdict, not where a host keeps things.
 unset PR_GATE_CONTEXT_OVERRIDES PR_GATE_OK_TO_TEST_MAINTAINERS PR_GATE_CONTRIBUTED_LABEL
 site="$scratch/site"; mkdir -p "$site"

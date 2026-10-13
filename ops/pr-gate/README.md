@@ -243,7 +243,8 @@ name, never by the path a host installed it at:
 A host whose package set cannot be read binds a value unique to itself and so never shares a
 result. System directories use package versions plus names, sizes and link targets; this assumes
 operator-managed package files and does not detect same-size local tampering. Other bound trees use
-content hashes and escaped relative names. This operator-unsealed identity is not a sealed worker.
+content hashes and escaped relative names. Unreadable executable inputs fail closed; they never
+share a constant portable identity. This operator-unsealed identity is not a sealed worker.
 Sandboxed contributions additionally bind the sandbox executable, OS/kernel and machine identity:
 results remain host-specific until an independently bound guest-image contract exists.
 

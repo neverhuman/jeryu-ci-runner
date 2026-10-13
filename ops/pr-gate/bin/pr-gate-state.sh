@@ -172,10 +172,13 @@ gate_begin() {
 # Each line names the file relative to the tree, under the tree's label: where a host keeps the tree
 # is not an input, so the same tree hashes the same on every host.
 hash_fixture_tree() { # root [label] [all]
-  local root=${1%/} label=${2:-.} file digest name prefix
-  local -a filters=()
+  local root=${1%/} label=${2:-.} file digest name prefix walk_pid
+  local -a filters=() files=()
   [[ "${3:-}" == all ]] || filters=(-not -path '*/.build/*' -not -name '*.tmp')
-  while IFS= read -r -d '' file; do
+  mapfile -d '' -t files < <(set -o pipefail; find -L "$root" -ignore_readdir_race -type f "${filters[@]}" -print0 | LC_ALL=C sort -z)
+  walk_pid=$!
+  wait "$walk_pid" || { printf 'cannot walk input tree: %s\n' "$label" >&2; return 1; }
+  for file in "${files[@]}"; do
     name="$label/${file#"$root"/}" prefix=""
     if [[ "$name" == *$'\n'* || "$name" == *'\'* ]]; then
       name=${name//\\/\\\\}; name=${name//$'\n'/\\n}; prefix='\'
@@ -183,9 +186,14 @@ hash_fixture_tree() { # root [label] [all]
     if digest=$(sha256sum <"$file" 2>/dev/null); then
       printf '%s%s  %s\n' "$prefix" "${digest:0:64}" "$name"
     else
+      # Executable directories must be fully readable; absence/EACCES cannot prove equal bytes.
+      if [[ "${3:-}" == all ]]; then
+        printf 'cannot bind executable input: %s\n' "$name" >&2
+        return 1
+      fi
       printf '%svanished-during-hash  %s\n' "$prefix" "$name"
     fi
-  done < <(find -L "$root" -type f "${filters[@]}" -print0 | LC_ALL=C sort -z)
+  done
 }
 
 # One executable's line in the input identity: its content hash and the name the gate calls it by.
