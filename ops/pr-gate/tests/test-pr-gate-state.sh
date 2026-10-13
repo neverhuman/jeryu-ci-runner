@@ -651,7 +651,9 @@ gate_publish
 gate_decision "$scratch/host-a/inputs.json" 0 "$scratch/forge.json"
 [[ "$gate_action" == reuse && "$gate_action_source" == local ]] \
   || { printf 'an agreeing newer success superseded verified local evidence: %s/%s\n' "$gate_action" "$gate_action_source" >&2; exit 1; }
-forge_status success "pr-gate-runner@node-b operator-unsealed success; exit 0; attempt x; log y; inputs ${digest%?}0"
+wrong_digest="${digest%?}0"
+[[ "$wrong_digest" != "$digest" ]] || wrong_digest="${digest%?}1"
+forge_status success "pr-gate-runner@node-b operator-unsealed success; exit 0; attempt x; log y; inputs $wrong_digest"
 gate_decision "$scratch/host-a/inputs.json" 0 "$scratch/forge.json"
 [[ "$gate_action" == run ]] || { printf 'a newer success for other inputs did not supersede\n' >&2; exit 1; }
 exec 6>&-
