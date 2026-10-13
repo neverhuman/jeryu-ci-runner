@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 mod cleanup;
 mod records;
+mod uid_range;
+pub use uid_range::LEGACY_UID_BASE;
+pub(crate) use uid_range::UidRange;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,10 +62,15 @@ pub struct NodeJournal {
     root: PathBuf,
     _lock: Flock<File>,
     cleanup_locks: Mutex<BTreeMap<String, Weak<Mutex<()>>>>,
+    uid_range: UidRange,
 }
 
 impl NodeJournal {
     pub fn open(root: &Path) -> RunnerResult<Self> {
+        Self::open_with_uid_base(root, LEGACY_UID_BASE)
+    }
+
+    pub fn open_with_uid_base(root: &Path, uid_base: u32) -> RunnerResult<Self> {
         trusted_directory(root)?;
         let journals = root.join("records");
         if !journals.exists() {
@@ -83,15 +91,17 @@ impl NodeJournal {
         }
         let lock = Flock::lock(file, FlockArg::LockExclusiveNonblock)
             .map_err(|_| failed("node_already_running"))?;
+        let uid_range = UidRange::enroll(root, uid_base)?;
         Ok(Self {
             root: root.to_path_buf(),
             _lock: lock,
             cleanup_locks: Mutex::new(BTreeMap::new()),
+            uid_range,
         })
     }
 
     pub fn records(&self) -> RunnerResult<Vec<ResourceRecord>> {
-        records::load(&self.root)
+        records::load(&self.root, self.uid_range)
     }
 
     /// Unknown resource ownership must never permit UID/capacity reuse.
@@ -109,6 +119,9 @@ impl NodeJournal {
 
     pub fn write(&self, record: &ResourceRecord) -> RunnerResult<()> {
         valid_id(&record.resource_id)?;
+        if !self.uid_range.contains(record.uid) {
+            return Err(failed("node_journal_invalid"));
+        }
         let directory = self.root.join("records");
         let temporary = directory.join(format!("{}.new", record.resource_id));
         // A prior crash's incomplete replacement is discarded, without following it.
@@ -144,6 +157,9 @@ impl NodeJournal {
 
     pub fn cleanup(&self, record: &ResourceRecord) -> RunnerResult<Option<CheckpointReference>> {
         valid_id(&record.resource_id)?;
+        if !self.uid_range.contains(record.uid) {
+            return Err(failed("node_journal_invalid"));
+        }
         // Only this resource is held while waiting for its cgroup to empty.
         // Another session can reserve/admit capacity without waiting five seconds.
         let resource_lock = self.resource_lock(&record.resource_id)?;

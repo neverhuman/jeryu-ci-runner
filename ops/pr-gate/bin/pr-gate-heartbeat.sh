@@ -16,7 +16,10 @@
 # It also tells the forge's pipeline event log (POST /api/v1/events, kind gate.log) how each finished
 # attempt ended, with the tail of its build.log, so a red gate can be read on the pull request page
 # instead of over SSH. The status the runner posts says only red or green; timed_out, inputs_changed
-# and recovery_required were visible nowhere but this host. Reporting stays out of the runner for the
+# and recovery_required were visible nowhere but this host. The event also carries the queue wait the
+# runner recorded on the attempt (detail.queue_wait: from the moment the head became gateable to the
+# moment its gate started), which is what makes gate latency something a reader can measure rather
+# than infer from two timestamps on two pages. Reporting stays out of the runner for the
 # same reason as above. It reads receipts and logs and writes only its own markers under
 # cache/events-posted; attempt evidence is never touched. Events are admin-read on the forge, and the
 # log is the recipe's own output: the recipe runs under env -i and never sees the credential.
@@ -138,27 +141,51 @@ runner_code="" runner_tools=""
 declare -F gate_runner_code >/dev/null && runner_code=$(gate_runner_code "$HOME_DIR")
 declare -F gate_runner_tools >/dev/null && runner_tools=$(gate_runner_tools "$HOME_DIR")
 
+# The shape the forge last accepted is remembered for 30 minutes (cache/heartbeat-level: 0 full, 1 no
+# tools, 2 no code, 3 the oldest contract), so an older forge costs one request a slot, not four. After
+# that the newest shape is tried again, so an upgraded forge is noticed.
+LEVEL_FILE="$HOME_DIR/cache/heartbeat-level"
+level=0 minimal=0
+if [[ -n "$(find "$LEVEL_FILE" -mmin -30 2>/dev/null)" ]]; then level="$(cat "$LEVEL_FILE" 2>/dev/null || echo 0)"; fi
+[[ "$level" =~ ^[0-3]$ ]] || level=0
+((level < 1)) || runner_tools=""
+((level < 2)) || runner_code=""
+((level < 3)) || minimal=1
+level_seen=$level
+
 for slot in $SLOTS; do
   body=$(jq -nc --arg id "$HOST/slot$slot" --arg host "$HOST" --argjson slot "$slot" \
     --argjson current "$(current "$slot")" --argjson last "$(last "$slot")" \
     '{runnerId:$id, host:$host, slot:$slot, labels:["pr-gate"], current:$current, last:$last}')
-  if [[ -n "$runner_code$runner_tools" ]]; then
+  if ((minimal)); then
+    post_heartbeat "$(gate_heartbeat_minimal "$body")"
+  elif [[ -n "$runner_code$runner_tools" ]]; then
     post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "$runner_tools")"
   else
     post_heartbeat "$body"
   fi
   if [[ "$code" == 422 && -n "$runner_tools" ]]; then
     printf 'heartbeat tools refused (422); retrying without them\n' >&2
-    runner_tools=""
+    runner_tools="" level=1
     post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "")"
   fi
   if [[ "$code" == 422 && -n "$runner_code" ]]; then
     printf 'heartbeat code refused (422); retrying without it\n' >&2
-    runner_code=""
+    runner_code="" level=2
     post_heartbeat "$body"
+  fi
+  # Still refused: the forge predates the shape itself. Fall back to the oldest contract it accepted.
+  if [[ "$code" == 422 ]] && ((!minimal)); then
+    printf 'heartbeat shape refused (422); retrying with the oldest contract\n' >&2
+    minimal=1 level=3
+    post_heartbeat "$(gate_heartbeat_minimal "$body")"
   fi
   [[ "$code" == 200 ]] || printf 'slot %s: heartbeat answered %s: %s\n' "$slot" "$code" "${out%$'\n'*}" >&2
 done
+if ((level != level_seen)); then
+  mkdir -p "$HOME_DIR/cache"
+  printf '%s\n' "$level" >"$LEVEL_FILE"
+fi
 
 # ---- finished attempts -> pipeline events -------------------------------------------------------
 [[ "${GATE_RUNNER_EVENTS:-1}" != 0 ]] || exit 0
@@ -229,12 +256,14 @@ while IFS= read -r receipt; do
        repo: $repo, pr: $pr, sha: .sha, outcome: $outcome, seconds: $seconds,
        needs_human: (.recovery_required != null),
        summary: ($repo + (if $pr == null then "" else "#" + ($pr | tostring) end) + " " + (.inputs.required_context // "gate")
-                 + " " + $outcome + " in " + ($seconds | tostring) + "s on " + $host + "/slot" + (.slot // "0")),
+                 + " " + $outcome + " in " + ($seconds | tostring) + "s on " + $host + "/slot" + (.slot // "0")
+                 + (if (.queue_wait.seconds // null) == null then ""
+                    else " after " + (.queue_wait.seconds | tostring) + "s in the queue" end)),
        reason: (if .recovery_required == null then null else (.recovery_required | tostring | .[0:1000]) end),
        log_tail: (if $tail == "" then null else $tail end),
        log_url: (if $log_url == "" then null else $log_url end),
        detail: {attempt: .id, sequence, exit_code, execution_kind, recipe: .inputs.recipe, log_sha256, log_bytes: $log_bytes,
-                cache: (.cache // null), runner: ($host + "/slot" + (.slot // "0"))}}
+                cache: (.cache // null), queue_wait: (.queue_wait // null), runner: ($host + "/slot" + (.slot // "0"))}}
     | .summary |= .[0:300]' "$receipt" 2>/dev/null) || event=""
   rm -f -- "$tail_file"
   [[ -n "$event" ]] || { printf 'attempt %s: receipt could not be projected to an event\n' "$id" >&2; continue; }

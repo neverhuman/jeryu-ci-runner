@@ -18,17 +18,13 @@ impl MicroVmSession {
             nix::sys::stat::makedev(1, 3),
         )
         .map_err(|_| failed("microvm_resource_custody_failed"))?;
+        let directory = crate::custody::Directory::open(&root)?;
         for (source, target) in [(runtime.kernel(), "kernel"), (runtime.rootfs(), "rootfs")] {
-            std::fs::copy(source, root.join(target))?;
-            std::fs::set_permissions(root.join(target), std::fs::Permissions::from_mode(0o444))?;
+            source.copy_into(&directory, std::path::Path::new(target))?;
         }
         let source_bundle = runtime.workspace_bundle(&self.lease.workspace)?;
         if let Some(source) = &source_bundle {
-            std::fs::copy(source, root.join("source-bundle"))?;
-            std::fs::set_permissions(
-                root.join("source-bundle"),
-                std::fs::Permissions::from_mode(0o444),
-            )?;
+            source.copy_into(&directory, std::path::Path::new("source-bundle"))?;
         }
         let mut workspace = OpenOptions::new()
             .read(true)
@@ -57,7 +53,7 @@ impl MicroVmSession {
             "--id".into(),
             self.record.resource_id.clone(),
             "--exec-file".into(),
-            runtime.firecracker().display().to_string(),
+            "/tmp/jeryu-runtime-exec/firecracker".into(),
             "--uid".into(),
             self.record.uid.to_string(),
             "--gid".into(),
@@ -96,7 +92,7 @@ impl MicroVmSession {
             &self.lease,
             self.node.config.control_plane_lease_key,
             &root,
-            runtime.jailer(),
+            [runtime.jailer().file(), runtime.firecracker().file()],
             args,
             self.launch_fence
                 .take()

@@ -79,6 +79,15 @@ fn run() -> std::io::Result<()> {
         )?;
         return Err(std::io::Error::other("guest_image_class_mismatch"));
     }
+    if let Err(error) = jeryu_sandbox_linux::guest_network::initialize_loopback() {
+        write_frame(
+            &mut transport,
+            &GuestEvent::Error {
+                code: error.to_string(),
+            },
+        )?;
+        return Err(error);
+    }
     let workspace = match workspace::prepare(&lease) {
         Ok(ready) => ready,
         Err(error) => {

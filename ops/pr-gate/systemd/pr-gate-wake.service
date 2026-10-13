@@ -1,6 +1,6 @@
 # Start idle gate slots when a gated head appears or moves; see bin/pr-gate-wake.sh. Long-polls the
-# forge's gate-wanted signal, or reads the open-PR lists, the merge queue and the pending re-gates
-# when the forge has no signal. Never takes a gate lock or posts a status.
+# forge's gate-wanted signal and does nothing when the forge has none (heads are read only when the
+# operator opts in). Never takes a gate lock or posts a status.
 [Unit]
 Description=Wake idle PR gate runner slots on new or moved heads
 

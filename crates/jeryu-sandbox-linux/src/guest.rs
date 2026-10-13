@@ -120,34 +120,6 @@ pub fn spawn_workspace_git(args: &[&str], workspace: &Path) -> std::io::Result<C
     command.spawn()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn guest_launchers_refuse_accidental_host_execution() {
-        assert_ne!(std::process::id(), 1);
-        let error = spawn_workspace_git(&["status"], Path::new("/"))
-            .expect_err("the host must not execute guest Git");
-        assert_eq!(error.to_string(), "guest_pid1_required");
-        let (_master, slave) = crate::open_pty().unwrap();
-        let membership = File::open("/dev/null").unwrap();
-        let error = spawn_unprivileged_pty(
-            "/bin/true",
-            &[],
-            &BTreeMap::new(),
-            Path::new("/"),
-            &GuestPty {
-                slave: &slave,
-                cgroup_procs: &membership,
-                pids_max: 128,
-            },
-        )
-        .expect_err("the host must not execute a guest profile");
-        assert_eq!(error.to_string(), "guest_pid1_required");
-    }
-}
-
 pub struct GuestPty<'a> {
     pub slave: &'a OwnedFd,
     pub cgroup_procs: &'a File,
@@ -217,4 +189,32 @@ pub fn spawn_unprivileged_pty(
         });
     }
     command.spawn()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guest_launchers_refuse_accidental_host_execution() {
+        assert_ne!(std::process::id(), 1);
+        let error = spawn_workspace_git(&["status"], Path::new("/"))
+            .expect_err("the host must not execute guest Git");
+        assert_eq!(error.to_string(), "guest_pid1_required");
+        let (_master, slave) = crate::open_pty().unwrap();
+        let membership = File::open("/dev/null").unwrap();
+        let error = spawn_unprivileged_pty(
+            "/bin/true",
+            &[],
+            &BTreeMap::new(),
+            Path::new("/"),
+            &GuestPty {
+                slave: &slave,
+                cgroup_procs: &membership,
+                pids_max: 128,
+            },
+        )
+        .expect_err("the host must not execute a guest profile");
+        assert_eq!(error.to_string(), "guest_pid1_required");
+    }
 }

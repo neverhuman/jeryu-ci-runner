@@ -86,13 +86,19 @@ pub fn initialize(restored: bool) -> std::io::Result<()> {
     .map_err(|_| std::io::Error::other("guest_pty_mount_failed"))?;
     symlink("pts/ptmx", "/dev/ptmx")
         .map_err(|_| std::io::Error::other("guest_pty_device_failed"))?;
-    for directory in ["/run", "/tmp"] {
+    // Credential homes remain in the separately bounded /run tmpfs. Build and
+    // Git fixtures need more scratch space; this limit allocates pages on use
+    // and stays inside the VM's signed memory commitment.
+    for (directory, options) in [
+        ("/run", "size=64m,mode=1777"),
+        ("/tmp", "size=512m,mode=1777"),
+    ] {
         mount(
             Some("tmpfs"),
             directory,
             Some("tmpfs"),
             MsFlags::MS_NOSUID | MsFlags::MS_NODEV,
-            Some("size=64m,mode=1777"),
+            Some(options),
         )
         .map_err(|_| std::io::Error::other("guest_tmpfs_mount_failed"))?;
     }

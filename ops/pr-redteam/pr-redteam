@@ -904,7 +904,16 @@ beat_done() { # owner/name number sha conclusion started-epoch
 # not accept gets a log line: a JSON refusal, but also an HTML answer (a forge that predates the
 # route, or a proxy error page) and a curl failure.
 heartbeat() {
-  local current last f i id key
+  local current last f i id key poke_last labels payload poke_at
+  poke_last=null; labels='["redteam"]'
+  local poke_result; poke_result="$(systemctl --user show pr-redteam-poke.service -p Result --value 2>/dev/null || true)"
+  if [ -n "$poke_result" ] && [ "$poke_result" != success ]; then
+    poke_at="$(systemctl --user show pr-redteam-poke.service -p ExecMainExitTimestamp --value 2>/dev/null || true)"
+    poke_at="$(date -u -d "$poke_at" +%FT%TZ 2>/dev/null || true)"
+    poke_last="$(jq -nc --arg result "$poke_result" --arg at "$poke_at" \
+      '{recipe:"redteam-poke", conclusion:"failure", result:$result,
+        finished_at: (if $at == "" then null else $at end)}')"
+  fi
   # A review killed mid-flight leaves its current file behind; forget one after two hours rather
   # than reporting a task that is never going to finish.
   find "$beats/current" -name '*.json' -mmin +120 -delete 2>/dev/null || true
@@ -918,9 +927,15 @@ heartbeat() {
     if [ "$i" -eq 0 ] && [ ! -s "$f" ]; then f="$beats/last.json"; fi
     if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then last="$(cat "$f")"; fi
     id="$runner_id"; if [ "$i" -gt 0 ]; then id="$runner_id-$((i + 1))"; fi
-    api POST "/api/v1/runners/heartbeat" "$(jq -nc --arg id "$id" --arg host "$runner_host" \
+    payload="$(jq -nc --arg id "$id" --arg host "$runner_host" \
       --argjson slot "$i" --argjson current "$current" --argjson last "$last" \
-      '{runnerId: $id, host: $host, slot: $slot, labels: ["redteam"], current: $current, last: $last}')"
+      --argjson labels "$labels" --argjson poke "$poke_last" \
+      '{runnerId: $id, host: $host, slot: $slot, labels: $labels, current: $current,
+        last: $last} + (if $slot == 0 and $poke != null then {poke:$poke} else {} end)')"
+    api POST "/api/v1/runners/heartbeat" "$payload"
+    if [ "$code" = 422 ] && [ "$poke_last" != null ]; then
+      api POST "/api/v1/runners/heartbeat" "$(jq -c 'del(.poke)' <<<"$payload")"
+    fi
     if [ "$code" = 000 ]; then
       say "heartbeat refused for $id (no answer): $body"
     elif ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1; then

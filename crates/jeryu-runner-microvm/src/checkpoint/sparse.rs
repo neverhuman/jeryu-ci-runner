@@ -135,6 +135,46 @@ pub(super) fn decrypt(
     expected_plain: &str,
     expected_cipher: &str,
 ) -> std::io::Result<()> {
+    decode(
+        source,
+        Some(target),
+        raw_key,
+        bytes,
+        binding,
+        expected_plain,
+        expected_cipher,
+    )
+}
+
+/// Authenticate the same bounded format without materializing any plaintext.
+pub(super) fn verify(
+    source: &mut impl Read,
+    raw_key: &[u8; 32],
+    bytes: u64,
+    binding: &[u8],
+    expected_plain: &str,
+    expected_cipher: &str,
+) -> std::io::Result<()> {
+    decode(
+        source,
+        None,
+        raw_key,
+        bytes,
+        binding,
+        expected_plain,
+        expected_cipher,
+    )
+}
+
+fn decode(
+    source: &mut impl Read,
+    mut target: Option<&mut File>,
+    raw_key: &[u8; 32],
+    bytes: u64,
+    binding: &[u8],
+    expected_plain: &str,
+    expected_cipher: &str,
+) -> std::io::Result<()> {
     maximum_size(bytes)?;
     let mut header = [0; 24];
     source.read_exact(&mut header)?;
@@ -146,9 +186,11 @@ pub(super) fn decrypt(
     let mut plain_hash = plaintext_hash(bytes);
     let mut cipher_hash = Sha256::new();
     cipher_hash.update(header);
-    // The caller owns this new exact successor disk; clear all prior contents.
-    target.set_len(0)?;
-    target.set_len(bytes)?;
+    if let Some(target) = &mut target {
+        // The caller owns this new exact successor disk; clear prior contents.
+        target.set_len(0)?;
+        target.set_len(bytes)?;
+    }
     let mut sequence = 0_u32;
     let mut previous_end = 0;
     loop {
@@ -195,8 +237,10 @@ pub(super) fn decrypt(
         }
         plain_hash.update(&meta[..12]);
         plain_hash.update(&plain);
-        target.seek(SeekFrom::Start(offset))?;
-        target.write_all(plain)?;
+        if let Some(target) = &mut target {
+            target.seek(SeekFrom::Start(offset))?;
+            target.write_all(plain)?;
+        }
         previous_end = offset + length as u64;
         sequence = sequence.checked_add(1).ok_or_else(failed)?;
     }

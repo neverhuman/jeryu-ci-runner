@@ -13,6 +13,9 @@ cat > /dev/null
 printf '%s\n' "$@" >> "$HEARTBEAT_SENT"
 case "$HEARTBEAT_FIXTURE" in
   accepted) printf '{"accepted":true,"runnerId":"fixture/redteam"}\n200' ;;
+  old-schema)
+    if [[ "$*" == *'"poke":'* ]]; then printf '{"message":"unknown poke field"}\n422'
+    else printf '{"accepted":true}\n200'; fi ;;
   json-403) printf '{"code":"permission_denied","message":"this account may not report runner heartbeats (JERYU_RUNNER_REPORTERS)"}\n403' ;;
   html-403) printf '<html>\n<body>403 Forbidden</body>\n</html>\n403' ;;
   empty-502) printf '\n502' ;;
@@ -20,6 +23,15 @@ case "$HEARTBEAT_FIXTURE" in
 esac
 FIXTURE
 chmod +x "$t/bin/curl"
+cat > "$t/bin/systemctl" <<'FIXTURE'
+#!/usr/bin/env bash
+case "$*" in
+  '--user show pr-redteam-poke.service -p Result --value') printf '%s\n' "${POKE_RESULT:-success}" ;;
+  '--user show pr-redteam-poke.service -p ExecMainExitTimestamp --value') printf '%s\n' '2026-10-09 08:00:00 UTC' ;;
+  *) exit 2 ;;
+esac
+FIXTURE
+chmod +x "$t/bin/systemctl"
 printf 'fixture-bearer\n' > "$t/token"
 beat() { # fixture jobs
   : > "$t/sent"
@@ -57,4 +69,20 @@ ids="$(grep -o '"runnerId":"[^"]*"' "$t/sent" | tr '\n' ' ')"
 grep -q '"runnerId":"fixture/redteam-2","host":"[^"]*","slot":1,"labels":\["redteam"\],"current":{' "$t/sent" \
   || { echo "slot 1 is not the row reporting the review: $(cat "$t/sent")" >&2; exit 1; }
 echo 'ok slots'
+printf '{"recipe":"redteam-review","conclusion":"success","finished_at":"2026-10-09T07:00:00Z"}\n' \
+  >"$t/state/beats/last-0.json"
+: >"$t/sent"
+POKE_RESULT=exit-code HEARTBEAT_FIXTURE=accepted HEARTBEAT_SENT="$t/sent" PATH="$t/bin:$PATH" \
+  JERYU_BASE=https://forge.invalid JERYU_TOKEN_FILE="$t/token" REDTEAM_STATE="$t/state" \
+  REDTEAM_RUNNER_ID=fixture/redteam REDTEAM_JOBS=1 "$here/pr-redteam" heartbeat >"$t/out" 2>&1
+grep -q '"labels":\["redteam"\]' "$t/sent"
+grep -q '"recipe":"redteam-poke","conclusion":"failure","result":"exit-code"' "$t/sent"
+grep -q '"last":{"recipe":"redteam-review","conclusion":"success"' "$t/sent"
+grep -q '"finished_at":"2026-10-09T08:00:00Z"' "$t/sent"
+POKE_RESULT=exit-code beat accepted 1
+grep -q '"last":{"recipe":"redteam-review","conclusion":"success"' "$t/sent"
+POKE_RESULT=exit-code beat old-schema 1
+[[ ! -s "$t/out" ]] || { cat "$t/out" >&2; exit 1; }
+[[ "$(grep -c '"runnerId":"fixture/redteam"' "$t/sent")" == 2 ]]
+echo 'ok poke failure reported'
 echo 'HEARTBEAT LOG PASS'

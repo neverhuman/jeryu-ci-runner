@@ -464,7 +464,18 @@ run="$inputs_probe/tree" repo=real recipe_name="just required" TOOLS="$scratch/h
   || { printf 'a changed governed tool kept the same identity\n' >&2; exit 1; }
 printf 'PASS portable inputs: no host or path in the identity, content still bound\n'
 
+# Escaped tree names cannot add synthetic identity rows.
+mkdir -p "$scratch/escaped"
+printf x >"$scratch/escaped/"$'line\nbreak'
+printf y >"$scratch/escaped/back\\slash"
+hash_fixture_tree "$scratch/escaped" tools >"$scratch/escaped.txt"
+[[ "$(wc -l <"$scratch/escaped.txt")" == 2 ]]
+grep -qF 'tools/line\nbreak' "$scratch/escaped.txt"
+grep -qF 'tools/back\\slash' "$scratch/escaped.txt"
+printf 'PASS fixture names escape newline/backslash without identity-row injection\n'
+
 # The site configuration binds the settings that can change a verdict, not where a host keeps things.
+unset PR_GATE_CONTEXT_OVERRIDES PR_GATE_OK_TO_TEST_MAINTAINERS PR_GATE_CONTRIBUTED_LABEL
 site="$scratch/site"; mkdir -p "$site"
 cat >"$site/a.env" <<'ENV'
 # host a
@@ -511,7 +522,12 @@ printf 'PR_GATE_LOCK_SOURCES=y\nPR_GATE_LOCK_SOURCES=x\n' >"$site/yx.env"
 # shellcheck disable=SC2088  # a literal "~/" value, as a site file may carry it
 [[ "$(PR_GATE_SANDBOX_COMMAND="$HOME/bin/vm" gate_site_config_digest "$site/a.env")" \
    == "$(PR_GATE_SANDBOX_COMMAND="~/bin/vm" gate_site_config_digest "$site/a.env")" ]]
-[[ -z "$(gate_site_config_digest "$site/missing.env")" ]]
+missing=$(gate_site_config_digest "$site/missing.env")
+[[ "$missing" =~ ^[0-9a-f]{64}$ ]]
+[[ "$(PR_GATE_SANDBOX_COMMAND=/vm/a gate_site_config_digest "$site/missing.env")" \
+   != "$(PR_GATE_SANDBOX_COMMAND=/vm/b gate_site_config_digest "$site/missing.env")" ]]
+[[ "$(PR_GATE_OK_TO_TEST_MAINTAINERS=dana gate_site_config_digest "$site/missing.env")" \
+   != "$(PR_GATE_OK_TO_TEST_MAINTAINERS=mallory gate_site_config_digest "$site/missing.env")" ]]
 printf 'PASS site digest: the effective settings that can change a verdict, not host-local ones, comments or order\n'
 
 # The published required status names the inputs' digest, so another host can match it.
@@ -536,6 +552,7 @@ forge_status() { # state description [creator]
     description:$d,created_at:"2026-10-12T00:00:00Z"} + (if $c == "" then {} else {creator:{login:$c}} end)]}' >"$scratch/forge.json"
 }
 expect_forge() { # want-action retry
+  rm -f "$gate_key_dir/forge-deferred.json" # independent fixture decisions
   gate_decision "$scratch/host-a/inputs.json" "$2" "$scratch/forge.json"
   [[ "$gate_action" == "$1" ]] || { printf 'forge decision: got %s, expected %s\n' "$gate_action" "$1" >&2; cat "$scratch/forge.json" >&2; exit 1; }
 }
@@ -544,6 +561,9 @@ other="pr-gate-runner@node-b operator-unsealed"
 forge_status success "$other success; exit 0; attempt x; log y; inputs $digest"
 expect_forge reuse 0
 [[ "$gate_action_source" == forge ]]
+# A process restart/busy pass cannot adopt these inputs for a second look.
+gate_decision "$scratch/host-a/inputs.json" 0 "$scratch/forge.json"
+[[ "$gate_action" == run && "$gate_action_source" == local ]]
 expect_forge run 1
 forge_status failure "$other failure; exit 1; attempt x; log y; inputs $digest; cause: tests failed"
 expect_forge hold 0
@@ -558,6 +578,8 @@ expect_forge run 0
 forge_status success "$other success; exit 0; attempt x; log y; inputs $digest" ''
 expect_forge run 0
 forge_status success "$other success; exit 0; attempt x; log y; inputs $digest" someone-else
+expect_forge run 0
+forge_status success "$other success; inputs $digest; cause: text; inputs $digest"
 expect_forge run 0
 forge_status success "manual: inputs $digest"
 expect_forge run 0
@@ -579,6 +601,7 @@ envprobe="$HOME/.cache/pr-gate-test-$$"
 mkdir -p "$envprobe/bin"
 trap 'rm -rf -- "$scratch" "$envprobe"' EXIT
 printf '#!/bin/sh\nexit 0\n' >"$envprobe/bin/helper"
+printf old >"$envprobe/bin/reachable.tmp"
 recipe_inputs() { # output
   run="$inputs_probe/tree" repo=real recipe_name="just required" TOOLS="$scratch/host-a/tools" \
     RUNTIME_TOOLS="$scratch/host-a/runtime" VENDOR="" HOME_DIR="$scratch/host-a/home" \
@@ -597,10 +620,22 @@ printf '#!/bin/sh\nexit 1\n' >"$envprobe/bin/helper"
 recipe_inputs "$scratch/env-2.json"
 [[ "$(gate_inputs_digest "$scratch/env-1.json")" != "$(gate_inputs_digest "$scratch/env-2.json")" ]] \
   || { printf 'a changed executable on the recipe PATH kept the same identity\n' >&2; exit 1; }
+printf changed >"$envprobe/bin/reachable.tmp"
+recipe_inputs "$scratch/env-3.json"
+[[ "$(gate_inputs_digest "$scratch/env-2.json")" != "$(gate_inputs_digest "$scratch/env-3.json")" ]]
 if gate_inputs_digest "$scratch/no-such-inputs.json" 2>/dev/null; then printf 'digest of nothing\n' >&2; exit 1; fi
 printf '[]\n' >"$scratch/not-inputs.json"
 if gate_inputs_digest "$scratch/not-inputs.json" 2>/dev/null; then printf 'digest of a non-object\n' >&2; exit 1; fi
 printf 'PASS recipe PATH: every directory the recipe can execute from is an input; no digest of nothing\n'
+
+# A contribution binds sandbox implementation bytes and host custody, including in cheap input reuse.
+printf '#!/bin/sh\nexit 0\n' >"$envprobe/sandbox"
+GATE_SANDBOX=1 SANDBOX_COMMAND="$envprobe/sandbox" recipe_inputs "$scratch/sandbox-1.json"
+jq -r .tools "$scratch/sandbox-1.json" | grep -q '^sandbox-host  '
+printf '#!/bin/sh\nexit 1\n' >"$envprobe/sandbox"
+GATE_SANDBOX=1 SANDBOX_COMMAND="$envprobe/sandbox" recipe_inputs "$scratch/sandbox-2.json"
+[[ "$(gate_inputs_digest "$scratch/sandbox-1.json")" != "$(gate_inputs_digest "$scratch/sandbox-2.json")" ]]
+printf 'PASS sandbox executable bytes and host custody are bound\n'
 
 # Re-proving an adopted head turns forge reuse off; a newer success of this identity for the same inputs
 # confirms this host's own verified receipt instead of superseding it.
@@ -628,6 +663,8 @@ own_success '{"context":"jeryu-web/required","state":"success","description":"pr
   || { printf 'own creator-less success not recognised\n' >&2; exit 1; }
 if own_success '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-b operator-unsealed success","created_at":"2026-09-18T14:00:00Z"}'; then
   printf 'a creator-less success naming another host was kept green\n' >&2; exit 1; fi
+own_success '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-a operator-unsealed success","creator":{"login":"renamed-bot"},"created_at":"2026-09-18T14:00:00Z"}' \
+  || { printf 'own marker lost keep-green after identity rename\n' >&2; exit 1; }
 printf 'PASS keep green without a creator: this host'"'"'s own marker only\n'
 
 # A forge that shortens the description drops the digest; the runner says so instead of failing silently.

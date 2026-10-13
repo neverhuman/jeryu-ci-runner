@@ -1,14 +1,10 @@
 use super::{RunnerResult, denied};
 use rustix::{
     fd::{AsFd, OwnedFd},
-    fs::{AtFlags, Mode, OFlags, fchmod, fstat, fsync, mkdirat, open, openat, statat},
+    fs::{AtFlags, Mode, OFlags, fchmod, fstat, fsync, mkdirat, openat, statat},
     io::Errno,
 };
-use std::{
-    fs::File,
-    io::Write,
-    path::{Component, Path},
-};
+use std::{fs::File, io::Write};
 
 fn directory_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
@@ -26,25 +22,11 @@ fn verify_directory(fd: &impl AsFd) -> RunnerResult<()> {
     Ok(())
 }
 
-pub(super) fn trusted_root(path: &Path) -> RunnerResult<OwnedFd> {
-    if !path.is_absolute() {
-        return Err(denied("image_staging_custody_denied"));
-    }
-    let mut current = open("/", directory_flags(), Mode::empty())
-        .map_err(|_| denied("image_staging_custody_denied"))?;
-    verify_directory(&current)?;
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                current = openat(&current, name, directory_flags(), Mode::empty())
-                    .map_err(|_| denied("image_staging_custody_denied"))?;
-                verify_directory(&current)?;
-            }
-            _ => return Err(denied("image_staging_custody_denied")),
-        }
-    }
-    Ok(current)
+#[cfg(test)]
+pub(super) fn trusted_root(path: &std::path::Path) -> RunnerResult<OwnedFd> {
+    crate::custody::Directory::open(path)
+        .map(crate::custody::Directory::into_fd)
+        .map_err(|_| denied("image_staging_custody_denied"))
 }
 
 pub(super) fn directories(

@@ -17,6 +17,8 @@ cat >"$fx/bin/curl" <<SH
 #!/usr/bin/env bash
 [[ "\$*" != *WAKE-TOKEN-7f3a* ]] || exit 9
 url="\${@: -1}"
+hdr=""; prev=""
+for a in "\$@"; do [[ "\$prev" != --dump-header ]] || hdr=\$a; prev=\$a; done
 printf '%s\n' "\$url" >>"$fx/curl.log"
 case "\$url" in
   */repos/acme%2Facme-a/pulls*) f=a;;
@@ -26,7 +28,10 @@ case "\$url" in
   */gate-wanted*) f=wanted;;
   *) f=none;;
 esac
-if [[ -e "$fx/forge/\$f.json" ]]; then printf '%s\n200' "\$(cat "$fx/forge/\$f.json")"; else printf 'oops\n500'; fi
+if [[ -e "$fx/forge/\$f.status" ]]; then
+  [[ -z "\$hdr" ]] || cat "$fx/forge/retry-after" >"\$hdr" 2>/dev/null || true
+  printf 'nope\n%s' "\$(cat "$fx/forge/\$f.status")"
+elif [[ -e "$fx/forge/\$f.json" ]]; then printf '%s\n200' "\$(cat "$fx/forge/\$f.json")"; else printf 'oops\n500'; fi
 SH
 # Slots 0..2 have active timers; a slot is busy when $fx/busy-N exists.
 cat >"$fx/bin/systemctl" <<SH
@@ -41,7 +46,7 @@ chmod +x "$fx/bin/curl" "$fx/bin/systemctl"
 pulls() { local f=$1; shift; printf '{"items":[%s]}' "$(IFS=,; echo "$*")" >"$fx/forge/$f.json"; }
 pr() { printf '{"number":%s,"head_sha":"%s"}' "$1" "$2"; }
 run() { : >"$fx/started.log"; HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" JERYU_TOKEN_FILE="$fx/token" \
-  PR_GATE_CONFIG="$fx/pr-gate.env" bash "$wake" >"$fx/out"; }
+  GATE_RUNNER_WAKE_POLL_HEADS="${poll:-1}" GATE_RUNNER_WAKE_POLL_INTERVAL=0 PR_GATE_CONFIG="$fx/pr-gate.env" bash "$wake" >"$fx/out"; }
 must() { local why=$1; shift; "$@" || { printf 'FAIL: %s\n' "$why" >&2; cat "$fx/out" "$fx/started.log" >&2; exit 1; }; }
 started() { grep -c . "$fx/started.log" || true; }
 A1=$(printf 'a%.0s' {1..40}) A2=$(printf 'c%.0s' {1..40}) B1=$(printf 'b%.0s' {1..40}) Q1=$(printf 'd%.0s' {1..40})
@@ -51,6 +56,7 @@ run
 must 'first poll records and wakes nothing' test "$(started)" == 0
 must 'view recorded' grep -qx "acme/acme-a 1 $A1" "$fx/home/cache/wake-heads"
 must 'the fallback says why it read heads' grep -q 'no gate-wanted signal' "$fx/out"
+rm -f "$fx/home/cache/wake-signal-pause"
 must 'no sequence is kept without the signal' test ! -e "$fx/home/cache/wake-seq"
 must 'token never reaches argv' test "$(grep -c WAKE-TOKEN-7f3a "$fx/curl.log" || true)" == 0
 run
@@ -143,8 +149,19 @@ run
 must 'first look records the sequence and wakes nothing' test "$(started)" == 0
 must 'the sequence is the forge current one' test "$(seq_file)" == 4
 must 'the first look does not wait' grep -q 'gate-wanted?after=0&wait=0' "$fx/curl.log"
-must 'no heads were read' test "$(grep -c '/pulls' "$fx/curl.log" || true)" == 0
-printf 'PASS the first look records the sequence, reads no heads and wakes nothing\n'
+must 'the open-PR view is recorded too' grep -qx "acme/acme-a 1 $A1" "$fx/home/cache/wake-heads"
+printf 'PASS the first look records the sequence and the head view, and wakes nothing\n'
+
+: >"$fx/curl.log"
+signal 4
+run
+must 'the view is not read again within the period' test "$(grep -c '/pulls' "$fx/curl.log" || true)" == 0
+must 'and nothing was woken' test "$(started)" == 0
+: >"$fx/curl.log"
+GATE_RUNNER_WAKE_HEADS_EVERY=0 run
+must 'a period of 0 reads it every look' test "$(grep -c '/pulls' "$fx/curl.log" || true)" == 2
+must 'an unchanged view still wakes nothing' test "$(started)" == 0
+printf 'PASS with the signal working the open-PR view is read on a period, not on every look\n'
 
 signal 6 "$(wanted acme/acme-a "$A2" push)" "$(wanted acme/acme-a "$Q1" queue)"
 : >"$fx/curl.log"
@@ -204,3 +221,112 @@ if GATE_RUNNER_WAKE_WAIT=x run 2>"$fx/err"; then
 must 'a nonnumeric wait is refused' grep -q 'GATE_RUNNER_WAKE_WAIT' "$fx/err"
 must 'and nothing was requested' test "$(grep -c . "$fx/curl.log" || true)" == 0
 printf 'PASS the wait is validated before any request\n'
+
+# ---------------------------------------------------------------------------
+# What the signal cannot say, and what the woken slot is told. A pull request opened on a branch
+# that was already pushed got its push signal before it existed, so no signal names it now: only the
+# open-PR view does. Each started slot is handed the head it was started for.
+# ---------------------------------------------------------------------------
+rm -rf -- "$fx/home"; mkdir -p "$fx/home/cache"
+printf 'acme/acme-a\n' >"$fx/home/cache/protected-acme"
+pulls a; pulls b; printf '{"entries":[]}' >"$fx/forge/queue.json"; rm -f "$fx/forge/regate.json"
+dispatch() { cat "$fx/home/cache/wake-dispatch" 2>/dev/null || true; }
+signal 4
+run
+must 'nothing open yet, nothing woken' test "$(started)" == 0
+must 'and no head was handed to anybody' test "$(dispatch)" == ""
+
+# The push happens before a PR exists. Preserve the same cache across both looks.
+signal 5 "$(wanted acme/acme-a "$A1" push)"
+GATE_RUNNER_WAKE_HEADS_EVERY=0 run
+must 'the earlier push wakes a slot without an open PR' test "$(started)" == 1
+: >"$fx/home/cache/wake-dispatch"
+signal 6
+pulls a "$(pr 5 "$A1")"
+GATE_RUNNER_WAKE_HEADS_EVERY=0 run
+must 'an opened pull request wakes a slot although no signal names it' test "$(started)" == 1
+# The time is "-": the view says when it was read, not when the pull request was opened, and the
+# runner dates such a head from the pull request itself.
+must 'and the slot is told which head' test "$(dispatch)" == "acme/acme-a 5 $A1 pr-head -"
+printf 'PASS a pull request opened on an already-pushed branch wakes a slot from the open-PR view\n'
+
+: >"$fx/home/cache/wake-dispatch"
+signal 7 "$(wanted acme/acme-a "$A2" regate | jq '.number = 5')"
+pulls a "$(pr 5 "$A2")"
+GATE_RUNNER_WAKE_HEADS_EVERY=0 run
+must 'a signal naming this PR wakes exactly one slot, not one per source' test "$(started)" == 1
+must 'and carries the moment the forge recorded it' \
+  test "$(dispatch)" == "acme/acme-a 5 $A2 regate 2026-10-08T09:00:00Z"
+printf 'PASS a signal naming the same PR deduplicates only the current look\n'
+
+: >"$fx/home/cache/wake-dispatch"
+touch "$fx/busy-1" "$fx/busy-2"
+signal 9 "$(wanted acme/acme-a "$B1" push)" "$(wanted acme/acme-a "$Q1" queue)"
+run
+must 'one idle slot, one slot started' test "$(started)" == 1
+must 'and one head handed over, the first of the two' \
+  test "$(dispatch)" == "acme/acme-a - $B1 push 2026-10-08T09:00:00Z"
+rm -f "$fx"/busy-*
+printf 'PASS a head with no idle slot to take it is not handed to anybody\n'
+
+# The file cannot grow without bound: it is the newest few heads, not a backlog.
+for i in $(seq 1 70); do printf 'acme/acme-a %s %s pr-head -\n' "$i" "$A1" >>"$fx/home/cache/wake-dispatch"; done
+signal 11 "$(wanted acme/acme-a "$A1" regate)"
+run
+must 'the dispatch file is held to its newest lines' test "$(dispatch | wc -l)" -le 64
+must 'and the newest head is the one just handed over' test "$(dispatch | tail -1)" == "acme/acme-a - $A1 regate 2026-10-08T09:00:00Z"
+printf 'PASS the handed-over heads are bounded\n'
+# A runner newer than its forge: the forge has no gate-wanted route. Wake probes once, remembers the
+# 404, reads no heads, and wakes nothing, instead of flooding the forge every second.
+# ---------------------------------------------------------------------------
+reset_home() {
+  rm -rf -- "$fx/home" "$fx/forge"; mkdir -p "$fx/home/cache" "$fx/forge"
+  printf 'acme/acme-a\ngate-a/gate-b\n' >"$fx/home/cache/protected-acme"
+  pulls a "$(pr 1 "$A1")"; pulls b; printf '{"entries":[]}' >"$fx/forge/queue.json"
+  : >"$fx/curl.log"
+}
+reset_home
+printf 404 >"$fx/forge/wanted.status"
+poll=0 run
+must 'a 404 wakes nothing' test "$(started)" == 0
+must 'the 404 is probed once' test "$(grep -c gate-wanted "$fx/curl.log")" == 1
+must 'and no head is read' test "$(grep -c -e /pulls -e merge-queue -e gate-regate "$fx/curl.log" || true)" == 0
+must 'it says the endpoint is absent' grep -q 'no gate-wanted endpoint' "$fx/out"
+for _ in 1 2 3 4 5; do poll=0 run; done
+must 'the cached 404 means no further request' test "$(grep -c . "$fx/curl.log")" == 1
+printf '%s\n' "$(( $(date +%s) - 1 ))" >"$fx/home/cache/wake-signal-pause"
+poll=0 run
+must 'after the TTL the route is probed again' test "$(grep -c gate-wanted "$fx/curl.log")" == 2
+printf 'PASS a 404 for gate-wanted is probed once, cached, and costs no further request\n'
+
+# Even when head reads are opted into, they are throttled to the poll interval, never every tick.
+reset_home
+printf 404 >"$fx/forge/wanted.status"
+HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" JERYU_TOKEN_FILE="$fx/token" \
+  GATE_RUNNER_WAKE_POLL_HEADS=1 GATE_RUNNER_WAKE_POLL_INTERVAL=3600 PR_GATE_CONFIG="$fx/pr-gate.env" bash "$wake" >"$fx/out"
+HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" JERYU_TOKEN_FILE="$fx/token" \
+  GATE_RUNNER_WAKE_POLL_HEADS=1 GATE_RUNNER_WAKE_POLL_INTERVAL=3600 PR_GATE_CONFIG="$fx/pr-gate.env" bash "$wake" >"$fx/out"
+must 'opted-in head reads happen once per interval' test "$(grep -c '/pulls' "$fx/curl.log")" == 2
+printf 'PASS opted-in head reads are throttled to the poll interval\n'
+
+# Any other failure pauses the signal for a minute rather than retrying each second.
+reset_home
+printf 500 >"$fx/forge/wanted.status"
+poll=0 run
+for _ in 1 2 3; do poll=0 run; done
+must 'a 500 is not retried each tick' test "$(grep -c gate-wanted "$fx/curl.log")" == 1
+printf 'PASS a failing signal route is paused, not retried every second\n'
+
+# 429: the shared back-off honours Retry-After, makes no request while it lasts, and ends on success.
+reset_home
+printf 429 >"$fx/forge/wanted.status"
+printf 'HTTP/1.1 429 Too Many Requests\r\nRetry-After: 120\r\n\r\n' >"$fx/forge/retry-after"
+poll=0 run
+until_=$(cut -d' ' -f1 "$fx/home/cache/forge-backoff")
+must 'Retry-After is honoured' test "$until_" -ge "$(( $(date +%s) + 100 ))"
+for _ in 1 2 3; do poll=0 run; done
+must 'no request while backing off' test "$(grep -c . "$fx/curl.log")" == 1
+poll=1 run
+must 'not even head reads while backing off' test "$(grep -c . "$fx/curl.log")" == 1
+must 'nothing woken' test "$(started)" == 0
+printf 'PASS a 429 backs off for Retry-After across runs, signal and head reads alike\n'

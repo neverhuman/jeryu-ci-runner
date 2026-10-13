@@ -1,0 +1,27 @@
+# launch-inventory.allow — lane A. Owners review every change.
+# Six tab-separated fields: path, rule, class, owner, expires, reason.
+# debt + M6 hides a finding only while the script is report-only.
+# not-agent + permanent hides a finding in report-only and in --enforce.
+# A new finding needs a reviewed row in the same change. Milestone M6 passes --enforce.
+crates/jeryu-agent-auth/src/import.rs	import_from_host	debt	lane-R	M6	Host credential import, not used by a managed launch after M6
+crates/jeryu-agent-auth/src/import.rs	managed_launch_without_connection_id	debt	lane-R	M6	Host import is a credential launch without connection_id
+crates/jeryu-agent-auth/src/lib.rs	import_from_host	debt	lane-R	M6	Re-exports import_from_host for the host import path
+crates/jeryu-agent-auth/src/lib.rs	managed_launch_without_connection_id	debt	lane-R	M6	Auth library export has no connection_id binding
+crates/jeryu-agent-auth/src/oauth.rs	import_from_host	debt	lane-R	M6	OAuth module documents the host import path
+crates/jeryu-agent-auth/src/oauth.rs	managed_launch_without_connection_id	debt	lane-R	M6	OAuth host import path has no connection_id
+crates/jeryu-agent-auth/tests/auth_bridge.rs	import_from_host	debt	lane-R	M6	Tests call import_from_host and leave with that API
+crates/jeryu-agent-auth/tests/auth_bridge.rs	managed_launch_without_connection_id	debt	lane-R	M6	Auth bridge tests have no connection_id
+crates/jeryu-agentbridge/src/pty_driver.rs	managed_launch_without_connection_id	debt	lane-R	M6	PTY driver export is a host launch without connection_id
+crates/jeryu-agentbridge/src/pty_driver.rs	spawn_command_on_pty	debt	lane-R	M6	Re-exports the host PTY spawn used for agents
+crates/jeryu-agentbridge/src/pty_driver/implementation.rs	docker_or_podman_run	debt	lane-R	M6	Host PTY path documents docker run as the agent jail
+crates/jeryu-agentbridge/src/pty_driver/implementation.rs	managed_launch_without_connection_id	debt	lane-R	M6	Host PTY implementation launches without connection_id
+crates/jeryu-agentbridge/src/pty_driver/implementation.rs	spawn_command_on_pty	debt	lane-R	M6	Spawns the agent command on a host PTY
+crates/jeryu-sandbox-linux/src/launch.rs	docker_or_podman_run	debt	lane-R	M6	Host sandbox launcher documents docker run for the agent
+crates/jeryu-sandbox-linux/src/launch.rs	managed_launch_without_connection_id	debt	lane-R	M6	Host sandbox launch has no connection_id
+crates/jeryu-sandbox-linux/src/launch.rs	spawn_command_on_pty	debt	lane-R	M6	Defines spawn_command_on_pty for a host agent PTY
+crates/jeryu-sandbox-linux/src/lib.rs	managed_launch_without_connection_id	debt	lane-R	M6	Sandbox library re-exports the host PTY spawn
+crates/jeryu-sandbox-linux/src/lib.rs	spawn_command_on_pty	debt	lane-R	M6	Public export of spawn_command_on_pty
+ops/pr-redteam/install.sh	managed_launch_without_connection_id	debt	lane-R	M6	Host pr-redteam install looks up the claude CLI
+ops/pr-redteam/test/installation.sh	managed_launch_without_connection_id	debt	lane-R	M6	pr-redteam install test fakes a host claude binary
+ops/pr-redteam/test/verdict-validation.sh	managed_launch_without_connection_id	debt	lane-R	M6	pr-redteam test drives a host claude stand-in
+tests/sandbox_escape_matrix.sh	docker_or_podman_run	not-agent	lane-R	permanent	Sandbox escape matrix, not a coding-agent launch
