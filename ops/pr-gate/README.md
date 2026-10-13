@@ -363,20 +363,35 @@ empty distribution set; unreadable existing directories and failed rustup/find c
 ## What the gate is checking, and how long each step takes
 
 While a gate runs, the runner reads the step lines its recipe prints (`[pr-ci] <step>`,
-`[ci] required|fast lane: <step>`, `==> <step>`, and npm's `> <script>` banner) from the attempt's
-`build.log`, records when each first appeared in `steps.tsv` (`epoch<TAB>step`, beside the log;
-`steps.end` holds the end), and posts the list as the `pr-gate-runner` check run's summary each
-time a step starts (at least every two minutes):
+`[ci] required|fast lane: <step>`, `==> <step>`, and npm/pnpm's `> <pkg>@<version> <script>` run
+banner, as `npm <script>`) from the attempt's `build.log`, and records when each first appeared in
+`steps.tsv` (`epoch<TAB>step`, beside the log; `steps.end` holds the end). Only complete lines count,
+and tabs and control characters become spaces. It posts the list as the `pr-gate-runner` check run's
+summary when a step starts, at most once every 15 s and at least every two minutes:
 
     ✓ jankurai pin drift check · 4s
     ▸ cargo clippy · 1m12s so far
     ○ cargo test · usually 3m05s
 
-`○` steps and their "usually" come from the repository's last green attempt
-(`$HOME_DIR/cache/steps-<owner>__<repo>.tsv`). The finished check run lists every step with its
-time (`✗` and the cause on the step that failed). The required status and the check run link to the
-PR's checks page (`<html_url>/checks`). Times are first-seen, polled every 2 s.
+**Step names are not log text.** The recipe is the head's own and runs as the gate user, so it could
+print a credential as a step. A step is published by name only when that text occurs literally in the
+repository's gate sources on protected `main` -- Justfiles, `ops/`, `scripts/`, Makefiles and
+`package.json` files, read from the mirror at gate time into the attempt's `step-sources` -- is in a
+short charset, and is cut to 80 characters. Any other step is published as `step N`. At most 60 steps
+are listed (the latest, with a count of the earlier ones). The real text stays in `steps.tsv` on the
+runner, as the log does (the same rule as the failure cause: nothing free-form from the log is
+published).
+
+`○` steps and their "usually" come from the repository's last green attempt that recorded its end
+(`$HOME_DIR/cache/steps-<owner>__<repo>.tsv`). The finished check run lists every step with its time
+(`✗` and the cause on the step that failed). For a pull-request head, the required status and the
+check run link to that PR's checks page, built from the `html_url` the forge returns for exactly that
+PR when it is admitted (`<html_url>/checks`); a merge-queue commit and main-health link nothing. A
+forge that refuses the link (422) gets the same status or check run without it, so the link never
+fails a gate. Live posts are skipped while the shared forge back-off is running and never clear it.
+Times are first-seen, polled every 2 s.
 
 `bin/pr-gate-steps-report.sh [--all] [--days N] [OWNER/REPO...]` ranks each repository's steps by
 median time over its green attempts (all with `--all`), with p90, max, share of the total and run
-count: the numbers for deciding whether a long, low-value step should leave the required gate.
+count: the numbers for deciding whether a long, low-value step should leave the required gate. It
+runs on the gate host and reads the real step text.

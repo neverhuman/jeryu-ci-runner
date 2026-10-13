@@ -190,7 +190,7 @@ git_env=(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2
   GIT_CONFIG_KEY_0="$GIT_CONFIG_KEY_0" GIT_CONFIG_VALUE_0=""
   GIT_CONFIG_KEY_1="$GIT_CONFIG_KEY_1" GIT_CONFIG_VALUE_1="$GIT_CONFIG_VALUE_1")
 
-only_repo=""; only_pr=""; list=0; main_health=0; pr_html_url=""
+only_repo=""; only_pr=""; list=0; main_health=0
 while (($#)); do case "$1" in
   --repo) only_repo="${2:?--repo needs a value}"; shift 2;;
   --pr) only_pr="${2:?--pr needs a number}"; shift 2;;
@@ -248,6 +248,8 @@ printf 'header = "Authorization: Bearer %s"\n' "$(cat "$TOKEN_FILE")" >"$AUTH_CO
 # A 429 from any call starts the shared forge back-off (pr-gate-backoff.sh): until it passes, reads
 # answer 429 locally without a request, so every slot stands back together instead of retrying each
 # tick. Writes still go out, because a gate's verdict must not be lost to a read-side limit.
+# GATE_API_PASSIVE (the progress watcher's posts) never clears a back-off: a write going through says
+# nothing about the reads the forge limited.
 api() { # method path [json]
   local hdr out args=(--silent --show-error --max-time 60 -X "$1"
     --config "$AUTH_CONFIG" -H 'Accept: application/json')
@@ -257,13 +259,21 @@ api() { # method path [json]
   out="$(curl "${args[@]}" --dump-header "$hdr" -w '\n%{http_code}' "$BASE$2")" || out=$'\n000'
   code="${out##*$'\n'}"
   body="${out%$'\n'*}"
-  if [[ "$code" == 429 ]]; then backoff_note_429 "$hdr"; elif [[ "$code" =~ ^2 ]]; then backoff_clear; fi
+  if [[ "$code" == 429 ]]; then backoff_note_429 "$hdr"; elif [[ "$code" =~ ^2 && -z "${GATE_API_PASSIVE:-}" ]]; then backoff_clear; fi
   rm -f -- "$hdr"
 }
 
+# The link (target_url) is a convenience and never decides a gate: a forge that refuses it (422) gets
+# the same status again without it, as the heartbeat retries without fields an older forge refuses.
 post_status() { # owner repo sha state description [target_url]
-  api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg s "$4" --arg c "$(gate_status_context "$1" "$2")" \
-    --arg d "$5" --arg u "${6:-}" '{state: $s, context: $c, description: $d} + (if $u == "" then {} else {target_url: $u} end)')"
+  local url=${6:-}
+  while :; do
+    api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg s "$4" --arg c "$(gate_status_context "$1" "$2")" \
+      --arg d "$5" --arg u "$url" '{state: $s, context: $c, description: $d} + (if $u == "" then {} else {target_url: $u} end)')"
+    [[ "$code" == 422 && -n "$url" ]] || break
+    say "status link refused (422); posting $1/$2 $4 without it"
+    url=""
+  done
   [[ "$code" == 201 ]] || die "posting $1/$2 $(gate_status_context "$1" "$2")=$4 on $3 answered $code: $body"
 }
 
@@ -557,8 +567,6 @@ for qualified in $REPOS; do
     api GET "/api/v3/repos/$owner/$repo/pulls/$number"
     author="$(jq -r '.user.login // ""' <<<"$body")"
     head_ref="$(jq -r '.head.ref // ""' <<<"$body")"
-    # The PR's own web page: the required status and the progress check link to its checks tab.
-    pr_html_url="$(jq -r '.html_url // ""' <<<"$body")"
     [[ "$code" == 200 && -n "$author" ]] \
       || { say "cannot read $owner/$repo#$number's author ($code); skipping rather than guessing"; continue; }
     # Never prove this runner's own work. A proof is only worth the independence of whoever
@@ -1134,6 +1142,7 @@ case "${gate_action:?}" in
 esac
 # A head moving during preparation must not run under the earlier admission. A queue commit is still
 # admitted only while its entry is building at the same sha.
+checks_url=""
 if [[ "$main_health" == 1 ]]; then
   api GET "/api/v3/repos/$owner/$repo/branches/main"
   [[ "$code" == 200 ]] || die "cannot refresh main before admission ($code)"
@@ -1144,6 +1153,9 @@ elif [[ "$qref" == - ]]; then
   [[ "$code" == 200 ]] || die "cannot refresh PR before admission ($code)"
   admitted=0
   [[ "$(jq -r '.head.sha' <<<"$body")" == "$sha" && "$(jq -r '.state' <<<"$body")" == open ]] && admitted=1
+  # The checks page of exactly this pull request, from the forge's answer for it just now. A queue
+  # commit and main-health link nothing: no PR checks page shows their sha.
+  checks_url=$(gate_checks_url "$owner" "$repo" "$number" "$body")
 else
   api GET "/api/v1/merge-queue?state=building"
   [[ "$code" == 200 ]] || die "cannot refresh the merge queue before admission ($code)"
@@ -1205,13 +1217,15 @@ rm -f -- "$identity" "$status_snapshot"
 log="$gate_attempt_dir/build.log"
 steps_tsv="$gate_attempt_dir/steps.tsv"
 : >"$steps_tsv"
-checks_url=""
-[[ "$main_health" == 1 || -z "${pr_html_url:-}" ]] || checks_url="${pr_html_url%/}/checks"
+# What a step may be published as: protected main's gate sources (pr-gate-progress.sh). Local only.
+step_sources="$gate_attempt_dir/step-sources"
+gate_step_vocabulary "$run/$repo" mirror/main "$step_sources" || say "could not read $owner/$repo main's gate sources; steps publish unnamed"
 if ((keep_green)); then
   say "re-verifying $owner/$repo@$sha without pending: its newest $(gate_status_context "$owner" "$repo") is this runner's success"
 else
   post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")" "$checks_url"
 fi
+# shellcheck disable=SC2016  # a jq program: $url is jq's
 gate_update --arg url "$checks_url" '.phase="running" | .checks_url=$url'
 started_at="$(date -u +%FT%TZ)" started_s="$(date +%s)"
 heartbeat "$(jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" \
@@ -1361,7 +1375,7 @@ gate_worker=$!
 gate_update --argjson worker "$gate_worker" '.worker_pid=$worker'
 # What the gate is checking, step by step, while it runs (pr-gate-progress.sh). Best effort.
 gate_progress_watch "$log" "$steps_tsv" "$gate_worker" "$owner" "$repo" "$sha" \
-  "$(gate_planned_path "$owner" "$repo")" "$checks_url" >/dev/null 2>&1 &
+  "$(gate_planned_path "$owner" "$repo")" "$step_sources" "$checks_url" >/dev/null 2>&1 &
 progress_watcher=$!
 worker_exit=0
 wait "$gate_worker" || worker_exit=$?

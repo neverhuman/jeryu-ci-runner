@@ -34,5 +34,7 @@ backoff_note_429() {
   [[ -z "$retry" ]] || { ((retry <= BACKOFF_CAP)) || retry=$BACKOFF_CAP; ((retry <= delay)) || delay=$retry; }
   now=$(date +%s)
   mkdir -p -- "$(dirname -- "$BACKOFF_FILE")"
-  printf '%s %s\n' "$((now + delay))" "$((n + 1))" >"$BACKOFF_FILE.tmp.$$" && mv -f -- "$BACKOFF_FILE.tmp.$$" "$BACKOFF_FILE"
+  # $BASHPID, not $$: a subshell (the runner's progress watcher) shares $$ with its parent, and two
+  # writers on one temp path can lose a record.
+  printf '%s %s\n' "$((now + delay))" "$((n + 1))" >"$BACKOFF_FILE.tmp.$BASHPID" && mv -f -- "$BACKOFF_FILE.tmp.$BASHPID" "$BACKOFF_FILE"
 }

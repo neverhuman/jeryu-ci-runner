@@ -6,6 +6,8 @@ while read -r leaked; do unset "$leaked"; done < <(compgen -e | grep -E '^(GATE_
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)
 # shellcheck source=ops/pr-gate/bin/pr-gate-state.sh
 source "$script_dir/pr-gate-state.sh"
+# shellcheck source=ops/pr-gate/bin/pr-gate-progress.sh
+source "$script_dir/pr-gate-progress.sh"
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
 owner=acme repo=fixture SLOT=0 MARKER=pr-gate-runner@test
@@ -275,6 +277,12 @@ for line in \
   expect_cause "$line\nerror: recipe \`required\` failed on line 1 with exit code 1\n" ''
   gate_begin "$identity"
   cp "$cause_log" "$gate_attempt_dir/build.log"
+  # The same line printed as a step (the head's recipe chooses what it prints), beside one step that
+  # protected main's gate sources name: only that one may be published by name.
+  printf '[pr-ci] jankurai pin drift check\n==> %s\n' "$line" >>"$gate_attempt_dir/build.log"
+  printf 'echo "[pr-ci] jankurai pin drift check" >&2\n' >"$gate_attempt_dir/step-sources"
+  gate_steps_record "$gate_attempt_dir/build.log" "$gate_attempt_dir/steps.tsv" 100 || true
+  printf '130\n' >"$gate_attempt_dir/steps.end"
   gate_finish failure 1 "$gate_attempt_dir/build.log"
   gate_publish
 done
@@ -285,11 +293,15 @@ for secret in "${secrets[@]}"; do
   fi
 done
 if grep -q 'cause:' "$scratch/published-tail.jsonl"; then printf 'an unrecognised line produced a cause\n' >&2; exit 1; fi
+# The checklist was published, naming main's step and only numbering the head's own lines.
+jq -se '[.[] | select(.output) | .output.summary] | length == 7 and all(test("^✓ jankurai pin drift check · 0s\n✗ step 2 · 30s\n"))' \
+  "$scratch/published-tail.jsonl" >/dev/null \
+  || { printf 'the published checklist is not main-named steps plus numbered ones\n' >&2; cat "$scratch/published-tail.jsonl" >&2; exit 1; }
 if jq -e 'select(.output) | .output | has("text")' "$scratch/published-tail.jsonl" >/dev/null; then
   printf 'a raw log excerpt was published\n' >&2; exit 1
 fi
 exec 6>&-
-printf 'PASS failure cause: known shapes only, allowlisted tokens, nothing else from the log is published\n'
+printf 'PASS failure cause and step checklist: known shapes, protected-main step names only; nothing else from the log is published\n'
 
 # A slot tree holds exactly the gate's family and repository: a repository synced for an earlier gate
 # made the same head fingerprint differently on every slot (12 passes in an hour, 2026-09-18).

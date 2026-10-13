@@ -656,6 +656,7 @@ gate_self_modification_note() { # receipt
 
 gate_publish() {
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
+  local steps_dir="" steps_end="" status_payload check_payload
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -666,10 +667,17 @@ gate_publish() {
   case "$outcome" in success) state=success;; failure|timed_out) state=failure;; *) state=error;; esac
   log=$(jq -r '.log // ""' "$gate_receipt")
   checks_url=$(jq -r '.checks_url // ""' "$gate_receipt")
-  # A green attempt's step times become the repo's "usually" for the next one.
-  if [[ "$state" == success && -n "$log" && -s "$(dirname -- "$log")/steps.tsv" ]] && declare -F gate_steps_learn >/dev/null; then
-    gate_steps_learn "$(dirname -- "$log")/steps.tsv" "$(cat "$(dirname -- "$log")/steps.end" 2>/dev/null || date +%s)" \
-      "$(gate_planned_path "$owner" "$repo")" || true
+  # The attempt's step checklist (pr-gate-progress.sh). steps.end is written when the worker ends; an
+  # attempt recovered without one ends at its receipt's finish time, and teaches no "usually".
+  if [[ -n "$log" ]] && declare -F gate_progress_summary >/dev/null; then
+    steps_dir=$(dirname -- "$log")
+    steps_end=$(cat "$steps_dir/steps.end" 2>/dev/null || true)
+    [[ "$steps_end" =~ ^[0-9]+$ ]] || steps_end=""
+    # A green attempt's step times become the repo's "usually" for the next one.
+    if [[ "$state" == success && -n "$steps_end" && -s "$steps_dir/steps.tsv" ]]; then
+      gate_steps_learn "$steps_dir/steps.tsv" "$steps_end" "$(gate_planned_path "$owner" "$repo")" || true
+    fi
+    [[ -n "$steps_end" ]] || steps_end=$(date -d "$(jq -r '.finished_at // ""' "$gate_receipt")" +%s 2>/dev/null || true)
   fi
   # How the attempt ran is read from its own receipt, so recovering an older one says what that one did.
   kind=$(jq -r '.execution_kind // .inputs.execution_kind // "operator-unsealed"' "$gate_receipt")
@@ -687,11 +695,14 @@ gate_publish() {
     inputs=$(gate_inputs_digest <(jq -c '.inputs' "$gate_receipt")) || return
   fi
   if ! jq -e '.publication.required_status' "$gate_receipt" >/dev/null; then
-    api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -nc --arg state "$state" --arg context "$context" \
+    status_payload=$(jq -nc --arg state "$state" --arg context "$context" \
       --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${inputs:+; inputs $inputs}${cause:+; cause: $cause}" \
-      --arg url "$checks_url" \
-      '{state:$state,context:$context,description:$description} + (if $url == "" then {} else {target_url:$url} end)')"
+      '{state:$state,context:$context,description:$description}')
+    api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -c --arg url "$checks_url" \
+      '. + (if $url == "" then {} else {target_url:$url} end)' <<<"$status_payload")"
     : "${code:?}" "${body:?}"
+    # The link never decides a gate: a forge that refuses it (422) gets the same status without it.
+    if [[ "$code" == 422 && -n "$checks_url" ]]; then api POST "/repos/$owner/$repo/statuses/$sha" "$status_payload"; fi
     if [[ "$code" != 201 ]] || ! jq -e '.id != null' <<<"$body" >/dev/null; then
       gate_update --arg code "$code" '.recovery_required="required-status publication rejected or unacknowledged" | .publication.http_status=$code' || return
       return 1
@@ -711,20 +722,23 @@ gate_publish() {
     # matching needs_human item from the same paths, so the PR also shows up on /needs-you.
     note=$(gate_self_modification_note "$gate_receipt")
     # The step checklist with each step's time (pr-gate-progress.sh), then the attempt's identity.
+    # Step names are published only as gate_step_public allows (protected main's own text, or "step N").
     steps=""
-    if [[ -n "$log" && -f "$(dirname -- "$log")/steps.tsv" ]] && declare -F gate_progress_summary >/dev/null; then
-      steps=$(gate_progress_summary "$(dirname -- "$log")/steps.tsv" "" \
+    if [[ -n "$steps_dir" && -f "$steps_dir/steps.tsv" ]]; then
+      steps=$(gate_progress_summary "$steps_dir/steps.tsv" "" "$steps_dir/step-sources" \
         "$( [[ "$state" == success ]] && printf success || printf failure)" \
-        "$(cat "$(dirname -- "$log")/steps.end" 2>/dev/null || date +%s)" "$cause")
+        "${steps_end:-$(tail -n 1 "$steps_dir/steps.tsv" | cut -f1)}" "$cause")
     fi
-    api POST "/repos/$owner/$repo/check-runs" "$(jq -nc --arg sha "$sha" --arg state "$state" \
+    check_payload=$(jq -nc --arg sha "$sha" --arg state "$state" \
       --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" \
       --arg summary "${steps:+$steps
 }Attempt $id; log sha256 $digest; $kind${note:+; changes its own gate}$review" \
-      --arg note "$note" --arg url "$checks_url" \
+      --arg note "$note" \
       '{name:"pr-gate-runner",head_sha:$sha,status:"completed",conclusion:(if $state=="error" then "failure" else $state end),
-        output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}
-      + (if $url == "" then {} else {details_url:$url} end)')"
+        output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}')
+    api POST "/repos/$owner/$repo/check-runs" "$(jq -c --arg url "$checks_url" \
+      '. + (if $url == "" then {} else {details_url:$url} end)' <<<"$check_payload")"
+    if [[ "$code" == 422 && -n "$checks_url" ]]; then api POST "/repos/$owner/$repo/check-runs" "$check_payload"; fi
     # The check run is not a required context and never gates a merge: the required status above is
     # the gate. A rejection is recorded and reported, and must not hold the attempt in recovery or
     # stop later ticks, which is what a return 1 here did.

@@ -69,6 +69,8 @@ if [[ -f "$fixture_root/mutate-tool" ]]; then
   printf 'changed during recipe\n' >>"$fixture_root/tools/environment-probe"
 fi
 printf 'error: expected rejection in a passing negative test\n'
+# Step lines, one of them the gate's own credential: what a head's recipe may print, never publish.
+printf '[pr-ci] fixture recipe step\n==> %s\n' "$(cat "$fixture_root/token")"
 [[ "$(cat mode)" == pass ]] || exit 7
 SH
 cat >"$fixture/tools/curl" <<'SH'
@@ -96,6 +98,7 @@ case "$method $url" in
   'GET '*'/pulls/2')
     jq -nc --arg sha "$(cat "$FAKE_FORGE/head2")" \
       '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/second"},
+        html_url:"https://forge.invalid/repos/jeryu/acme/fixture/pulls/2",
         created_at:"2026-10-09T18:26:18Z",updated_at:"2026-10-09T18:26:18Z"}'
     printf '\n200';;
   'GET '*'/pulls/1')
@@ -108,7 +111,8 @@ case "$method $url" in
     opened=2026-10-09T18:26:18Z
     [[ ! -f "$FAKE_FORGE/pr-opened" ]] || read -r opened <"$FAKE_FORGE/pr-opened"
     jq -nc --arg sha "$head" --arg opened "$opened" \
-      '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/feature"},created_at:$opened,updated_at:$opened}'
+      '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/feature"},created_at:$opened,updated_at:$opened,
+        html_url:"https://forge.invalid/repos/jeryu/acme/fixture/pulls/1"}'
     printf '\n200';;
   'GET '*'/branches/main/protection')
     jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'
@@ -137,6 +141,10 @@ case "$method $url" in
     else printf '{"statuses":[]}'; fi
     printf '\n200';;
   'POST '*'/statuses/'*)
+    # A forge that predates the status link refuses the field.
+    if [[ -f "$FAKE_FORGE/reject-target-url" ]] && jq -e 'has("target_url")' <<<"$payload" >/dev/null; then
+      printf 'Failed to deserialize the JSON body: unknown field `target_url`\n422'; exit
+    fi
     if [[ -f "$FAKE_FORGE/reject-terminal" && "$(jq -r '.state' <<<"$payload")" != pending ]]; then
       printf '{"message":"publication denied"}\n403'; exit
     fi
@@ -565,8 +573,8 @@ grep -q "preparing acme/fixture#1 at $qsha (merge queue refs/queue/main/1)" "$fi
   || { printf 'the queue commit was not gated first\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" \
   | jq -se --arg s "$qsha" 'length==2 and all(.sha==$s and .context=="fixture/required")
-      and .[0].state=="pending" and .[1].state=="success"' >/dev/null \
-  || { printf 'queue statuses were not pending then success on the queue sha\n' >&2; cat "$fixture/statuses.jsonl" >&2; exit 1; }
+      and .[0].state=="pending" and .[1].state=="success" and all(has("target_url") | not)' >/dev/null \
+  || { printf 'queue statuses were not pending then success on the queue sha (with no PR checks link)\n' >&2; cat "$fixture/statuses.jsonl" >&2; exit 1; }
 printf 'PASS merge queue: the queue commit is gated first, at its exact sha, with the same context\n'
 
 # The forge rebuilt the entry: its ref no longer points at the listed sha, so nothing runs for it.
@@ -971,8 +979,45 @@ invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
   || { printf 'without a wake-up the tick did not take the first head of its pass\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
-rm -f "$fixture/head2"
 printf 'PASS a woken slot gates the head it was woken for before the rest of its pass\n'
+
+# The link on the status and the check run names the PR actually gated, never the last one listed:
+# with #1 and #2 open, a tick that gates #1 links #1's checks page.
+new_head
+rm -f "$fixture/check-runs.jsonl"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q 'preparing acme/fixture#1' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
+tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" | jq -se --arg s "$(cat "$fixture/head")" '
+  length == 2 and all(.sha == $s and .target_url == "https://forge.invalid/repos/jeryu/acme/fixture/pulls/1/checks")' >/dev/null \
+  || { printf 'the status did not link the gated PR\n' >&2; tail -2 "$fixture/statuses.jsonl" >&2; exit 1; }
+jq -se 'last.details_url == "https://forge.invalid/repos/jeryu/acme/fixture/pulls/1/checks"' "$fixture/check-runs.jsonl" >/dev/null \
+  || { printf 'the check run did not link the gated PR\n' >&2; cat "$fixture/check-runs.jsonl" >&2; exit 1; }
+# The head printed the gate's credential as a step line: the attempt keeps it, the forge never sees it.
+receipt="$fixture/runner/attempts/acme-fixture-$(cat "$fixture/head")/last-result.json"
+grep -qF synthetic-fixture-token "$(dirname "$(jq -r '.log' "$receipt")")/steps.tsv" \
+  || { printf 'the step was not recorded on the runner\n' >&2; exit 1; }
+if grep -qF synthetic-fixture-token "$fixture/check-runs.jsonl" "$fixture/statuses.jsonl"; then
+  printf 'a step line printed by the head reached the forge\n' >&2; exit 1
+fi
+jq -se 'last.output.summary | test("^✓ step 1 · [0-9]+s\n✓ step 2 · ")' "$fixture/check-runs.jsonl" >/dev/null \
+  || { printf 'steps outside protected main were not published as numbers\n' >&2; cat "$fixture/check-runs.jsonl" >&2; exit 1; }
+rm -f "$fixture/head2"
+printf 'PASS the links name the gated PR; a head-printed step line never reaches the forge\n'
+
+# A forge that refuses the link (422) still gets the gate's statuses, without it: the link never fails a gate.
+new_head
+touch "$fixture/reject-target-url"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" | jq -se --arg s "$(cat "$fixture/head")" '
+  length == 2 and all(.sha == $s and (has("target_url") | not)) and .[0].state == "pending" and .[1].state == "success"' >/dev/null \
+  || { printf 'a refused link failed or changed the gate\n' >&2; cat "$fixture/runner.log" >&2; tail -2 "$fixture/statuses.jsonl" >&2; exit 1; }
+grep -q 'status link refused (422)' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/reject-target-url"
+printf 'PASS a forge that refuses the status link gets the same statuses without it\n'
 # A 429 on a read starts one back-off for every slot: the next tick makes no request at all, and
 # the first answer that is not a 429 ends it.
 rm -f "$fixture/runner/cache/forge-backoff" "$fixture/rate-limited.log"
