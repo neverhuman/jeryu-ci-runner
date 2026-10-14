@@ -102,6 +102,11 @@ PRIMARY_OWNER="${PR_GATE_PRIMARY_OWNER:-}"
 SLOT="${GATE_RUNNER_SLOT:-0}"
 [[ "$SLOT" =~ ^[0-9]+$ ]] || { printf 'GATE_RUNNER_SLOT must be a number, not %s\n' "$SLOT" >&2; exit 2; }
 FAMILY="${GATE_RUNNER_FAMILY:-}"   # space-separated sibling repos to mirror; default: every repo of the PR's owner under its checkout root
+DEPENDENCIES="${PR_GATE_DEPENDENCIES:-}"
+pr_gate_dependencies_valid "$DEPENDENCIES" || {
+  printf 'PR_GATE_DEPENDENCIES must map unique owner/repo keys to sibling names separated by commas (or -)\n' >&2
+  exit 2
+}
 TOOLS="${GATE_RUNNER_TOOLS:-$HOME_DIR/governed-tools/bin}"
 # The one PATH a recipe (and its locked-crate prefetch) runs with. gate_inputs binds every directory on
 # it (gate_host_environment), so a result names everything the recipe could have executed.
@@ -716,7 +721,7 @@ for candidate in "${candidates[@]}"; do
     say "re-gate requested for $owner/$repo#$number at $sha"
     fresh+=("$candidate"); continue
   fi
-  if [[ "$main_health" == 0 && -z "$only_pr" ]] && gate_regate_settling "$HOME_DIR/cache/mains-$owner" "$REGATE_SETTLE"; then
+  if [[ "$main_health" == 0 && -z "$only_pr" ]] && gate_regate_settling "$HOME_DIR/cache/mains/$owner/$repo" "$REGATE_SETTLE"; then
     say "deferring re-gate of $owner/$repo#$number: $owner mains moved within ${REGATE_SETTLE}s"; continue
   fi
   seen_before+=("$candidate")
@@ -793,7 +798,12 @@ fi
 
 # 3. the family's canonical mains
 family="$FAMILY"
-if [[ -z "$family" ]]; then
+declared_dependencies=0
+if dependencies=$(pr_gate_lookup "$DEPENDENCIES" "$owner/$repo"); then
+  declared_dependencies=1
+  family="${dependencies//,/ }"
+  [[ "$family" != - ]] || family=""
+elif [[ -z "$family" ]]; then
   root="$(split_root "$owner")" || die "cannot discover the $owner family"
   for d in "$root"/*/; do
     n="$(basename "$d")"
@@ -832,6 +842,7 @@ for n in $family $repo; do
       flock -u 8; exec 6>&-; exec 7>&-
       continue 2
     fi
+    ((declared_dependencies == 0)) || die "declared dependency $owner/$n has no canonical main"
     # Drop the mirror as well. A repository whose main was deleted upstream would otherwise keep an
     # older main here, and step 5 would check the sibling out from it: a phantom main in the tree
     # while this line says the tree lacks it. With no mirror, step 5 skips the sibling.
@@ -844,7 +855,9 @@ for n in $family $repo; do
   flock -u 8
 done
 exec 8>&-
-gate_record_mains "$HOME_DIR/cache/mains-$owner" "$mirrors" $family $repo || say "could not record $owner mains"
+# Different repositories may have different closures; they must not reset each other's settle clock.
+mkdir -p "$HOME_DIR/cache/mains/$owner"
+gate_record_mains "$HOME_DIR/cache/mains/$owner/$repo" "$mirrors" $family $repo || say "could not record $owner/$repo mains"
 
 # 4. reuse an identical result before preparing a tree
 # Most of what a tick examines is a head nobody has touched since it was gated, and the only way to
@@ -967,7 +980,9 @@ done
 # every slot. On 2026-09-18 one web PR passed 12 times in an hour as slots 1, 4 and 5 disagreed about
 # such repositories, each pass followed by a fresh `pending` that kept the PR unmergeable. Anything
 # else is moved aside -- it is a disposable checkout of a mirror, kept only until the next move.
-for n in $(gate_detach_strays "$run" "$HOME_DIR/detached/slot$SLOT" $family $repo); do
+detached=$(gate_detach_strays "$run" "$HOME_DIR/detached/slot$SLOT" $family $repo) \
+  || die "cannot remove undeclared checkouts from $owner/$repo's slot tree"
+for n in $detached; do
   say "moved $owner/$n out of the slot tree: not in this gate's family"
 done
 mapfile -t evidence < <(gate_evidence_for "$owner")

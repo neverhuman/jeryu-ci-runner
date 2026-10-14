@@ -88,6 +88,9 @@ mkdir -p target
 count=0
 [[ ! -f "$fixture_root/executions" ]] || read -r count <"$fixture_root/executions"
 printf '%s\n' "$((count + 1))" >"$fixture_root/executions"
+if [[ -f "$fixture_root/require-sibling" ]]; then
+  cat ../sibling/file >/dev/null || exit 34
+fi
 if [[ -f "$fixture_root/mutate-tool" ]]; then
   printf 'changed during recipe\n' >>"$fixture_root/tools/environment-probe"
 fi
@@ -664,7 +667,7 @@ printf 'main moved\n' >"$fixture/source/moved"
 "$real_git" -C "$fixture/source" commit -qm main-moves
 "$real_git" -C "$fixture/source" push -q "$fixture/source.git" HEAD:refs/heads/main
 moved_main=$("$real_git" -C "$fixture/source" rev-parse HEAD)
-mains="$fixture/runner/cache/mains-acme"
+mains="$fixture/runner/cache/mains/acme/fixture"
 invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 grep -qx "fixture $moved_main" "$mains" \
@@ -1173,6 +1176,53 @@ grep -q 'read without preparing a tree' "$fixture/runner.log"
 rm -f "$fixture/tools/governed-marker"
 export GATE_RUNNER_FAMILY=fixture
 printf 'PASS cheap identity: reuse before preparation claims nothing and never parks the head in recovery\n'
+
+# A declared closure binds the policy and real sibling inputs, and physically removes old checkouts.
+# It must not just omit them from the digest while recipes can still read them.
+export GATE_RUNNER_FAMILY="fixture sibling"
+export PR_GATE_DEPENDENCIES='acme/fixture=sibling'
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+before_count=$(count)
+printf 'declared dependency moved\n' >>"$fixture/sibling-src/file"
+git -C "$fixture/sibling-src" commit -qam declared-dependency-moves
+git -C "$fixture/sibling-src" push -q "$fixture/sibling.git" main
+invoke
+expect_count "$((before_count + 1))"
+receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
+jq -e '[.inputs.sources[].repository] == ["fixture","sibling"]' "$receipt" >/dev/null
+export PR_GATE_DEPENDENCIES='acme/fixture=-'
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 2))"
+[[ ! -e "$fixture/runner/tree/sibling" ]]
+jq -e '[.inputs.sources[].repository] == ["fixture"]' "$receipt" >/dev/null
+settled=$(stat -c %Y "$fixture/runner/cache/mains/acme/fixture")
+printf 'unrelated sibling moved\n' >>"$fixture/sibling-src/file"
+git -C "$fixture/sibling-src" commit -qam unrelated-sibling-moves
+git -C "$fixture/sibling-src" push -q "$fixture/sibling.git" main
+invoke
+expect_count "$((before_count + 2))"
+grep -q 'read without preparing a tree' "$fixture/runner.log"
+[[ "$(stat -c %Y "$fixture/runner/cache/mains/acme/fixture")" == "$settled" ]]
+touch "$fixture/require-sibling"
+invoke --repo acme/fixture --pr 1
+expect_count "$((before_count + 3))"
+jq -e '.terminal and .exit_code == 34' "$receipt" >/dev/null
+rm -f "$fixture/require-sibling"
+export PR_GATE_DEPENDENCIES='acme/fixture=nomain'
+invoke
+[[ "$runner_exit" != 0 ]]
+expect_count "$((before_count + 3))"
+grep -q 'declared dependency acme/nomain has no canonical main' "$fixture/runner.log"
+# An unrelated map entry must not change the default family selection for this repository.
+export PR_GATE_DEPENDENCIES='acme/other=-'
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -e '.outcome == "success" and ([.inputs.sources[].repository] == ["fixture","sibling"])' "$receipt" >/dev/null
+unset PR_GATE_DEPENDENCIES
+export GATE_RUNNER_FAMILY=fixture
+printf 'PASS declared closure: dependency moves re-gate, unrelated moves reuse, undeclared reads and missing dependencies fail\n'
 
 # Isolating the home/toolchain must not turn input hashing into a canned answer. A byte change
 # with the same reported version still invalidates reuse, both for a compiler and a user helper.

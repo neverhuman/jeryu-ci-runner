@@ -80,6 +80,36 @@ refused -- this runner's own work, a closed pull request, a head that moved -- a
 reads no requests, being a retry already. A forge without the route (404) is silent; any other
 answer is reported, because it would otherwise ignore every re-gate asked for without a word.
 
+## Declaring sibling dependencies
+
+By default, every canonical sibling main is an input to every gate in its family. A merge to an
+unrelated sibling therefore invalidates existing results. After qualifying a repository's complete
+gate with a smaller source closure, the operator can set `PR_GATE_DEPENDENCIES` in the site config:
+
+```text
+PR_GATE_DEPENDENCIES=acme/web=tool,core acme/tool=-
+```
+
+Keys are exact `owner/repo` names. Values list all same-owner sibling source dependencies, including
+transitive ones, separated by commas; `-` means none. The gated repository is always included.
+Unlisted repositories keep the default family or `GATE_RUNNER_FAMILY`. Paths, globs, duplicate keys,
+duplicate dependencies and self references are refused. A declared sibling without canonical main
+is an error, even though default family discovery tolerates scaffold-only siblings.
+
+The runner fetches and prepares only the selected checkouts and moves old undeclared checkouts out
+of the slot tree before running a recipe. Failure to remove one stops the gate. Both the declaration
+and exact selected source identities are bound into the result. Changing a declared sibling still
+re-gates; changing an unrelated sibling does not. Settle records live at `cache/mains/<owner>/<repo>`
+so different closures cannot keep resetting each other's timer. Existing owner-wide records are
+unused after upgrade. No site is enrolled by installing this code.
+
+This controls sibling source inputs, not OS access: trusted recipes still have their normal host
+permissions, and separately configured immutable evidence repositories remain available. Before
+enrollment, audit recipes and helper scripts for sibling access and run the full required gate with
+exactly the proposed checkouts. Add a dependency before introducing a new sibling read. A missing
+optional read that a recipe silently skips needs an explicit assertion in that recipe; the runner
+cannot infer dependencies from skipped code.
+
 ## Starting a gate when the head appears
 
 A slot looks for work when its own timer fires, so a head that appeared just after a tick waited for

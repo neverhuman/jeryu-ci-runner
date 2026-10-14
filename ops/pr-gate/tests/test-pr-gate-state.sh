@@ -540,6 +540,7 @@ a=$(gate_site_config_digest "$site/a.env")
   || { printf 'host-local settings changed the site digest\n' >&2; exit 1; }
 # A changed setting is put first: of repeated keys the loader keeps the first, and so does the digest.
 for change in 'PR_GATE_LOCK_SOURCES=git+https://other.example.test/' 'PR_GATE_CONTEXT_OVERRIDES=acme/x=y/required' \
+    'PR_GATE_DEPENDENCIES=acme/web=tool' \
     'PR_GATE_SOME_FUTURE_SETTING=1' 'PR_GATE_OK_TO_TEST_MAINTAINERS=*' 'PR_GATE_CONTRIBUTED_LABEL=outside'; do
   { printf '%s\n' "$change"; cat "$site/a.env"; } >"$site/changed.env"
   [[ "$(gate_site_config_digest "$site/changed.env")" != "$a" ]] \

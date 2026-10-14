@@ -82,3 +82,13 @@ pr_gate_listed 'x y' z y || fail 'any name listed'
 ! pr_gate_listed 'acme-*' acme || fail 'glob expanded against the working directory'
 ! pr_gate_listed '' acme || fail 'empty list'
 printf 'PASS path, lookup and list helpers\n'
+
+for valid in '' 'acme/web=-' 'acme/web=tool,core other/web=tool'; do
+  pr_gate_dependencies_valid "$valid" || fail "valid dependency map refused: $valid"
+done
+for invalid in 'acme/web' 'acme/web=' 'acme/*=tool' '../web=tool' 'acme/web=../tool' \
+  'acme/web=tool,' 'acme/web=,tool' 'acme/web=tool,,core' 'acme/web=tool,tool' \
+  'acme/web=web' 'acme/web=-,tool' 'acme/web=tool acme/web=core' 'acme/web=tool/other'; do
+  ! pr_gate_dependencies_valid "$invalid" || fail "invalid dependency map accepted: $invalid"
+done
+printf 'PASS dependency declarations reject ambiguous keys, duplicate names, paths and globs\n'

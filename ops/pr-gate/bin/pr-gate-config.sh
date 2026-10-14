@@ -56,6 +56,29 @@ pr_gate_lookup() { # list key
   return 1
 }
 
+# Site-owned source closure, not PR-controlled configuration. Each exact owner/repo maps to
+# comma-separated same-owner sibling names, or '-' for no siblings. Validate the whole map so a
+# typo cannot silently leave some repositories on a different policy. No paths, globs or duplicates.
+pr_gate_dependencies_valid() { # map
+  local - word key deps dep
+  local name='[A-Za-z0-9_][A-Za-z0-9_.-]*'
+  local -A keys=() names=()
+  set -f
+  for word in $1; do
+    [[ "$word" == *=* ]] || return 1
+    key=${word%%=*} deps=${word#*=}
+    [[ "$key" =~ ^$name/$name$ && -z "${keys[$key]+set}" ]] || return 1
+    keys[$key]=1
+    [[ "$deps" != - ]] || continue
+    [[ "$deps" =~ ^$name(,$name)*$ ]] || return 1
+    names=()
+    for dep in ${deps//,/ }; do
+      [[ "$dep" != "${key#*/}" && -z "${names[$dep]+set}" ]] || return 1
+      names[$dep]=1
+    done
+  done
+}
+
 # True when NAME is one of the space-separated words (globs) in LIST.
 pr_gate_listed() { # list name...
   local - list=$1 pattern name; shift
