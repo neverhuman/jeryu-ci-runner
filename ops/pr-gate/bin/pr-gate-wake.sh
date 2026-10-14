@@ -29,11 +29,10 @@
 #      re-gate requests, waking on a line the view gained since the last poll.
 #
 # Either way the first look after boot or install only records where things stand and wakes nothing,
-# because the slot timers already cover the backlog. Signals arriving while every slot is busy are
-# not saved for later for the same reason: the running ticks, and the timers behind them, find that
-# work on their own.
+# because the slot timers already cover the backlog. Later signals are saved before starting slots,
+# including when all slots are busy, so the next scheduled tick retains their priority.
 #
-# A woken slot is told which head it was woken for: one line per started slot in
+# A woken slot is told which head it was woken for: one line per new head in
 # cache/wake-dispatch, as "<owner/repo> <number|-> <sha|-> <source> <when>". The runner takes one
 # line per tick and gates that head first of the ones its own pass found, and dates the queue wait
 # its gate.log event reports from <when>. The line decides nothing -- the runner chooses, claims and
@@ -138,19 +137,17 @@ get() { # path [max-time] -> $body, $code. A 429 starts the shared back-off; whi
   rm -f -- "$hdr"
 }
 
-# Hand one head to a slot that was just started. Appended under its own lock, newest last, and the
-# file is held to the newest DISPATCH_KEEP lines: a line is worth taking only while the head is still
-# the newest thing that happened, and the runner drops a stale one anyway.
+# Retain head hints before waking any slot, including heads arriving while every slot is busy.
+# Append a batch atomically under the reader's lock. Keep the newest DISPATCH_KEEP lines; this is
+# bounded priority, not execution authority or a work journal. The runner drops expired/moved heads.
 DISPATCH_KEEP=64
-dispatch_add() { # "<owner/repo> <number|-> <sha|-> <source> <when>"
-  local line="$1" kept
-  [[ -n "${line// }" ]] || return 0
-  exec 5>"$DISPATCH.lock" || return 0
-  flock -w 2 5 || { exec 5>&-; return 0; }
-  printf '%s\n' "$line" >>"$DISPATCH"
-  if kept="$(tail -n "$DISPATCH_KEEP" "$DISPATCH")"; then
-    printf '%s\n' "$kept" >"$DISPATCH.tmp" && mv -f -- "$DISPATCH.tmp" "$DISPATCH"
-  fi
+dispatch_add() { # heads-file
+  local heads="$1" kept
+  [[ -s "$heads" ]] || return 0
+  exec 5>"$DISPATCH.lock" || return 1
+  flock -w 2 5 || { exec 5>&-; return 1; }
+  kept=$({ [[ ! -f "$DISPATCH" ]] || cat "$DISPATCH"; cat "$heads"; } | tail -n "$DISPATCH_KEEP") || return 1
+  printf '%s\n' "$kept" >"$DISPATCH.tmp" && mv -f -- "$DISPATCH.tmp" "$DISPATCH" || return 1
   exec 5>&-
 }
 
@@ -191,11 +188,15 @@ wake_main_health() { # count
 
 # Start up to $1 idle slots and say what it did. Idle is: the slot's timer is active (so neither
 # drained nor disabled) and its service is neither running nor starting. $3 names the heads, one
-# line per wake-up in the same order: each started slot is handed the line it was started for, and a
-# head with no slot left to take it is not kept for later.
+# line per wake-up in the same order. Persist all hints first: a fast-starting service must find
+# its hint, and the next scheduled tick must still find hints that arrived while all slots were busy.
 wake_slots() { # count what [heads-file]
   local want="$1" what="$2" heads="${3:-}" n slot_state woke=() slots
   ((want > 0)) || return 0
+  [[ -z "$heads" ]] || dispatch_add "$heads" || {
+    say 'cannot retain wake-up hints; leaving this view unacknowledged'
+    return 1
+  }
   slots="${GATE_RUNNER_SLOTS:-$(systemctl --user list-units --no-legend --plain --state=active 'pr-gate-runner@*.timer' \
     | sed -n 's/^pr-gate-runner@\([0-9]\+\)\.timer.*/\1/p' | sort -n | tr '\n' ' ' || true)}"
   for n in $slots; do
@@ -204,7 +205,6 @@ wake_slots() { # count what [heads-file]
     [[ "$slot_state" == inactive || "$slot_state" == failed ]] || continue
     systemctl --user start --no-block "pr-gate-runner@$n.service" || continue
     woke+=("$n")
-    [[ -z "$heads" ]] || dispatch_add "$(sed -n "${#woke[@]}p" "$heads")"
   done
   say "$want $what; woke slot(s): ${woke[*]:-none idle}"
 }
@@ -235,7 +235,6 @@ if ! signal_paused; then
       fresh="$(grep -c . "$heads" || true)"
       awk '$2 ~ /^[0-9]+$/ { print $1, $2, $3 }' "$heads" >"$signalled"
     fi
-    printf '%s\n' "$seq" >"$SEQ.tmp" && mv -f -- "$SEQ.tmp" "$SEQ"
     wake_slots "$fresh" 'gate-wanted signal(s)' "$heads"
     # A push to the default branch also wakes a main-health slot: that is the gate on the new head,
     # so a red main surfaces when it happens and not at the next main-health timer tick. Called on
@@ -249,6 +248,7 @@ if ! signal_paused; then
       [[ "$main_pushes" =~ ^[0-9]+$ ]] || main_pushes=0
     fi
     wake_main_health "$main_pushes"
+    printf '%s\n' "$seq" >"$SEQ.tmp" && mv -f -- "$SEQ.tmp" "$SEQ"
     signal=1
   else
     case "$code" in
@@ -325,7 +325,5 @@ comm -13 "$STATE" "$now" \
     else cat; fi \
   | awk 'NF >= 3 { print $1, $2, $3, ($4 == "" ? "pr-head" : $4), "-" }' >"$heads"
 fresh=$(grep -c . "$heads" || true)
-cp -- "$now" "$STATE.tmp" && mv -f -- "$STATE.tmp" "$STATE"
-((fresh > 0)) || exit 0
-
 wake_slots "$fresh" 'new or moved head(s)' "$heads"
+cp -- "$now" "$STATE.tmp" && mv -f -- "$STATE.tmp" "$STATE"

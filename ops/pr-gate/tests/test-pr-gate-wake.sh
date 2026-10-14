@@ -39,7 +39,9 @@ cat >"$fx/bin/systemctl" <<SH
 case "\$*" in
   *list-units*) printf 'pr-gate-runner@0.timer loaded active waiting x\npr-gate-runner@1.timer loaded active waiting x\npr-gate-runner@2.timer loaded active waiting x\n';;
   *is-active*) n=\${3#pr-gate-runner@}; n=\${n%.service}; if [[ -e "$fx/busy-\$n" ]]; then echo active; else echo inactive; exit 3; fi;;
-  *start*) printf '%s\n' "\$*" >>"$fx/started.log";;
+  *start*) printf '%s\n' "\$*" >>"$fx/started.log"
+    [[ ! -f "$fx/reject-start" ]] || exit 1
+    cat "$fx/home/cache/wake-dispatch" >>"$fx/dispatch-at-start.log";;
 esac
 SH
 chmod +x "$fx/bin/curl" "$fx/bin/systemctl"
@@ -67,6 +69,7 @@ pulls a "$(pr 1 "$A2")"
 run
 must 'moved head wakes exactly one slot' test "$(started)" == 1
 must 'the lowest idle slot' grep -qx -- '--user start --no-block pr-gate-runner@0.service' "$fx/started.log"
+must 'the hint is present before the service starts' grep -qx "acme/acme-a 1 $A2 pr-head -" "$fx/dispatch-at-start.log"
 printf 'PASS a moved head wakes one idle slot\n'
 
 touch "$fx/busy-0"
@@ -100,6 +103,7 @@ pulls a "$(pr 1 "$A1")"
 run
 must 'no idle slot, nothing started' test "$(started)" == 0
 must 'says so' grep -q 'none idle' "$fx/out"
+must 'the polled head retains its priority' grep -qx "acme/acme-a 1 $A1 pr-head -" "$fx/home/cache/wake-dispatch"
 rm -f "$fx"/busy-*
 printf 'PASS all slots busy: nothing started, the timers pick it up\n'
 
@@ -192,16 +196,20 @@ must 'a restarted forge wakes nothing' test "$(started)" == 0
 must 'and its sequence is adopted' test "$(seq_file)" == 2
 printf 'PASS a sequence that went backwards resyncs without waking a slot\n'
 
-# With every slot busy the signal is spent, exactly as a new head is in the fallback: the running
-# ticks and the slot timers behind them pick that work up.
+# A busy fleet acknowledges the signal only after retaining its priority for the next tick.
+: >"$fx/home/cache/wake-dispatch"
 touch "$fx/busy-0" "$fx/busy-1" "$fx/busy-2"
 signal 3 "$(wanted acme/acme-a "$A2" regate)"
 run
 must 'no idle slot, nothing started' test "$(started)" == 0
 must 'says so' grep -q 'none idle' "$fx/out"
-must 'the signal is not kept for later' test "$(seq_file)" == 3
+must 'the signal was acknowledged' test "$(seq_file)" == 3
+must 'the priority survives busy slots' grep -qx "acme/acme-a - $A2 regate 2026-10-08T09:00:00Z" "$fx/home/cache/wake-dispatch"
+signal 3   # no newer signals after the acknowledged sequence
+run
+must 'the same signal does not duplicate its hint' test "$(wc -l <"$fx/home/cache/wake-dispatch")" == 1
 rm -f "$fx"/busy-*
-printf 'PASS all slots busy: the signal is spent and the timers pick it up\n'
+printf 'PASS all slots busy: signal acknowledged once, priority retained for the next tick\n'
 
 # A forge that answers the signal route with something unusable falls back to reading heads, so the
 # timer path keeps working against a forge that does not have the signal.
@@ -264,10 +272,11 @@ touch "$fx/busy-1" "$fx/busy-2"
 signal 9 "$(wanted acme/acme-a "$B1" push)" "$(wanted acme/acme-a "$Q1" queue)"
 run
 must 'one idle slot, one slot started' test "$(started)" == 1
-must 'and one head handed over, the first of the two' \
-  test "$(dispatch)" == "acme/acme-a - $B1 push 2026-10-08T09:00:00Z"
+must 'both hints retained although only one slot is idle' test "$(dispatch | wc -l)" == 2
+must 'the first head retains FIFO order' test "$(dispatch | head -1)" == "acme/acme-a - $B1 push 2026-10-08T09:00:00Z"
+must 'the remaining head is retained too' test "$(dispatch | tail -1)" == "acme/acme-a - $Q1 queue 2026-10-08T09:00:00Z"
 rm -f "$fx"/busy-*
-printf 'PASS a head with no idle slot to take it is not handed to anybody\n'
+printf 'PASS priority is retained for heads with no idle slot\n'
 
 # The file cannot grow without bound: it is the newest few heads, not a backlog.
 for i in $(seq 1 70); do printf 'acme/acme-a %s %s pr-head -\n' "$i" "$A1" >>"$fx/home/cache/wake-dispatch"; done
@@ -276,6 +285,20 @@ run
 must 'the dispatch file is held to its newest lines' test "$(dispatch | wc -l)" -le 64
 must 'and the newest head is the one just handed over' test "$(dispatch | tail -1)" == "acme/acme-a - $A1 regate 2026-10-08T09:00:00Z"
 printf 'PASS the handed-over heads are bounded\n'
+
+# Do not acknowledge a new signal when its hint could not be saved. A later look retries it.
+mkdir "$fx/home/cache/wake-dispatch.tmp"
+signal 12 "$(wanted acme/acme-a "$A2" push)"
+if run 2>"$fx/write-error"; then printf 'FAIL: a failed hint write was accepted\n' >&2; exit 1; fi
+must 'failed write leaves sequence unchanged' test "$(seq_file)" == 11
+must 'failed write starts no service' test "$(started)" == 0
+rmdir "$fx/home/cache/wake-dispatch.tmp"
+touch "$fx/reject-start"
+run
+must 'saved hint is acknowledged even if service start fails' test "$(seq_file)" == 12
+must 'failed service start retains the hint' test "$(dispatch | tail -1)" == "acme/acme-a - $A2 push 2026-10-08T09:00:00Z"
+rm -f "$fx/reject-start"
+printf 'PASS failed hint writes are retried; failed service starts retain the saved hint\n'
 # A runner newer than its forge: the forge has no gate-wanted route. Wake probes once, remembers the
 # 404, reads no heads, and wakes nothing, instead of flooding the forge every second.
 # ---------------------------------------------------------------------------

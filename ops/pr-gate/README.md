@@ -127,13 +127,17 @@ starts an idle slot the moment it learns a head can be gated, from two sources:
   existed, so nothing pointed a slot at it and it waited for a timer. Only an exact PR/head named
   by a signal in the same look is skipped by the view; a pushed SHA alone cannot suppress an opening.
 
-Each started slot is handed the head it was started for, as one line of
+Before starting any slot, the waker saves every new head hint as one line of
 `~/gate-runner/cache/wake-dispatch` (`<owner/repo> <number|-> <sha|-> <source> <when|->`). The runner
 takes one line per tick and gates that head first of the pull-request heads its own pass found --
 merge-queue entries still come first, each being one gate from landing -- and dates the queue wait
 from `<when>`. The line decides nothing else: the tick still lists, chooses, claims and gates heads
-by the ordinary rules, which is what keeps the slot timers a sufficient fallback. A line nobody takes,
-or one older than `GATE_RUNNER_DISPATCH_TTL` seconds (default 600), is dropped unread.
+by the ordinary rules, which is what keeps the slot timers a sufficient fallback. Hints survive busy
+slots and failed service starts for the next scheduled tick (normally 20–25 seconds after a slot
+finishes). Saving hints happens before acknowledging the signal or updating the observed PR view;
+a failed write leaves that view available to retry. The file keeps at most the newest 64 hints.
+Dated hints older than `GATE_RUNNER_DISPATCH_TTL` seconds (default 600) are dropped when read.
+This is bounded priority, not a durable work queue: current forge state remains authoritative.
 
 ## How long a head waited
 
