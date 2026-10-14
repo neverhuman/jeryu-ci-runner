@@ -12,7 +12,7 @@ mkdir -p "$fx/install" "$fx/bin" "$fx/home" "$fx/forge" "$fx/git"
 for f in pr-gate-audit.sh pr-gate-config.sh pr-gate-backoff.sh pr-gate-state.sh; do cp "$src_bin/$f" "$fx/install/"; done
 audit="$fx/install/pr-gate-audit.sh"
 printf 'AUDIT-TOKEN-5c1e\n' >"$fx/token"; chmod 0600 "$fx/token"
-printf 'PR_GATE_FORGE_URL=https://forge.example.test\nJERYU_TOKEN_FILE=%s\nGATE_RUNNER_IDENTITY=gate-bot\n' "$fx/token" >"$fx/pr-gate.env"
+printf 'PR_GATE_FORGE_URL=https://forge.example.test\nJERYU_TOKEN_FILE=%s\nGATE_RUNNER_IDENTITY=gate-bot\nGATE_RUNNER_OWNERS=acme\n' "$fx/token" >"$fx/pr-gate.env"
 HOST=$(hostname -s)
 
 # A repository on the fixture forge: base commit, then a head that changes one file.
@@ -59,6 +59,9 @@ done
 set -- "\$sub" "\${args[@]}"
 [[ "\${1:-}" == diff-audit ]] || tree=.
 cat "\$tree/agent/audit-policy.toml" >"$fx/policy.seen" 2>/dev/null || true
+ls "\$tree/agent" >"$fx/agent.seen" 2>/dev/null || true
+git -C "\$tree" status --porcelain --untracked-files=no >"$fx/status.seen" 2>/dev/null || true
+[[ ! -e "$fx/noisy" ]] || printf 'noisy \033[31mred\033[0m \001tail\n' >&2
 [[ ! -e "$fx/tool-fails" ]] || exit 3
 out=""; prev=""; for a in "\$@"; do [[ "\$prev" != --json ]] || out=\$a; prev=\$a; done
 mkdir -p "\$(dirname "\$out")"
@@ -97,11 +100,14 @@ case "\$url" in
     cp "\${data#@}" "$fx/forge/score-\$n.json"
     printf '%s\n' "\${data#@}" >>"$fx/score-bodies.log"
     answer '{"score":91}' "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
-  */pulls\?state=open)
+  */pulls\?state=open*)
     if [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"; else
-    answer "\$( { sed 's/.*/{"number":1,"head_sha":"&","labels":["origin:internal"]}/' "$fx/forge/internal-heads" 2>/dev/null
-               sed 's/.*/{"number":2,"head_sha":"&","labels":["origin:contributed"]}/' "$fx/forge/contributed-heads" 2>/dev/null; } \
-               | jq -cs '{items: .}')" 200; fi;;
+    page=\$(sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p' <<<"\$url")
+    if [[ -e "$fx/forge/paged" && "\${page:-1}" == 1 ]]; then answer '{"items":[],"page":{"has_more":true}}' 200; else
+    items=\$( { sed 's/.*/{"number":1,"head_sha":"&","labels":["origin:internal"]}/' "$fx/forge/internal-heads" 2>/dev/null
+               sed 's/.*/{"number":2,"head_sha":"&","labels":["origin:contributed"]}/' "$fx/forge/contributed-heads" 2>/dev/null; } | jq -cs .)
+    [[ ! -e "$fx/forge/summary-labels" ]] || items=\$(jq -c 'map({number, head_sha, summary: {labels}})' <<<"\$items")
+    answer "\$(jq -c '{items: ., page: {has_more: false}}' <<<"\$items")" 200; fi; fi;;
   */runners/heartbeat)
     b=\$(cat)
     if [[ -e "$fx/forge/old-heartbeat" ]] && jq -e 'has("tools") or has("code") or has("intervalSeconds")' >/dev/null <<<"\$b"; then answer nope 422
@@ -309,3 +315,44 @@ run
 must 'a full job with no base is audited' grep -q "acme/orphanpr@$h7 scored .*full audit" "$fx/out"
 must 'its base is passed on as given' test "$(jq -r '.base_sha' "$fx/forge/score-$(($(scores) - 1)).json")" == ""
 printf 'PASS a full job with no commit base is audited, not dropped\n'
+
+# --- scope, main, metadata, and what the auditor sees ------------------------------------------------
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"other","repo":"widget","branch":"main","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$HEAD_SHA" "$BASE_SHA" >"$fx/forge/claim.json"
+: >"$fx/git-helper.log"
+run
+must 'another owner is not served' grep -q 'other is not an owner this host serves' "$fx/out"
+must 'another owner is never cloned' test ! -s "$fx/git-helper.log"
+
+w="$fx/w-side"; git init -q -b main "$w"; echo a >"$w/a"; git -C "$w" add -A; git -C "$w" -c user.name=t -c user.email=t@example.test commit -qm base
+sb=$(git -C "$w" rev-parse HEAD); git -C "$w" checkout -q -b side; echo s >"$w/s"; git -C "$w" add -A
+git -C "$w" -c user.name=t -c user.email=t@example.test commit -qm side; sh=$(git -C "$w" rev-parse HEAD); git clone -q --bare "$w" "$fx/git/side.git"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"side","branch":"main","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$sh" "$sb" >"$fx/forge/claim.json"
+: >"$fx/jankurai.log"
+run
+must 'a ticket that says main for a head not on main is refused' grep -q 'the ticket says main, but the head is not on main' "$fx/out"
+must 'and nothing is audited' test ! -s "$fx/jankurai.log"
+printf 'PASS only this host s owners, and main only when the head is on main\n'
+
+read -r b8 h8 < <(repo zones 'mkdir agent; printf "minimum_score = 88\n" >agent/audit-policy.toml; ln -s ../../../etc agent/escape' \
+  'printf "[[zone]]\npath = \"src\"\n" >agent/generated-zones.toml; echo y >y; ln -sf /etc/hostname host-link')
+tickets "zones:$b8:$h8"
+touch "$fx/noisy"
+run
+must 'the head s own zones never reach the auditor' test "$(grep -c generated-zones "$fx/agent.seen" || true)" == 0
+must 'the base policy is used' grep -qx 'minimum_score = 88' "$fx/policy.seen"
+must 'the auditor sees none of the hardening as a change' test ! -s "$fx/status.seen"
+must 'no control character reaches the journal' test "$(LC_ALL=C grep -c $'[\x01\x1b]' "$fx/out" || true)" == 0
+rm -f "$fx/noisy"
+printf 'PASS a diff job audits with the base metadata, and the hardening is invisible to the diff\n'
+
+touch "$fx/forge/summary-labels" "$fx/forge/paged"
+tickets "lowers:$b1:$h1"
+run
+must 'a head on page 2 with summary labels is admitted' grep -q "acme/lowers@$h1 scored" "$fx/out"
+rm -f "$fx/forge/summary-labels" "$fx/forge/paged"
+printf 'PASS labels under .summary and heads past the first page are found\n'
+
+set +e; HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" PR_GATE_CONFIG="$fx/pr-gate.env" PR_GATE_AUDIT_MAX=8 PR_GATE_AUDIT_TIMEOUT=5000 bash "$audit" >"$fx/out" 2>&1; rc=$?; set -e
+must 'a pass that cannot fit the unit is refused' test "$rc" == 2
+must 'and says why' grep -q "exceeds the unit's 10h limit" "$fx/out"
+printf 'PASS jobs x timeout must fit the unit\n'

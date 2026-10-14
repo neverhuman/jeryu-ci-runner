@@ -67,12 +67,21 @@ MAX="${PR_GATE_AUDIT_MAX:-1}"
 [[ "$MAX" =~ ^[1-8]$ ]] || { say "PR_GATE_AUDIT_MAX must be 1..8"; exit 2; }
 AUDIT_TIMEOUT="${PR_GATE_AUDIT_TIMEOUT:-900}"
 [[ "$AUDIT_TIMEOUT" =~ ^[1-9][0-9]{0,4}$ ]] || { say "PR_GATE_AUDIT_TIMEOUT must be seconds"; exit 2; }
+# A pass must end inside the unit's TimeoutStartSec (10h): every job's audit plus its clone and submit.
+((MAX * (AUDIT_TIMEOUT + 300) <= 36000)) \
+  || { say "PR_GATE_AUDIT_MAX x (PR_GATE_AUDIT_TIMEOUT + 300s) exceeds the unit's 10h limit"; exit 2; }
 BEAT_EVERY="${PR_GATE_AUDIT_BEAT_EVERY:-60}"
 [[ "$BEAT_EVERY" =~ ^[1-9][0-9]*$ ]] || BEAT_EVERY=60
 HOST="$(hostname -s)"
 [[ "$HOST" =~ ^[A-Za-z0-9.-]{1,64}$ ]] || { say "this host's short name is not usable as a runner id"; exit 2; }
 RUNNER_ID="$HOST/jankurai-audit"
 LAST_FILE="$HOME_DIR/cache/audit-last.json"
+# The repositories this host serves, exactly as the slots and the wake timer choose them: an explicit
+# GATE_RUNNER_REPOS list (owner/repo), else every repository of GATE_RUNNER_OWNERS. A job for any other
+# repository is left alone.
+REPOS="${GATE_RUNNER_REPOS:-auto}"
+OWNERS="${GATE_RUNNER_OWNERS:-}"
+[[ "$REPOS" != auto || -n "${OWNERS// }" ]] || not_configured "GATE_RUNNER_OWNERS (or GATE_RUNNER_REPOS)"
 INTERNAL_LABEL="${PR_GATE_INTERNAL_LABEL:-origin:internal}"
 CONTRIBUTED_LABEL="${PR_GATE_CONTRIBUTED_LABEL:-origin:contributed}"
 for tool in curl jq git sha256sum timeout flock; do command -v "$tool" >/dev/null || { say "$tool is required"; exit 2; }; done
@@ -132,7 +141,11 @@ AUTH_CONFIG="$WORK_DIR/curl-auth.conf"
   printf 'header = "Authorization: Bearer %s"\n' "$token" >"$AUTH_CONFIG" )
 # shellcheck disable=SC2016  # expanded by git's helper shell, not here
 GIT_HELPER='!f() { [ "$3" = get ] || exit 0; printf "username=%s\npassword=%s\n" "$1" "$(cat "$2")"; }; f'
-git_auth=(env GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 GIT_CONFIG_COUNT=2
+# Every git command of the pass runs with this environment -- the checkout most of all, since it is the
+# one that writes the head's files: no LFS smudge (a head's .lfsconfig could name any URL), no prompt,
+# and no global or system configuration (filters, hooks paths, URL rewrites) beyond the credential.
+git_auth=(env GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  GIT_CONFIG_COUNT=2
   GIT_CONFIG_KEY_0="credential.$BASE/git/.helper" GIT_CONFIG_VALUE_0=""
   GIT_CONFIG_KEY_1="credential.$BASE/git/.helper" GIT_CONFIG_VALUE_1="$GIT_HELPER '$IDENTITY' '$TOKEN_FILE'")
 
@@ -222,14 +235,27 @@ default_policy() {
     "required_tool_version = \"$JERYU_JANKURAI_SEMVER\""
 }
 
-# prepare_tree SRC BASE MODE: make the checked-out head safe to audit and give it the trusted policy.
-# Every symlink that resolves outside the clone is removed, so the auditor can neither read a host
-# file through the tree nor write through one; the paths the auditor writes to (.jankurai, target)
-# and the policy path are replaced with real directories and a fresh file whatever the head put
-# there. Fails (nonzero) rather than audit a tree it could not make safe.
+# prepare_tree SRC BASE MODE: make the checked-out head safe to audit and give it trusted metadata.
+#
+# What the auditor reads besides the code -- agent/ (policy, generated zones, boundaries, test and owner
+# maps) and .jeryu/ (the CI declaration) -- comes from the base commit for a diff job, so a head can
+# neither lower its floor nor mark its own files generated or excluded; a full job (no base) keeps the
+# head's metadata but always the default policy. Then every symlink resolving outside the clone is
+# removed, so the auditor can neither read a host file through the tree nor write through one, and the
+# paths it writes to (.jankurai, target) are real directories. Finally every tracked path this changed
+# is marked assume-unchanged: diff-audit scores the worktree against the base, and must see only what
+# the head committed, never these edits. Fails (nonzero) rather than audit a tree it could not make safe.
 prepare_tree() {
-  local src=$1 base=$2 mode=$3 root link target entry
+  local src=$1 base=$2 mode=$3 root link target entry dir
   root="$(realpath -- "$src")" || return 1
+  if [[ "$mode" == diff ]]; then
+    for dir in agent .jeryu; do
+      rm -rf -- "${root:?}/$dir" || return 1
+      if [[ -n "$("${git_auth[@]}" git -C "$root" ls-tree "$base" -- "$dir")" ]]; then
+        "${git_auth[@]}" git -C "$root" archive --format=tar "$base" -- "$dir" | tar -x -C "$root" || return 1
+      fi
+    done
+  fi
   while IFS= read -r -d '' link; do
     target="$(realpath -m -- "$link")" || target=""
     [[ "$target" == "$root" || "$target" == "$root"/* ]] || rm -f -- "$link" || return 1
@@ -238,17 +264,19 @@ prepare_tree() {
     if [[ -L "$root/$entry" || ( -e "$root/$entry" && ! -d "$root/$entry" ) ]]; then rm -f -- "$root/$entry" || return 1; fi
     mkdir -p -- "$root/$entry" || return 1
   done
-  rm -rf -- "$root/agent/audit-policy.toml" || return 1
-  if [[ "$mode" == diff ]] && [[ "$(git -C "$root" ls-tree "$base" -- agent/audit-policy.toml | cut -d' ' -f1)" == 100644 ]]; then
-    git -C "$root" show "$base:agent/audit-policy.toml" >"$WORK_DIR/policy.toml" || return 1
+  if [[ "$mode" == diff && -f "$root/agent/audit-policy.toml" && ! -L "$root/agent/audit-policy.toml" ]]; then
+    cp -- "$root/agent/audit-policy.toml" "$WORK_DIR/policy.toml"
     policy_source="base $base"
   else
+    rm -rf -- "$root/agent/audit-policy.toml" || return 1
     default_policy >"$WORK_DIR/policy.toml"
+    cp -- "$WORK_DIR/policy.toml" "$root/agent/audit-policy.toml"
     policy_source=default
   fi
-  # The parent is a real directory inside the clone and the path was just removed, so this creates a
-  # new file there; no link the head planted is followed.
-  cp -- "$WORK_DIR/policy.toml" "$root/agent/audit-policy.toml"
+  # Hide this function's own edits from the diff: modified and deleted tracked paths keep the head's
+  # index entry. New files are untracked and never enter the diff set.
+  "${git_auth[@]}" git -C "$root" ls-files -z -m -d | sort -zu \
+    | xargs -0 -r "${git_auth[@]}" git -C "$root" update-index --assume-unchanged -- || return 1
 }
 
 # admission OWNER REPO BRANCH HEAD: nothing when the head is reviewed code this host may check out;
@@ -256,13 +284,24 @@ prepare_tree() {
 # the forge marks internal (jeryu's own rows label every pull request internal or contributed, set by
 # the importer, never by the author); anything the forge cannot vouch for is refused.
 admission() {
-  local owner=$1 repo=$2 branch=$3 head=$4 row
+  local owner=$1 repo=$2 branch=$3 head=$4 row="" page more
+  if [[ "$REPOS" != auto ]]; then
+    pr_gate_listed "$REPOS" "$owner/$repo" || { printf '%s/%s is not one of the repositories this host serves' "$owner" "$repo"; return; }
+  else
+    pr_gate_listed "$OWNERS" "$owner" || { printf '%s is not an owner this host serves' "$owner"; return; }
+  fi
+  # main is checked after the clone, against the clone's own main (the ticket's word is not enough).
   [[ "$branch" != main ]] || return 0
-  api GET "/api/v1/repos/$owner%2F$repo/pulls?state=open"
-  [[ "$code" == 200 ]] || { printf 'the forge answered %s listing its pull requests' "$code"; return; }
-  row="$(jq -c --arg h "$head" 'first(.items[]? | select(.head_sha == $h)) // empty' <<<"$body" 2>/dev/null)"
+  for ((page = 1; page <= 20; page++)); do
+    api GET "/api/v1/repos/$owner%2F$repo/pulls?state=open&per_page=500&page=$page"
+    [[ "$code" == 200 ]] || { printf 'the forge answered %s listing its pull requests' "$code"; return; }
+    row="$(jq -c --arg h "$head" 'first(.items[]? | select(.head_sha == $h)) // empty' <<<"$body" 2>/dev/null)"
+    more="$(jq -r '.page.has_more // false' <<<"$body" 2>/dev/null)"
+    [[ -z "$row" && "$more" == true ]] || break
+  done
   [[ -n "$row" ]] || { printf 'no open pull request holds this head'; return; }
-  label_on() { jq -e --arg name "$2" 'any((.labels // [])[]?; (if type == "string" then . else (.name // "") end) == $name)' <<<"$1" >/dev/null 2>&1; }
+  # A label is a string or a {name} object, on the row or under its summary (as the slots read it).
+  label_on() { jq -e --arg name "$2" 'any((.labels // .summary.labels // [])[]?; (if type == "string" then . else (.name // "") end) == $name)' <<<"$1" >/dev/null 2>&1; }
   if label_on "$row" "$CONTRIBUTED_LABEL"; then
     printf 'a contribution (%s): the gate host checks out nothing of it' "$CONTRIBUTED_LABEL"; return
   fi
@@ -294,10 +333,15 @@ audit_one() { # owner repo branch head base mode
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "clone failed"; return 0
   fi
   # A head the branch no longer points at (or one only a pull request ref holds) is fetched by ref.
-  if ! git -C "$src" cat-file -e "$head^{commit}" 2>/dev/null; then
+  if ! "${git_auth[@]}" git -C "$src" cat-file -e "$head^{commit}" 2>/dev/null; then
     "${git_auth[@]}" git -C "$src" fetch -q origin '+refs/pull/*/head:refs/remotes/origin/pull/*' 2>&1 || true
   fi
-  if ! git -C "$src" -c advice.detachedHead=false checkout -q --detach "$head" 2>&1; then
+  # main is admitted only when the head really is main's: reachable from the clone's own main.
+  if [[ "$branch" == main ]] && ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$head" refs/remotes/origin/main 2>/dev/null; then
+    say "not auditing $owner/$repo@$head here: the ticket says main, but the head is not on main"
+    beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "the head is not on main"; return 0
+  fi
+  if ! "${git_auth[@]}" git -C "$src" -c advice.detachedHead=false checkout -q --detach "$head" 2>&1; then
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "head is not in the clone"; return 0
   fi
   if ! prepare_tree "$src" "$base" "$mode"; then
@@ -315,7 +359,8 @@ audit_one() { # owner repo branch head base mode
   fi
   ( cd "$src" && timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$JERYU_GOVERNED_JANKURAI_BIN" "${args[@]}" ) \
     >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
-  tail -n 3 "$WORK_DIR/audit.log" | sed 's/^/  /' || true
+  # The auditor's output can quote the head; only a bounded, printable tail reaches the journal.
+  tail -n 3 "$WORK_DIR/audit.log" | LC_ALL=C tr -cd '[:print:]\n' | cut -c1-200 | sed 's/^/  /' || true
 
   local conclusion=scored reason=""
   ((exit_code == 0)) || { conclusion="tool-failed"; reason="jankurai exited $exit_code"; }

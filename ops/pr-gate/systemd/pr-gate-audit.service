@@ -13,5 +13,5 @@ Environment=GATE_RUNNER_HOME=%h/gate-runner
 ExecStart=%h/gate-runner/bin/pr-gate-audit.sh
 Nice=10
 # Each audit is time-boxed (PR_GATE_AUDIT_TIMEOUT, default 900s) and a pass claims at most
-# PR_GATE_AUDIT_MAX (default 1) jobs.
-TimeoutStartSec=2h
+# PR_GATE_AUDIT_MAX (default 1) jobs; the script refuses a MAX x TIMEOUT that would not fit in 10h.
+TimeoutStartSec=10h
