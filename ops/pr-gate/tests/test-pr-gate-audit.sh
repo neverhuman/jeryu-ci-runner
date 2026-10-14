@@ -51,7 +51,11 @@ sub=\$1; shift; args=("\$@"); i=0
 while ((i < \${#args[@]})); do
   a=\${args[i]}
   case "\$sub \$a" in
-    "diff-audit --base-ref"|"diff-audit --json"|"audit --json"|"audit --policy"|"audit --mode") i=\$((i + 2));;
+    # jankurai 1.7 accepts only the in-tree policy file.
+    "audit --policy") [[ "\${args[i+1]:-}" == agent/audit-policy.toml || "\${args[i+1]:-}" == ./agent/audit-policy.toml ]] \
+                        || { echo "Error: unsupported audit policy source: --policy must identify ./agent/audit-policy.toml" >&2; exit 1; }
+                      i=\$((i + 2));;
+    "diff-audit --base-ref"|"diff-audit --json"|"audit --json"|"audit --mode") i=\$((i + 2));;
     "diff-audit --advisory-only"|"diff-audit --skip-proof"|"audit --full"|"audit --no-score-history"|"audit .") i=\$((i + 1));;
     *) echo "error: unexpected argument '\$a' for \$sub" >&2; exit 2;;
   esac
@@ -160,7 +164,7 @@ ticket full
 run
 must 'a full ticket is submitted' test "$(scores)" == 2
 must 'the full audit names its mode' test "$(jq -r .audit_mode "$fx/forge/score-1.json")" == full
-must 'the full audit audits the whole tree, as score.sh does' grep -q '| *audit \. --full --mode advisory --policy [^ ]*/policy.toml --json' "$fx/jankurai.log"
+must 'the full audit audits the whole tree, as score.sh does' grep -q '| *audit \. --full --mode advisory --policy agent/audit-policy.toml --json' "$fx/jankurai.log"
 printf 'PASS a full ticket audits the whole tree\n'
 
 printf '409\n' >"$fx/forge/score.status"

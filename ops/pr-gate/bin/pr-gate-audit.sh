@@ -382,7 +382,9 @@ audit_one() { # owner repo branch head base mode
   # the host's (skipping the proof plan when there is no owner map to prove lanes against).
   local -a args
   if [[ "$mode" == full ]]; then
-    args=(audit . --full --mode advisory --policy "$WORK_DIR/policy.toml" --json "$out" --no-score-history)
+    # The policy is named in-tree: jankurai 1.7 refuses any other --policy source. prepare_tree has
+    # already written the trusted bytes there (and hidden the edit from the diff).
+    args=(audit . --full --mode advisory --policy agent/audit-policy.toml --json "$out" --no-score-history)
   else
     args=(diff-audit "$src" --base-ref "$base" --json "$out" --advisory-only)
     [[ -f "$src/agent/owner-map.json" ]] || args+=(--skip-proof)
