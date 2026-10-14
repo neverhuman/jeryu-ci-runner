@@ -36,6 +36,8 @@ if [[ "\${1:-}" == clone ]]; then
   args=(); for a in "\$@"; do args+=("\${a/https:\/\/forge.example.test\/git\/acme\//$fx/git/}"); done
   exec "$real_git" "\${args[@]}"
 fi
+# A staged auditor that vanishes after the claim: removed when the head is checked out.
+if [[ -e "$fx/vanish-on-checkout" && " \$* " == *" checkout "* ]]; then rm -f -- "\$(cat "$fx/vanish-on-checkout")"; fi
 exec "$real_git" "\$@"
 SH
 # The stand-in auditor: records how it was called and writes a report padded past 128 KiB, unless
@@ -44,6 +46,7 @@ cat >"$fx/bin/jankurai" <<SH
 #!/usr/bin/env bash
 [[ "\${1:-}" != --version ]] || { echo 'jankurai 9.9.9'; exit 0; }
 printf '%s|%s\n' "\$PWD" "\$*" >>"$fx/jankurai.log"
+printf '%s\n' "\$0" >>"$fx/jankurai-bin.log"
 # Accept exactly the family's invocations (ops/ci/score.sh, ops/ci/jankurai-gate.sh); the real CLI
 # refuses an argument it does not know, so must this stand-in.
 sub=\$1; shift; args=("\$@"); i=0
@@ -95,7 +98,14 @@ done
 printf '%s %s\n' "\$method" "\$url" >>"$fx/curl.log"
 answer() { if ((quiet)); then printf '%s' "\$2"; else printf '%s\n%s' "\$1" "\$2"; fi; }
 case "\$url" in
+  */api/v1/capabilities)
+    if [[ -e "$fx/forge/bound" ]]; then answer '{"api_version":1,"jankurai_audit_jobs":{"binding":1,"release":true}}' 200; else answer nope 404; fi;;
+  */jankurai-audits/*/release)
+    j=\${url%/release}; j=\${j##*/}
+    printf '%s %s\n' "\$j" "\$(jq -r .reason "\${data#@}")" >>"$fx/forge/releases.log"
+    answer '{}' 200;;
   */jankurai-audits/claim)
+    cp "\${data#@}" "$fx/forge/claim-body.json"
     if [[ -e "$fx/forge/claim.status" ]]; then answer nope "\$(cat "$fx/forge/claim.status")"
     elif [[ -e "$fx/forge/claim.json" ]]; then answer "\$(cat "$fx/forge/claim.json")" 200; rm -f "$fx/forge/claim.json"
     else answer '{"leaseSeconds":1800,"tickets":[]}' 200; fi;;
@@ -103,7 +113,7 @@ case "\$url" in
     n=0; for f in "$fx"/forge/score-*.json; do [[ -e "\$f" ]] && n=\$((n + 1)); done
     cp "\${data#@}" "$fx/forge/score-\$n.json"
     printf '%s\n' "\${data#@}" >>"$fx/score-bodies.log"
-    answer '{"score":91}' "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
+    answer "\$(cat "$fx/forge/score.body" 2>/dev/null || echo '{"score":91}')" "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
   */pulls\?state=open*)
     if [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"; else
     page=\$(sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p' <<<"\$url")
@@ -387,3 +397,116 @@ run
 must 'a refusing verifier still tells /runners why' test "$(last_beat | jq -r '.last.reason')" == "the governed jankurai does not verify on this host: governed jankurai custody mismatch"
 rm -f "$fx/verifier-refuses"
 printf 'PASS the pass budget is enforced, the token sits apart, and a refusal is visible on /runners\n'
+
+# --- the bound contract (ADR 0011): job-assigned auditors, staged by digest -----------------------------
+SIGNER=$(printf 'c%.0s' {1..64}) TARGET=x86_64-unknown-linux-gnu MREV=$(printf 'a%.0s' {1..40}) MSHA=$(printf 'b%.0s' {1..64})
+# stage: put the stand-in auditor under <tools>/jankurai/<sha>/ with an installation receipt; prints its digest.
+stage() {
+  local sha d
+  sha=$(sha256sum <"$fx/bin/jankurai" | cut -c1-64); d="$fx/tools/jankurai/$sha"
+  mkdir -p "$d/bin"; cp "$fx/bin/jankurai" "$d/bin/jankurai"; chmod 0755 "$d/bin/jankurai"
+  jq -n --arg sha "$sha" --arg signer "$SIGNER" --arg target "$TARGET" '{schema: "jeryu.jankurai-installation/v3",
+    binary: {sha256: $sha, version_output: "jankurai 9.9.9"}, build: {target_triple: $target},
+    signature: {verified: true, signer_sha256: $signer}, test_mode: false, conclusion: "success",
+    governance: {status: "governed", manifest_commit: "0000000000000000000000000000000000000000"}}' >"$d/receipt.json"
+  printf '%s\n' "$sha"
+}
+# bticket NAME BASE HEAD METADATA POLICY-SHA [ORIGIN PURPOSE AUDITOR-SHA VERSION BRANCH MODE]: one bound job.
+bticket() {
+  jq -n --arg repo "$1" --arg base "$2" --arg head "$3" --arg mc "$4" --arg psha "$5" --arg origin "${6:-internal}" \
+    --arg purpose "${7:-proof}" --arg sha "${8:-$SSHA}" --arg ver "${9:-9.9.9}" --arg branch "${10:-feature/x}" \
+    --arg mode "${11:-diff}" --arg signer "$SIGNER" --arg target "$TARGET" --arg mrev "$MREV" --arg msha "$MSHA" '
+    {leaseSeconds: 1800, tickets: [{job_id: ("job-" + ($head | .[0:8])), owner: "acme", repo: $repo, branch: $branch,
+      head_sha: $head, base_sha: $base, audit_mode: $mode, purpose: $purpose, origin: $origin,
+      metadata_commit: $mc, policy_sha256: $psha,
+      auditor: {manifest_revision: $mrev, manifest_sha256: $msha, version: $ver, target: $target,
+                binary_sha256: $sha, signing_identity: $signer}}]}' >"$fx/forge/claim.json"
+}
+polsha() { git -C "$fx/git/$1.git" show "$2:agent/audit-policy.toml" | sha256sum | cut -c1-64; }
+DEFAULT_SHA=$(printf '%s\n' 'schema_version = "1.0.0"' 'workspace = "unconfigured"' 'minimum_score = 85' \
+  'hard_findings_allowed = 0' 'required_tool = "jankurai"' | sha256sum | cut -c1-64)
+released() { tail -n 1 "$fx/forge/releases.log" 2>/dev/null; }
+last_score() { jq -c . "$fx/forge/score-$(($(scores) - 1)).json"; }
+
+touch "$fx/forge/bound"
+printf 'PR_GATE_AUDIT_TOOLS=%s\n' "$fx/tools" >>"$fx/pr-gate.env"
+# The bound contract needs no release-specific verifier: prove it by taking that one away.
+mv "$fx/install/pr-gate-ensure-jankurai.sh" "$fx/verifier.bound-off"
+SSHA=$(stage)
+run
+must 'a bound claim offers the staged auditor by digest' test "$(jq -c '.capabilities' "$fx/forge/claim-body.json")" == "{\"jankurai\":[\"$SSHA\"],\"sandbox\":false}"
+must 'the beat lists the staged auditor' test "$(last_beat | jq -r '.tools[0].sha256')" == "$SSHA"
+printf 'PASS a bound claim offers exactly the staged, receipt-verified auditors\n'
+
+: >"$fx/jankurai-bin.log"
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")"
+run
+s=$(last_score)
+must 'a bound job is submitted with its binding' test "$(jq -r '[.job_id, .metadata_commit, .auditor.binary_sha256, .jankurai_sha256, .jankurai_version] | join(" ")' <<<"$s")" == "job-${h1:0:8} $b1 $SSHA $SSHA jankurai 9.9.9"
+must 'the policy digest is echoed' test "$(jq -r .policy_sha256 <<<"$s")" == "$(polsha lowers "$b1")"
+must 'the receipt digest is the staged receipt s' test "$(jq -r .receipt_sha256 <<<"$s")" == "$(sha256sum <"$fx/tools/jankurai/$SSHA/receipt.json" | cut -c1-64)"
+must 'the assigned, staged binary ran' test "$(tail -n 1 "$fx/jankurai-bin.log")" == "$fx/tools/jankurai/$SSHA/bin/jankurai"
+must 'the job s metadata commit supplied the policy' grep -qx 'minimum_score = 90' "$fx/policy.seen"
+must 'the report carries no runner-side policy note' test "$(jq -r '.report | has("jeryu_audit_policy")' <<<"$s")" == false
+must 'the publishing state was reported' grep -q '"state":"publishing"' "$fx/forge/beats.jsonl"
+must 'a bound job is scored' test "$(last_beat | jq -r .last.conclusion)" == scored
+printf 'PASS a bound job runs its assigned auditor on its metadata and echoes the binding\n'
+
+before=$(scores)
+bticket nopolicy "$b2" "$h2" "$b2" "$DEFAULT_SHA"
+run
+must 'a commit without a policy is scored by the fixed default' test "$(scores)" == "$((before + 1))"
+must 'the default names no auditor version' test "$(grep -c required_tool_version "$fx/policy.seen" || true)" == 0
+printf 'PASS the fixed default policy hashes to the bound digest\n'
+
+bad() { # why reason [git-helper must stay empty]
+  local why=$1 reason=$2 before; before=$(scores); : >"$fx/git-helper.log"
+  run
+  must "$why: handed back as $reason" test "$(released | cut -d' ' -f2)" == "$reason"
+  must "$why: nothing submitted" test "$(scores)" == "$before"
+  must "$why: reported released" test "$(last_beat | jq -r .last.conclusion)" == released
+  [[ "${3:-}" != uncloned ]] || must "$why: never cloned" test ! -s "$fx/git-helper.log"
+}
+bticket lowers "$b1" "$h1" "$b1" "$(printf '0%.0s' {1..64})"; bad 'a policy that does not hash to the job' policy-mismatch
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")" internal proof "$(printf 'd%.0s' {1..64})"
+bad 'an auditor this host has not staged' staged-digest-missing uncloned
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")" internal proof "$SSHA" 9.9.8
+bad 'a staged auditor whose receipt names another version' verifier-mismatch uncloned
+bticket stack "$xb" "$yh" "$xb" "$(polsha stack "$xb")" internal proof "$SSHA" 9.9.9 y
+bad 'a metadata commit main does not reach' not-on-main
+printf '%s\n' "$fx/tools/jankurai/$SSHA/bin/jankurai" >"$fx/vanish-on-checkout"
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")"; bad 'an auditor that vanished after the claim' tool-gone
+rm -f "$fx/vanish-on-checkout"; SSHA=$(stage)
+printf 'PASS a bound job its host cannot honestly run is handed back with its reason, never scored\n'
+
+: >"$fx/git-helper.log"
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")" contributed
+run
+must 'a contribution is handed back' test "$(released | cut -d' ' -f2)" == contributed
+must 'a contribution is never cloned' test ! -s "$fx/git-helper.log"
+jq -n '{leaseSeconds: 1800, tickets: [{job_id: "job-bad", owner: "acme", repo: "lowers", branch: "feature/x",
+  head_sha: "'"$h1"'", base_sha: "'"$b1"'", audit_mode: "diff", purpose: "proof", origin: "internal"}]}' >"$fx/forge/claim.json"
+run
+must 'a ticket with no auditor binding is handed back as malformed' test "$(released)" == 'job-bad malformed-ticket'
+printf 'PASS contributions and malformed bound tickets are handed back without a clone\n'
+
+printf '202\n' >"$fx/forge/score.status"
+printf '{"job_id":"j","recorded_as":"qualification","qualification":"q-1"}\n' >"$fx/forge/score.body"
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")" internal qualification
+run
+must 'a qualification run is reported as qualified' test "$(last_beat | jq -r .last.conclusion)" == qualified
+must 'and names its record' grep -q 'recorded as qualification q-1 for jankurai 9.9.9' "$fx/out"
+printf '422\n' >"$fx/forge/score.status"
+printf '{"code":"auditor_mismatch","field":"policy_sha256"}\n' >"$fx/forge/score.body"
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")"
+run
+must 'a refused binding is a rejected publication' test "$(last_beat | jq -r .last.conclusion)" == rejected-publication
+must 'with the forge s reason' test "$(last_beat | jq -r .last.reason)" == 'the forge refused the report (HTTP 422; auditor_mismatch: policy_sha256)'
+rm -f "$fx/forge/score.status" "$fx/forge/score.body"
+printf 'PASS qualification and rejected publications are reported as such\n'
+
+rm -rf "$fx/tools/jankurai"
+run
+must 'a bound host with nothing staged claims nothing' test "$(last_beat | jq -r .last.reason)" == "no staged jankurai under $fx/tools/jankurai verifies on its receipt"
+rm -f "$fx/forge/bound"; mv "$fx/verifier.bound-off" "$fx/install/pr-gate-ensure-jankurai.sh"
+printf 'PASS a bound host with no staged auditor says so on /runners\n'

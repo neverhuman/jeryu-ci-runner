@@ -349,11 +349,44 @@ pass refuses a `PR_GATE_AUDIT_MAX` x (`PR_GATE_AUDIT_TIMEOUT` + 300 s) that woul
 unit's 10 h `TimeoutStartSec`, and audits at most `PR_GATE_AUDIT_MAX` jobs whatever the forge hands out. The
 gate identity must be allowed to submit scores on the forge (an administrator, or listed among its
 jankurai scorers) and must not author the pull requests it scores. Set the tuning keys
-(`PR_GATE_AUDIT_*`, `PR_GATE_INTERNAL_LABEL`) on the unit with a drop-in `Environment=` line, not in `pr-gate.env`: every
+(`PR_GATE_AUDIT_*` including `PR_GATE_AUDIT_TOOLS`, `PR_GATE_INTERNAL_LABEL`) on the unit with a drop-in `Environment=` line, not in `pr-gate.env`: every
 `PR_GATE_*` key in the site file is bound into each gate's inputs unless it is host-local, so a key
 added there would re-gate every open head. A forge without the audit routes answers 404/405 and the
 pass ends quietly. The script never takes a gate lock, posts a commit status or touches a gate tree,
 and it is not a gate input: installing a new version of it re-gates nothing.
+
+### Bound jobs: the forge assigns the auditor (ADR 0011, as superseded by ADR 0012)
+
+When the forge's `/api/v1/capabilities` reports `jankurai_audit_jobs.binding >= 1`, the pass switches to
+the bound contract; an older forge keeps everything above unchanged.
+
+- **Staged auditors.** The host's tool installer stages every approved auditor side by side, keyed by
+  its binary digest: `<tools>/jankurai/<binary sha256>/bin/jankurai` and `.../receipt.json`
+  (`PR_GATE_AUDIT_TOOLS`, a host path set on the unit; default `~/.jeryu/tools`). Each one is checked on
+  its own installation receipt -- binary digest, `jankurai --version`, `test_mode` false, signature
+  verified, governed -- and the verified digests are what the claim offers
+  (`capabilities: {jankurai: [...], sandbox: false}`) and what the heartbeat's `tools` lists. No
+  release-specific verifier is involved, so an auditor release reaches this host without a pr-gate or
+  consumer change.
+- **Each job names its auditor** (`auditor`: manifest revision and digest, version, target, binary and
+  signer digests), its `metadata_commit` and `policy_sha256`, its `origin` and its `purpose` (`proof` or
+  `qualification`). Before anything is checked out, the assigned auditor must be staged here and match
+  that identity on its receipt; it is checked again right before it runs. The receipt's install-time
+  manifest is not compared: one binary stays approved across manifest revisions.
+- **Metadata and policy come from the job.** `agent/` and `.jeryu/` are taken from `metadata_commit`,
+  which main must reach, and its policy (or the fixed default, whose bytes name no auditor version) must
+  hash to `policy_sha256`.
+- **A job this host will not run is handed back at once**
+  (`POST /api/v1/jankurai-audits/:job_id/release {reason}`) with one of `not-served-by-this-host`,
+  `contributed`, `not-on-main`, `malformed-ticket`, `policy-mismatch`, `staged-digest-missing`,
+  `verifier-mismatch` or `tool-gone` (the auditor vanished or changed after the claim), and reported
+  `released`. It is never scored.
+- **The submission echoes the binding** (`job_id`, `auditor`, `metadata_commit`, `policy_sha256`, head,
+  base, `receipt_sha256`); the forge refuses any difference, and the pass reports
+  `rejected-publication` with the forge's reason. A qualification job's report is recorded as
+  qualification evidence (202, `recorded_as: qualification`) and reported `qualified`.
+- **States.** While an audit runs, `current.state` is `running`, then `publishing`; a forge that does
+  not know the field gets the beat without it.
 
 ## Site configuration
 
