@@ -20,6 +20,7 @@ identity authored.
 | `bin/pr-gate-heartbeat.sh` | reports every slot to the forge's `/runners` page and finished attempts as events |
 | `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears, moves, or is asked for again -- on the forge's `gate-wanted` signal and from the open-PR view -- and hands it the head it started it for |
 | `bin/pr-gate-install.sh` | keeps the installed copy equal to the source branch (drains slots first) |
+| `bin/pr-gate-audit.sh` | claims the forge's queued jankurai audit jobs, scores each head with the governed jankurai in a throwaway clone, and submits the report (see [Scoring heads with jankurai](#scoring-heads-with-jankurai)) |
 | `bin/pr-gate-advisory-refresh.sh`, `bin/pr-gate-grype-db-refresh.sh` | keep security databases fresh outside the gates |
 | `systemd/` | the `--user` units and timers; `pr-gate-runner@N` is one slot |
 | `tests/` | the offline regression suite (`tests/required.sh`) |
@@ -202,6 +203,50 @@ receipt as `gate_input_paths` and its check run's summary says `gate inputs chan
 required` (beside the self-gate annotation above, never on the required status). That never changes
 whether the gate runs -- it is a green gate that still needs a human to read the change.
 
+## Scoring heads with jankurai
+
+The forge keeps one jankurai audit job per pushed head of `main` and of every open pull request
+(branch, head, base, `diff` or `full`) and completes `jankurai/proof` only from a report that comes
+back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, from
+`pr-gate-audit.timer` (30 s after the previous pass), is that producer:
+
+1. claim at most `PR_GATE_AUDIT_MAX` (default 1) jobs as `<short host>/jankurai-audit`
+   (`POST /api/v1/jankurai-audits/claim`), unless the shared back-off says wait;
+2. clone the head into a throwaway directory with the gate's own credential (through a git credential
+   helper that reads the token file; it is in no argv, environment or clone config);
+3. run the host's governed jankurai there: `diff-audit --base-ref <base> --advisory-only` for a `diff`
+   job, the whole-tree `audit` for a `full` one (a head with no commit base), niced, idle I/O, and
+   time-boxed by `PR_GATE_AUDIT_TIMEOUT` (default 900 s). A head with no `agent/audit-policy.toml` is
+   audited against a default naming the verified auditor's version;
+4. submit the report from a file (`POST /api/v1/repos/<owner>%2F<repo>/jankurai-scores`), naming the
+   auditor's version, sha256 and installation receipt -- the forge refuses any other auditor.
+
+The report submitted is always the one this script produced. A recipe that audits its own head (most
+`required` recipes enforce a score floor) writes a report too, but that file is written by the code
+under test, so it is never what the forge is told the governed auditor found.
+
+The auditor is the one the host's installer keeps current and verifies: `bin/pr-gate-ensure-jankurai.sh`
+is the repository's generated verifier (`ops/ci/ensure-jankurai.sh`, installed beside the scripts by
+`pr-gate-install.sh`; `PR_GATE_SOURCE_VERIFIER` names another path). It checks the binary, its
+installation receipt and the host's authority stamp, and a host whose auditor does not verify audits
+nothing. `PR_GATE_AUDIT_JANKURAI` points it at another install path. When the tool pin moves, the
+host's tool installer replaces the binary and receipt, and the next pass audits with the new version.
+
+Each pass beats `/runners` as `<short host>/jankurai-audit` (label `jankurai-audit`): `current` while
+an audit runs (kept alive every `PR_GATE_AUDIT_BEAT_EVERY`, default 60 s) and `last` when it ends --
+`scored`, `tool-failed` (the auditor wrote no usable report; it is still submitted, with its exit),
+`refused` (the forge refused the submission, e.g. a 409 for a job already taken, or a 422 for an
+auditor it does not accept) or `failed` (the head could not be fetched). A refusal never fails the pass.
+
+It runs wherever `pr-gate-audit.timer` is installed; mask the timer to keep a host from auditing. The
+gate identity must be allowed to submit scores on the forge (an administrator, or listed among its
+jankurai scorers) and must not author the pull requests it scores. Set the tuning keys
+(`PR_GATE_AUDIT_*`) on the unit with a drop-in `Environment=` line, not in `pr-gate.env`: every
+`PR_GATE_*` key in the site file is bound into each gate's inputs unless it is host-local, so a key
+added there would re-gate every open head. A forge without the audit routes answers 404/405 and the
+pass ends quietly. The script never takes a gate lock, posts a commit status or touches a gate tree,
+and it is not a gate input: installing a new version of it re-gates nothing.
+
 ## Site configuration
 
 Nothing in this directory names a site. Everything that does -- the forge URL, the credential file,
@@ -296,7 +341,9 @@ reported without it), `commit` the installed commit, and `version` e.g. `pr-gate
 `pr-gate-install.sh` runs from `pr-gate-install.timer` every 10 minutes. It fetches
 `PR_GATE_SOURCE_BRANCH` (default `main`) of `PR_GATE_SOURCE_URL` into its own bare mirror
 (`~/gate-runner/source/pr-gate.git`), and compares `PR_GATE_SOURCE_SUBDIR` (default `ops/pr-gate`)
-`bin/pr-gate-*.sh` and `systemd/pr-gate-*.{service,timer}` there with the installed copies. A change to
+`bin/pr-gate-*.sh` and `systemd/pr-gate-*.{service,timer}` there, and the repository's governed-jankurai
+verifier (`PR_GATE_SOURCE_VERIFIER`, default `ops/ci/ensure-jankurai.sh`, installed as
+`bin/pr-gate-ensure-jankurai.sh`), with the installed copies. A change to
 the runner, its state library or its config library drains every slot first (stops the slot timers
 and waits for running gates, at most 45 minutes, else installs nothing and retries). Each changed file
 is installed atomically with its predecessor kept as `<file>.<old>-pre-<new>.bak`; a unit change

@@ -1,0 +1,17 @@
+# Claim queued jankurai audits from the forge and score them here with the governed jankurai; see
+# bin/pr-gate-audit.sh. One pass, one claim batch, one audit at a time. Never takes a gate lock, posts
+# a status or touches a gate's tree. Mask pr-gate-audit.timer to keep a host from auditing.
+[Unit]
+Description=Score queued heads with the governed jankurai (forge audit jobs -> jankurai/proof)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=GATE_RUNNER_HOME=%h/gate-runner
+ExecStart=%h/gate-runner/bin/pr-gate-audit.sh
+Nice=10
+# Each audit is time-boxed (PR_GATE_AUDIT_TIMEOUT, default 900s) and a pass claims at most
+# PR_GATE_AUDIT_MAX (default 1) jobs.
+TimeoutStartSec=2h

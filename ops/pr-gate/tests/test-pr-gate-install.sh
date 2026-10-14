@@ -249,3 +249,28 @@ must 'backoff library change drains' called 'stop pr-gate-runner@0.timer'
 must 'backoff library change resumes' called 'start pr-gate-runner@1.timer'
 must 'backoff library installed' grep -q 'return 0' "$bin/pr-gate-backoff.sh"
 printf 'PASS a backoff-only library change drains the slots before installing\n'
+
+# The auditor: its script, its timer, and the repository's governed-jankurai verifier, which lives
+# outside the component and is installed beside the scripts under its own name. None of it drains.
+mkdir -p "$fx/src/ops/ci"
+put $c/bin/pr-gate-audit.sh '#!/usr/bin/env bash
+echo audit v1'
+put $c/systemd/pr-gate-audit.service '[Service]'
+put $c/systemd/pr-gate-audit.timer '[Timer]'
+put ops/ci/ensure-jankurai.sh '#!/usr/bin/env bash
+echo verifier v1'
+commit audit
+run >"$fx/out"
+must 'the audit script is installed' grep -q 'audit v1' "$bin/pr-gate-audit.sh"
+must 'the verifier is installed beside it' grep -q 'verifier v1' "$bin/pr-gate-ensure-jankurai.sh"
+must 'the verifier is not installed under its source name' test ! -e "$bin/ensure-jankurai.sh"
+must 'the audit timer is enabled' called 'enable --now pr-gate-audit.timer'
+if called 'stop pr-gate-runner@0.timer'; then printf 'FAIL: drained for the auditor\n' >&2; exit 1; fi
+put ops/ci/ensure-jankurai.sh '#!/usr/bin/env bash
+echo verifier v2'
+commit verifier-render
+run >"$fx/out"
+must 'a re-rendered verifier is installed' grep -q 'verifier v2' "$bin/pr-gate-ensure-jankurai.sh"
+must 'its predecessor is kept' compgen -G "$bin/pr-gate-ensure-jankurai.sh.*-pre-*.bak" >/dev/null
+if called 'stop pr-gate-runner@0.timer'; then printf 'FAIL: drained for the verifier\n' >&2; exit 1; fi
+printf 'PASS the auditor and its verifier install and enable without draining\n'

@@ -1,0 +1,12 @@
+# 30s after the last pass finished: an idle pass is one claim request and one heartbeat, and the
+# heartbeat keeps the auditor on /runners. A 429 backs it off with every other pr-gate unit.
+[Unit]
+Description=Claim queued jankurai audits every 30 seconds (one pass at a time)
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=30s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target
