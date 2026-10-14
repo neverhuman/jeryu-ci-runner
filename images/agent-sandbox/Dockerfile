@@ -35,46 +35,75 @@ RUN cargo build --locked --release -p jeryu-git-guard --bin jeryu-git \
 # `cargo fetch`'s workspace-manifest read.
 RUN cargo fetch --locked
 
-# ---- jankurai build stage: compile the pinned auditor ---------------------------------
-# KEEP IN SYNC with ops/ci/ensure-jankurai.sh (the pin source of truth). The runtime
-# container runs `--network none`, so the auditor must ship IN the image — a CI lane
-# inside the sandbox can never cargo-install it at session time. Bumping the pin means
-# bumping it there first, then rebuilding this image.
-FROM rust:1.95-slim-bookworm AS jankurai-build
-ARG JANKURAI_REPO="https://git.neverhuman.org/git/jeryu/jankurai.git"
-ARG JANKURAI_REV="2ec7eb2af47e16d2e0dce0bed31c521be4322920"
-ARG JANKURAI_VERSION="jankurai 1.6.11"
-ARG JANKURAI_BUILD_CONTEXT_SHA256="9c66e2485632b6c16c8c5ea945f5a649786bff18abbee3ebb74654d9e21e517f"
-ARG JANKURAI_BUILD_COMMAND="cargo install --locked --offline --path /opt/jeryu/jankurai/crates/jankurai --root /opt/jeryu/out --bin jankurai"
-ARG JANKURAI_RUSTFLAGS="--remap-path-prefix=/opt/jeryu/jankurai=/jankurai-build/source --remap-path-prefix=/opt/jeryu/vendor=/jankurai-build/vendor --remap-path-prefix=/opt/jeryu/target=/jankurai-build/target --remap-path-prefix=/usr/local/cargo=/jankurai-build/cargo"
-ARG JANKURAI_BUILD_ENVIRONMENT="CARGO_NET_OFFLINE=true,HOME=/tmp,LANG=C,LC_ALL=C,SOURCE_DATE_EPOCH=0,TZ=UTC"
-ARG JANKURAI_CARGO_CONFIG_SHA256="b8982c761d62e447f2d1653c199d2d58e6b2de6c5a6f8ddba3d38e47b7f863d6"
-ARG JANKURAI_VENDOR_FILE_COUNT="14889"
-ARG JANKURAI_VENDOR_FILES_SHA256="a7e332f4495d9748ea020ae8ee37c4240f0f035059799bd3dc74497437143d99"
-ARG JANKURAI_GLIBC_VERSION="ldd (Debian GLIBC 2.36-9+deb12u14) 2.36"
-ARG JANKURAI_LINKER_VERSION="GNU ld (GNU Binutils for Debian) 2.40"
-ARG JANKURAI_BUILDER_IMAGE_ID="sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082"
-ARG JANKURAI_BUILDER_IMAGE="rust@sha256:d7482085ff5b415f84dba5647ae71606650bdef00db7aeb69f4b3d170c3e4082"
-ARG JANKURAI_PACKAGE_PATH="crates/jankurai"
-ARG JANKURAI_BUILD_MODE="oci-vendor-locked-offline-workspace-member-v2"
+# ---- jankurai release stage: fetch the governed auditor (GENERATED — DO NOT EDIT) ----
+# Rendered by jeryu-tool from tool-manifest.toml, the one pin of record. The
+# auditor is a key-signed public Jankurai release: this stage downloads the
+# pinned asset and provenance, verifies their digests and offline signatures,
+# binds archive provenance and source identity to the pin, and checks binary
+# digest and version. The runtime container runs `--network none`, so the auditor
+# ships in the image. The approved release is qualified on Debian bookworm.
+FROM debian:bookworm-slim AS jankurai-build
+ARG JANKURAI_RELEASE_REPO="https://github.com/neverhuman/jankurai-audit"
+ARG JANKURAI_TAG="v1.7.5"
+ARG JANKURAI_VERSION="jankurai 1.7.5"
+ARG JANKURAI_SEMVER="1.7.5"
 ARG JANKURAI_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
-ARG JANKURAI_CARGO_VERSION="cargo 1.95.0 (f2d3ce0bd 2026-03-21)"
-ARG JANKURAI_RUSTC_VERSION="rustc 1.95.0 (59807616e 2026-04-14)"
-ARG JANKURAI_RUST_TOOLCHAIN="1.95.0"
-ARG JANKURAI_BINARY_SHA256="9aa101c10cdc40c8a15e3f5c1341be3bce78e86f61754d849bbe8229e485a783"
-ARG JANKURAI_CARGO_LOCK_SHA256="b9acb981c326226a687d0b6703e4f7ee303148e9e1a6dda1aa03d77988820f6a"
-ARG JANKURAI_SOURCE_ARCHIVE_SHA256="66849f13399e5a8b5d461c48a27322fe3b29a83e86cc5ce41d8c5d89e5d045ea"
-ARG JANKURAI_SOURCE_TREE="d3c63d138583404a57dc3177f0972952b1b399c7"
-ARG JANKURAI_SEMVER="1.6.11"
-ARG JANKURAI_TAG="v1.6.11-deadlang-precision-split.6"
-ENV CARGO_HOME=/opt/rust/cargo
+ARG JANKURAI_ASSET="jankurai-1.7.5-x86_64-unknown-linux-gnu.tar.gz"
+ARG JANKURAI_ASSET_SHA256="792c16465c274a266f64541152eb5c796fdf22113120133789d28bf99bcf915c"
+ARG JANKURAI_BINARY_SHA256="d2414884a3dbe1cc2d02b4240588869f6afac26ff0f167829e907b1617501121"
+ARG JANKURAI_PROVENANCE_ASSET="provenance-x86_64-unknown-linux-gnu.json"
+ARG JANKURAI_PROVENANCE_SHA256="4da1f261f3ec0fa8a3dff3b920fbba29267ca7721a8c34baf5f7ad63a03fb8c8"
+ARG JANKURAI_SOURCE_COMMIT="bb5a1ccaeda629ab2c36d99d20f9b89855ab6fcb"
+ARG JANKURAI_SOURCE_TREE="9cd7195f548500505e7c7aa8b8260836448046ae"
+ARG JANKURAI_FAMILY_LOCK_SHA256="076b4b7c03c1685589c3b860439eefe6bc70b7b7419b77052d87b74fc0e845f4"
+ARG JANKURAI_CARGO_LOCK_SHA256="861176e141b043a70741ac8872ede9a2f2ca0b59c9f4ad24833f864076f47885"
+ARG JANKURAI_RUSTC_VERSION="rustc 1.97.1 (8bab26f4f 2026-07-14)"
+ARG JANKURAI_CARGO_VERSION="cargo 1.97.1 (c980f4866 2026-06-30)"
+ARG JANKURAI_RELEASE_SIGNER="jankurai-release-2026.pub"
+ARG JANKURAI_RELEASE_SIGNER_SHA256="99f48af11e4e6463544652ddfaefb0e9953de15fb0802b174123ac2907ff06fc"
+ARG JANKURAI_COSIGN_VERSION="v3.1.3"
+ARG JANKURAI_COSIGN_SHA256="4629c757b7618056f8ddd7e2625ae9fdd94c0372a65049520bc7d9df9efc7f71"
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      git ca-certificates \
+      ca-certificates curl jq \
     && rm -rf /var/lib/apt/lists/*
-# Same install invocation as ensure-jankurai.sh; the version assert fails the build if
-# the rev and the version string ever drift apart.
-RUN cargo install --git "$JANKURAI_REPO" --rev "$JANKURAI_REV" --locked --bin jankurai jankurai \
-    && /opt/rust/cargo/bin/jankurai --version | grep -qx "$JANKURAI_VERSION"
+RUN set -eu; \
+    work="$(mktemp -d)"; cd "$work"; \
+    fetch() { curl --proto '=https' --tlsv1.2 -fsSL --retry 3 "$1" -o "$2"; }; \
+    fetch "https://github.com/sigstore/cosign/releases/download/${JANKURAI_COSIGN_VERSION}/cosign-linux-amd64" cosign; \
+    echo "${JANKURAI_COSIGN_SHA256}  cosign" | sha256sum -c -; \
+    chmod 0755 cosign; \
+    base="${JANKURAI_RELEASE_REPO}/releases/download/${JANKURAI_TAG}"; \
+    fetch "$base/${JANKURAI_RELEASE_SIGNER}" release.pub; \
+    fetch "$base/${JANKURAI_ASSET}" "${JANKURAI_ASSET}"; \
+    fetch "$base/${JANKURAI_ASSET}.cosign.bundle" "${JANKURAI_ASSET}.cosign.bundle"; \
+    fetch "$base/${JANKURAI_PROVENANCE_ASSET}" "${JANKURAI_PROVENANCE_ASSET}"; \
+    fetch "$base/${JANKURAI_PROVENANCE_ASSET}.cosign.bundle" "${JANKURAI_PROVENANCE_ASSET}.cosign.bundle"; \
+    echo "${JANKURAI_RELEASE_SIGNER_SHA256}  release.pub" | sha256sum -c -; \
+    echo "${JANKURAI_ASSET_SHA256}  ${JANKURAI_ASSET}" | sha256sum -c -; \
+    echo "${JANKURAI_PROVENANCE_SHA256}  ${JANKURAI_PROVENANCE_ASSET}" | sha256sum -c -; \
+    ./cosign verify-blob "${JANKURAI_ASSET}" --bundle "${JANKURAI_ASSET}.cosign.bundle" \
+      --key release.pub --insecure-ignore-tlog=true --offline=true; \
+    ./cosign verify-blob "${JANKURAI_PROVENANCE_ASSET}" --bundle "${JANKURAI_PROVENANCE_ASSET}.cosign.bundle" \
+      --key release.pub --insecure-ignore-tlog=true --offline=true; \
+    stem="${JANKURAI_ASSET%.tar.gz}"; \
+    tar -xzf "${JANKURAI_ASSET}" --no-same-owner --no-same-permissions "$stem/jankurai" "$stem/provenance.json" "$stem/family.lock" "$stem/Cargo.lock"; \
+    cmp "$stem/provenance.json" "${JANKURAI_PROVENANCE_ASSET}"; \
+    echo "${JANKURAI_FAMILY_LOCK_SHA256}  $stem/family.lock" | sha256sum -c -; \
+    echo "${JANKURAI_CARGO_LOCK_SHA256}  $stem/Cargo.lock" | sha256sum -c -; \
+    jq -e --arg repo "${JANKURAI_RELEASE_REPO}" --arg tag "${JANKURAI_TAG}" \
+      --arg version "${JANKURAI_SEMVER}" --arg target "${JANKURAI_TARGET_TRIPLE}" \
+      --arg commit "${JANKURAI_SOURCE_COMMIT}" --arg tree "${JANKURAI_SOURCE_TREE}" \
+      --arg family "${JANKURAI_FAMILY_LOCK_SHA256}" --arg cargo_lock "${JANKURAI_CARGO_LOCK_SHA256}" \
+      --arg rustc "${JANKURAI_RUSTC_VERSION}" --arg cargo "${JANKURAI_CARGO_VERSION}" \
+      ' .schema == "jankurai.release/v2" and .repository == $repo and .tag == $tag and \
+      .version == $version and .target == $target and .commit == $commit and .tree == $tree and \
+      .family_lock_sha256 == $family and .cargo_lock_sha256 == $cargo_lock and \
+      (.toolchain.rustc | split("\n") | .[0]) == $rustc and .toolchain.cargo == $cargo and \
+      .signing == "cosign-key"' "${JANKURAI_PROVENANCE_ASSET}" >/dev/null; \
+    install -D -m 0755 "$stem/jankurai" /opt/rust/cargo/bin/jankurai; \
+    echo "${JANKURAI_BINARY_SHA256}  /opt/rust/cargo/bin/jankurai" | sha256sum -c -; \
+    /opt/rust/cargo/bin/jankurai --version | grep -qx "${JANKURAI_VERSION}"; \
+    cd /; rm -rf "$work"
 
 # ---- runtime image -------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -105,7 +134,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 # ops/ci/common.sh derives from CARGO_HOME (${CARGO_HOME}/bin/jankurai), so the CI lanes
 # need zero changes, and JERYU_JANKURAI_BIN pins lanes to this binary — never a bare
 # `jankurai` PATH lookup a stale build could shadow.
-ARG JANKURAI_VERSION="jankurai 1.6.11"
+ARG JANKURAI_VERSION="jankurai 1.7.5"
 COPY --from=jankurai-build /opt/rust/cargo/bin/jankurai /opt/rust/cargo/bin/jankurai
 ENV JERYU_JANKURAI_BIN=/opt/rust/cargo/bin/jankurai
 RUN /opt/rust/cargo/bin/jankurai --version | grep -qx "${JANKURAI_VERSION}"

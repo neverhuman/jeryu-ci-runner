@@ -25,7 +25,7 @@ source "${repo_root}/ops/ci/hosted-git-env.sh"
 ci_kit_resolve_jobs
 JOBS="${JERYU_CI_JOBS}"
 
-# The pinned Jankurai 1.6.11 lives in ~/.cargo/bin. Other host installations
+# The pinned Jankurai 1.7.5 lives in ~/.cargo/bin. Other host installations
 # may appear earlier on PATH, so resolve the pinned auditor first; scripts that
 # source lib.sh additionally invoke its physical path so login-shell proof
 # replay cannot change audit semantics (see ops/ci/ensure-jankurai.sh).

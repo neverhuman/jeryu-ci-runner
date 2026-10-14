@@ -17,7 +17,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/hosted-git-env.sh"
 # process put the pinned Cargo bin first. Keep every library consumer bound to
 # the repository's pinned Cargo installation instead.
 readonly JERYU_JANKURAI_BIN="${CARGO_HOME:-${HOME}/.cargo}/bin/jankurai"
-# Jankurai 1.6.11 fingerprints the repository policy even when --fail-under
+# Jankurai 1.7.5 fingerprints the repository policy even when --fail-under
 # supplies a stricter run-local threshold. Keep the fleet floor centralized so
 # candidate and protected-main ratchet reports receive the identical override.
 readonly JERYU_FLEET_MINIMUM_SCORE=91
