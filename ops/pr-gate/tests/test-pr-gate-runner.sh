@@ -84,8 +84,10 @@ expected_mirror="$fixture_root/runner/mirror/fixture.git"
   || { printf 'worker cache mirror is not separately named\n' >&2; exit 33; }
 mkdir -p target
 if [[ -n "${JERYU_CI_BUILD_CACHE_DIR:-}" ]]; then
-  [[ "$JERYU_CI_BUILD_CACHE_DIR" == target/build-cache && -d target/build-cache && ! -L target/build-cache ]] || exit 35
-  printf 'ordinary build artifact\n' >target/build-cache/artifact
+  # Absolute, and exactly this checkout's cache: a cargo step run from a subdirectory must not grow a
+  # nested target/ of its own.
+  [[ "$JERYU_CI_BUILD_CACHE_DIR" == "$PWD/target/build-cache" && -d target/build-cache && ! -L target/build-cache ]] || exit 35
+  printf 'ordinary build artifact\n' >"$JERYU_CI_BUILD_CACHE_DIR/artifact"
   [[ ! -f "$fixture_root/fail-build-cache" ]] || exit 36
 fi
 # The counter lives beside the fake forge, not in target/: a repository that does not share the build
@@ -1217,7 +1219,9 @@ jq -e '.terminal and .exit_code == 34' "$receipt" >/dev/null
 rm -f "$fixture/require-sibling"
 export PR_GATE_DEPENDENCIES='acme/fixture=nomain'
 invoke
-[[ "$runner_exit" != 0 ]]
+# The head fails; the tick does not: a missing declared main must never wedge every slot.
+[[ "$runner_exit" == 0 ]] || { printf 'a missing declared main ended the tick\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+grep -q 'acme/fixture cannot be gated' "$fixture/runner.log"
 expect_count "$((before_count + 3))"
 grep -q 'declared dependency acme/nomain has no canonical main' "$fixture/runner.log"
 jq -se 'last.state == "failure" and (last.description | contains("declared dependency acme/nomain"))' "$fixture/statuses.jsonl" >/dev/null

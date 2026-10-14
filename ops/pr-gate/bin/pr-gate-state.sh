@@ -75,6 +75,9 @@ gate_prepare_target() { # target-dir retain-build-cache(0|1)
     [[ ! -L "$target" && ! -L "$target/build-cache" ]] || return 1
     mkdir -p "$target/build-cache" || return
     find "$target" -mindepth 1 -maxdepth 1 ! -name build-cache -exec rm -rf -- {} + || return
+    # Test scratch space (CARGO_TARGET_TMPDIR, nextest's state) is a previous head's runtime data,
+    # not compilation: it never carries over.
+    rm -rf -- "$target/build-cache/tmp" "$target/build-cache/nextest" || return
   else
     rm -rf -- "$target" && mkdir -p "$target" || return
   fi

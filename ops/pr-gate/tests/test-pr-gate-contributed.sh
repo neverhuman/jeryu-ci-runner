@@ -213,10 +213,21 @@ git -C "$fixture/source" rev-parse HEAD >"$fixture/head"
 allow "$(head_sha)" robin
 mkdir -p "$fixture/runner/cache/build-target/0/acme"
 printf '%064d\n' 1 >"$fixture/runner/cache/build-target/0/acme/fixture"
+# An enrolled sibling sharing the slot tree: the sandbox could write into its retained cache, so the
+# contribution must leave neither its authorization nor its outputs for a later trusted gate.
+printf '%064d\n' 2 >"$fixture/runner/cache/build-target/0/acme/sibling"
+mkdir -p "$fixture/runner/tree/sibling/target/build-cache/debug"
+printf 'planted\n' >"$fixture/runner/tree/sibling/target/build-cache/debug/build-script-build"
 invoke
 expect_count 1
 [[ ! -e "$fixture/runner/cache/build-target/0/acme/fixture" ]] || {
   printf 'a contribution retained ordinary-build cache authorization\n' >&2; exit 1;
+}
+[[ ! -e "$fixture/runner/cache/build-target/0/acme/sibling" ]] || {
+  printf 'a contribution left a sibling cache authorized in its slot\n' >&2; exit 1;
+}
+[[ ! -e "$fixture/runner/tree/sibling/target/build-cache" ]] || {
+  printf 'a contribution left a sibling build cache it could have written\n' >&2; exit 1;
 }
 [[ "$(cat "$fixture/sandbox-runs")" == 1 ]] || { printf 'the recipe did not go through the sandbox\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 [[ "$(cat "$fixture/last-recipe-sandbox")" == 1 ]] || { printf 'the recipe did not see a sandbox\n' >&2; exit 1; }

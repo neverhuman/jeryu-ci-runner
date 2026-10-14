@@ -844,8 +844,12 @@ for n in $family $repo; do
       continue 2
     fi
     if ((declared_dependencies)); then
+      # Fail this head, not the tick: like a repository with no main of its own, every other
+      # candidate is still gated. Dying here would repeat on every tick and starve the queue.
       post_status "$owner" "$repo" "$sha" failure "declared dependency $owner/$n has no canonical main ($MARKER)"
-      die "declared dependency $owner/$n has no canonical main"
+      say "declared dependency $owner/$n has no canonical main; $owner/$repo cannot be gated"
+      flock -u 8; exec 6>&-; exec 7>&-
+      continue 2
     fi
     # Drop the mirror as well. A repository whose main was deleted upstream would otherwise keep an
     # older main here, and step 5 would check the sibling out from it: a phantom main in the tree
@@ -1078,6 +1082,13 @@ fi
 # the default is a colder build; the benefit is that a gate result is about the commit.
 SHARED_TARGETS="${GATE_RUNNER_SHARED_TARGETS:-}"
 ((sandbox == 0)) || SHARED_TARGETS=""   # a contribution builds only in its own tree
+if ((sandbox)); then
+  # The sandbox sees the whole slot tree, siblings' retained build caches included. Revoke every
+  # cache this slot holds for the owner and remove the caches themselves before a contribution runs,
+  # so no later trusted gate can reuse an output a contribution could have written.
+  rm -rf -- "${HOME_DIR:?}/cache/build-target/$SLOT/$owner"
+  for d in "$run"/*/target/build-cache; do [[ ! -e "$d" && ! -L "$d" ]] || rm -rf -- "$d"; done
+fi
 shared_target=""
 for pattern in $SHARED_TARGETS; do
   # shellcheck disable=SC2053
@@ -1381,7 +1392,9 @@ cache_env=()
 [[ -z "$SCCACHE" ]] || cache_env=(RUSTC_WRAPPER="$SCCACHE" CARGO_INCREMENTAL=0 "${sccache_env[@]}")
 root_env=()
 for var in $WORKER_ROOT_VARS; do root_env+=("$var=$worker_root"); done
-((build_cache == 0)) || root_env+=(JERYU_CI_BUILD_CACHE_DIR=target/build-cache)
+# Absolute: a recipe step that runs cargo from a subdirectory must still use the one cache this
+# runner prepares and revokes, never create a nested target/ that survives between gates.
+((build_cache == 0)) || root_env+=(JERYU_CI_BUILD_CACHE_DIR="$worker_root/$repo/target/build-cache")
 if ((sandbox)); then
   # The sandbox contract: <command> <tree-root> <repo> <recipe...>. The site's command puts the tree
   # root in an ephemeral, network-restricted VM or container at that same path, enters <repo> there
