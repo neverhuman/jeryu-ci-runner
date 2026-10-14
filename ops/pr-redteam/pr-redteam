@@ -757,6 +757,50 @@ report_review_cost() { # receipt work repo number sha started-epoch
   esac
 }
 
+# What a review found goes on the forge's event log as one `review.finding` per finding (reviewer
+# kind `agent`), so the Scorecard can say whether a finding changed the code. When the same pull
+# request's previous head had findings this head no longer shows, each of those is a
+# `review.resolved` with outcome `caught`: the reviewer saw the code change. The forge writes
+# `caught` or `not_acted` for what is left when the pull request merges. Findings are posted for a
+# published verdict only, never for a dry run, and not for the quality gate's own hold (a
+# `(whole repository)` finding, which is a gate result rather than something review found); ids are per head and index, so a retry is a no-op.
+# Best-effort.
+report_review_findings() { # receipt repo number sha
+  local receipt="$1" repo="$2" number="$3" sha="$4" prior previous events
+  jq -e '.dry_run == true or (.verdict | type) != "object"' "$receipt" >/dev/null 2>&1 && return 0
+  events="$(jq -c --arg repo "$repo" --argjson pr "$number" --arg sha "$sha" '
+    [.verdict.findings // [] | to_entries[] | .key as $n | .value as $f
+     | select($f.file != "(whole repository)")
+     | {event_id: "pr-redteam:\($sha[0:12]):finding:\($n)", source: "pr-redteam",
+        kind: "review.finding", actor: "pr-redteam", repo: $repo, pr: $pr, sha: $sha,
+        outcome: $f.severity,
+        summary: "pr-redteam found \($f.severity) in \($f.file) on \($repo)#\($pr)",
+        detail: {reviewer_kind: "agent", severity: $f.severity, title: $f.title,
+                 path: $f.file, line: ($f.line // null)}}]' "$receipt" 2>/dev/null)" || return 0
+  prior="$(ls -t "$state/receipts/$repo/$number"-*.json 2>/dev/null | grep -v -- "-$sha.json$" | head -1 || true)"
+  if [[ -n "$prior" ]]; then
+    previous="${prior##*/$number-}"; previous="${previous%.json}"
+    events="$(jq -c --slurpfile p "$prior" --argjson found "$events" --arg repo "$repo" --argjson pr "$number" \
+      --arg sha "$sha" --arg old "$previous" '
+      $found + [($p[0].verdict.findings // []) | to_entries[] | .key as $n | .value as $f
+        | select($f.file != "(whole repository)")
+        | select((.value | [.file, .title]) as $k
+                 | ([$found[].detail | [.path, .title]] | index($k)) == null)
+        | {event_id: "pr-redteam:\($sha[0:12]):resolved:\($old[0:12]):\($n)", source: "pr-redteam",
+           kind: "review.resolved", actor: "pr-redteam", repo: $repo, pr: $pr, sha: $sha,
+           outcome: "caught",
+           summary: "a later head no longer shows a finding of \($old[0:12]) on \($repo)#\($pr)",
+           detail: {finding: "pr-redteam:\($old[0:12]):finding:\($n)", reviewer_kind: "agent",
+                    reason: "reviewer_resolved"}}]' "$receipt" 2>/dev/null)" || return 0
+  fi
+  [[ "$events" != "[]" && -n "$events" ]] || return 0
+  api POST /api/v1/events "$(jq -c '{events: .}' <<<"$events")"
+  case "$code" in
+    200|201) ;;
+    *) say "could not report the review findings of $repo#$number ($code)" ;;
+  esac
+}
+
 finish_review_attempt() { # latest receipt, attempt history, repo, number, sha, start, work
   local receipt="$1" history="$2" repo="$3" number="$4" sha="$5" started="$6" work="$7" decision
   if jq -e '.decision == "reviewing"' "$receipt" > /dev/null; then
@@ -768,6 +812,7 @@ finish_review_attempt() { # latest receipt, attempt history, repo, number, sha, 
   decision="$(jq -r .decision "$receipt")"
   (review_check_done "$receipt" "$repo" "$number" "$sha" "$started") || true
   (report_review_cost "$receipt" "$work" "$repo" "$number" "$sha" "$started") || true
+  (report_review_findings "$receipt" "$repo" "$number" "$sha") || true
   beat_done "$repo" "$number" "$sha" "$decision" "$started"
   rm -rf -- "$work"
 }

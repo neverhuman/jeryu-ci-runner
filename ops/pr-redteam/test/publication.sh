@@ -363,6 +363,26 @@ review
 [[ "$(count "$t/events")" == 1 ]]
 echo 'ok review cost reported once per costed attempt, never on a dry run'
 
+# Each finding of a review is a `review.finding` event from the agent reviewer; a later head that no
+# longer shows one gets a `review.resolved` (caught) naming it.
+printf '{"verdict":"approve","summary":"fixture review complete","findings":[{"severity":"low","title":"name is vague","file":"README.md","line":2,"detail":"d","evidence":"e"}]}\n' > "$t/verdict"
+advance
+review
+before="$(count "$t/events")"
+finding_sha="$(cat "$t/head")"
+jq -s -e --arg sha "$finding_sha" '.[-1].events | length == 1 and .[0].kind == "review.finding"
+  and .[0].source == "pr-redteam" and .[0].sha == $sha and .[0].pr == 1 and .[0].outcome == "low"
+  and (.[0].event_id | length <= 64) and .[0].detail.reviewer_kind == "agent"
+  and .[0].detail.path == "README.md" and .[0].detail.line == 2' "$t/events" > /dev/null
+printf '{"verdict":"approve","summary":"fixture review complete","findings":[]}\n' > "$t/verdict"
+advance
+review
+[[ "$(count "$t/events")" == "$((before + 1))" ]]
+jq -s -e --arg old "${finding_sha:0:12}" '.[-1].events | length == 1 and .[0].kind == "review.resolved"
+  and .[0].outcome == "caught" and .[0].detail.finding == "pr-redteam:\($old):finding:0"
+  and (.[0].event_id | length <= 64)' "$t/events" > /dev/null
+echo 'ok findings reported per head, and resolved once a later head drops them'
+
 # A full pass over a head this tool did not approve lands nothing and rewrites no branch, even with
 # a merger credential present. Landing an approved head is test/merge-pass.sh.
 "$here/pr-redteam" run --repo jeryu/fixture --pr 1 >> "$t/controller.log" 2>&1
