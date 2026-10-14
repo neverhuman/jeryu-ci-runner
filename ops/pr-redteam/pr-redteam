@@ -44,6 +44,15 @@
 # spend is capped too: one agent review per head, a per-PR budget and a per-day budget, all well
 # below an internal PR's. Over a cap the PR is left for a maintainer instead of reviewed.
 #
+# An owner's recorded decision is read, not guessed. When a review's only blocking findings are
+# that nobody has recorded an owner decision, the approvals on the exact head are re-read at the
+# moment of publication: a repository owner's approval on that head whose body says "Owner
+# decision" satisfies those findings, the findings stay in the published review, and the head is
+# approved only if nothing else holds it. A mechanical hold (the quality gate, a committed private
+# key, an unreviewable binary) is never satisfied this way, and a contribution is still never
+# approved here. Re-reading at publication is the point: a review that loaded the pull request
+# seconds before the approval landed used to hold on a finding the owner had already answered.
+#
 # What it never does: tag, waive, post statuses, or approve a PR whose author is the token's
 # own identity (the forge forbids self-approval). If the agent errors, times out or returns
 # something unparseable, the PR is left alone and retried on the next run — a failed review is never
@@ -105,6 +114,10 @@
 #   REDTEAM_FIX_TODO_FAMILY (forge family)       Todoq family override for an unlabelled repository
 #   REDTEAM_TODOQ          todoq                owner-qualified Todoq executable
 #   REDTEAM_HUMAN_AUTHORS  (none)               selected humans also get a recent-activity refusal
+#   REDTEAM_OWNER_DECISION_AUTHORS (none)       logins whose approval on the exact head counts as a
+#                          recorded owner decision, space-separated. The account that owns a
+#                          repository's namespace always counts for that repository; everybody else
+#                          has to be listed here, because a login is one installation's data
 #   REDTEAM_HUMAN_ACTIVITY_SECS 86400           recent-activity window for selected human authors
 #   REDTEAM_STATE          ~/.local/state/pr-redteam   receipts, git cache, locks
 #   REDTEAM_ACCEPT_IDENTITIES (none)            space-separated earlier review identities (64 hex)
@@ -137,6 +150,7 @@ agent_timeout="${REDTEAM_TIMEOUT:-2400}"
 max_diff_bytes="${REDTEAM_MAX_DIFF_BYTES:-20000000}"
 max_blob_bytes="${REDTEAM_MAX_BLOB_BYTES:-1000000}"
 read -ra author_domains <<<"${REDTEAM_AUTHOR_DOMAINS:-}"
+read -ra owner_decision_authors <<<"${REDTEAM_OWNER_DECISION_AUTHORS:-}"
 state="${REDTEAM_STATE:-$HOME/.local/state/pr-redteam}"
 claude_bin="${REDTEAM_CLAUDE:-$(command -v claude || echo "$HOME/.local/bin/claude")}"
 
@@ -169,7 +183,7 @@ review_input_identity() {
     printf 'review-format %s\n' "$review_format"
     (cd "$here" && sha256sum prompt.md verdict.schema.json validate-verdict.jq)
     if [[ -f "$claude_bin" ]]; then sha256sum "$claude_bin"; else printf 'cli-unavailable\n'; fi
-    printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes" "${author_domains[*]}"
+    printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes" "${author_domains[*]}" "${owner_decision_authors[*]}"
   } | sha256sum | cut -c1-64
 }
 review_identity="$(review_input_identity)"
@@ -309,6 +323,85 @@ proof_without_result() { # gate reason -> 0 when the proof has no result yet
     *"queued or running"*|*"has not run"*) return 0 ;;
   esac
   return 1
+}
+
+# --- owner decisions ----------------------------------------------------------------------------
+
+# Whether `login` may record an owner decision for `owner/name`. The account that owns the
+# repository's namespace always may; everybody else has to be named in
+# REDTEAM_OWNER_DECISION_AUTHORS, because a login is one installation's data and this source is
+# public. An unlisted approval satisfies nothing, however it is worded.
+owner_decision_author() { # owner/name login
+  local candidate
+  [ -n "${2:-}" ] || return 1
+  [ "${1%%/*}" != "$2" ] || return 0
+  for candidate in "${owner_decision_authors[@]}"; do
+    [ "$candidate" != "$2" ] || return 0
+  done
+  return 1
+}
+
+# The explicit owner decision recorded on this exact head, as one JSON object, or nothing.
+# Three things have to hold together: the approval is effective on this head (not a stale one),
+# its author may record a decision for this repository, and its body says so in words — an
+# approval with no stated decision is an approval, not a decision.
+owner_decision_in_detail() { # pr-detail-json owner/name sha
+  local candidates candidate login
+  candidates="$(jq -c --arg sha "$3" '
+    (.reviews // [])
+    | map(select((.effective // false) == true
+                 and ((.state // "") | ascii_upcase) == "APPROVED"
+                 and (.head_sha // "") == $sha
+                 and (((.body_markdown // "") | ascii_downcase) | test("owner decision|owner sign-?off"))))
+    | sort_by(.submitted_at // "") | reverse | .[]' <<<"$1" 2>/dev/null)" || return 0
+  while IFS= read -r candidate; do
+    [ -n "$candidate" ] || continue
+    login="$(jq -r '.author // ""' <<<"$candidate")"
+    if owner_decision_author "$2" "$login"; then
+      jq -c '{login: (.author // ""), at: (.submitted_at // ""), review_id: (.id // ""),
+              excerpt: (((.body_markdown // "") | gsub("\\s+"; " "))[0:200])}' <<<"$candidate"
+      return 0
+    fi
+  done <<<"$candidates"
+}
+
+# The same, read from the forge now. Called right before a review is published, never earlier:
+# an approval that landed while the agent was reading the diff is still an owner's decision on
+# this head, and a review that missed it by seconds held a pull request nobody could unblock
+# without pushing an empty commit.
+owner_decision_on_head() { # owner/name number sha
+  api GET "/api/v1/repos/${1/\//%2F}/pulls/$2"
+  [ "$code" = 200 ] || return 0
+  owner_decision_in_detail "$body" "$1" "$3"
+}
+
+# A finding whose whole ask is that an owner record a decision.
+owner_decision_asks() { # verdict-json -> how many findings ask for one
+  jq '[.findings[]? | select((((.title // "") + " " + (.detail // "")) | ascii_downcase)
+       | test("owner decision|owner sign-?off"))] | length' <<<"$1" 2>/dev/null || echo 0
+}
+
+# Answer those findings with the decision, and lift the hold when nothing else holds the head.
+# The findings stay in the review, with the decision that answered them written into each one: a
+# record that hides what it cleared is not a record. Any other high or critical finding keeps the
+# block, so this can only ever clear the one question it is about.
+satisfy_owner_decision() { # verdict-json decision-json
+  jq -c --argjson d "$2" '
+    def asks: (((.title // "") + " " + (.detail // "")) | ascii_downcase)
+      | test("owner decision|owner sign-?off");
+    .findings = [.findings[]?
+      | if asks then
+          .severity = "low"
+          | .detail = ((.detail // "") + " Satisfied: " + $d.login
+                       + " recorded an owner decision on this exact head at " + $d.at
+                       + " — \"" + $d.excerpt + "\".")
+        else . end]
+    | if ([.findings[]? | select(.severity == "critical" or .severity == "high")] | length) == 0
+      then .verdict = "approve"
+           | .summary = ((.summary // "") + " " + $d.login
+                         + " recorded an owner decision on this exact head, which answers the "
+                         + "findings that asked for one; nothing else holds this head.")
+      else . end' <<<"$1"
 }
 
 # A draft is skipped on every pass until somebody marks it ready, so saying so
@@ -589,8 +682,9 @@ signals() { # review-dir
   } >"$d/signals.txt"
 }
 
-render_body() { # verdict-json decision sha origin
-  jq -r --arg decision "$2" --arg sha "$3" --arg model "$model" --arg origin "${4:-internal}" '
+render_body() { # verdict-json decision sha origin [owner-decision-json]
+  jq -r --arg decision "$2" --arg sha "$3" --arg model "$model" --arg origin "${4:-internal}" \
+    --argjson owner "${5:-null}" '
     def sev_icon: {"critical":"🔴","high":"🟠","medium":"🟡","low":"⚪"}[.] // "•";
     (if $origin == "contributed" then "**Red team: advice on a contributed pull request.**"
      elif $decision == "approve" then "**Red team: approved.**"
@@ -603,6 +697,11 @@ render_body() { # verdict-json decision sha origin
         + "approves nor lands anything. A maintainer on the configured list has to approve this "
         + "exact head before it can merge.", "")
      else empty end),
+    (if $owner == null then empty else
+       ("**Owner decision recorded.** " + $owner.login + " approved this exact head at "
+        + $owner.at + " with a stated decision, which answers the findings below that asked for "
+        + "one. They stay listed: a decision that hides what it cleared is not a record.", "")
+     end),
     (if (.findings | length) == 0 then "No findings."
      else ("| | Finding | Where |", "|---|---|---|",
            (.findings | sort_by({"critical":0,"high":1,"medium":2,"low":3}[.severity])[]
@@ -866,8 +965,12 @@ review_one() { # owner/name number dry-run force include-drafts
   # The gate before the agent: a head the quality gate blocks cannot be approved
   # whatever the review concludes, so it holds with the gate's reason and the
   # per-PR agent budget is not spent on it.
-  local verdict
+  # A hold this controller imposes mechanically, rather than one the agent reasoned to. An owner's
+  # decision never clears one: the quality gate, a committed key and an unreviewable blob are not
+  # questions an owner was asked.
+  local verdict mechanical_hold=0
   if [ -n "$gate_reason" ]; then
+    mechanical_hold=1
     say "$tag: quality gate holds ${sha:0:12} — $gate_reason"
     verdict="$(jq -nc --arg reason "$gate_reason" \
       '{verdict: "block", summary: ("The quality gate blocks this head: " + $reason),
@@ -902,6 +1005,7 @@ review_one() { # owner/name number dry-run force include-drafts
   esac
   if grep -qE '^\+.*-----BEGIN [A-Z ]*PRIVATE KEY-----' "$d/diff.patch"; then
     decision=hold
+    mechanical_hold=1
   fi
   # Unreviewable payloads hold mechanically. The agent cannot open a binary, and its severity for
   # "a blob I can't inspect" was seen to flip between runs on the same file; this rule cannot.
@@ -914,12 +1018,31 @@ review_one() { # owner/name number dry-run force include-drafts
   local blobs; blobs="$(unpinned_blobs "$cache" "$base_sha" "$sha" "$d/diff.patch")"
   if [ -n "$blobs" ]; then
     decision=hold
+    mechanical_hold=1
     verdict="$(jq -c --slurpfile b <(printf '%s\n' "$blobs") '.verdict = "block" | .findings =
       ([$b[] | {severity: "critical", title: "Unpinned binary or archive (\(.size) bytes)", file: .path,
         detail: "Adds or changes a \(.size)-byte binary/archive that cannot be reviewed as text, and nothing in the diff pins its sha256. pr-redteam holds these mechanically, whatever the agent concluded: record the digest in a checked manifest or verification step, or fetch the artifact from a verified source.",
         evidence: "sha256 \(.sha256)"}] + .findings)' <<<"$verdict")"
   fi
-  local body; body="$(render_body "$verdict" "$decision" "$sha" "$origin")"
+  # An owner's decision, read from the forge now rather than when this review started. The review
+  # that holds a pull request on "nobody recorded an owner decision" is the one that loaded the
+  # approvals seconds before the decision landed, so the approvals are re-read here, at the last
+  # moment before publication, and only then is the hold decided.
+  local owner_decision=""
+  if [ "$decision" = hold ] && [ "$mechanical_hold" = 0 ] && [ "$origin" != contributed ] \
+     && [ "$(owner_decision_asks "$verdict")" != 0 ]; then
+    owner_decision="$(owner_decision_on_head "$repo" "$number" "$sha")"
+    if [ -n "$owner_decision" ]; then
+      verdict="$(satisfy_owner_decision "$verdict" "$owner_decision")"
+      if [ "$(jq -r .verdict <<<"$verdict")" = approve ]; then
+        decision=approve
+        say "$tag: $(jq -r .login <<<"$owner_decision") recorded an owner decision on ${sha:0:12}; the findings that asked for one are satisfied"
+      else
+        say "$tag: $(jq -r .login <<<"$owner_decision") recorded an owner decision on ${sha:0:12}, but other findings still hold this head"
+      fi
+    fi
+  fi
+  local body; body="$(render_body "$verdict" "$decision" "$sha" "$origin" "$owner_decision")"
   # The latest receipt was admitted before the worker started.
   local cost; cost="$(jq -r '.total_cost_usd // null' "$work/agent.json" 2>/dev/null || true)"
   [ -n "$cost" ] || cost=null
@@ -948,8 +1071,9 @@ review_one() { # owner/name number dry-run force include-drafts
     --arg decision "$decision" --argjson verdict "$verdict" --arg model "$model" --argjson cost "$cost" --arg identity "$review_identity" --arg reviewer "$me" \
     --argjson posted "$posted" --arg code "$post_code" --argjson dry "$([ "$dry" = 1 ] && echo true || echo false)" \
     --arg at "$(date -u +%FT%TZ)" --argjson diff_bytes "$diff_bytes" --argjson files "$files_count" \
-    --arg origin "$origin" \
+    --arg origin "$origin" --argjson owner_decision "${owner_decision:-null}" \
     '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, diff_base_sha:$diff_base, decision:$decision, posted:$posted,
+      owner_decision:$owner_decision,
       post_http:$code, dry_run:$dry, model:$model, cost_usd:$cost, reviewed_at:$at, origin:$origin,
       diff_bytes:$diff_bytes, files:$files, verdict:$verdict, reviewer_login:$reviewer, review_identity:$identity}' | store_receipt "$receipt"
 }
@@ -1686,7 +1810,7 @@ while [ $# -gt 0 ]; do
     --jobs) jobs="$2"; shift ;;
     --repo) only_repo="$2"; shift ;;
     --pr) only_pr="$2"; shift ;;
-    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = _holds ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _owner_decision ] || [ "$cmd" = _owner_satisfy ] || [ "$cmd" = _owner_body ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = _holds ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
   esac
   shift
 done
@@ -1747,6 +1871,12 @@ case "$cmd" in
     reason="$(jankurai_gate_reason "$(cat "$1")" "$(cat "$2")")"
     [ -n "$reason" ] || exit 0
     if proof_without_result "$reason"; then printf 'wait\t%s\n' "$reason"; else printf 'hold\t%s\n' "$reason"; fi ;;
+  _owner_decision) # internal/testing: pr-detail.json owner/name sha -> decision JSON (no forge calls)
+    owner_decision_in_detail "$(cat "$1")" "$2" "$3" ;;
+  _owner_satisfy) # internal/testing: verdict.json decision.json -> the answered verdict
+    satisfy_owner_decision "$(cat "$1")" "$(cat "$2")" ;;
+  _owner_body) # internal/testing: verdict.json decision sha origin decision.json -> review body
+    render_body "$(cat "$1")" "$2" "$3" "$4" "$(cat "$5")" ;;
   _blobs) # internal/testing: git-dir base head diff.patch -> unpinned binaries (no forge calls)
     unpinned_blobs "$1" "$2" "$3" "$4" ;;
   _agent) # internal/testing: review-dir tag sha -> verdict JSON (no forge calls)

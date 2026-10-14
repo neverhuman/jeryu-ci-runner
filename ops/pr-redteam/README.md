@@ -57,6 +57,33 @@ review with a neutral comment. Free-text replacement messages are not closure
 proof. A maintainer decides supersession using a complete salvage bundle and
 exact repository, original head and landed replacement evidence.
 
+## An owner's recorded decision
+
+Some findings ask for a decision only the repository's owner can make: a policy floor the change
+lowers deliberately, a rule the owner has decided to accept here. The agent is right to hold such a
+head, and wrong to hold it once the owner has answered.
+
+So when a review's only blocking findings are that nobody has recorded an owner decision, the
+approvals on the exact head are re-read at the moment of publication. An approval on that head
+whose body states a decision ("Owner decision: ...", or an owner sign-off), by a login that may
+record one for that repository, answers those findings: they stay in the published review, each one
+carrying the login, the time and the owner's own words that answered it, and the head is approved
+only when nothing else holds it.
+
+Who may record one is site configuration, like every other login in this controller: the account
+that owns a repository's namespace always may, and anybody else has to be named in
+`REDTEAM_OWNER_DECISION_AUTHORS`. An unlisted approval answers nothing, however it is worded, and
+neither does an approval on another head, a dismissed one, or one that states no decision.
+
+What a decision never clears: a hold this controller imposes mechanically — a failing quality
+gate, a committed private key, an unreviewable binary — and the rule that a contribution is never
+approved here. Those are not questions an owner was asked.
+
+Reading the approvals at publication rather than at the start of the review is the whole point. A
+review that loaded the pull request seconds before the approval landed used to publish a hold on a
+finding the owner had already answered, leaving no way forward but switching branch protection off
+or pushing an empty commit to force a re-review.
+
 ## Contributed pull requests
 
 The GitHub repositories are read-only mirrors of the forge. An outside contributor opens a pull
@@ -124,7 +151,7 @@ reinstalls" below), so existing receipts requalify.
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,
-credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, contributed-origin and installation checks. The actual repository required lane
+credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, contributed-origin, owner-decision and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
 publication refusal, restart, duplicate dispatch, worker loss and changed heads,
@@ -135,6 +162,9 @@ review is posted as advice and stays unmerged, its head gets one agent review
 whatever is asked of it, the per-pull-request and per-day budgets each hold the
 next head for a maintainer, an unmarked row is treated as contributed, and an
 internal pull request is reviewed, approved and merged exactly as before.
+The owner-decision suite covers who may record one, what counts as one, which
+findings it answers, that the answered findings stay in the published review,
+and that another finding — or a mechanical hold — still holds the head.
 
 `test/canary.sh` is a separate paid live-model qualification for the service owner.
 It requires the exact pinned CLI and selected model. Offline source qualification
