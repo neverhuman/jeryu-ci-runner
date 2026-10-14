@@ -98,26 +98,6 @@ source "$BIN_DIR/pr-gate-backoff.sh"
 # shellcheck source=ops/pr-gate/bin/pr-gate-state.sh
 source "$BIN_DIR/pr-gate-state.sh" 2>/dev/null || true
 
-# The governed auditor. The verifier exits nonzero, naming why, when the install does not verify.
-# Nothing ambient may widen what it accepts: the site file back-fills JERYU_* keys, and the verifier
-# reads switches that admit a test receipt, a caller-named receipt or authority, or a release broker.
-unset JERYU_JANKURAI_ALLOW_TEST_RECEIPT JERYU_JANKURAI_RECEIPT JERYU_JANKURAI_RECEIPT_SHA256 \
-  JERYU_JANKURAI_AUTHORITY_SHA256 JERYU_GOVERNED_JANKURAI_BIN JAIN_RELEASE_CI
-# A host without a verifying auditor is a configuration state, not a failure every 30 seconds: the
-# pass says why once per run and claims nothing. The verifier exits on refusal, so it is tried in a
-# subshell first.
-VERIFIER="$BIN_DIR/pr-gate-ensure-jankurai.sh"
-[[ -f "$VERIFIER" ]] || { say "$VERIFIER is not installed; nothing audited"; exit 0; }
-# shellcheck source=ops/ci/ensure-jankurai.sh
-if ! why="$( ( source "$VERIFIER" ) 2>&1 >/dev/null )"; then
-  say "the governed jankurai does not verify on this host (${why:0:300}); nothing audited"; exit 0
-fi
-# shellcheck source=ops/ci/ensure-jankurai.sh
-source "$VERIFIER" >/dev/null
-for var in JERYU_GOVERNED_JANKURAI_BIN JERYU_JANKURAI_VERSION JERYU_JANKURAI_SHA256 JERYU_JANKURAI_SEMVER; do
-  [[ -n "${!var:-}" ]] || { say "the verifier did not name $var; nothing audited"; exit 0; }
-done
-
 # Clones live under the gate home (disk), never a shared tmpfs; a crashed pass's leftovers are swept
 # here, under the pass lock.
 mkdir -p "$HOME_DIR/audit-work"
@@ -131,10 +111,12 @@ stop_keepalive() {
   wait "$keepalive" 2>/dev/null || true
   keepalive=""
 }
-trap 'stop_keepalive; rm -rf -- "$WORK_DIR"' EXIT
 # The token reaches curl through a 0600 config file and git through a credential helper that reads
-# the token file when git asks, so it is in no argv, environment or clone config.
-AUTH_CONFIG="$WORK_DIR/curl-auth.conf"
+# the token file when git asks, so it is in no argv, environment or clone config. The config lives in
+# the gate's cache, never beside the clone a head is unpacked into.
+AUTH_CONFIG="$(mktemp "$HOME_DIR/cache/audit-auth.XXXXXX")"
+trap 'stop_keepalive; rm -rf -- "$WORK_DIR"; rm -f -- "$AUTH_CONFIG"' EXIT
+chmod 0600 "$AUTH_CONFIG"
 ( umask 077
   token="$(cat "$TOKEN_FILE")"
   [[ "$token" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] || { say "the credential has an invalid bearer-token shape"; exit 2; }
@@ -148,6 +130,9 @@ git_auth=(env GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 GIT_CONFIG_GLOBAL=/dev
   GIT_CONFIG_COUNT=2
   GIT_CONFIG_KEY_0="credential.$BASE/git/.helper" GIT_CONFIG_VALUE_0=""
   GIT_CONFIG_KEY_1="credential.$BASE/git/.helper" GIT_CONFIG_VALUE_1="$GIT_HELPER '$IDENTITY' '$TOKEN_FILE'")
+# The auditor runs git inside the head's tree too: the same hardening, without any credential.
+audit_env=(env GIT_TERMINAL_PROMPT=0 GIT_LFS_SKIP_SMUDGE=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  GIT_CONFIG_COUNT=0)
 
 # api METHOD PATH [BODY-FILE]: sets $code and $body. A 429 widens the host's shared back-off.
 api() {
@@ -163,8 +148,7 @@ api() {
 
 # --- heartbeat (best effort: a beat never fails the pass) ---------------------------------------
 beat_code="$(declare -F gate_runner_code >/dev/null && gate_runner_code "$HOME_DIR" || true)"
-beat_tools="$(jq -cn --arg v "$JERYU_JANKURAI_SEMVER" --arg s "$JERYU_JANKURAI_SHA256" \
-  '[{name: "jankurai", version: $v, sha256: $s}]')"
+beat_tools='[]'  # filled in once the verifier has named the auditor
 beat_current=null
 beat_last() { jq -ce 'select(type == "object" and (.conclusion | type) == "string")' "$LAST_FILE" 2>/dev/null || echo null; }
 beat() {
@@ -176,11 +160,11 @@ beat() {
     + (if $current != null then {current: $current} else {} end)
     + (if $last != null then {last: $last} else {} end)
     + (if $code != "" then {code: ($code | fromjson)} else {} end)
-    + {tools: $tools}')" || return 0
+    + (if ($tools | length) > 0 then {tools: $tools} else {} end)')" || return 0
   # An older forge refuses the whole beat (422) for a field it does not know: it is retried without
   # tools, then without code too, then in the oldest shape the slots' own heartbeat sends.
   local shape
-  for shape in . 'del(.tools)' 'del(.tools, .code)' 'del(.tools, .code, .intervalSeconds)'; do
+  for shape in . 'del(.tools)' 'del(.tools, .code)' 'del(.tools, .code, .intervalSeconds)' 'del(.tools, .code, .intervalSeconds, .last)'; do
     status="$(jq -c "$shape" <<<"$body" | curl --disable --config "$AUTH_CONFIG" --silent --max-time 5 \
       -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary @- \
       "$BASE/api/v1/runners/heartbeat" 2>/dev/null)" || status=000
@@ -208,6 +192,38 @@ beat_finish() { # repo sha conclusion seconds [reason]
   beat
 }
 
+# The governed auditor. The verifier exits nonzero, naming why, when the install does not verify.
+# Nothing ambient may widen what it accepts: the site file back-fills JERYU_* keys, and the verifier
+# reads switches that admit a test receipt, a caller-named receipt or authority, or a release broker.
+unset JERYU_JANKURAI_ALLOW_TEST_RECEIPT JERYU_JANKURAI_RECEIPT JERYU_JANKURAI_RECEIPT_SHA256 \
+  JERYU_JANKURAI_AUTHORITY_SHA256 JERYU_GOVERNED_JANKURAI_BIN JAIN_RELEASE_CI
+# A host without a verifying auditor is a configuration state, not a failure every 30 seconds: the
+# pass says why once per run and claims nothing. The verifier exits on refusal, so it is tried in a
+# subshell first.
+VERIFIER="$BIN_DIR/pr-gate-ensure-jankurai.sh"
+# A refusal is reported where operators look (/runners), not only in the journal.
+no_auditor() { # reason
+  say "$1; nothing audited"
+  jq -cn --arg reason "$1" --arg at "$(date -u +%FT%TZ)" \
+    '{recipe: "jankurai audit", conclusion: "failed", seconds: 0, finishedAt: $at, reason: $reason}' \
+    >"$LAST_FILE.tmp.$$" && mv -f -- "$LAST_FILE.tmp.$$" "$LAST_FILE" || true
+  beat
+  exit 0
+}
+[[ -f "$VERIFIER" ]] || no_auditor "$VERIFIER is not installed"
+# shellcheck source=ops/ci/ensure-jankurai.sh
+if ! why="$( ( source "$VERIFIER" ) 2>&1 >/dev/null )"; then
+  no_auditor "the governed jankurai does not verify on this host: $(LC_ALL=C tr -cd '[:print:]' <<<"${why:0:300}")"
+fi
+# shellcheck source=ops/ci/ensure-jankurai.sh
+source "$VERIFIER" >/dev/null
+for var in JERYU_GOVERNED_JANKURAI_BIN JERYU_JANKURAI_VERSION JERYU_JANKURAI_SHA256 JERYU_JANKURAI_SEMVER; do
+  [[ -n "${!var:-}" ]] || no_auditor "the verifier did not name $var"
+done
+beat_tools="$(jq -cn --arg v "$JERYU_JANKURAI_SEMVER" --arg s "$JERYU_JANKURAI_SHA256" \
+  '[{name: "jankurai", version: $v, sha256: $s}]')"
+
+
 # --- claim ---------------------------------------------------------------------------------------
 if (($(backoff_remaining) > 0)); then say "the forge asked this host to back off; nothing claimed"; exit 0; fi
 jq -cn --arg id "$RUNNER_ID" --argjson max "$MAX" '{runner_id: $id, max: $max}' >"$WORK_DIR/claim.json"
@@ -223,6 +239,8 @@ esac
 mapfile -t jobs < <(jq -r '.tickets[]? | [.owner, .repo, .branch, .headSha, (.baseSha // ""), (.auditMode // "diff")]
   | map(tostring | gsub("[\u0000-\u001f]"; "")) | join("\u001f")' <<<"$body" 2>/dev/null || true)
 if ((${#jobs[@]} == 0)); then say "no audit work claimed"; beat; exit 0; fi
+# The pass's time budget is MAX jobs; a forge that hands out more gets the rest back when leases lapse.
+((${#jobs[@]} <= MAX)) || { say "the forge handed out ${#jobs[@]} jobs for $MAX; auditing $MAX"; jobs=("${jobs[@]:0:MAX}"); }
 
 # --- audit and submit one job ---------------------------------------------------------------------
 # The policy the auditor scores by never comes from the head under test: a head could lower its own
@@ -235,24 +253,37 @@ default_policy() {
     "required_tool_version = \"$JERYU_JANKURAI_SEMVER\""
 }
 
-# prepare_tree SRC BASE MODE: make the checked-out head safe to audit and give it trusted metadata.
+# prepare_tree SRC BASE MODE BRANCH: make the checked-out head safe to audit and give it trusted
+# metadata.
 #
 # What the auditor reads besides the code -- agent/ (policy, generated zones, boundaries, test and owner
-# maps) and .jeryu/ (the CI declaration) -- comes from the base commit for a diff job, so a head can
-# neither lower its floor nor mark its own files generated or excluded; a full job (no base) keeps the
-# head's metadata but always the default policy. Then every symlink resolving outside the clone is
-# removed, so the auditor can neither read a host file through the tree nor write through one, and the
-# paths it writes to (.jankurai, target) are real directories. Finally every tracked path this changed
-# is marked assume-unchanged: diff-audit scores the worktree against the base, and must see only what
-# the head committed, never these edits. Fails (nonzero) rather than audit a tree it could not make safe.
+# maps) and .jeryu/ (the CI declaration) -- comes only from a commit main reaches, so a head can neither
+# lower its floor nor mark its own files generated or excluded: the job's base when main reaches it, the
+# head itself when the job is main's (admission proved it is on main), else main's current tip; with no
+# main at all, none (the metadata is removed and the default policy used). Then every symlink resolving
+# outside the clone is removed, so the auditor can neither read a host file through the tree nor write
+# through one, and the paths it writes to (.jankurai, target) are real directories. Finally every
+# tracked path this changed is marked assume-unchanged: diff-audit scores the worktree against the base,
+# and must see only what the head committed, never these edits. Fails (nonzero) rather than audit a tree
+# it could not make safe.
 prepare_tree() {
-  local src=$1 base=$2 mode=$3 root link target entry dir
+  local src=$1 base=$2 mode=$3 branch=$4 root link target entry dir meta="" main=""
   root="$(realpath -- "$src")" || return 1
-  if [[ "$mode" == diff ]]; then
+  main="$("${git_auth[@]}" git -C "$root" rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null)" || main=""
+  if [[ "$mode" == diff && -n "$main" ]] && "${git_auth[@]}" git -C "$root" merge-base --is-ancestor "$base" "$main" 2>/dev/null; then
+    meta=$base; policy_source="base $base"
+  elif [[ "$branch" == main ]]; then
+    meta="head"; policy_source="main $("${git_auth[@]}" git -C "$root" rev-parse HEAD 2>/dev/null || echo head)"
+  elif [[ -n "$main" ]]; then
+    meta=$main; policy_source="main $main (the base is not on main)"
+  else
+    meta=none; policy_source=default
+  fi
+  if [[ "$meta" != head ]]; then
     for dir in agent .jeryu; do
       rm -rf -- "${root:?}/$dir" || return 1
-      if [[ -n "$("${git_auth[@]}" git -C "$root" ls-tree "$base" -- "$dir")" ]]; then
-        "${git_auth[@]}" git -C "$root" archive --format=tar "$base" -- "$dir" | tar -x -C "$root" || return 1
+      if [[ "$meta" != none && -n "$("${git_auth[@]}" git -C "$root" ls-tree "$meta" -- "$dir")" ]]; then
+        "${git_auth[@]}" git -C "$root" archive --format=tar "$meta" -- "$dir" | tar -x -C "$root" || return 1
       fi
     done
   fi
@@ -264,9 +295,8 @@ prepare_tree() {
     if [[ -L "$root/$entry" || ( -e "$root/$entry" && ! -d "$root/$entry" ) ]]; then rm -f -- "$root/$entry" || return 1; fi
     mkdir -p -- "$root/$entry" || return 1
   done
-  if [[ "$mode" == diff && -f "$root/agent/audit-policy.toml" && ! -L "$root/agent/audit-policy.toml" ]]; then
+  if [[ "$meta" != none && -f "$root/agent/audit-policy.toml" && ! -L "$root/agent/audit-policy.toml" ]]; then
     cp -- "$root/agent/audit-policy.toml" "$WORK_DIR/policy.toml"
-    policy_source="base $base"
   else
     rm -rf -- "$root/agent/audit-policy.toml" || return 1
     default_policy >"$WORK_DIR/policy.toml"
@@ -344,7 +374,7 @@ audit_one() { # owner repo branch head base mode
   if ! "${git_auth[@]}" git -C "$src" -c advice.detachedHead=false checkout -q --detach "$head" 2>&1; then
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "head is not in the clone"; return 0
   fi
-  if ! prepare_tree "$src" "$base" "$mode"; then
+  if ! prepare_tree "$src" "$base" "$mode" "$branch"; then
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "the tree could not be made safe to audit"; return 0
   fi
   # The invocations are the family's own: a full job as ops/ci/score.sh audits a whole tree (advisory
@@ -357,7 +387,7 @@ audit_one() { # owner repo branch head base mode
     args=(diff-audit "$src" --base-ref "$base" --json "$out" --advisory-only)
     [[ -f "$src/agent/owner-map.json" ]] || args+=(--skip-proof)
   fi
-  ( cd "$src" && timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$JERYU_GOVERNED_JANKURAI_BIN" "${args[@]}" ) \
+  ( cd "$src" && "${audit_env[@]}" timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$JERYU_GOVERNED_JANKURAI_BIN" "${args[@]}" ) \
     >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
   # The auditor's output can quote the head; only a bounded, printable tail reaches the journal.
   tail -n 3 "$WORK_DIR/audit.log" | LC_ALL=C tr -cd '[:print:]\n' | cut -c1-200 | sed 's/^/  /' || true

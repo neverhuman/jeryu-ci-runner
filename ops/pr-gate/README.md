@@ -222,12 +222,14 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    that); its claim lapses with its lease;
 3. clone the head under the gate home (`audit-work/`, swept at the start of each pass) with the gate's own credential (through a git credential
    helper that reads the token file; it is in no argv, environment or clone config);
-4. make the tree safe to audit and give it trusted metadata. For a `diff` job everything the auditor
-   reads besides the code -- `agent/` (policy, generated zones, boundaries, test and owner maps) and
-   `.jeryu/` (the CI declaration) -- comes from the **base** commit, so a head can neither lower its
-   floor nor mark its own files generated or excluded; a `full` job (no base exists) keeps the head's
-   metadata but always gets the default policy (the forge's floor of 85, the verified auditor's
-   version, no exclusions). Every symlink that resolves outside the clone is removed and the paths the
+4. make the tree safe to audit and give it trusted metadata. Everything the auditor reads besides the
+   code -- `agent/` (policy, generated zones, boundaries, test and owner maps) and `.jeryu/` (the CI
+   declaration) -- comes only from a commit `main` reaches, so a head can neither lower its floor nor
+   mark its own files generated or excluded: the job's base when `main` reaches it, the head itself when
+   the job is `main`'s (admission proved it is on `main`), else `main`'s current tip (a pull request
+   stacked on an unreviewed branch is scored by `main`'s metadata, never that branch's). With no `main`
+   at all the metadata is removed and the default policy is used (the forge's floor of 85, the verified
+   auditor's version, no exclusions). Every symlink that resolves outside the clone is removed and the paths the
    auditor writes to (`.jankurai`, `target`) become real directories. Every tracked path this changes is
    then marked assume-unchanged, because `diff-audit` scores the worktree against the base: the score
    must reflect only what the head committed, never the hardening;
@@ -236,8 +238,8 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    `--skip-proof` without an owner map), a `full` job (a head with no commit base) as `ops/ci/score.sh`
    audits a tree (`audit --full --mode advisory --policy`); niced, idle I/O, and time-boxed by
    `PR_GATE_AUDIT_TIMEOUT` (default 900 s). A head that a branch no longer points at is fetched through
-   `refs/pull/*`. Every git command of the pass -- the checkout above all -- runs with no LFS smudge, no
-   prompt and no global or system git configuration; the auditor's output reaches the journal only as a
+   `refs/pull/*`. Every git command of the pass -- the checkout above all -- and the auditor itself run
+   with no LFS smudge, no prompt and no global or system git configuration; the auditor's output reaches the journal only as a
    bounded, printable tail;
 6. submit the report from a file (`POST /api/v1/repos/<owner>%2F<repo>/jankurai-scores`), naming the
    auditor's version, sha256 and installation receipt -- the forge refuses any other auditor. The report
@@ -256,7 +258,9 @@ is the repository's generated verifier (`ops/ci/ensure-jankurai.sh`, a fixed pat
 scripts by `pr-gate-install.sh`). It is sourced with the switches that would widen what it accepts
 (a test receipt, a caller-named receipt or authority, a release broker) unset. It checks the binary, its
 installation receipt and the host's authority stamp, and a host whose auditor does not verify audits
-nothing (each pass says why and claims nothing; the unit does not fail every 30 s). When the tool pin
+nothing (each pass says why, claims nothing and beats `/runners` with the reason as its `last`; the
+unit does not fail every 30 s). The token's curl config is a 0600 file in the gate's `cache/`, never
+beside a clone. When the tool pin
 moves, the host's tool installer replaces the binary and receipt, and the next pass audits with the new
 version. The verifier is code sourced next to the credential that changes without draining or
 re-gating: it comes only from `ops/ci/ensure-jankurai.sh` on the protected source branch (itself a gate
@@ -271,7 +275,7 @@ auditor it does not accept) or `failed` (the head could not be fetched). A refus
 
 It runs wherever `pr-gate-audit.timer` is installed; mask the timer to keep a host from auditing. A
 pass refuses a `PR_GATE_AUDIT_MAX` x (`PR_GATE_AUDIT_TIMEOUT` + 300 s) that would not finish inside the
-unit's 10 h `TimeoutStartSec`. The
+unit's 10 h `TimeoutStartSec`, and audits at most `PR_GATE_AUDIT_MAX` jobs whatever the forge hands out. The
 gate identity must be allowed to submit scores on the forge (an administrator, or listed among its
 jankurai scorers) and must not author the pull requests it scores. Set the tuning keys
 (`PR_GATE_AUDIT_*`, `PR_GATE_INTERNAL_LABEL`) on the unit with a drop-in `Environment=` line, not in `pr-gate.env`: every

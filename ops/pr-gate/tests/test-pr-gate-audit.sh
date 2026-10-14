@@ -282,7 +282,7 @@ must 'no widening switch reaches the verifier' test "$(cat "$fx/verifier.env")" 
 touch "$fx/verifier-refuses"
 : >"$fx/curl.log"
 run
-must 'a refusing verifier is named' grep -q 'does not verify on this host (governed jankurai custody mismatch)' "$fx/out"
+must 'a refusing verifier is named' grep -q 'does not verify on this host: governed jankurai custody mismatch' "$fx/out"
 must 'a refusing verifier claims nothing' test "$(grep -c 'jankurai-audits/claim' "$fx/curl.log" || true)" == 0
 rm -f "$fx/verifier-refuses"
 printf 'PASS the verifier runs with no widening switches, and a refusal audits nothing\n'
@@ -356,3 +356,30 @@ set +e; HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" PR_GATE
 must 'a pass that cannot fit the unit is refused' test "$rc" == 2
 must 'and says why' grep -q "exceeds the unit's 10h limit" "$fx/out"
 printf 'PASS jobs x timeout must fit the unit\n'
+
+# --- the metadata source must itself be on main --------------------------------------------------------
+# A PR based on an author-pushed branch X: X's policy (floor 0) must not score it; main's (floor 92) does.
+w="$fx/w-stack"; git init -q -b main "$w"; mkdir -p "$w/agent"; printf 'minimum_score = 92\n' >"$w/agent/audit-policy.toml"
+git -C "$w" add -A; git -C "$w" -c user.name=t -c user.email=t@example.test commit -qm main
+git -C "$w" checkout -q -b x; printf 'minimum_score = 0\n' >"$w/agent/audit-policy.toml"; git -C "$w" -c user.name=t -c user.email=t@example.test commit -qam x
+xb=$(git -C "$w" rev-parse HEAD); git -C "$w" checkout -q -b y; echo y >"$w/y"; git -C "$w" add -A
+git -C "$w" -c user.name=t -c user.email=t@example.test commit -qm y; yh=$(git -C "$w" rev-parse HEAD); git clone -q --bare "$w" "$fx/git/stack.git"
+internal "$yh"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"stack","branch":"y","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$yh" "$xb" >"$fx/forge/claim.json"
+run
+must 'a base main does not reach never supplies the policy' grep -qx 'minimum_score = 92' "$fx/policy.seen"
+must 'and the report says so' grep -q 'policy: main .*(the base is not on main)' "$fx/out"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"stack","branch":"y","headSha":"%s","baseSha":"","auditMode":"full"}]}' "$yh" >"$fx/forge/claim.json"
+run
+must 'a full job off main is scored by main s metadata, not the head s' grep -qx 'minimum_score = 92' "$fx/policy.seen"
+printf 'PASS the metadata source is always a commit main reaches\n'
+
+tickets "lowers:$b1:$h1" "nopolicy:$b2:$h2"
+run
+must 'more tickets than asked are cut to MAX' grep -q 'the forge handed out 2 jobs for 1; auditing 1' "$fx/out"
+must 'the token config is not beside the clone' test "$(find "$fx/home/audit-work" -name 'curl-auth*' 2>/dev/null | wc -l)" == 0
+touch "$fx/verifier-refuses"
+run
+must 'a refusing verifier still tells /runners why' test "$(last_beat | jq -r '.last.reason')" == "the governed jankurai does not verify on this host: governed jankurai custody mismatch"
+rm -f "$fx/verifier-refuses"
+printf 'PASS the pass budget is enforced, the token sits apart, and a refusal is visible on /runners\n'
