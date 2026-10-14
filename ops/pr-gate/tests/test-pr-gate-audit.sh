@@ -44,7 +44,20 @@ cat >"$fx/bin/jankurai" <<SH
 #!/usr/bin/env bash
 [[ "\${1:-}" != --version ]] || { echo 'jankurai 9.9.9'; exit 0; }
 printf '%s|%s\n' "\$PWD" "\$*" >>"$fx/jankurai.log"
-tree=.; [[ "\${1:-}" != diff-audit ]] || tree=\$2
+# Accept exactly the family's invocations (ops/ci/score.sh, ops/ci/jankurai-gate.sh); the real CLI
+# refuses an argument it does not know, so must this stand-in.
+sub=\$1; shift; args=("\$@"); i=0
+[[ "\$sub" != diff-audit ]] || { tree=\${args[0]}; i=1; }
+while ((i < \${#args[@]})); do
+  a=\${args[i]}
+  case "\$sub \$a" in
+    "diff-audit --base-ref"|"diff-audit --json"|"audit --json"|"audit --policy"|"audit --mode") i=\$((i + 2));;
+    "diff-audit --advisory-only"|"diff-audit --skip-proof"|"audit --full"|"audit --no-score-history"|"audit .") i=\$((i + 1));;
+    *) echo "error: unexpected argument '\$a' for \$sub" >&2; exit 2;;
+  esac
+done
+set -- "\$sub" "\${args[@]}"
+[[ "\${1:-}" == diff-audit ]] || tree=.
 cat "\$tree/agent/audit-policy.toml" >"$fx/policy.seen" 2>/dev/null || true
 [[ ! -e "$fx/tool-fails" ]] || exit 3
 out=""; prev=""; for a in "\$@"; do [[ "\$prev" != --json ]] || out=\$a; prev=\$a; done
@@ -84,6 +97,11 @@ case "\$url" in
     cp "\${data#@}" "$fx/forge/score-\$n.json"
     printf '%s\n' "\${data#@}" >>"$fx/score-bodies.log"
     answer '{"score":91}' "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
+  */pulls\?state=open)
+    if [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"; else
+    answer "\$( { sed 's/.*/{"number":1,"head_sha":"&","labels":["origin:internal"]}/' "$fx/forge/internal-heads" 2>/dev/null
+               sed 's/.*/{"number":2,"head_sha":"&","labels":["origin:contributed"]}/' "$fx/forge/contributed-heads" 2>/dev/null; } \
+               | jq -cs '{items: .}')" 200; fi;;
   */runners/heartbeat)
     b=\$(cat)
     if [[ -e "$fx/forge/old-heartbeat" ]] && jq -e 'has("tools") or has("code") or has("intervalSeconds")' >/dev/null <<<"\$b"; then answer nope 422
@@ -97,7 +115,9 @@ run() { cd "$fx" && HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/h
   bash "$audit" >"$fx/out" 2>&1; }
 must() { local why=$1; shift; "$@" || { printf 'FAIL: %s\n' "$why" >&2; cat "$fx/out" >&2; exit 1; }; }
 scores() { local n=0 f; for f in "$fx"/forge/score-*.json; do [[ -e "$f" ]] && n=$((n + 1)); done; echo "$n"; }
+internal() { printf '%s\n' "$@" >>"$fx/forge/internal-heads"; }
 ticket() { # mode
+  internal "$HEAD_SHA"
   printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"widget","branch":"feature/x","headSha":"%s","baseSha":"%s","auditMode":"%s"}]}' \
     "$HEAD_SHA" "$BASE_SHA" "$1" >"$fx/forge/claim.json"
 }
@@ -121,7 +141,8 @@ must 'the receipt digest is passed on' test "$(jq -r '.jankurai_receipt_sha256' 
 must 'the runner id is the auditor' test "$(jq -r '.runner_id' "$s")" == "$HOST/jankurai-audit"
 must 'the report is the auditor output' test "$(jq -r '.report.score' "$s")" == 91
 must 'a report larger than one argv string still goes out' test "$(stat -c %s "$s")" -gt 131072
-must 'the diff audit ran against the ticketed base' grep -q "diff-audit .* --base-ref $BASE_SHA .*--advisory-only" "$fx/jankurai.log"
+must 'the diff audit ran against the ticketed base, as jankurai-gate.sh renders it' grep -q "diff-audit .* --base-ref $BASE_SHA --json [^ ]* --advisory-only --skip-proof\$" "$fx/jankurai.log"
+must 'the report names the policy it was scored by' test "$(jq -r '.report.jeryu_audit_policy.source' "$s")" == default
 must 'a head without a policy gets the default naming the verified version' grep -qx 'required_tool_version = "9.9.9"' "$fx/policy.seen"
 must 'the clone was authorized through the helper, by file' grep -q "'gate-bot' '$fx/token'" "$fx/git-helper.log"
 must 'the scored beat is the last' test "$(last_beat | jq -r '.last.conclusion + " " + .last.repo')" == "scored acme/widget"
@@ -133,7 +154,7 @@ ticket full
 run
 must 'a full ticket is submitted' test "$(scores)" == 2
 must 'the full audit names its mode' test "$(jq -r .audit_mode "$fx/forge/score-1.json")" == full
-must 'the full audit audits the whole tree' grep -q '| *audit \. --policy [^ ]*/policy.toml --json' "$fx/jankurai.log"
+must 'the full audit audits the whole tree, as score.sh does' grep -q '| *audit \. --full --mode advisory --policy [^ ]*/policy.toml --json' "$fx/jankurai.log"
 printf 'PASS a full ticket audits the whole tree\n'
 
 printf '409\n' >"$fx/forge/score.status"
@@ -175,8 +196,9 @@ rm -f "$fx/home/cache/forge-backoff"
 printf 'PASS the shared back-off holds the claim\n'
 
 mv "$fx/install/pr-gate-ensure-jankurai.sh" "$fx/verifier.off"
-set +e; run; rc=$?; set -e
-must 'no verifier, no audit' test "$rc" == 2
+: >"$fx/curl.log"
+run
+must 'no verifier, no claim' test "$(grep -c 'jankurai-audits/claim' "$fx/curl.log" || true)" == 0
 must 'it says the verifier is missing' grep -q 'pr-gate-ensure-jankurai.sh is not installed' "$fx/out"
 printf 'PASS a host without the verifier audits nothing\n'
 
@@ -197,6 +219,7 @@ repo() {
 tickets() { # name:base:head ...
   local t out=() n b h
   for t in "$@"; do IFS=: read -r n b h <<<"$t"
+    internal "$h"
     out+=("$(printf '{"owner":"acme","repo":"%s","branch":"feature/x","headSha":"%s","baseSha":"%s","auditMode":"diff"}' "$n" "$h" "$b")")
   done
   printf '{"leaseSeconds":1800,"tickets":[%s]}' "$(IFS=,; echo "${out[*]}")" >"$fx/forge/claim.json"
@@ -252,8 +275,37 @@ run
 must 'no widening switch reaches the verifier' test "$(cat "$fx/verifier.env")" == "unset|unset|unset"
 touch "$fx/verifier-refuses"
 : >"$fx/curl.log"
-set +e; run; rc=$?; set -e
-must 'a refusing verifier stops the pass' test "$rc" != 0
+run
+must 'a refusing verifier is named' grep -q 'does not verify on this host (governed jankurai custody mismatch)' "$fx/out"
 must 'a refusing verifier claims nothing' test "$(grep -c 'jankurai-audits/claim' "$fx/curl.log" || true)" == 0
 rm -f "$fx/verifier-refuses"
 printf 'PASS the verifier runs with no widening switches, and a refusal audits nothing\n'
+
+# --- only reviewed code is checked out ---------------------------------------------------------------
+read -r b6 h6 < <(repo contrib 'echo a >a' 'echo b >b')
+printf '%s\n' "$h6" >>"$fx/forge/contributed-heads"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"contrib","branch":"fork/x","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$h6" "$b6" >"$fx/forge/claim.json"
+: >"$fx/git-helper.log"; before=$(scores)
+run
+must 'a contribution is not audited here' grep -q "not auditing acme/contrib@$h6 here: a contribution (origin:contributed)" "$fx/out"
+must 'a contribution is never cloned' test ! -s "$fx/git-helper.log"
+must 'a contribution submits nothing' test "$(scores)" == "$before"
+read -r b7 h7 < <(repo orphanpr 'echo c >c' 'echo d >d')
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"orphanpr","branch":"feature/y","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$h7" "$b7" >"$fx/forge/claim.json"
+run
+must 'a head no open pull request holds is not audited' grep -q 'no open pull request holds this head' "$fx/out"
+printf '503\n' >"$fx/forge/pulls.status"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"orphanpr","branch":"feature/y","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$h7" "$b7" >"$fx/forge/claim.json"
+run
+must 'a forge that cannot say is refused' grep -q 'the forge answered 503 listing its pull requests' "$fx/out"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"orphanpr","branch":"main","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$h7" "$b7" >"$fx/forge/claim.json"
+run
+must 'main is reviewed code and needs no pull request' grep -q "acme/orphanpr@$h7 scored" "$fx/out"
+rm -f "$fx/forge/pulls.status"
+printf 'PASS only main and internal pull request heads are checked out; contributions and unknowns are not\n'
+
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"orphanpr","branch":"main","headSha":"%s","baseSha":"","auditMode":"full"}]}' "$h7" >"$fx/forge/claim.json"
+run
+must 'a full job with no base is audited' grep -q "acme/orphanpr@$h7 scored .*full audit" "$fx/out"
+must 'its base is passed on as given' test "$(jq -r '.base_sha' "$fx/forge/score-$(($(scores) - 1)).json")" == ""
+printf 'PASS a full job with no commit base is audited, not dropped\n'

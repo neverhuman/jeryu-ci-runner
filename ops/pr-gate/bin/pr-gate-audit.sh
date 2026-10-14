@@ -14,10 +14,15 @@
 # gate slots share the machine. It never takes a gate lock, posts a status or touches a gate's tree.
 #
 # The auditor is the one jankurai the host's installer verifies: pr-gate-ensure-jankurai.sh (the
-# repository's generated verifier, installed beside this script) checks the binary, its installation
-# receipt and the host's authority stamp, and names the version, sha256 and receipt the submission
-# states. A host whose auditor does not verify audits nothing. PR_GATE_AUDIT_JANKURAI points the
-# verifier at another install path; unset, it uses the verifier's own default.
+# repository's generated verifier, installed beside this script) checks the binary at its governed
+# install path, its installation receipt and the host's authority stamp, and names the version,
+# sha256 and receipt the submission states. A host whose auditor does not verify audits nothing.
+#
+# Only reviewed code is checked out here. A job for main, or for the head of an open pull request the
+# forge marks origin:internal (PR_GATE_INTERNAL_LABEL), is audited; a contribution (origin:contributed),
+# a head no open pull request holds, or a forge that cannot say, is left alone -- this host checks out
+# nothing of a contribution, exactly as the gate slots do not. A job left alone, like one whose clone
+# failed, is not refused on the forge (it has no route for that): its claim lapses with its lease.
 #
 # Each pass beats once as "<short host>/jankurai-audit" (label jankurai-audit) so /runners shows the
 # auditor beside the slots: `current` while an audit runs (kept alive every 60s; an audit can outlast
@@ -29,7 +34,7 @@
 # timer); an operator who does not want this host to audit masks the timer. A forge without the audit
 # routes (404/405) is not an error: the pass says so and ends.
 #
-# Tuning (PR_GATE_AUDIT_MAX, PR_GATE_AUDIT_TIMEOUT, PR_GATE_AUDIT_BEAT_EVERY, PR_GATE_AUDIT_JANKURAI)
+# Tuning (PR_GATE_AUDIT_MAX, PR_GATE_AUDIT_TIMEOUT, PR_GATE_AUDIT_BEAT_EVERY)
 # belongs on this unit (a drop-in Environment= line), not in pr-gate.env: every PR_GATE_* key in the
 # site file is bound into each gate's inputs unless it is listed as host-local, so a key added there
 # re-gates every open head.
@@ -68,6 +73,8 @@ HOST="$(hostname -s)"
 [[ "$HOST" =~ ^[A-Za-z0-9.-]{1,64}$ ]] || { say "this host's short name is not usable as a runner id"; exit 2; }
 RUNNER_ID="$HOST/jankurai-audit"
 LAST_FILE="$HOME_DIR/cache/audit-last.json"
+INTERNAL_LABEL="${PR_GATE_INTERNAL_LABEL:-origin:internal}"
+CONTRIBUTED_LABEL="${PR_GATE_CONTRIBUTED_LABEL:-origin:contributed}"
 for tool in curl jq git sha256sum timeout flock; do command -v "$tool" >/dev/null || { say "$tool is required"; exit 2; }; done
 
 [[ -f "$TOKEN_FILE" && ! -L "$TOKEN_FILE" && "$(stat -c '%a' "$TOKEN_FILE")" == 600 ]] \
@@ -87,19 +94,26 @@ source "$BIN_DIR/pr-gate-state.sh" 2>/dev/null || true
 # reads switches that admit a test receipt, a caller-named receipt or authority, or a release broker.
 unset JERYU_JANKURAI_ALLOW_TEST_RECEIPT JERYU_JANKURAI_RECEIPT JERYU_JANKURAI_RECEIPT_SHA256 \
   JERYU_JANKURAI_AUTHORITY_SHA256 JERYU_GOVERNED_JANKURAI_BIN JAIN_RELEASE_CI
-if [[ -n "${PR_GATE_AUDIT_JANKURAI:-}" ]]; then
-  JERYU_GOVERNED_JANKURAI_BIN="$(pr_gate_path "$PR_GATE_AUDIT_JANKURAI")"
-  export JERYU_GOVERNED_JANKURAI_BIN
-fi
+# A host without a verifying auditor is a configuration state, not a failure every 30 seconds: the
+# pass says why once per run and claims nothing. The verifier exits on refusal, so it is tried in a
+# subshell first.
 VERIFIER="$BIN_DIR/pr-gate-ensure-jankurai.sh"
-[[ -f "$VERIFIER" ]] || { say "$VERIFIER is not installed; nothing audited"; exit 2; }
+[[ -f "$VERIFIER" ]] || { say "$VERIFIER is not installed; nothing audited"; exit 0; }
+# shellcheck source=ops/ci/ensure-jankurai.sh
+if ! why="$( ( source "$VERIFIER" ) 2>&1 >/dev/null )"; then
+  say "the governed jankurai does not verify on this host (${why:0:300}); nothing audited"; exit 0
+fi
 # shellcheck source=ops/ci/ensure-jankurai.sh
 source "$VERIFIER" >/dev/null
 for var in JERYU_GOVERNED_JANKURAI_BIN JERYU_JANKURAI_VERSION JERYU_JANKURAI_SHA256 JERYU_JANKURAI_SEMVER; do
-  [[ -n "${!var:-}" ]] || { say "the verifier did not name $var; nothing audited"; exit 2; }
+  [[ -n "${!var:-}" ]] || { say "the verifier did not name $var; nothing audited"; exit 0; }
 done
 
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pr-gate-audit.XXXXXX")"
+# Clones live under the gate home (disk), never a shared tmpfs; a crashed pass's leftovers are swept
+# here, under the pass lock.
+mkdir -p "$HOME_DIR/audit-work"
+find "$HOME_DIR/audit-work" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + 2>/dev/null || true
+WORK_DIR="$(mktemp -d "$HOME_DIR/audit-work/pass.XXXXXX")"
 keepalive=""
 stop_keepalive() {
   [[ -n "$keepalive" ]] || return 0
@@ -191,7 +205,10 @@ case "$code" in
   429) say "rate-limited; backing off"; exit 0;;
   *) say "claim refused (HTTP $code): ${body:0:300}"; beat; exit 0;;
 esac
-mapfile -t jobs < <(jq -r '.tickets[]? | [.owner, .repo, .branch, .headSha, .baseSha, (.auditMode // "diff")] | @tsv' <<<"$body" 2>/dev/null || true)
+# Fields are split on the unit separator, not a tab: tab is IFS whitespace, so `read` would collapse an
+# empty field (a full job's base) and shift every later one.
+mapfile -t jobs < <(jq -r '.tickets[]? | [.owner, .repo, .branch, .headSha, (.baseSha // ""), (.auditMode // "diff")]
+  | map(tostring | gsub("[\u0000-\u001f]"; "")) | join("\u001f")' <<<"$body" 2>/dev/null || true)
 if ((${#jobs[@]} == 0)); then say "no audit work claimed"; beat; exit 0; fi
 
 # --- audit and submit one job ---------------------------------------------------------------------
@@ -234,19 +251,45 @@ prepare_tree() {
   cp -- "$WORK_DIR/policy.toml" "$root/agent/audit-policy.toml"
 }
 
+# admission OWNER REPO BRANCH HEAD: nothing when the head is reviewed code this host may check out;
+# else why not. main is reviewed by protection. Any other head must be held by an open pull request
+# the forge marks internal (jeryu's own rows label every pull request internal or contributed, set by
+# the importer, never by the author); anything the forge cannot vouch for is refused.
+admission() {
+  local owner=$1 repo=$2 branch=$3 head=$4 row
+  [[ "$branch" != main ]] || return 0
+  api GET "/api/v1/repos/$owner%2F$repo/pulls?state=open"
+  [[ "$code" == 200 ]] || { printf 'the forge answered %s listing its pull requests' "$code"; return; }
+  row="$(jq -c --arg h "$head" 'first(.items[]? | select(.head_sha == $h)) // empty' <<<"$body" 2>/dev/null)"
+  [[ -n "$row" ]] || { printf 'no open pull request holds this head'; return; }
+  label_on() { jq -e --arg name "$2" 'any((.labels // [])[]?; (if type == "string" then . else (.name // "") end) == $name)' <<<"$1" >/dev/null 2>&1; }
+  if label_on "$row" "$CONTRIBUTED_LABEL"; then
+    printf 'a contribution (%s): the gate host checks out nothing of it' "$CONTRIBUTED_LABEL"; return
+  fi
+  label_on "$row" "$INTERNAL_LABEL" || printf 'its pull request is not marked %s' "$INTERNAL_LABEL"
+}
+
 audit_one() { # owner repo branch head base mode
   local owner=$1 repo=$2 branch=$3 head=$4 base=$5 mode=$6 started=$SECONDS
   local src="$WORK_DIR/src" out="$WORK_DIR/report.json" request="$WORK_DIR/request.json" exit_code=0
   policy_source=""
+  # A full job is the one with no commit base: its base may be empty or a marker, never handed to the
+  # auditor. A diff job needs a real one.
   if ! [[ "$owner" =~ ^[A-Za-z0-9._-]{1,100}$ && "$repo" =~ ^[A-Za-z0-9._-]{1,100}$ && "$owner$repo" != *..* &&
-          "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ && "$mode" =~ ^(diff|full)$ &&
-          "$branch" =~ ^[A-Za-z0-9._/-]{1,255}$ ]]; then
+          "$head" =~ ^[0-9a-f]{40}$ && "$mode" =~ ^(diff|full)$ && "$branch" =~ ^[A-Za-z0-9._/-]{1,255}$ &&
+          ( "$base" =~ ^[0-9a-f]{40}$ || ( "$mode" == full && -z "$base" ) ) ]]; then
     say "skipping a malformed ticket: ${owner:0:100}/${repo:0:100}@${head:0:40}"
+    return 0
+  fi
+  local refusal
+  refusal="$(admission "$owner" "$repo" "$branch" "$head")"
+  if [[ -n "$refusal" ]]; then
+    say "not auditing $owner/$repo@$head here: $refusal"
     return 0
   fi
   say "$owner/$repo@$head ($branch, $([[ $mode == full ]] && echo "whole tree" || echo "vs $base"))"
   beat_start "$owner/$repo" "$head"
-  rm -rf -- "$src" "$out" "$WORK_DIR/proof.json"
+  rm -rf -- "$src" "$out"
   if ! "${git_auth[@]}" git clone -q --no-checkout "$BASE/git/$owner/$repo.git" "$src" 2>&1; then
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "clone failed"; return 0
   fi
@@ -260,24 +303,30 @@ audit_one() { # owner repo branch head base mode
   if ! prepare_tree "$src" "$base" "$mode"; then
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "the tree could not be made safe to audit"; return 0
   fi
+  # The invocations are the family's own: a full job as ops/ci/score.sh audits a whole tree (advisory
+  # mode, so the forge, not the tool, decides), a diff job exactly as ops/ci/jankurai-gate.sh renders
+  # the host's (skipping the proof plan when there is no owner map to prove lanes against).
+  local -a args
   if [[ "$mode" == full ]]; then
-    # No commit to diff against (a first main, an orphan branch): the whole tree, as a recipe audits
-    # it. A low score exits nonzero too, so a written report is what counts.
-    ( cd "$src" && timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$JERYU_GOVERNED_JANKURAI_BIN" audit . \
-        --policy "$WORK_DIR/policy.toml" --json "$out" --no-score-history ) >"$WORK_DIR/audit.log" 2>&1 \
-      || exit_code=$?
-    [[ ! -s "$out" ]] || exit_code=0
+    args=(audit . --full --mode advisory --policy "$WORK_DIR/policy.toml" --json "$out" --no-score-history)
   else
-    # --advisory-only always writes the report and exits 0; the forge derives the verdict from it.
-    timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$JERYU_GOVERNED_JANKURAI_BIN" diff-audit "$src" \
-      --base-ref "$base" --json "$out" --proof-out "$WORK_DIR/proof.json" --advisory-only \
-      >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
+    args=(diff-audit "$src" --base-ref "$base" --json "$out" --advisory-only)
+    [[ -f "$src/agent/owner-map.json" ]] || args+=(--skip-proof)
   fi
+  ( cd "$src" && timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$JERYU_GOVERNED_JANKURAI_BIN" "${args[@]}" ) \
+    >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
   tail -n 3 "$WORK_DIR/audit.log" | sed 's/^/  /' || true
 
   local conclusion=scored reason=""
   ((exit_code == 0)) || { conclusion="tool-failed"; reason="jankurai exited $exit_code"; }
-  jq -e 'type == "object"' "$out" >/dev/null 2>&1 || printf 'null\n' >"$out"
+  # The report names the policy it was scored by, so a reader comparing it with a local run of the
+  # head's own policy can see why they differ.
+  if jq -e 'type == "object"' "$out" >/dev/null 2>&1; then
+    jq --arg source "$policy_source" --arg sha "$(sha256sum "$WORK_DIR/policy.toml" | cut -d' ' -f1)" \
+      '. + {jeryu_audit_policy: {source: $source, sha256: $sha}}' "$out" >"$out.tmp" && mv -f -- "$out.tmp" "$out"
+  else
+    printf 'null\n' >"$out"
+  fi
   jq -n --arg branch "$branch" --arg head "$head" --arg base "$base" --arg runner "$RUNNER_ID" \
     --arg version "$JERYU_JANKURAI_VERSION" --arg sha "$JERYU_JANKURAI_SHA256" \
     --arg receipt "${JERYU_JANKURAI_RECEIPT_SHA256:-}" --arg mode "$mode" --argjson exit "$exit_code" \
@@ -302,7 +351,7 @@ audit_one() { # owner repo branch head base mode
 # background and waited for, so `set -e` stays in force inside it (a subshell tested by `if` would
 # run with it silently off) and its keepalive dies with it.
 for job in "${jobs[@]}"; do
-  IFS=$'\t' read -r owner repo branch head base mode <<<"$job"
+  IFS=$'\x1f' read -r owner repo branch head base mode <<<"$job"
   ( trap stop_keepalive EXIT; audit_one "$owner" "$repo" "$branch" "$head" "$base" "$mode" ) &
   if ! wait "$!"; then
     beat_finish "$owner/$repo" "$head" failed 0 "the audit stopped unexpectedly"
