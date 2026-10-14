@@ -714,6 +714,7 @@ gate_regate_wanted() { # owner repo number sha
 fresh=() seen_before=()
 for candidate in "${candidates[@]}"; do
   read -r owner repo number sha qref contributed ready <<<"$candidate"
+  [[ "$owner" != . && "$owner" != .. && "$repo" != . && "$repo" != .. ]] || die "invalid repository path in dispatch"
   if [[ ! -d "$HOME_DIR/attempts/$owner-$repo-$sha" ]]; then fresh+=("$candidate"); continue; fi
   # Somebody asked for this head: it is as urgent as a new one, and coalescing a burst of merges is
   # not a reason to make them wait for it.
@@ -842,7 +843,10 @@ for n in $family $repo; do
       flock -u 8; exec 6>&-; exec 7>&-
       continue 2
     fi
-    ((declared_dependencies == 0)) || die "declared dependency $owner/$n has no canonical main"
+    if ((declared_dependencies)); then
+      post_status "$owner" "$repo" "$sha" failure "declared dependency $owner/$n has no canonical main ($MARKER)"
+      die "declared dependency $owner/$n has no canonical main"
+    fi
     # Drop the mirror as well. A repository whose main was deleted upstream would otherwise keep an
     # older main here, and step 5 would check the sibling out from it: a phantom main in the tree
     # while this line says the tree lacks it. With no mirror, step 5 skips the sibling.
@@ -1081,10 +1085,20 @@ for pattern in $SHARED_TARGETS; do
     shared_target="$HOME_DIR/targets/$owner/$repo"; break
   fi
 done
+build_cache=0
+build_cache_stamp="$HOME_DIR/cache/build-target/$SLOT/$owner/$repo"
+if ((sandbox == 0)) && pr_gate_listed "${PR_GATE_BUILD_CACHE_REPOS:-}" "$owner/$repo"; then
+  [[ -z "$shared_target" ]] || die "PR_GATE_BUILD_CACHE_REPOS cannot overlap GATE_RUNNER_SHARED_TARGETS"
+  build_cache=1
+fi
+retain_build_cache=0
+if ((build_cache)) && [[ -f "$build_cache_stamp" ]] && grep -qxE '[0-9a-f]{64}' "$build_cache_stamp"; then
+  retain_build_cache=1
+fi
+((build_cache)) || rm -f -- "$build_cache_stamp"
 if [[ -z "$shared_target" ]]; then
-  rm -rf "$run/$repo/target"
-  mkdir -p "$run/$repo/target"
-  say "$owner/$repo builds in its own clean tree (not in GATE_RUNNER_SHARED_TARGETS)"
+  gate_prepare_target "$run/$repo/target" "$retain_build_cache" || die "cannot prepare physical target for $owner/$repo"
+  say "$owner/$repo has fresh outputs in its own tree (retained ordinary build cache: $retain_build_cache)"
 elif [[ -d "$run/$repo/target" && ! -L "$run/$repo/target" ]]; then
   if [[ ! -e "$shared_target" ]]; then
     mv "$run/$repo/target" "$shared_target"   # first gate of this repo keeps its warm build
@@ -1155,6 +1169,16 @@ case "${gate_action:?}" in
     exec 6>&-; exec 7>&-
     continue;;
 esac
+build_cache_key=""
+if ((build_cache)); then
+  build_cache_key=$(gate_build_cache_key "$identity" "$repo" "$run/$repo") || die "cannot bind $owner/$repo build cache"
+  if [[ "$build_cache_key" != "$(cat "$build_cache_stamp" 2>/dev/null || true)" ]]; then
+    rm -rf -- "$run/$repo/target/build-cache"
+  fi
+  mkdir -p "$run/$repo/target/build-cache" "$(dirname "$build_cache_stamp")"
+  # Until a completed, successful gate reauthorizes it, interrupted/failed outputs are disposable.
+  rm -f -- "$build_cache_stamp"
+fi
 # A head moving during preparation must not run under the earlier admission. A queue commit is still
 # admitted only while its entry is building at the same sha.
 checks_url=""
@@ -1357,6 +1381,7 @@ cache_env=()
 [[ -z "$SCCACHE" ]] || cache_env=(RUSTC_WRAPPER="$SCCACHE" CARGO_INCREMENTAL=0 "${sccache_env[@]}")
 root_env=()
 for var in $WORKER_ROOT_VARS; do root_env+=("$var=$worker_root"); done
+((build_cache == 0)) || root_env+=(JERYU_CI_BUILD_CACHE_DIR=target/build-cache)
 if ((sandbox)); then
   # The sandbox contract: <command> <tree-root> <repo> <recipe...>. The site's command puts the tree
   # root in an ephemeral, network-restricted VM or container at that same path, enters <repo> there
@@ -1408,6 +1433,9 @@ if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" \
   state=inputs_changed
 fi
 gate_finish "$state" "$worker_exit" "$log"
+if ((build_cache)) && [[ "$state" == success ]]; then
+  printf '%s\n' "$build_cache_key" | gate_atomic "$build_cache_stamp" || say "could not retain $owner/$repo build cache"
+fi
 gate_publish || die "terminal $state saved; publication recovery required in $gate_receipt"
 seconds=$(( $(date +%s) - started_s ))
 jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" --arg recipe "$recipe_name" \

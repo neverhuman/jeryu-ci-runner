@@ -67,6 +67,32 @@ gate_detach_strays() { # tree detached-dir name...
   done
 }
 
+# Prepare fresh outputs, optionally retaining only a qualified ordinary-build cache. Coverage,
+# reports and proof outputs belong outside build-cache and are always removed. No symlink shims.
+gate_prepare_target() { # target-dir retain-build-cache(0|1)
+  local target=$1 retain=$2
+  if [[ "$retain" == 1 ]]; then
+    [[ ! -L "$target" && ! -L "$target/build-cache" ]] || return 1
+    mkdir -p "$target/build-cache" || return
+    find "$target" -mindepth 1 -maxdepth 1 ! -name build-cache -exec rm -rf -- {} + || return
+  else
+    rm -rf -- "$target" && mkdir -p "$target" || return
+  fi
+}
+
+# Ordinary Cargo reuse binds tools, policy, recipe and dependency identities. The gated repository's
+# own head/tree may change: Cargo checks source freshness, and sync_repo stamps all tracked files.
+# Its lock and origin remain bound. Other sibling heads stay bound (they may supply build helpers).
+gate_build_cache_key() { # inputs-json gated-repository-name checkout
+  local recipe_files
+  recipe_files=$(git -C "$3" ls-tree -r HEAD -- Justfile justfile ops/ci ops/ci-kit ops/pr-gate \
+    .jeryu .github/workflows .forgejo/workflows .gitea/workflows agent policies .cargo \
+    Cargo.toml rust-toolchain rust-toolchain.toml | sha256sum | cut -c1-64) || return
+  jq -cS --arg repo "$2" --arg files "$recipe_files" \
+    '(.sources |= map(if .repository == $repo then del(.head,.tree) else . end)) | .recipe_files=$files' "$1" \
+    | sha256sum | cut -c1-64
+}
+
 # Evidence repositories are read by exact tag/commit/tree from outside a gate's family (a docs
 # repository reading another owner's release evidence, say). Keep a bare <name>.git of each beside
 # the family checkouts: it has no .git subdirectory, so gate_detach_strays leaves it alone. A refresh

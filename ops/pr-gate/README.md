@@ -110,6 +110,32 @@ exactly the proposed checkouts. Add a dependency before introducing a new siblin
 optional read that a recipe silently skips needs an explicit assertion in that recipe; the runner
 cannot infer dependencies from skipped code.
 
+## Reusing ordinary compilation without retaining proof
+
+`PR_GATE_BUILD_CACHE_REPOS` optionally selects full `owner/repo` names (or globs) for a separate,
+physical, per-slot `target/build-cache` directory. Selected internal recipes receive
+`JERYU_CI_BUILD_CACHE_DIR=target/build-cache`. The runner does **not** globally set `CARGO_TARGET_DIR`.
+The recipe must explicitly use the directory only for ordinary compilation, for example:
+
+```bash
+CARGO_TARGET_DIR="${JERYU_CI_BUILD_CACHE_DIR:-target}" cargo check --locked --workspace
+CARGO_TARGET_DIR="${JERYU_CI_BUILD_CACHE_DIR:-target}" cargo nextest run --locked --workspace
+CARGO_TARGET_DIR=target/coverage-build cargo llvm-cov --json --output-path target/coverage.json
+```
+
+Everything else under `target/`, including coverage builds, profiles, reports and proof receipts,
+starts fresh. Never put instrumentation or gate evidence inside `build-cache`. This contract needs
+a complete recipe audit and cold/warm qualification before enrollment; the runner cannot classify
+arbitrary files a recipe writes. Installing the feature enables no repository automatically.
+
+Only a completed successful gate authorizes reuse. Tool, runner, configuration, recipe, lock or
+sibling-source identity changes discard it; an ordinary change to the gated repository's source
+can reuse it. Cargo still checks source freshness, and the runner stamps tracked files on checkout.
+An interrupted, failed or input-changing attempt leaves no authorization for its cache. Contributions
+get a clean target and no cache variable, and revoke any prior authorization for that slot/repository.
+Opting out restores fully clean targets. Symlinked cache directories and overlap with
+`GATE_RUNNER_SHARED_TARGETS` are refused. No cross-slot cache or extra repository lock is introduced.
+
 ## Starting a gate when the head appears
 
 A slot looks for work when its own timer fires, so a head that appeared just after a tick waited for
@@ -404,6 +430,11 @@ Claims are still local, so two hosts must not gate the same owners at once; fail
 owner from one host's `GATE_RUNNER_OWNERS` to the other's.
 
 ## Version
+
+Version 3.0.0 moves the mains settle records from owner-wide files to per-repository paths as
+described above. Existing attempt journals and status/receipt formats are unchanged. Upgrade in a
+single drained install after the 2.1.1 audit fix; the installer handles the usual input invalidation.
+Dependency and build-cache enrollment remain separate operator configuration changes.
 
 `VERSION` is the gate component's semantic version, independent of this repository's release tags:
 

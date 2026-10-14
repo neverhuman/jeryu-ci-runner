@@ -83,6 +83,11 @@ expected_mirror="$fixture_root/runner/mirror/fixture.git"
    || "$("$worker_git" remote get-url cache-mirror)" == "${expected_mirror/\/runner\//\/runner-b\/}" ]] \
   || { printf 'worker cache mirror is not separately named\n' >&2; exit 33; }
 mkdir -p target
+if [[ -n "${JERYU_CI_BUILD_CACHE_DIR:-}" ]]; then
+  [[ "$JERYU_CI_BUILD_CACHE_DIR" == target/build-cache && -d target/build-cache && ! -L target/build-cache ]] || exit 35
+  printf 'ordinary build artifact\n' >target/build-cache/artifact
+  [[ ! -f "$fixture_root/fail-build-cache" ]] || exit 36
+fi
 # The counter lives beside the fake forge, not in target/: a repository that does not share the build
 # directory has target/ rebuilt from scratch for every gate, which would erase it.
 count=0
@@ -418,7 +423,7 @@ invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 [[ ! -L "$fixture/runner/tree/fixture/target" && -d "$fixture/runner/tree/fixture/target" ]] \
   || { printf 'target stayed a symlink for an unshared repository\n' >&2; exit 1; }
-grep -q 'builds in its own clean tree' "$fixture/runner.log"
+grep -q 'fresh outputs in its own tree' "$fixture/runner.log"
 printf 'stale\n' >"$fixture/runner/tree/fixture/target/stale-profile"
 printf 'pass\n' >"$fixture/source/mode"
 printf 'again\n' >"$fixture/source/marker"
@@ -1215,6 +1220,7 @@ invoke
 [[ "$runner_exit" != 0 ]]
 expect_count "$((before_count + 3))"
 grep -q 'declared dependency acme/nomain has no canonical main' "$fixture/runner.log"
+jq -se 'last.state == "failure" and (last.description | contains("declared dependency acme/nomain"))' "$fixture/statuses.jsonl" >/dev/null
 # An unrelated map entry must not change the default family selection for this repository.
 export PR_GATE_DEPENDENCIES='acme/other=-'
 invoke
@@ -1242,6 +1248,42 @@ for changed_tool in "$fixture/toolchain/bin/rustc" "$fixture/home/.local/bin/fix
   expect_count "$((before_count + 1))"
 done
 printf 'PASS fixture compiler and user-tool byte changes invalidate reuse without a version change\n'
+
+# Only the explicitly separated ordinary-build directory survives a successful opted-in gate.
+export PR_GATE_BUILD_CACHE_REPOS=acme/fixture
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+target="$fixture/runner/tree/fixture/target"
+stamp="$fixture/runner/cache/build-target/0/acme/fixture"
+[[ -f "$target/build-cache/artifact" && -s "$stamp" ]]
+printf 'keep\n' >"$target/build-cache/ordinary-cache"
+mkdir -p "$target/llvm-cov-target" "$target/proof"
+touch "$target/llvm-cov-target/stale.profraw" "$target/proof/report.json"
+new_head
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+[[ -f "$target/build-cache/ordinary-cache" && ! -e "$target/llvm-cov-target" && ! -e "$target/proof" ]]
+printf 'changed compiler bytes\n' >"$fixture/tools/cache-tool-change"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+[[ ! -e "$target/build-cache/ordinary-cache" && -s "$stamp" ]]
+rm -f "$fixture/tools/cache-tool-change"
+touch "$fixture/fail-build-cache"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 && ! -e "$stamp" ]]
+jq -e '.outcome == "failure"' "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null
+rm -f "$fixture/fail-build-cache"
+touch "$target/build-cache/failed-output"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 && ! -e "$target/build-cache/failed-output" && -s "$stamp" ]]
+rm -f "$stamp"  # no authorization after an interrupted attempt
+touch "$target/build-cache/interrupted-output"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 && ! -e "$target/build-cache/interrupted-output" && -s "$stamp" ]]
+unset PR_GATE_BUILD_CACHE_REPOS
+invoke
+[[ "$runner_exit" == 0 && ! -e "$target/build-cache" && ! -e "$stamp" ]]
+printf 'PASS ordinary build cache survives source changes; proof/coverage, changed tools, failed and interrupted outputs do not\n'
 
 # Mutable execution inputs cannot retain a green verdict for the pre-recipe identity.
 printf 'before\n' >"$fixture/tools/environment-probe"

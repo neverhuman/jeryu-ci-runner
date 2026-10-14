@@ -303,6 +303,41 @@ fi
 exec 6>&-
 printf 'PASS failure cause and step checklist: known shapes, protected-main step names only; nothing else from the log is published\n'
 
+# Output cleanup cannot preserve a symlink to somebody else's build or evidence tree.
+cache_target="$scratch/cache-target"
+mkdir -p "$cache_target/build-cache" "$scratch/cache-outside"
+touch "$cache_target/build-cache/artifact" "$cache_target/report.json" "$scratch/cache-outside/evidence"
+gate_prepare_target "$cache_target" 1
+[[ -f "$cache_target/build-cache/artifact" && ! -e "$cache_target/report.json" ]]
+gate_prepare_target "$cache_target" 0
+[[ ! -e "$cache_target/build-cache" ]]
+ln -s "$scratch/cache-outside" "$cache_target/build-cache"
+if gate_prepare_target "$cache_target" 1; then printf 'symlinked cache accepted\n' >&2; exit 1; fi
+[[ -f "$scratch/cache-outside/evidence" ]]
+gate_prepare_target "$cache_target" 0
+[[ -f "$scratch/cache-outside/evidence" && ! -e "$cache_target/build-cache" ]]
+printf 'PASS ordinary build retention keeps only its physical directory and refuses cache symlinks\n'
+
+cache_source="$scratch/cache-source"
+git init -q --initial-branch=main "$cache_source"
+git -C "$cache_source" config user.name Fixture
+git -C "$cache_source" config user.email fixture@example.invalid
+printf 'original recipe\n' >"$cache_source/Justfile"
+git -C "$cache_source" add Justfile
+git -C "$cache_source" commit -qm recipe
+printf '%s\n' '{"tools":"compiler-a","sources":[{"repository":"fixture","head":"a","tree":"b","cargo_lock_sha256":"lock"},{"repository":"tool","head":"c","tree":"d"}]}' >"$scratch/cache-inputs.json"
+cache_key=$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")
+jq '.sources[0].head="changed" | .sources[0].tree="changed"' "$scratch/cache-inputs.json" >"$scratch/cache-changed.json"
+[[ "$cache_key" == "$(gate_build_cache_key "$scratch/cache-changed.json" fixture "$cache_source")" ]]
+for change in '.tools="compiler-b"' '.sources[0].cargo_lock_sha256="new-lock"' '.sources[1].head="new-sibling"'; do
+  jq "$change" "$scratch/cache-inputs.json" >"$scratch/cache-changed.json"
+  [[ "$cache_key" != "$(gate_build_cache_key "$scratch/cache-changed.json" fixture "$cache_source")" ]]
+done
+printf 'changed recipe\n' >"$cache_source/Justfile"
+git -C "$cache_source" commit -qam changed-recipe
+[[ "$cache_key" != "$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")" ]]
+printf 'PASS cache identity permits source edits but binds recipe files, compiler bytes, lock and sibling identities\n'
+
 # A slot tree holds exactly the gate's family and repository: a repository synced for an earlier gate
 # made the same head fingerprint differently on every slot (12 passes in an hour, 2026-09-18).
 strays="$scratch/strays"

@@ -130,6 +130,7 @@ ENV
 export PR_GATE_CONFIG="$fixture/pr-gate.env"
 export GATE_RUNNER_HOME="$fixture/runner" GATE_RUNNER_TOOLS="$fixture/tools"
 export GATE_RUNNER_REPOS=acme/fixture GATE_RUNNER_FAMILY=fixture GATE_RUNNER_SCCACHE=""
+export PR_GATE_BUILD_CACHE_REPOS=acme/fixture
 export GATE_RUNNER_SLOT=0 GATE_RUNNER_REGATE_SETTLE=0
 export PATH="$fixture/tools:/usr/local/bin:/usr/bin:/bin"
 
@@ -210,8 +211,13 @@ git -C "$fixture/source" commit -qm allowed-head
 git -C "$fixture/source" push -q "$fixture/source.git" main
 git -C "$fixture/source" rev-parse HEAD >"$fixture/head"
 allow "$(head_sha)" robin
+mkdir -p "$fixture/runner/cache/build-target/0/acme"
+printf '%064d\n' 1 >"$fixture/runner/cache/build-target/0/acme/fixture"
 invoke
 expect_count 1
+[[ ! -e "$fixture/runner/cache/build-target/0/acme/fixture" ]] || {
+  printf 'a contribution retained ordinary-build cache authorization\n' >&2; exit 1;
+}
 [[ "$(cat "$fixture/sandbox-runs")" == 1 ]] || { printf 'the recipe did not go through the sandbox\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 [[ "$(cat "$fixture/last-recipe-sandbox")" == 1 ]] || { printf 'the recipe did not see a sandbox\n' >&2; exit 1; }
 jq -se 'last.state=="success" and (last.description|contains("sandboxed-contribution"))' "$fixture/statuses.jsonl" >/dev/null \
@@ -234,7 +240,7 @@ if grep -q 'synthetic-fixture-token' "$sandbox_env"; then
 fi
 for forbidden in JERYU_TOKEN_FILE JERYU_BASE GATE_RUNNER_IDENTITY GATE_RUNNER_HOME GATE_RUNNER_TOOLS \
     PR_GATE_CONFIG PR_GATE_FORGE_URL HOME USER RUSTC_WRAPPER SCCACHE_DIR SCCACHE_SERVER_PORT \
-    CARGO_HOME SSH_AUTH_SOCK; do
+    CARGO_HOME SSH_AUTH_SOCK JERYU_CI_BUILD_CACHE_DIR; do
   if grep -q "^$forbidden=" "$sandbox_env"; then
     printf 'the sandbox environment carries %s\n' "$forbidden" >&2; grep "^$forbidden=" "$sandbox_env" >&2; exit 1
   fi
