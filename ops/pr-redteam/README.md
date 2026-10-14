@@ -118,11 +118,12 @@ that domain (any case; subdomains and lookalikes do not match). Any other PR is
 held once per head with an `author_domain` receipt, before any agent budget is
 spent, and is left for a person. Git emails are self-asserted, so this narrows
 what the controller approves; who may push is still the forge's decision.
-Changing the rules changes the review identity, so existing receipts requalify.
+Changing the rules changes the review identity (see "Review identity and
+reinstalls" below), so existing receipts requalify.
 
 ## Qualification
 
-`bash test/required.sh` runs offline quality-gate, draft-skip, verdict, binary-payload,
+`bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,
 credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, contributed-origin and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
@@ -147,6 +148,7 @@ activation approval.
 ./pr-redteam run --dry-run --repo acme/widget-web --pr 16
 ./pr-redteam run --repo acme/widget-web --pr 16
 ./pr-redteam show acme/widget-web 16
+./pr-redteam identity
 ./pr-redteam heartbeat
 ./pr-redteam poke --dry-run
 ```
@@ -246,6 +248,34 @@ archives it as interrupted before retrying. Terminal attempts remain under
 `attempts/`, latest receipts under `receipts/`, and current work is removed when
 an attempt terminates normally or recovers. Failed attempts never count as an
 approval. Operators should investigate pending claims when no worker owns them.
+
+### Review identity and reinstalls
+
+Every receipt records `review_identity`, a sha256 over the review inputs: the
+`review_format` constant in `pr-redteam`, `prompt.md`, `verdict.schema.json`,
+`validate-verdict.jq`, the bytes of the `claude` CLI, the model, the CLI pin,
+`REDTEAM_MAX_DIFF_BYTES`, `REDTEAM_MAX_BLOB_BYTES` and `REDTEAM_AUTHOR_DOMAINS`.
+A head counts as already reviewed only when its receipt carries the current
+identity (and the same base), so a review is reused only for the same review
+inputs; any change to them re-reviews every open PR at its unchanged head.
+`./pr-redteam identity` prints the current value.
+
+The script's own bytes are not part of the identity. A release that only changes
+plumbing (heartbeat, poke, merge pass, logging) keeps every receipt and does not
+re-review unchanged heads. A change to the script that alters what the agent
+sees or how its verdict becomes a decision -- diff, description or context
+construction, the mechanical holds, the verdict-to-decision mapping, the
+rendered review -- must bump `review_format` in the same commit.
+
+`REDTEAM_ACCEPT_IDENTITIES` (space-separated, empty by default; set it in
+`site.env` so the review pass and poke agree) lists earlier identities whose
+receipts still count as already reviewed. It is for carrying receipts across a
+release that only changed plumbing but moved the identity, such as the release
+that took the script out of it. Read the live identity from any recent receipt
+before reinstalling (`jq -r .review_identity <receipt>`), list it here, and
+remove it once the heads it covers have moved on. Entries that are not 64
+lowercase hex characters are logged and ignored. Only the "already reviewed"
+decision reads this list; a new review always records the current identity.
 
 ## Before the first contribution
 

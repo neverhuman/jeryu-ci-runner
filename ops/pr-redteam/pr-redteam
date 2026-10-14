@@ -4,6 +4,7 @@
 #   pr-redteam run [--dry-run] [--jobs N] [--repo owner/name] [--pr N] [--include-drafts] [--force]
 #   pr-redteam list                        what `run` would review right now, and why others skip
 #   pr-redteam show owner/name N           the latest local receipt for one PR
+#   pr-redteam identity                    the current review identity (what receipts must match)
 #   pr-redteam heartbeat                   report liveness to jeryu's /runners page (one-minute timer),
 #                                          one row per reviewer slot (REDTEAM_JOBS rows)
 #   pr-redteam poke [--dry-run]            start a pass now if a new head needs review, an unreviewed
@@ -106,6 +107,9 @@
 #   REDTEAM_HUMAN_AUTHORS  (none)               selected humans also get a recent-activity refusal
 #   REDTEAM_HUMAN_ACTIVITY_SECS 86400           recent-activity window for selected human authors
 #   REDTEAM_STATE          ~/.local/state/pr-redteam   receipts, git cache, locks
+#   REDTEAM_ACCEPT_IDENTITIES (none)            space-separated earlier review identities (64 hex)
+#                          whose receipts still count as "already reviewed"; for carrying receipts
+#                          across a release that changed only plumbing (see review_format below)
 set -euo pipefail
 umask 077
 
@@ -148,16 +152,42 @@ say() { echo "[$(date -u +%H:%M:%S)] $*"; }
 [ -r "$token_file" ] || die "token file $token_file is not readable (set JERYU_TOKEN_FILE)"
 for tool in curl jq git tar timeout flock sync sha256sum base64 od; do command -v "$tool" >/dev/null || die "$tool is required"; done
 mkdir -p "$state"/{receipts,cache,locks,work}
-# A successful receipt is reusable only for the same review implementation and
-# declared model/CLI inputs. Hosted approval alone does not establish that match.
+# The review format. Bump it in any change to this script that alters what the reviewing agent
+# sees or how its verdict becomes a decision: the diff, description, signals or other context handed
+# to the agent; the mechanical holds (unpinned blobs, diff size, author domains, the quality gate);
+# the mapping from verdict to approve/hold; or the rendering of the posted review.
+review_format=1
+
+# A receipt counts as "already reviewed" only for the same review inputs: the review format above,
+# the prompt, the verdict schema and validator, the exact CLI bytes, the model, the CLI pin and the
+# size/domain limits. Hosted approval alone does not establish that match. This script's own bytes
+# are not hashed: plumbing (heartbeat, poke, merge pass, logging) does not change a review, and
+# hashing it re-reviewed every open PR at its unchanged head on every reinstall. A change that does
+# affect a review must bump review_format, which requalifies every receipt.
 review_input_identity() {
   {
-    (cd "$here" && sha256sum pr-redteam prompt.md verdict.schema.json validate-verdict.jq)
+    printf 'review-format %s\n' "$review_format"
+    (cd "$here" && sha256sum prompt.md verdict.schema.json validate-verdict.jq)
     if [[ -f "$claude_bin" ]]; then sha256sum "$claude_bin"; else printf 'cli-unavailable\n'; fi
     printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes" "${author_domains[*]}"
   } | sha256sum | cut -c1-64
 }
 review_identity="$(review_input_identity)"
+
+# REDTEAM_ACCEPT_IDENTITIES lists earlier review identities whose receipts still count as "already
+# reviewed" in skip_reason, and nowhere else: it carries receipts across a release that changed only
+# plumbing but moved the identity (such as the release that stopped hashing this script). Entries
+# must be exact 64-character lowercase hex; anything else is logged and ignored. A review published
+# by this process always records the current identity, never an accepted one.
+accept_identities=()
+for accepted in ${REDTEAM_ACCEPT_IDENTITIES:-}; do
+  if [[ "$accepted" =~ ^[0-9a-f]{64}$ ]]; then
+    accept_identities+=("$accepted")
+  else
+    echo "pr-redteam: ignoring REDTEAM_ACCEPT_IDENTITIES entry ${accepted:0:80}: not a 64-character lowercase hex identity" >&2
+  fi
+done
+reusable_identities="$(printf '%s\n' "$review_identity" "${accept_identities[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')"
 
 
 # --- forge -------------------------------------------------------------------------------------
@@ -381,8 +411,8 @@ skip_reason() { # row me include_drafts force
     [ -z "$reason" ] || { echo "$reason"; return; }
   fi
   receipt="$(receipt_path "$repo" "$number" "$sha")"
-  if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" --arg identity "$review_identity" --arg base "$(jq -r .base_sha <<< "$row")" \
-      '.review_identity == $identity and .base_sha == $base
+  if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" --argjson identities "$reusable_identities" --arg base "$(jq -r .base_sha <<< "$row")" \
+      '(.review_identity as $id | $identities | any(. == $id)) and .base_sha == $base
        and (.posted == true or .decision == "base_missing" or .decision == "author_domain"
             or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
     case "$(jq -r .decision "$receipt")" in
@@ -1662,6 +1692,8 @@ case "$cmd" in
     run_agent "$1" "$2" "$3" "$w" ;;
   _review) # internal: dry force include-drafts owner/name number
     review_one "$4" "$5" "$1" "$2" "$3" ;;
+  identity) # print the current review identity; reads nothing from the forge
+    printf '%s\n' "$review_identity" ;;
   show)
     [ $# = 2 ] || die "usage: show owner/name N"
     ls -t "$state/receipts/$1/$2"-*.json 2>/dev/null | head -1 | xargs -r jq . || die "no receipt for $1#$2"
