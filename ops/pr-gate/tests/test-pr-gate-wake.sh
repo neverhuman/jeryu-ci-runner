@@ -317,6 +317,25 @@ for _ in 1 2 3; do poll=0 run; done
 must 'a 500 is not retried each tick' test "$(grep -c gate-wanted "$fx/curl.log")" == 1
 printf 'PASS a failing signal route is paused, not retried every second\n'
 
+# A push to the default branch also starts a main-health slot (the gate on the new head); a push to
+# any other branch does not.
+reset_home
+printf 'acme/acme-a\n' >"$fx/home/cache/protected-acme"
+pushed() { # seq ref
+  printf '{"seq":%s,"signals":[{"seq":%s,"repo":"acme/acme-a","ref_name":"%s","sha":"%s","source":"push","at":"2026-10-08T09:00:00Z"}]}' \
+    "$1" "$1" "$2" "$A1" >"$fx/forge/wanted.json"
+}
+pushed 10 refs/heads/main
+GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
+pushed 11 refs/heads/main
+GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
+must 'a push to main wakes a main-health slot' grep -qx -- '--user start --no-block pr-gate-main-health@5.service' "$fx/started.log"
+: >"$fx/started.log"
+pushed 12 refs/heads/feature-x
+GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
+must 'a push to another branch wakes none' test "$(grep -c main-health "$fx/started.log" || true)" == 0
+printf 'PASS a push to the default branch wakes a main-health slot, a feature branch does not\n'
+
 # 429: the shared back-off honours Retry-After, makes no request while it lasts, and ends on success.
 reset_home
 printf 429 >"$fx/forge/wanted.status"

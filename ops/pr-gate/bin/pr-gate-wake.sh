@@ -152,6 +152,24 @@ dispatch_add() { # "<owner/repo> <number|-> <sha|-> <source> <when>"
   exec 5>&-
 }
 
+# Start one idle main-health slot when $1 pushes landed on a default branch. This only says WHEN: the
+# slot gates whatever main is by then (newest head wins), under the repository lock that keeps it to
+# one gate per repository, and a slot already running is left to finish its pass.
+wake_main_health() { # count
+  local want="$1" n slots woke=() slot_state
+  ((want > 0)) || return 0
+  slots="${GATE_RUNNER_MAIN_HEALTH_SLOTS:-$(systemctl --user list-units --no-legend --plain --state=active 'pr-gate-main-health@*.timer' \
+    | sed -n 's/^pr-gate-main-health@\([0-9]\+\)\.timer.*/\1/p' | sort -n | tr '\n' ' ' || true)}"
+  for n in $slots; do
+    ((${#woke[@]} < 1)) || break
+    slot_state="$(systemctl --user is-active "pr-gate-main-health@$n.service" 2>/dev/null || true)"
+    [[ "$slot_state" == inactive || "$slot_state" == failed ]] || continue
+    systemctl --user start --no-block "pr-gate-main-health@$n.service" || continue
+    woke+=("$n")
+  done
+  say "$want default-branch push(es); main-health slot(s) woken: ${woke[*]:-none idle}"
+}
+
 # Start up to $1 idle slots and say what it did. Idle is: the slot's timer is active (so neither
 # drained nor disabled) and its service is neither running nor starting. $3 names the heads, one
 # line per wake-up in the same order: each started slot is handed the line it was started for, and a
@@ -200,6 +218,16 @@ if ! signal_paused; then
     fi
     printf '%s\n' "$seq" >"$SEQ.tmp" && mv -f -- "$SEQ.tmp" "$SEQ"
     wake_slots "$fresh" 'gate-wanted signal(s)' "$heads"
+    if [[ -n "$after" ]] && ((seq >= after)); then
+      # A push to the default branch also wakes a main-health slot: that is the gate on the new
+      # head, so a red main surfaces when it happens and not at the next main-health timer tick.
+      # shellcheck disable=SC2086
+      main_pushes="$(jq -r '[.signals[]? | select(.repo | IN($ARGS.positional[]))
+        | select(.source == "push" and ((.ref_name // "") | test("^(refs/heads/)?(main|master)$")))] | length' \
+        <<<"$body" --args $watch)"
+      [[ "$main_pushes" =~ ^[0-9]+$ ]] || main_pushes=0
+      wake_main_health "$main_pushes"
+    fi
     signal=1
   else
     case "$code" in

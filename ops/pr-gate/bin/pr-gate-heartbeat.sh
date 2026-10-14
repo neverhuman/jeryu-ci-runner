@@ -249,8 +249,16 @@ while IFS= read -r receipt; do
   fi
   log_url=""
   [[ "$log_bytes" == 0 ]] || log_url=$(log_url_of "$id" "$slot" "$repo" "$sha")
+  # The failing tests, by name, when the recipe's own output says them ("test a::b ... FAILED"). The
+  # forge's flake detection reports them when a gate fails and then passes on the same commit.
+  tests_json='[]'
+  if [[ "$outcome" != success && -f "$log" && ! -L "$log" ]]; then
+    tests_json=$(sed -n 's/\x1b\[[0-9;?]*[A-Za-z]//g; s/^test \(.\{1,200\}\) \.\.\. FAILED.*/\1/p' "$log" \
+      | { LC_ALL=C grep -v '[^[:print:]]' || true; } | sort -u | head -20 | jq -Rsc 'split("\n")[:-1]' 2>/dev/null) || tests_json='[]'
+    [[ -n "$tests_json" ]] || tests_json='[]'
+  fi
   event=$(jq -c --arg host "$HOST" --arg repo "$repo" --argjson pr "$(pr_of "$slot" "$repo" "$sha")" \
-    --rawfile tail "$tail_file" --argjson log_bytes "$log_bytes" --arg log_url "$log_url" '
+    --argjson tests "$tests_json" --rawfile tail "$tail_file" --argjson log_bytes "$log_bytes" --arg log_url "$log_url" '
     (.outcome // "error") as $outcome
     | ((.finished_at // .started_at | fromdateiso8601) - (.started_at | fromdateiso8601)) as $seconds
     | {event_id: ("pr-gate:" + .id), source: "pr-gate", kind: "gate.log", actor: ($host + "/slot" + (.slot // "0")),
@@ -264,7 +272,7 @@ while IFS= read -r receipt; do
        log_tail: (if $tail == "" then null else $tail end),
        log_url: (if $log_url == "" then null else $log_url end),
        detail: {attempt: .id, sequence, exit_code, execution_kind, recipe: .inputs.recipe, log_sha256, log_bytes: $log_bytes,
-                cache: (.cache // null), queue_wait: (.queue_wait // null), runner: ($host + "/slot" + (.slot // "0"))}}
+                cache: (.cache // null), queue_wait: (.queue_wait // null), tests: (if ($tests | length) > 0 then $tests else null end), runner: ($host + "/slot" + (.slot // "0"))}}
     | .summary |= .[0:300]' "$receipt" 2>/dev/null) || event=""
   rm -f -- "$tail_file"
   [[ -n "$event" ]] || { printf 'attempt %s: receipt could not be projected to an event\n' "$id" >&2; continue; }

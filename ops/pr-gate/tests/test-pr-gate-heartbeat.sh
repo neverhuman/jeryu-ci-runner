@@ -110,7 +110,7 @@ events() { jq -c 'select(.url | endswith("/api/v1/events")) | .body' "$HEARTBEAT
 [[ -z "$(events)" ]]
 printf 'PASS a running attempt posts no event\n'
 attempt_dir=$(dirname "$receipt")
-{ printf 'early line that must fall outside the tail\n'; head -c 20000 /dev/zero | tr '\0' 'x'; printf '\n\033[31merror\033[0m: test failed\r\nlast line\n'; } > "$attempt_dir/build.log"
+{ printf 'early line that must fall outside the tail\ntest suite::slow_case ... FAILED\ntest suite::fine ... ok\n'; head -c 20000 /dev/zero | tr '\0' 'x'; printf '\n\033[31merror\033[0m: test failed\r\nlast line\n'; } > "$attempt_dir/build.log"
 jq '.terminal=true | .outcome="failure" | .exit_code=101 | .id="attempt-1" | .sequence=1 | .execution_kind="operator-unsealed" | .cache="none"
     | .log="/etc/passwd" | .recovery_required=null | .finished_at=(.started_at | fromdateiso8601 + 65 | todateiso8601)
     | .inputs.required_context="jeryu-tool/required"
@@ -133,6 +133,7 @@ events | jq -e '.event_id=="pr-gate:attempt-1" and .source=="pr-gate" and .kind=
   and (.summary|test("jeryu/jeryu-tool#4 jeryu-tool/required failure in 65s"))
   and .detail.attempt=="attempt-1" and .detail.exit_code==101 and .detail.recipe=="ops/ci/pr-ci.sh" and .detail.log_bytes>20000
   and .detail.cache=="none"
+  and .detail.tests==["suite::slow_case"]
   and .detail.queue_wait.seconds==322 and .detail.queue_wait.source=="pr-opened"
   and (.summary|test("after 322s in the queue"))
   and .detail.runner==.actor
@@ -149,7 +150,7 @@ head -c 20000 /dev/zero | tr '\0' 'y' > "$attempt_dir/build.log"
 bash "$source_file"
 events | jq -se 'length==1 and (.[0].log_tail|startswith("y")) and ((.[0].log_tail|utf8bytelength) <= 12288)' >/dev/null
 printf 'PASS a log of one line longer than the tail still reports that line\n'
-{ printf 'early line that must fall outside the tail\n'; head -c 20000 /dev/zero | tr '\0' 'x'; printf '\n\033[31merror\033[0m: test failed\r\nlast line\n'; } > "$attempt_dir/build.log"
+{ printf 'early line that must fall outside the tail\ntest suite::slow_case ... FAILED\ntest suite::fine ... ok\n'; head -c 20000 /dev/zero | tr '\0' 'x'; printf '\n\033[31merror\033[0m: test failed\r\nlast line\n'; } > "$attempt_dir/build.log"
 
 # Where the logs are served, each event names this attempt's whole build.log.
 rm -f "$fixture/home/cache/events-posted/"*
