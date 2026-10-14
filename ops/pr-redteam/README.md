@@ -368,3 +368,11 @@ or successful merge. Transient PR-detail, merge and queue errors leave the retry
 pass. A refused queue request remains author work, as before. The native wire contract is
 `QueueEntry`/`list_all` in jeryu-deploy `crates/jeryu-api/src/web/merge_queue.rs` (`base_sha`,
 `enqueued_at`, `attempts[].at`, `reason`, and `page.has_more`); the fixture uses those actual fields.
+
+### This integration's receipt boundary
+
+This source also integrates the owner-context and progress behavior from #78.
+It is a semantic controller change: predecessor review identities must not be
+accepted for this upgrade. `REDTEAM_ACCEPT_IDENTITIES` is only appropriate for
+a separately documented plumbing-equivalent reinstall. It stays unset for
+this integration; new receipts use the current input identity.
