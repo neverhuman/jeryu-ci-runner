@@ -126,6 +126,17 @@ runner's latest green main-health status; `--main-health --repo owner/name` runs
 demand. If `GATE_RUNNER_RELEASE_GUARD_FILE` names an existing file, main-health exits quietly so it
 does not compete with a release.
 
+`pr-gate-wake.sh` also starts one main-health slot as soon as the forge's signal reports a push to a
+default branch, so main is gated when it moves instead of at the next timer tick. It says only WHEN:
+the pass gates whatever main is by then (newest head wins) under the same slot lock, which keeps it
+to one gate per repository, and a slot that is mid-pass is left to finish. A push that found every
+slot busy is kept in `cache/wake-main-pending` and woken on a later look, because the fallback behind
+main-health is its own far-apart timer. A red main SHA is gated again on the next pass (only a green
+one is skipped), which is what tells a flake -- the same commit failing and then passing -- from a
+defect that stays red; jeryu folds both out of the `main.status` events the heartbeat posts
+(jeryu-deploy: `GET /api/v1/main-health`), and a failed attempt's event names the failing tests the
+recipe output reported.
+
 The installer stages the template units but does not activate their instances.
 To schedule the nightly pass, the service owner creates
 `~/gate-runner-main-health/pr-gate.env` with the required site settings and

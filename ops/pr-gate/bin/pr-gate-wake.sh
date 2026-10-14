@@ -70,6 +70,8 @@ STATE="$HOME_DIR/cache/wake-heads"
 SEQ="$HOME_DIR/cache/wake-seq"
 # The heads handed to the slots this script started; the runner takes one line per tick.
 DISPATCH="$HOME_DIR/cache/wake-dispatch"
+# A push to a default branch that found every main-health slot busy, to retry on the next look.
+MAIN_PENDING="$HOME_DIR/cache/wake-main-pending"
 # Signal deduplication is local to this look and names a concrete PR, never just a pushed SHA.
 # Longest the open-PR view may go unread while the signal is working. It costs one list per gated
 # repository, so it is read on a short period rather than on every look.
@@ -155,11 +157,23 @@ dispatch_add() { # "<owner/repo> <number|-> <sha|-> <source> <when>"
 # Start one idle main-health slot when $1 pushes landed on a default branch. This only says WHEN: the
 # slot gates whatever main is by then (newest head wins), under the repository lock that keeps it to
 # one gate per repository, and a slot already running is left to finish its pass.
+#
+# A push that finds every main-health slot busy IS remembered (cache/wake-main-pending) and retried
+# on later looks, unlike a pull-request signal: the fallback behind main-health is its own timer,
+# which runs far apart, so a forgotten push would leave main ungated until then. The memory is one
+# bit -- the next pass gates whatever main is by then -- and a host with no main-health slot at all
+# keeps nothing.
 wake_main_health() { # count
   local want="$1" n slots woke=() slot_state
-  ((want > 0)) || return 0
   slots="${GATE_RUNNER_MAIN_HEALTH_SLOTS:-$(systemctl --user list-units --no-legend --plain --state=active 'pr-gate-main-health@*.timer' \
     | sed -n 's/^pr-gate-main-health@\([0-9]\+\)\.timer.*/\1/p' | sort -n | tr '\n' ' ' || true)}"
+  if [[ -z "${slots// /}" ]]; then
+    rm -f -- "$MAIN_PENDING"
+    ((want > 0)) && say "$want default-branch push(es); this host runs no main-health slot"
+    return 0
+  fi
+  [[ ! -e "$MAIN_PENDING" ]] || want=$((want + 1))
+  ((want > 0)) || return 0
   for n in $slots; do
     ((${#woke[@]} < 1)) || break
     slot_state="$(systemctl --user is-active "pr-gate-main-health@$n.service" 2>/dev/null || true)"
@@ -167,7 +181,12 @@ wake_main_health() { # count
     systemctl --user start --no-block "pr-gate-main-health@$n.service" || continue
     woke+=("$n")
   done
-  say "$want default-branch push(es); main-health slot(s) woken: ${woke[*]:-none idle}"
+  if ((${#woke[@]} > 0)); then
+    rm -f -- "$MAIN_PENDING"
+  else
+    : >"$MAIN_PENDING"
+  fi
+  say "$want default-branch push(es); main-health slot(s) woken: ${woke[*]:-none idle, kept for the next look}"
 }
 
 # Start up to $1 idle slots and say what it did. Idle is: the slot's timer is active (so neither
@@ -218,16 +237,18 @@ if ! signal_paused; then
     fi
     printf '%s\n' "$seq" >"$SEQ.tmp" && mv -f -- "$SEQ.tmp" "$SEQ"
     wake_slots "$fresh" 'gate-wanted signal(s)' "$heads"
+    # A push to the default branch also wakes a main-health slot: that is the gate on the new head,
+    # so a red main surfaces when it happens and not at the next main-health timer tick. Called on
+    # every look with the signal, so a push that found the slots busy is retried.
+    main_pushes=0
     if [[ -n "$after" ]] && ((seq >= after)); then
-      # A push to the default branch also wakes a main-health slot: that is the gate on the new
-      # head, so a red main surfaces when it happens and not at the next main-health timer tick.
       # shellcheck disable=SC2086
       main_pushes="$(jq -r '[.signals[]? | select(.repo | IN($ARGS.positional[]))
         | select(.source == "push" and ((.ref_name // "") | test("^(refs/heads/)?(main|master)$")))] | length' \
         <<<"$body" --args $watch)"
       [[ "$main_pushes" =~ ^[0-9]+$ ]] || main_pushes=0
-      wake_main_health "$main_pushes"
     fi
+    wake_main_health "$main_pushes"
     signal=1
   else
     case "$code" in

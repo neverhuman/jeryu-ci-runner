@@ -336,6 +336,25 @@ GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
 must 'a push to another branch wakes none' test "$(grep -c main-health "$fx/started.log" || true)" == 0
 printf 'PASS a push to the default branch wakes a main-health slot, a feature branch does not\n'
 
+# A push that finds the main-health slot busy is remembered and woken on a later look: the fallback
+# behind main-health is its own far-apart timer, so a forgotten push would leave main ungated.
+: >"$fx/busy-pr-gate-main-health@5"
+pushed 13 refs/heads/main
+GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
+must 'a busy slot starts nothing' test "$(grep -c main-health "$fx/started.log" || true)" == 0
+must 'the push is kept' test -e "$fx/home/cache/wake-main-pending"
+rm -f "$fx/busy-pr-gate-main-health@5"
+pushed 14 refs/heads/feature-x
+GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
+must 'the kept push is woken on the next look' \
+  grep -qx -- '--user start --no-block pr-gate-main-health@5.service' "$fx/started.log"
+must 'and then forgotten' test ! -e "$fx/home/cache/wake-main-pending"
+# A host that runs no main-health slot keeps nothing to retry.
+pushed 15 refs/heads/main
+GATE_RUNNER_MAIN_HEALTH_SLOTS=' ' run
+must 'no main-health slot, nothing kept' test ! -e "$fx/home/cache/wake-main-pending"
+printf 'PASS a push that found every main-health slot busy is gated on a later look\n'
+
 # 429: the shared back-off honours Retry-After, makes no request while it lasts, and ends on success.
 reset_home
 printf 429 >"$fx/forge/wanted.status"
