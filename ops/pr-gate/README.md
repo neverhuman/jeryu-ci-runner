@@ -214,20 +214,30 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    (`POST /api/v1/jankurai-audits/claim`), unless the shared back-off says wait;
 2. clone the head into a throwaway directory with the gate's own credential (through a git credential
    helper that reads the token file; it is in no argv, environment or clone config);
-3. run the host's governed jankurai there: `diff-audit --base-ref <base> --advisory-only` for a `diff`
-   job, the whole-tree `audit` for a `full` one (a head with no commit base), niced, idle I/O, and
-   time-boxed by `PR_GATE_AUDIT_TIMEOUT` (default 900 s). A head with no `agent/audit-policy.toml` is
-   audited against a default naming the verified auditor's version;
-4. submit the report from a file (`POST /api/v1/repos/<owner>%2F<repo>/jankurai-scores`), naming the
+3. make the tree safe to audit and give it the trusted policy: every symlink that resolves outside
+   the clone is removed, the paths the auditor writes to (`.jankurai`, `target`, `agent`) become real
+   directories whatever the head put there, and `agent/audit-policy.toml` is replaced -- by the
+   **base** commit's (a regular file in git) for a `diff` job, else by a default at the forge's floor
+   of 85 naming the verified auditor's version. The head under test never chooses the policy that
+   scores it;
+4. run the host's governed jankurai there: `diff-audit --base-ref <base> --advisory-only` (its proof
+   plan written outside the clone) for a `diff` job, the whole-tree `audit --policy` for a `full` one
+   (a head with no commit base), niced, idle I/O, and time-boxed by `PR_GATE_AUDIT_TIMEOUT` (default
+   900 s). A head that a branch no longer points at is fetched through `refs/pull/*`;
+5. submit the report from a file (`POST /api/v1/repos/<owner>%2F<repo>/jankurai-scores`), naming the
    auditor's version, sha256 and installation receipt -- the forge refuses any other auditor.
+
+Each job runs in its own subshell: whatever a head does to its own audit, the job is reported
+`failed` and the pass goes on to the next one.
 
 The report submitted is always the one this script produced. A recipe that audits its own head (most
 `required` recipes enforce a score floor) writes a report too, but that file is written by the code
 under test, so it is never what the forge is told the governed auditor found.
 
 The auditor is the one the host's installer keeps current and verifies: `bin/pr-gate-ensure-jankurai.sh`
-is the repository's generated verifier (`ops/ci/ensure-jankurai.sh`, installed beside the scripts by
-`pr-gate-install.sh`; `PR_GATE_SOURCE_VERIFIER` names another path). It checks the binary, its
+is the repository's generated verifier (`ops/ci/ensure-jankurai.sh`, a fixed path, installed beside the
+scripts by `pr-gate-install.sh`). It is sourced with the switches that would widen what it accepts
+(a test receipt, a caller-named receipt or authority, a release broker) unset. It checks the binary, its
 installation receipt and the host's authority stamp, and a host whose auditor does not verify audits
 nothing. `PR_GATE_AUDIT_JANKURAI` points it at another install path. When the tool pin moves, the
 host's tool installer replaces the binary and receipt, and the next pass audits with the new version.
@@ -342,8 +352,9 @@ reported without it), `commit` the installed commit, and `version` e.g. `pr-gate
 `PR_GATE_SOURCE_BRANCH` (default `main`) of `PR_GATE_SOURCE_URL` into its own bare mirror
 (`~/gate-runner/source/pr-gate.git`), and compares `PR_GATE_SOURCE_SUBDIR` (default `ops/pr-gate`)
 `bin/pr-gate-*.sh` and `systemd/pr-gate-*.{service,timer}` there, and the repository's governed-jankurai
-verifier (`PR_GATE_SOURCE_VERIFIER`, default `ops/ci/ensure-jankurai.sh`, installed as
-`bin/pr-gate-ensure-jankurai.sh`), with the installed copies. A change to
+verifier (`ops/ci/ensure-jankurai.sh`, installed as `bin/pr-gate-ensure-jankurai.sh`), with the
+installed copies. The verifier is not a gate input and drains nothing, but `pr-gate-audit.sh` sources
+it next to the credential, so it comes from that one path of the protected source branch only. A change to
 the runner, its state library or its config library drains every slot first (stops the slot timers
 and waits for running gates, at most 45 minutes, else installs nothing and retries). Each changed file
 is installed atomically with its predecessor kept as `<file>.<old>-pre-<new>.bak`; a unit change

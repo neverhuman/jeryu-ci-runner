@@ -58,6 +58,8 @@ cat >"$fx/install/pr-gate-ensure-jankurai.sh" <<SH
 export JERYU_GOVERNED_JANKURAI_BIN="$fx/bin/jankurai" JERYU_JANKURAI_VERSION="jankurai 9.9.9"
 export JERYU_JANKURAI_SEMVER=9.9.9 JERYU_JANKURAI_SHA256="\$(sha256sum "$fx/bin/jankurai" | cut -d' ' -f1)"
 export JERYU_JANKURAI_RECEIPT_SHA256=$(printf 'e%.0s' {1..64})
+printf '%s|%s|%s\n' "\${JERYU_JANKURAI_ALLOW_TEST_RECEIPT-unset}" "\${JERYU_JANKURAI_RECEIPT-unset}" "\${JAIN_RELEASE_CI-unset}" >"$fx/verifier.env"
+[[ ! -e "$fx/verifier-refuses" ]] || { echo 'governed jankurai custody mismatch' >&2; exit 1; }
 echo 'governed jankurai ok'
 SH
 # The fixture forge. Claims answer $fx/forge/claim.json once (then nothing), or claim.status; scores
@@ -82,7 +84,10 @@ case "\$url" in
     cp "\${data#@}" "$fx/forge/score-\$n.json"
     printf '%s\n' "\${data#@}" >>"$fx/score-bodies.log"
     answer '{"score":91}' "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
-  */runners/heartbeat) cat >>"$fx/forge/beats.jsonl"; printf '\n' >>"$fx/forge/beats.jsonl"; answer '' 200;;
+  */runners/heartbeat)
+    b=\$(cat)
+    if [[ -e "$fx/forge/old-heartbeat" ]] && jq -e 'has("tools") or has("code") or has("intervalSeconds")' >/dev/null <<<"\$b"; then answer nope 422
+    else printf '%s\n' "\$b" >>"$fx/forge/beats.jsonl"; answer '' 200; fi;;
   *) answer nope 404;;
 esac
 SH
@@ -128,7 +133,7 @@ ticket full
 run
 must 'a full ticket is submitted' test "$(scores)" == 2
 must 'the full audit names its mode' test "$(jq -r .audit_mode "$fx/forge/score-1.json")" == full
-must 'the full audit audits the whole tree' grep -q '| *audit \. --json' "$fx/jankurai.log"
+must 'the full audit audits the whole tree' grep -q '| *audit \. --policy [^ ]*/policy.toml --json' "$fx/jankurai.log"
 printf 'PASS a full ticket audits the whole tree\n'
 
 printf '409\n' >"$fx/forge/score.status"
@@ -174,3 +179,81 @@ set +e; run; rc=$?; set -e
 must 'no verifier, no audit' test "$rc" == 2
 must 'it says the verifier is missing' grep -q 'pr-gate-ensure-jankurai.sh is not installed' "$fx/out"
 printf 'PASS a host without the verifier audits nothing\n'
+
+mv "$fx/verifier.off" "$fx/install/pr-gate-ensure-jankurai.sh"
+
+# --- what the head may not choose or reach ---------------------------------------------------------
+# repo NAME BASE-SETUP HEAD-SETUP: a bare repository on the fixture forge with a base commit and a
+# head commit, each made by running the given shell snippet in the work tree; prints "<base> <head>".
+repo() {
+  local w="$fx/w-$1"
+  git init -q -b main "$w"
+  ( cd "$w" && eval "$2" ) && git -C "$w" add -A && git -C "$w" -c user.name=t -c user.email=t@example.test commit -q --allow-empty -m base
+  local b; b=$(git -C "$w" rev-parse HEAD)
+  ( cd "$w" && eval "$3" ) && git -C "$w" add -A && git -C "$w" -c user.name=t -c user.email=t@example.test commit -q --allow-empty -m head
+  git clone -q --bare "$w" "$fx/git/$1.git"
+  printf '%s %s\n' "$b" "$(git -C "$w" rev-parse HEAD)"
+}
+tickets() { # name:base:head ...
+  local t out=() n b h
+  for t in "$@"; do IFS=: read -r n b h <<<"$t"
+    out+=("$(printf '{"owner":"acme","repo":"%s","branch":"feature/x","headSha":"%s","baseSha":"%s","auditMode":"diff"}' "$n" "$h" "$b")")
+  done
+  printf '{"leaseSeconds":1800,"tickets":[%s]}' "$(IFS=,; echo "${out[*]}")" >"$fx/forge/claim.json"
+}
+
+read -r b1 h1 < <(repo lowers 'mkdir agent; printf "minimum_score = 90\n" >agent/audit-policy.toml' \
+  'printf "minimum_score = 10\n" >agent/audit-policy.toml; echo x >f')
+tickets "lowers:$b1:$h1"
+run
+must 'a head that lowers its own floor is scored by the base policy' grep -qx 'minimum_score = 90' "$fx/policy.seen"
+must 'the policy used is named' grep -q "policy: base $b1" "$fx/out"
+printf 'PASS the base commit, not the head, supplies the policy\n'
+
+read -r b2 h2 < <(repo nopolicy 'echo a >a' 'mkdir agent; printf "minimum_score = 1\n" >agent/audit-policy.toml')
+tickets "nopolicy:$b2:$h2"
+run
+must 'a base without a policy gets the default, not the head s' grep -qx 'minimum_score = 85' "$fx/policy.seen"
+must 'the default names the verified version' grep -qx 'required_tool_version = "9.9.9"' "$fx/policy.seen"
+must 'the default excludes nothing' test "$(grep -c excluded "$fx/policy.seen" || true)" == 0
+printf 'PASS a base without a policy gets the default floor\n'
+
+mkdir -p "$fx/outside"; printf 'SECRET-HOST-FILE\n' >"$fx/outside/secret"
+read -r b3 h3 < <(repo agentfile 'echo a >a' 'printf "not a dir\n" >agent')
+read -r b4 h4 < <(repo plantnew 'echo a >a' "mkdir agent; ln -s '$fx/outside/created-by-head' agent/audit-policy.toml")
+read -r b5 h5 < <(repo plantold 'echo a >a' "mkdir agent; ln -s '$fx/outside/secret' agent/audit-policy.toml; ln -s '$fx/outside' .jankurai")
+before=$(scores)
+tickets "agentfile:$b3:$h3" "plantnew:$b4:$h4" "plantold:$b5:$h5"
+printf '3\n' >"$fx/maxjobs"
+HOME="$fx/home" PATH="$fx/bin:$PATH" GATE_RUNNER_HOME="$fx/home" PR_GATE_CONFIG="$fx/pr-gate.env" PR_GATE_AUDIT_MAX=3 \
+  bash "$audit" >"$fx/out" 2>&1 || { cat "$fx/out" >&2; printf 'FAIL: a hostile head aborted the pass\n' >&2; exit 1; }
+must 'all three hostile heads were audited and submitted' test "$(scores)" == "$((before + 3))"
+must 'an agent file did not stop the pass' grep -q "acme/agentfile@$h3 scored" "$fx/out"
+must 'a planted link created nothing outside the clone' test ! -e "$fx/outside/created-by-head"
+must 'a planted link never handed the auditor a host file' test "$(grep -c SECRET-HOST-FILE "$fx/policy.seen" "$fx"/forge/score-*.json 2>/dev/null | awk -F: '{s+=$NF} END {print s+0}')" == 0
+must 'nothing was written through a planted .jankurai' test "$(ls "$fx/outside")" == secret
+printf 'PASS hostile trees (agent as a file, planted links) are made safe and never stop the pass\n'
+
+printf '200\n' >"$fx/forge/score.status"
+tickets "lowers:$b1:$h1"
+run
+must 'a 200 from the ingest is a recorded score' test "$(last_beat | jq -r '.last.conclusion')" == scored
+rm -f "$fx/forge/score.status"
+printf 'PASS any 2xx from the ingest counts as recorded\n'
+
+touch "$fx/forge/old-heartbeat"
+run
+must 'an older forge still gets a beat' test "$(last_beat | jq -r '[.runnerId, has("tools"), has("intervalSeconds")] | join(" ")')" == "$HOST/jankurai-audit false false"
+rm -f "$fx/forge/old-heartbeat"
+printf 'PASS a forge that refuses the newer heartbeat fields still sees the auditor\n'
+
+printf 'JERYU_JANKURAI_ALLOW_TEST_RECEIPT=1\nJERYU_JANKURAI_RECEIPT=/tmp/x.json\n' >>"$fx/pr-gate.env"
+run
+must 'no widening switch reaches the verifier' test "$(cat "$fx/verifier.env")" == "unset|unset|unset"
+touch "$fx/verifier-refuses"
+: >"$fx/curl.log"
+set +e; run; rc=$?; set -e
+must 'a refusing verifier stops the pass' test "$rc" != 0
+must 'a refusing verifier claims nothing' test "$(grep -c 'jankurai-audits/claim' "$fx/curl.log" || true)" == 0
+rm -f "$fx/verifier-refuses"
+printf 'PASS the verifier runs with no widening switches, and a refusal audits nothing\n'

@@ -11,8 +11,8 @@
 #      protected branch, never another branch or a working tree;
 #   2. compare each managed file under PR_GATE_SOURCE_SUBDIR (default ops/pr-gate) there --
 #      bin/pr-gate-*.sh and systemd/pr-gate-*.{service,timer} -- and the repository's governed-jankurai
-#      verifier (PR_GATE_SOURCE_VERIFIER, default ops/ci/ensure-jankurai.sh, installed as
-#      bin/pr-gate-ensure-jankurai.sh for pr-gate-audit.sh) with the installed copy;
+#      verifier (ops/ci/ensure-jankurai.sh, a fixed path, installed as bin/pr-gate-ensure-jankurai.sh
+#      for pr-gate-audit.sh) with the installed copy;
 #   3. if the runner or a sourced state/config/backoff library differs, drain first: stop every
 #      pr-gate-runner@N.timer and wait until no runner process is left (at most
 #      GATE_INSTALL_DRAIN_SECONDS, default 45 minutes, else install nothing);
@@ -156,11 +156,10 @@ while IFS= read -r unit; do
   dest["$unit"]="$UNITS/$(basename "$unit")"
 done < <(git -C "$MIRROR" ls-tree --name-only "$commit" "$SUBDIR/systemd/" | grep -E '/pr-gate-[^/]+\.(service|timer)$' || true)
 ((${#dest[@]} > 0)) || { say "$BRANCH $short has no $SUBDIR/bin/pr-gate-*.sh; nothing installed"; exit 0; }
-# The governed-jankurai verifier pr-gate-audit.sh sources: the repository's generated one (rendered by
-# the tool pin's owner, never edited here), installed beside the scripts under its own name.
-VERIFIER_SRC="${PR_GATE_SOURCE_VERIFIER:-ops/ci/ensure-jankurai.sh}"
-[[ "$VERIFIER_SRC" =~ ^[A-Za-z0-9._/-]+$ && "$VERIFIER_SRC" != *..* && "$VERIFIER_SRC" != /* ]] \
-  || { say "PR_GATE_SOURCE_VERIFIER $VERIFIER_SRC is not a relative path"; exit 2; }
+# The governed-jankurai verifier pr-gate-audit.sh sources: the repository's generated one at its one
+# fixed path (rendered by the tool pin's owner, never edited here), installed beside the scripts under
+# its own name. No setting moves it: whatever is sourced next to the credential is that file or nothing.
+VERIFIER_SRC=ops/ci/ensure-jankurai.sh
 ! git -C "$MIRROR" cat-file -e "$commit:$VERIFIER_SRC" 2>/dev/null || dest["$VERIFIER_SRC"]="$BIN/pr-gate-ensure-jankurai.sh"
 
 stage=$(mktemp -d); trap 'rm -rf -- "$stage"' EXIT

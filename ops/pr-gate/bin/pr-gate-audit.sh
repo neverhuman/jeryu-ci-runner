@@ -83,6 +83,10 @@ source "$BIN_DIR/pr-gate-backoff.sh"
 source "$BIN_DIR/pr-gate-state.sh" 2>/dev/null || true
 
 # The governed auditor. The verifier exits nonzero, naming why, when the install does not verify.
+# Nothing ambient may widen what it accepts: the site file back-fills JERYU_* keys, and the verifier
+# reads switches that admit a test receipt, a caller-named receipt or authority, or a release broker.
+unset JERYU_JANKURAI_ALLOW_TEST_RECEIPT JERYU_JANKURAI_RECEIPT JERYU_JANKURAI_RECEIPT_SHA256 \
+  JERYU_JANKURAI_AUTHORITY_SHA256 JERYU_GOVERNED_JANKURAI_BIN JAIN_RELEASE_CI
 if [[ -n "${PR_GATE_AUDIT_JANKURAI:-}" ]]; then
   JERYU_GOVERNED_JANKURAI_BIN="$(pr_gate_path "$PR_GATE_AUDIT_JANKURAI")"
   export JERYU_GOVERNED_JANKURAI_BIN
@@ -139,20 +143,22 @@ beat_last() { jq -ce 'select(type == "object" and (.conclusion | type) == "strin
 beat() {
   local body status
   body="$(jq -cn --arg id "$RUNNER_ID" --arg host "$HOST" --argjson current "$beat_current" \
-    --argjson last "$(beat_last)" --arg code "${beat_code:-}" --argjson tools "$beat_tools" '
-    {runnerId: $id, host: $host, slot: 0, labels: ["jankurai-audit"], intervalSeconds: 30}
+    --argjson last "$(beat_last)" --arg code "${beat_code:-}" --argjson tools "$beat_tools" \
+    --argjson every "$BEAT_EVERY" '
+    {runnerId: $id, host: $host, slot: 0, labels: ["jankurai-audit"], intervalSeconds: $every}
     + (if $current != null then {current: $current} else {} end)
     + (if $last != null then {last: $last} else {} end)
     + (if $code != "" then {code: ($code | fromjson)} else {} end)
     + {tools: $tools}')" || return 0
-  status="$(curl --disable --config "$AUTH_CONFIG" --silent --max-time 5 -o /dev/null -w '%{http_code}' \
-    -X POST -H 'Content-Type: application/json' --data-binary @- "$BASE/api/v1/runners/heartbeat" <<<"$body" 2>/dev/null)" || status=000
-  if [[ "$status" == 422 ]]; then
-    # An older forge refuses fields it does not know; say the rest.
-    status="$(curl --disable --config "$AUTH_CONFIG" --silent --max-time 5 -o /dev/null -w '%{http_code}' \
-      -X POST -H 'Content-Type: application/json' --data-binary @- "$BASE/api/v1/runners/heartbeat" \
-      <<<"$(jq -c 'del(.code, .tools)' <<<"$body")" 2>/dev/null)" || status=000
-  fi
+  # An older forge refuses the whole beat (422) for a field it does not know: it is retried without
+  # tools, then without code too, then in the oldest shape the slots' own heartbeat sends.
+  local shape
+  for shape in . 'del(.tools)' 'del(.tools, .code)' 'del(.tools, .code, .intervalSeconds)'; do
+    status="$(jq -c "$shape" <<<"$body" | curl --disable --config "$AUTH_CONFIG" --silent --max-time 5 \
+      -o /dev/null -w '%{http_code}' -X POST -H 'Content-Type: application/json' --data-binary @- \
+      "$BASE/api/v1/runners/heartbeat" 2>/dev/null)" || status=000
+    [[ "$status" == 422 ]] || break
+  done
   [[ "$status" =~ ^2 ]] || say "heartbeat not accepted (HTTP $status; ignored)"
   return 0
 }
@@ -189,9 +195,49 @@ mapfile -t jobs < <(jq -r '.tickets[]? | [.owner, .repo, .branch, .headSha, .bas
 if ((${#jobs[@]} == 0)); then say "no audit work claimed"; beat; exit 0; fi
 
 # --- audit and submit one job ---------------------------------------------------------------------
+# The policy the auditor scores by never comes from the head under test: a head could lower its own
+# floor or exclude its own changes. A diff job uses the base commit's agent/audit-policy.toml (already
+# reviewed into the branch the head merges into); a full job, or a base without a regular policy
+# file, uses the default below. Its floor is the forge's own (85), its version the verified auditor's.
+default_policy() {
+  printf '%s\n' 'schema_version = "1.0.0"' 'workspace = "unconfigured"' 'minimum_score = 85' \
+    'hard_findings_allowed = 0' 'required_tool = "jankurai"' \
+    "required_tool_version = \"$JERYU_JANKURAI_SEMVER\""
+}
+
+# prepare_tree SRC BASE MODE: make the checked-out head safe to audit and give it the trusted policy.
+# Every symlink that resolves outside the clone is removed, so the auditor can neither read a host
+# file through the tree nor write through one; the paths the auditor writes to (.jankurai, target)
+# and the policy path are replaced with real directories and a fresh file whatever the head put
+# there. Fails (nonzero) rather than audit a tree it could not make safe.
+prepare_tree() {
+  local src=$1 base=$2 mode=$3 root link target entry
+  root="$(realpath -- "$src")" || return 1
+  while IFS= read -r -d '' link; do
+    target="$(realpath -m -- "$link")" || target=""
+    [[ "$target" == "$root" || "$target" == "$root"/* ]] || rm -f -- "$link" || return 1
+  done < <(find "$root" -path "$root/.git" -prune -o -type l -print0)
+  for entry in .jankurai target agent; do
+    if [[ -L "$root/$entry" || ( -e "$root/$entry" && ! -d "$root/$entry" ) ]]; then rm -f -- "$root/$entry" || return 1; fi
+    mkdir -p -- "$root/$entry" || return 1
+  done
+  rm -rf -- "$root/agent/audit-policy.toml" || return 1
+  if [[ "$mode" == diff ]] && [[ "$(git -C "$root" ls-tree "$base" -- agent/audit-policy.toml | cut -d' ' -f1)" == 100644 ]]; then
+    git -C "$root" show "$base:agent/audit-policy.toml" >"$WORK_DIR/policy.toml" || return 1
+    policy_source="base $base"
+  else
+    default_policy >"$WORK_DIR/policy.toml"
+    policy_source=default
+  fi
+  # The parent is a real directory inside the clone and the path was just removed, so this creates a
+  # new file there; no link the head planted is followed.
+  cp -- "$WORK_DIR/policy.toml" "$root/agent/audit-policy.toml"
+}
+
 audit_one() { # owner repo branch head base mode
   local owner=$1 repo=$2 branch=$3 head=$4 base=$5 mode=$6 started=$SECONDS
   local src="$WORK_DIR/src" out="$WORK_DIR/report.json" request="$WORK_DIR/request.json" exit_code=0
+  policy_source=""
   if ! [[ "$owner" =~ ^[A-Za-z0-9._-]{1,100}$ && "$repo" =~ ^[A-Za-z0-9._-]{1,100}$ && "$owner$repo" != *..* &&
           "$head" =~ ^[0-9a-f]{40}$ && "$base" =~ ^[0-9a-f]{40}$ && "$mode" =~ ^(diff|full)$ &&
           "$branch" =~ ^[A-Za-z0-9._/-]{1,255}$ ]]; then
@@ -200,34 +246,32 @@ audit_one() { # owner repo branch head base mode
   fi
   say "$owner/$repo@$head ($branch, $([[ $mode == full ]] && echo "whole tree" || echo "vs $base"))"
   beat_start "$owner/$repo" "$head"
-  rm -rf -- "$src" "$out"
+  rm -rf -- "$src" "$out" "$WORK_DIR/proof.json"
   if ! "${git_auth[@]}" git clone -q --no-checkout "$BASE/git/$owner/$repo.git" "$src" 2>&1; then
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "clone failed"; return 0
+  fi
+  # A head the branch no longer points at (or one only a pull request ref holds) is fetched by ref.
+  if ! git -C "$src" cat-file -e "$head^{commit}" 2>/dev/null; then
+    "${git_auth[@]}" git -C "$src" fetch -q origin '+refs/pull/*/head:refs/remotes/origin/pull/*' 2>&1 || true
   fi
   if ! git -C "$src" -c advice.detachedHead=false checkout -q --detach "$head" 2>&1; then
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "head is not in the clone"; return 0
   fi
-  # A head that carries no policy of its own is audited against a default, dropped into the throwaway
-  # clone only (untracked files do not enter the diff set). The version it names is the verified
-  # auditor's, never a literal that goes stale when the pin moves.
-  if [[ ! -f "$src/agent/audit-policy.toml" ]]; then
-    mkdir -p "$src/agent"
-    printf '%s\n' 'schema_version = "1.0.0"' 'workspace = "unconfigured"' 'minimum_score = 85' \
-      'hard_findings_allowed = 0' 'required_tool = "jankurai"' \
-      "required_tool_version = \"$JERYU_JANKURAI_SEMVER\"" '' '[scan]' \
-      'excluded_paths = [".jankurai/", "apps/web/dist/"]' >"$src/agent/audit-policy.toml"
+  if ! prepare_tree "$src" "$base" "$mode"; then
+    beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "the tree could not be made safe to audit"; return 0
   fi
   if [[ "$mode" == full ]]; then
     # No commit to diff against (a first main, an orphan branch): the whole tree, as a recipe audits
     # it. A low score exits nonzero too, so a written report is what counts.
-    ( cd "$src" && timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 \
-        "$JERYU_GOVERNED_JANKURAI_BIN" audit . --json "$out" --no-score-history ) >"$WORK_DIR/audit.log" 2>&1 \
+    ( cd "$src" && timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$JERYU_GOVERNED_JANKURAI_BIN" audit . \
+        --policy "$WORK_DIR/policy.toml" --json "$out" --no-score-history ) >"$WORK_DIR/audit.log" 2>&1 \
       || exit_code=$?
     [[ ! -s "$out" ]] || exit_code=0
   else
     # --advisory-only always writes the report and exits 0; the forge derives the verdict from it.
     timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$JERYU_GOVERNED_JANKURAI_BIN" diff-audit "$src" \
-      --base-ref "$base" --json "$out" --advisory-only >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
+      --base-ref "$base" --json "$out" --proof-out "$WORK_DIR/proof.json" --advisory-only \
+      >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
   fi
   tail -n 3 "$WORK_DIR/audit.log" | sed 's/^/  /' || true
 
@@ -243,8 +287,8 @@ audit_one() { # owner repo branch head base mode
      report: $report[0]}
     + (if ($receipt | test("^[0-9a-f]{64}$")) then {jankurai_receipt_sha256: $receipt} else {} end)' >"$request"
   api POST "/api/v1/repos/$owner%2F$repo/jankurai-scores" "$request"
-  if [[ "$code" == 201 ]]; then
-    say "$owner/$repo@$head scored $(jq -r '.score // "?"' <<<"$body" 2>/dev/null || echo "?") ($mode audit, $JERYU_JANKURAI_VERSION)"
+  if [[ "$code" =~ ^2[0-9][0-9]$ ]]; then
+    say "$owner/$repo@$head scored $(jq -r '.score // "?"' <<<"$body" 2>/dev/null || echo "?") ($mode audit, $JERYU_JANKURAI_VERSION, policy: $policy_source)"
   else
     say "$owner/$repo@$head report refused (HTTP $code): ${body:0:300}"
     conclusion=refused reason="the forge refused the report (HTTP $code)"
@@ -253,7 +297,14 @@ audit_one() { # owner repo branch head base mode
   rm -rf -- "$src"
 }
 
+# One job's failure is that job's: whatever a head does to its own audit, the pass goes on, the claim
+# is reported finished, and the next job runs. Each job runs in its own subshell, started in the
+# background and waited for, so `set -e` stays in force inside it (a subshell tested by `if` would
+# run with it silently off) and its keepalive dies with it.
 for job in "${jobs[@]}"; do
   IFS=$'\t' read -r owner repo branch head base mode <<<"$job"
-  audit_one "$owner" "$repo" "$branch" "$head" "$base" "$mode"
+  ( trap stop_keepalive EXIT; audit_one "$owner" "$repo" "$branch" "$head" "$base" "$mode" ) &
+  if ! wait "$!"; then
+    beat_finish "$owner/$repo" "$head" failed 0 "the audit stopped unexpectedly"
+  fi
 done
