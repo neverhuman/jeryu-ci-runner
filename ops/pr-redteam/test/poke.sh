@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The 30-second poke, against stand-in forge/model/systemd processes: it starts a pass early, once
-# per head, for a head nobody reviewed and for an approval that became landable, and it never
-# reviews, merges or starts anything on a dry run.
+# per head, for a head nobody reviewed, once more for such a head when its required gate turns
+# green, and for an approval that became landable, and it never reviews, merges or starts anything
+# on a dry run.
 set -euo pipefail
 umask 077
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -80,7 +81,13 @@ case "$url" in
     else printf '{"login":"independent-reviewer"}\n200'; fi ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"jeryu","name":"fixture"},"family":"jain","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
-  */pulls/107) row | jq -c '. + {merge_passport:{blockers:[]}}'; printf '\n200' ;;
+  */pulls/107)
+    # The forge's passport for the exact head: a jankurai/proof still running, or a failing
+    # required context, is a blocker.
+    blockers='[]'
+    [[ ! -e "$MERGE_FIXTURE/proof-pending" ]] || blockers='[{"code":"passport_blocked_pending_checks","message":"Required context `jankurai/proof` is queued or running."}]'
+    [[ ! -e "$MERGE_FIXTURE/required-failing" ]] || blockers='[{"code":"passport_blocked_checks","message":"Required context `jeryu-deploy/required` is failing."}]'
+    row | jq -c --argjson b "$blockers" '. + {merge_passport:{head_sha:.head_sha, blockers:$b}}'; printf '\n200' ;;
   */pulls/107/checks) checks ;;
   */pulls/107/merge)
     if [[ -e "$MERGE_FIXTURE/required-failing" ]]; then printf '{"message":"required contexts are not green"}\n409'; exit 0; fi
@@ -134,16 +141,45 @@ rm -f "$t/state/poke-seen"
 poke
 [[ "$(starts)" == 1 ]]
 grep -q 'poke: starting a pass now (review jeryu/fixture#107' "$t/controller.log"
+# While that pass runs, the still-unreviewed head starts nothing and uses up no key.
+touch "$t/pass-active"
+poke
+rm "$t/pass-active"
+[[ "$(starts)" == 1 ]]
+grep -q 'poke: pass already running (ready jeryu/fixture#107' "$t/controller.log"
+! grep -q '^ready ' "$t/state/poke-seen"
+echo 'ok an unreviewed head starts one pass'
+
+# That pass found jankurai/proof still running and left the head with no receipt. The used-up
+# `review` key does not strand it: once the passport for the head has no required-context blocker,
+# one `ready` poke starts a pass. Each such poke reads the pull request once.
+reads() { grep -c '/pulls/107 ' "$t/requests" || true; }
+touch "$t/proof-pending"
+pass
+grep -q 'waiting for jankurai/proof' "$t/controller.log"
+[[ ! -e "$t/state/receipts/jeryu/fixture/107-$(cat "$t/head").json" ]]
+before="$(reads)"; poke
+[[ "$(starts)" == 1 && "$(( $(reads) - before ))" == 1 ]]
+rm "$t/proof-pending"; touch "$t/required-failing"
 poke
 [[ "$(starts)" == 1 ]]
-echo 'ok an unreviewed head starts one pass'
+rm "$t/required-failing"
+poke --dry-run
+grep -q 'poke: would start a pass (ready jeryu/fixture#107' "$t/controller.log"
+[[ "$(starts)" == 1 ]]
+poke
+[[ "$(starts)" == 2 ]]
+grep -q 'poke: starting a pass now (ready jeryu/fixture#107' "$t/controller.log"
+before="$(reads)"; poke
+[[ "$(starts)" == 2 && "$(reads)" == "$before" ]]
+echo 'ok an unreviewed head whose gate went green starts one more pass'
 
 # Reviewed and approved while its required context fails: nothing to land yet, so no pass.
 touch "$t/required-failing"
 pass
 jq -e '.posted == true and .decision == "approve"' "$t/state/receipts/jeryu/fixture/107-$(cat "$t/head").json" > /dev/null
 poke
-[[ "$(starts)" == 1 ]]
+[[ "$(starts)" == 2 ]]
 echo 'ok an approval waiting on its gate starts nothing'
 
 # A failed managed start does not consume the poke. Poke has no merger credential.
@@ -157,7 +193,7 @@ jq --arg at "$(date -u -d '2 minutes ago' +%FT%TZ)" '.reviewed_at=$at' "$receipt
 mv "$t/receipt" "$receipt"
 touch "$t/pass-active"
 REDTEAM_MERGE_TOKEN_FILE= poke --repo jeryu/fixture --pr 107
-[[ "$(starts)" == 1 && "$(merge_starts)" == 2 && "$(count "$t/merges")" == 0 ]]
+[[ "$(starts)" == 2 && "$(merge_starts)" == 2 && "$(count "$t/merges")" == 0 ]]
 instance="jeryu:fixture:107:$(cat "$t/head")"
 grep -qxF -- "--user start --no-block pr-redteam-merge@$instance.service" "$t/systemctl"
 grep -Eq 'started scoped merge unit .*review_age_seconds=1[2-9][0-9]' "$t/controller.log"

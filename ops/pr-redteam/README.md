@@ -123,7 +123,7 @@ Changing the rules changes the review identity, so existing receipts requalify.
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, verdict, binary-payload,
-credential-transport, publication/recovery, merge-pass, contributed-origin and installation checks. The actual repository required lane
+credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, contributed-origin and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
 publication refusal, restart, duplicate dispatch, worker loss and changed heads,
@@ -155,8 +155,22 @@ activation approval.
 held-review handoff when the service owner has enabled it. `heartbeat` sends one
 beat per reviewer slot: a review takes a numbered slot for
 as long as it runs, so `/runners` shows `REDTEAM_JOBS` rows (`<id>`, `<id>-2` …)
-instead of one row for the whole pass. `poke` runs every 30 seconds from
-`pr-redteam-poke.timer`. Unreviewed heads start `pr-redteam.service` early.
+instead of one row for the whole pass. Each beat follows the forge's runner contract, which refuses a
+beat with any field it does not define: `current` and `last` are cut down to
+that contract's fields before sending, and a receipt decision the forge has no
+reviewer conclusion for (`base_missing`, `author_domain`, `advice`) is sent as
+`hold` with the decision in `reason`. A beat also names the code it runs,
+`code: {repo, commit}`: the commit comes from `source-commit`, which
+`git archive` fills in (`export-subst`), or from a git checkout whose
+`ops/pr-redteam` is unmodified; otherwise `code` is left out. `tools` lists the
+`claude` CLI version the last review measured. `poke` runs every 30 seconds from
+`pr-redteam-poke.timer`. Unreviewed heads start `pr-redteam.service` early. A
+head's `review` poke is usually used up while its required gate is still
+running, and that pass can leave it with no receipt (a jankurai/proof without a
+result is waited for). Such a head, still open, ready and with no receipt, gets
+one more poke, `ready`, once the forge's merge passport for that exact head has
+no required-context blocker; that check reads at most four pull requests per
+poke.
 Landable approvals start `pr-redteam-merge@owner:repo:PR:head.service`, even while
 other reviews are running. The instance scopes landing to that repository, PR
 and exact reviewed head; operator `--repo`/`--pr` filters therefore remain in

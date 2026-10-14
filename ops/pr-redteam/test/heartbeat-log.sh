@@ -69,7 +69,7 @@ ids="$(grep -o '"runnerId":"[^"]*"' "$t/sent" | tr '\n' ' ')"
 grep -q '"runnerId":"fixture/redteam-2","host":"[^"]*","slot":1,"labels":\["redteam"\],"current":{' "$t/sent" \
   || { echo "slot 1 is not the row reporting the review: $(cat "$t/sent")" >&2; exit 1; }
 echo 'ok slots'
-printf '{"recipe":"redteam-review","conclusion":"success","finished_at":"2026-10-09T07:00:00Z"}\n' \
+printf '{"repo":"jeryu/jeryu-web","pr":6,"sha":"abcdef1","recipe":"redteam-review","conclusion":"approve","seconds":5,"finished_at":"2026-10-09T07:00:00Z"}\n' \
   >"$t/state/beats/last-0.json"
 : >"$t/sent"
 POKE_RESULT=exit-code HEARTBEAT_FIXTURE=accepted HEARTBEAT_SENT="$t/sent" PATH="$t/bin:$PATH" \
@@ -77,10 +77,10 @@ POKE_RESULT=exit-code HEARTBEAT_FIXTURE=accepted HEARTBEAT_SENT="$t/sent" PATH="
   REDTEAM_RUNNER_ID=fixture/redteam REDTEAM_JOBS=1 "$here/pr-redteam" heartbeat >"$t/out" 2>&1
 grep -q '"labels":\["redteam"\]' "$t/sent"
 grep -q '"recipe":"redteam-poke","conclusion":"failure","result":"exit-code"' "$t/sent"
-grep -q '"last":{"recipe":"redteam-review","conclusion":"success"' "$t/sent"
+grep -q '"last":{"repo":"jeryu/jeryu-web","pr":6,"sha":"abcdef1","recipe":"redteam-review","conclusion":"approve"' "$t/sent"
 grep -q '"finished_at":"2026-10-09T08:00:00Z"' "$t/sent"
 POKE_RESULT=exit-code beat accepted 1
-grep -q '"last":{"recipe":"redteam-review","conclusion":"success"' "$t/sent"
+grep -q '"last":{"repo":"jeryu/jeryu-web","pr":6,"sha":"abcdef1","recipe":"redteam-review","conclusion":"approve"' "$t/sent"
 POKE_RESULT=exit-code beat old-schema 1
 [[ ! -s "$t/out" ]] || { cat "$t/out" >&2; exit 1; }
 [[ "$(grep -c '"runnerId":"fixture/redteam"' "$t/sent")" == 2 ]]

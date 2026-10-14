@@ -6,8 +6,9 @@
 #   pr-redteam show owner/name N           the latest local receipt for one PR
 #   pr-redteam heartbeat                   report liveness to jeryu's /runners page (one-minute timer),
 #                                          one row per reviewer slot (REDTEAM_JOBS rows)
-#   pr-redteam poke [--dry-run]            start a pass now if a new head needs review or an approval
-#                                          became landable (30-second timer; never reviews or merges)
+#   pr-redteam poke [--dry-run]            start a pass now if a new head needs review, an unreviewed
+#                                          head's required gate went green, or an approval became
+#                                          landable (30-second timer; never reviews or merges)
 #
 # Each open PR is reviewed at its exact head by a read-only agent. Confirmed high or critical
 # security/correctness findings block, and every explicit block verdict is honored. Invalid or
@@ -480,6 +481,10 @@ run_agent() { # review-dir tag sha work-dir origin spend-cap
   # Only the pinned CLI may review: an auto-updated `claude` is a different tool until someone
   # reviews the bump. A missing pin or a mismatch posts nothing.
   local have; have="$(model_process "$claude_bin" --version 2>/dev/null | awk '{print $1; exit}')"
+  # What the CLI says its version is, for the heartbeat's `tools` row. Best-effort.
+  if [ -n "$have" ]; then
+    mkdir -p "$beats" && printf '%s\n' "$have" >"$beats/claude-version" 2>/dev/null || true
+  fi
   if [ -z "$claude_version_pin" ] || [ "$have" != "$claude_version_pin" ]; then
     say "$tag: CLI version does not match the selected pin; no review published" >&2
     return 1
@@ -911,13 +916,69 @@ beat_done() { # owner/name number sha conclusion started-epoch
   rm -f "$beats/current/$key.json"
 }
 
+# The forge's heartbeat contract (jeryu-deploy GateRunnerHeartbeat and its GateRunnerTask,
+# GateRunnerResult and RunnerCode) denies unknown fields, and one unknown key anywhere refuses the
+# whole beat with 422 "the request body is not valid JSON for this route". The files under
+# $beats are this tool's own bookkeeping, so they are never sent as they are: `current` and `last`
+# are cut down to the contract's keys here. `slot` in a current file is the bookkeeping that frees a
+# slot when its review ends; sent inside `current`, it refused every busy beat, so /runners always
+# showed the reviewer idle.
+forge_current() { # current-file JSON -> GateRunnerTask JSON, or null
+  jq -c 'if type == "object" then {repo, pr, sha, recipe, started_at} else null end'
+}
+# The forge accepts only approve, hold, failed, interrupted, publication_rejected and too_large as a
+# reviewer's conclusion. The other receipt decisions are reviews left for a person (a missing base
+# branch, commit emails outside the required domain) or posted only as advice (a contributed pull
+# request): each is reported as `hold`, with its receipt decision in `reason`.
+forge_last() { # last-file JSON -> GateRunnerResult JSON, or null
+  jq -c 'if type == "object" then
+      (.conclusion // "") as $decision
+      | ({base_missing: "base_missing: the base branch does not exist yet; a person creates it",
+        author_domain: "author_domain: commit emails are outside the required domain; a person reviews it",
+        advice: "advice: contributed pull request, reviewed as advice; a maintainer decides"} | .[$decision]) as $why
+      | {repo, pr, sha, recipe, conclusion, seconds, finished_at}
+        + (if $why == null then {} else {conclusion: "hold", reason: $why} end)
+    else null end'
+}
+
+# The code this reviewer runs, as RunnerCode: this repository and the commit the running source came
+# from. An install is a `git archive` export, which writes the commit into source-commit (see
+# .gitattributes: export-subst); a git checkout answers for itself when its ops/pr-redteam is
+# unmodified. Anything else is unknown, and the optional field is left out rather than guessed.
+runner_code() { # -> RunnerCode JSON, or null
+  local commit
+  commit="$(head -c 64 "$here/source-commit" 2>/dev/null | tr -d '[:space:]' || true)"
+  if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+    commit=""
+    if git -C "$here" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+        && git -C "$here" diff --quiet HEAD -- . 2>/dev/null \
+        && [ -z "$(git -C "$here" ls-files --others --exclude-standard -- . 2>/dev/null)" ]; then
+      commit="$(git -C "$here" rev-parse HEAD 2>/dev/null || true)"
+    fi
+  fi
+  if [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
+    jq -nc --arg commit "$commit" '{repo: "jeryu/jeryu-ci-runner", commit: $commit}'
+  else
+    echo null
+  fi
+}
+
+# The CLI as the last review measured it (`claude --version`), as one RunnerTool row; empty before
+# the first review on this host. A review publishes only when it equals the pin.
+runner_tools() { # -> RunnerTool JSON array
+  local version
+  version="$(head -c 100 "$beats/claude-version" 2>/dev/null | tr -d '[:cntrl:]' || true)"
+  jq -nc --arg version "$version" 'if $version == "" then [] else [{name: "claude", version: $version}] end'
+}
+
 # One beat per reviewer slot. The first keeps the old runner id so its history carries on; the
 # others are <id>-2 .. <id>-N. A slot's `current` is the review holding that slot, never "the oldest
 # one", so a review does not hop between rows while its neighbours finish. Every beat the forge does
 # not accept gets a log line: a JSON refusal, but also an HTML answer (a forge that predates the
 # route, or a proxy error page) and a curl failure.
 heartbeat() {
-  local current last f i id key poke_last labels payload poke_at
+  local current last f i id key poke_last labels payload poke_at code_json tools_json
+  code_json="$(runner_code)"; tools_json="$(runner_tools)"
   poke_last=null; labels='["redteam"]'
   local poke_result; poke_result="$(systemctl --user show pr-redteam-poke.service -p Result --value 2>/dev/null || true)"
   if [ -n "$poke_result" ] && [ "$poke_result" != success ]; then
@@ -934,17 +995,19 @@ heartbeat() {
     current=null; last=null
     key="$(cat "$beats/slots/$i" 2>/dev/null || true)"
     f="$beats/current/$key.json"
-    if [ -n "$key" ] && jq -e . "$f" >/dev/null 2>&1; then current="$(cat "$f")"; fi
+    if [ -n "$key" ] && jq -e . "$f" >/dev/null 2>&1; then current="$(forge_current <"$f")"; fi
     f="$beats/last-$i.json"
     # Before the first review on a slot, the first row still shows the pass's last review.
     if [ "$i" -eq 0 ] && [ ! -s "$f" ]; then f="$beats/last.json"; fi
-    if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then last="$(cat "$f")"; fi
+    if [ -s "$f" ] && jq -e . "$f" >/dev/null 2>&1; then last="$(forge_last <"$f")"; fi
     id="$runner_id"; if [ "$i" -gt 0 ]; then id="$runner_id-$((i + 1))"; fi
     payload="$(jq -nc --arg id "$id" --arg host "$runner_host" \
       --argjson slot "$i" --argjson current "$current" --argjson last "$last" \
       --argjson labels "$labels" --argjson poke "$poke_last" \
+      --argjson code "$code_json" --argjson tools "$tools_json" \
       '{runnerId: $id, host: $host, slot: $slot, labels: $labels, current: $current,
-        last: $last} + (if $slot == 0 and $poke != null then {poke:$poke} else {} end)')"
+        last: $last, tools: $tools} + (if $code == null then {} else {code: $code} end)
+        + (if $slot == 0 and $poke != null then {poke:$poke} else {} end)')"
     api POST "/api/v1/runners/heartbeat" "$payload"
     if [ "$code" = 422 ] && [ "$poke_last" != null ]; then
       api POST "/api/v1/runners/heartbeat" "$(jq -c 'del(.poke)' <<<"$payload")"
@@ -1408,11 +1471,35 @@ fix_todo_pass() ( # dry; serialize independently of the caller run lock
 
 # Cheap event trigger (every ~30s from pr-redteam-poke.timer): start a full pass now if the queue has
 # something new — a PR head no pass has reviewed yet, or an approved head that the forge would now
-# land. Each head triggers at most once (state/poke-seen), so a review that keeps failing cannot turn
-# this into a pass every 30 seconds; the five-minute timer still retries it. It never reviews or
-# merges by itself. Landable approvals start an exact-head scoped, separately managed merge unit.
+# land. Each head triggers at most once per reason (state/poke-seen), so a review that keeps failing
+# cannot turn this into a pass every 30 seconds; the five-minute timer still retries it. It never
+# reviews or merges by itself. Landable approvals start an exact-head scoped, separately managed
+# merge unit.
+#
+# A head's `review` key is usually used up the moment the head appears, while its required gate is
+# still queued or running. The pass it starts can leave that head with no receipt at all (a
+# jankurai/proof without a result is waited for, not reviewed), and before `ready` existed nothing
+# else woke the reviewer: the head waited for the five-minute timer. So a ready, unreviewed head (no
+# receipt file for it) whose `review` key is used up gets one more key, `ready`, once the forge's
+# merge passport for that exact head has no required-context blocker (failing, queued, running or
+# not run). That costs one pull-request read per such head, at most poke_ready_reads per poke.
+poke_ready_reads=4
+
+# 0 when the forge's merge passport for this exact head lists no blocker about required contexts.
+required_contexts_green() { # owner/name number sha
+  api GET "/api/v1/repos/${1/\//%2F}/pulls/$2"
+  [ "$code" = 200 ] || return 1
+  jq -e --arg sha "$3" '
+    .merge_passport as $p
+    | $p != null and $p.head_sha == $sha
+      and (($p.blockers // []) | all(((.code // "") | test("checks")) == false
+                                     and ((.message // "") | test("^Required context")) == false))' \
+    <<<"$body" >/dev/null 2>&1
+}
+
 poke() { # dry
   local dry="$1" me row repo number sha key why="" seen="$state/poke-seen" age=unknown receipt reviewed epoch unit
+  local reads=0
   me="$(whoami_login)"
   while IFS= read -r row; do
     repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
@@ -1421,6 +1508,15 @@ poke() { # dry
     [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
     if [ -z "$(skip_reason "$row" "$me" 0 0)" ]; then
       key="review $repo#$number $sha"
+      if [ -f "$seen" ] && grep -qxF "$key" "$seen"; then
+        # Already poked for this head. Once more, only if it is still unreviewed and its gate is green.
+        key="ready $repo#$number $sha"
+        [ ! -e "$(receipt_path "$repo" "$number" "$sha")" ] || continue
+        ! grep -qxF "$key" "$seen" || continue
+        [ "$reads" -lt "$poke_ready_reads" ] || continue
+        reads=$((reads + 1))
+        required_contexts_green "$repo" "$number" "$sha" || continue
+      fi
     elif merge_receipt "$repo" "$number" "$sha" >/dev/null && [ -z "$(merge_hold_reason "$repo" "$number")" ]; then
       key="merge $repo#$number $sha"
       receipt="$(merge_receipt "$repo" "$number" "$sha")"
