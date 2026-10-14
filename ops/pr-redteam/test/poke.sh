@@ -96,6 +96,8 @@ case "$url" in
     jq -c . <<< "$data" >> "$MERGE_FIXTURE/merges"; printf '{"merged":true}\n200' ;;
   */reviews)
     jq -c . <<< "$data" >> "$MERGE_FIXTURE/posts"; printf '{"ok":true}\n201' ;;
+  */check-runs)
+    jq -c . <<< "$data" >> "$MERGE_FIXTURE/check-runs"; printf '{"id":"check-run-fixture"}\n201' ;;
   */heartbeat) printf '{"accepted":true}\n200' ;;
   *) printf 'forbidden API %s\n' "$url" >> "$MERGE_FIXTURE/danger"; exit 98 ;;
 esac

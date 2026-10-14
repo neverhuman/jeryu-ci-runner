@@ -64,6 +64,8 @@ case "$url" in
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
   */pulls/16) row | jq -c '. + {merge_passport:{blockers:[]}}'; printf '\n200' ;;
   */pulls/16/checks) printf '{"checks":[{"name":"acme/required","required":true,"conclusion":"success"}]}\n200' ;;
+  */check-runs)
+    jq -c . <<< "$data" >> "$CONTRIB_FIXTURE/check-runs"; printf '{"id":"check-run-fixture"}\n201' ;;
   */pulls/16/merge)
     # Nothing contributed may ever be merged from the controller.
     if [[ "$origin" == contributed ]]; then

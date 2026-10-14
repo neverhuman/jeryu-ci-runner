@@ -75,6 +75,8 @@ case "$url" in
     if [[ -e "$PUBLISH_FIXTURE/gate-blocked" ]]; then
       printf '{"checks":[{"name":"jankurai/proof","required":true,"title":"score 47 < floor 85"}]}\n200'
     else printf '{"checks":[]}\n200'; fi ;;
+  */check-runs)
+    jq -c . <<< "$data" >> "$PUBLISH_FIXTURE/check-runs"; printf '{"id":"check-run-fixture"}\n201' ;;
   */pulls/1/merge)
     # Nothing in this suite ends at an approved receipt, so any landing attempt here is a bug.
     printf 'merged a head without an approving receipt\n' >> "$PUBLISH_FIXTURE/danger"; exit 99 ;;
@@ -123,10 +125,14 @@ wait_model() { for ((i=0;i<200;i++)); do [[ ! -e "$t/model-started" ]] || return
 touch "$t/reject"
 review
 jq -e '.posted == false and .decision == "publication_rejected" and .post_http == "403"' "$(receipt)" > /dev/null
+jq -se 'map(select(.name == "pr-redteam/review" and .head_sha == $head)) | any(.status == "in_progress") and any(.status == "completed" and .conclusion == "failure")' \
+  --arg head "$(cat "$t/head")" "$t/check-runs" > /dev/null
 [[ "$(count "$t/accepted")" == 0 ]]
 rm "$t/reject"
 review
 jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
+jq -se 'map(select(.name == "pr-redteam/review" and .head_sha == $head)) | any(.status == "completed" and .conclusion == "success" and (.output.summary | contains("Reviewer:")) and (.output.summary | contains("Diff:")))' \
+  --arg head "$(cat "$t/head")" "$t/check-runs" > /dev/null
 [[ "$(count "$t/accepted")" == 1 ]]
 review
 [[ "$(count "$t/accepted")" == 1 && "$(count "$t/model-calls")" == 2 ]]

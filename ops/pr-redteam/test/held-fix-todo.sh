@@ -73,6 +73,7 @@ case "$url" in
   */pulls/7) row | jq -c '{summary: ., merge_passport:{blockers:[]}, passport_hash, reviews: []}'; printf '\n200' ;;
   */pulls/7/checks) printf '{"checks":[]}\n200' ;;
   */pulls/7/reviews) jq -c . <<< "$data" >> "$HOLD_FIXTURE/posts"; printf '{"ok":true}\n201' ;;
+  */check-runs) jq -c . <<< "$data" >> "$HOLD_FIXTURE/check-runs"; printf '{"id":"check-run-fixture"}\n201' ;;
   */api/v1/events) printf '%s\n' "$data" >> "$HOLD_FIXTURE/events"; printf '{"ok":true,"seqs":[1]}\n201' ;;
   *) printf 'forbidden API %s\n' "$url" >> "$HOLD_FIXTURE/danger"; exit 98 ;;
 esac

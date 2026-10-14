@@ -667,9 +667,68 @@ finish_review_attempt() { # latest receipt, attempt history, repo, number, sha, 
   fi
   cat "$receipt" | store_receipt "$history"
   decision="$(jq -r .decision "$receipt")"
+  (review_check_done "$receipt" "$repo" "$number" "$sha" "$started") || true
   (report_review_cost "$receipt" "$work" "$repo" "$number" "$sha" "$started") || true
   beat_done "$repo" "$number" "$sha" "$decision" "$started"
   rm -rf -- "$work"
+}
+
+review_check_payload() { # repo number sha status conclusion-or-null title summary text
+  local repo="$1" number="$2" sha="$3" status="$4" conclusion="$5" title="$6" summary="$7" text="$8"
+  jq -nc --arg name "pr-redteam/review" --arg sha "$sha" --arg status "$status" \
+    --arg conclusion "$conclusion" --arg title "$title" --arg summary "$summary" --arg text "$text" \
+    --arg url "$(printf '%s/repos/%s/pulls/%s' "$base" "$repo" "$number")" \
+    '{name:$name, head_sha:$sha, status:$status, details_url:$url,
+      output:{title:$title, summary:$summary, text:$text}}
+     + (if $conclusion == "" then {} else {conclusion:$conclusion} end)'
+}
+
+review_check_post() { # repo payload
+  local repo="$1" payload="$2"
+  api POST "/api/v3/repos/$repo/check-runs" "$payload"
+  case "$code" in
+    200|201) ;;
+    *) say "$repo: pr-redteam/review check-run update answered $code" ;;
+  esac
+}
+
+review_check_start() { # repo number sha reviewer-login
+  local summary
+  summary="Reviewer: $4. Review identity: $review_identity. Preparing exact-head review; measuring diff."
+  review_check_post "$1" "$(review_check_payload "$1" "$2" "$3" in_progress "" \
+    "pr-redteam review running" "$summary" "$summary")"
+}
+
+review_check_diff() { # repo number sha files bytes reviewer-login
+  local summary
+  summary="Reviewer: $6. Review identity: $review_identity. Diff: $4 files, $5 bytes."
+  review_check_post "$1" "$(review_check_payload "$1" "$2" "$3" in_progress "" \
+    "pr-redteam review running" "$summary" "$summary")"
+}
+
+review_check_done() { # receipt repo number sha started-epoch
+  local receipt="$1" repo="$2" number="$3" sha="$4" started="$5" decision conclusion title summary text seconds
+  decision="$(jq -r '.decision // "failed"' "$receipt" 2>/dev/null || echo failed)"
+  case "$decision" in
+    approve) conclusion=success; title="pr-redteam approved" ;;
+    advice) conclusion=neutral; title="pr-redteam posted advice" ;;
+    hold|too_large|author_domain|base_missing) conclusion=action_required; title="pr-redteam holds" ;;
+    interrupted) conclusion=cancelled; title="pr-redteam interrupted" ;;
+    *) conclusion=failure; title="pr-redteam review failed" ;;
+  esac
+  seconds="$(( $(date +%s) - ${started:-$(date +%s)} ))"
+  summary="$(jq -r --arg decision "$decision" --arg seconds "$seconds" \
+    '[
+      "Decision: " + $decision + ".",
+      "Reviewer: " + (.reviewer_login // "unknown") + ".",
+      "Review identity: " + (.review_identity // "unknown") + ".",
+      (if .diff_bytes then "Diff: " + ((.files // "?")|tostring) + " files, " + (.diff_bytes|tostring) + " bytes." else empty end),
+      "Elapsed: " + $seconds + " seconds.",
+      (if .reason then "Reason: " + .reason else empty end)
+    ] | join(" ")' "$receipt" 2>/dev/null || echo "Decision: $decision. Elapsed: $seconds seconds.")"
+  text="$(jq -r '.verdict.summary // .reason // empty' "$receipt" 2>/dev/null || true)"
+  [ -n "$text" ] || text="$summary"
+  review_check_post "$repo" "$(review_check_payload "$repo" "$number" "$sha" completed "$conclusion" "$title" "$summary" "$text")"
 }
 
 review_one() { # owner/name number dry-run force include-drafts
@@ -713,9 +772,10 @@ review_one() { # owner/name number dry-run force include-drafts
   history="$(mktemp "$state/attempts/$repo/$number-$sha.XXXXXX.json")"
   work="$state/work/${repo/\//_}-$number-${sha:0:12}"
   jq -nc --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$base_sha" \
-    --arg at "$(date -u +%FT%TZ)" --argjson pid "$BASHPID" --arg identity "$review_identity" \
-    '{repo:$repo,number:$number,head_sha:$sha,base_sha:$base,decision:"reviewing",posted:false,started_at:$at,pid:$pid,review_identity:$identity}' \
+    --arg at "$(date -u +%FT%TZ)" --argjson pid "$BASHPID" --arg identity "$review_identity" --arg reviewer "$me" \
+    '{repo:$repo,number:$number,head_sha:$sha,base_sha:$base,decision:"reviewing",posted:false,started_at:$at,pid:$pid,reviewer_login:$reviewer,review_identity:$identity}' \
     | store_receipt "$receipt"
+  review_check_start "$repo" "$number" "$sha" "$me"
   trap 'finish_review_attempt "$receipt" "$history" "$repo" "$number" "$sha" "$started_at" "$work"; trap - RETURN EXIT INT TERM' RETURN
   trap 'exit 143' TERM
   trap 'exit 130' INT
@@ -741,9 +801,9 @@ review_one() { # owner/name number dry-run force include-drafts
       say "$tag: base branch $base_ref does not exist yet; a person creates it — not retried"
       jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$base_sha" \
         --arg base_ref "$base_ref" --arg head_ref "$head_ref" --arg at "$(date -u +%FT%TZ)" \
-        --arg identity "$review_identity" \
+        --arg identity "$review_identity" --arg reviewer "$me" \
         '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, base_ref:$base_ref, head_ref:$head_ref,
-          decision:"base_missing", posted:false, reviewed_at:$at, review_identity:$identity,
+          decision:"base_missing", posted:false, reviewed_at:$at, reviewer_login:$reviewer, review_identity:$identity,
           reason:"the base branch does not exist on the forge yet; a person creates it"}' | store_receipt "$receipt"
       return 0
     fi
@@ -774,13 +834,15 @@ review_one() { # owner/name number dry-run force include-drafts
     ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/yarn.lock' ':(exclude,glob)**/go.sum' >"$d/diff.patch"
   git -C "$cache" archive "$sha" | tar -x -C "$d/checkout"
   signals "$d"
-  local diff_bytes; diff_bytes="$(wc -c <"$d/diff.patch")"
+  local diff_bytes files_count; diff_bytes="$(wc -c <"$d/diff.patch")"; files_count="$(wc -l <"$d/files.txt")"
+  review_check_diff "$repo" "$number" "$sha" "$files_count" "$diff_bytes" "$me"
   if [ "$diff_bytes" -gt "$max_diff_bytes" ]; then
     say "$tag: diff is $diff_bytes bytes (> $max_diff_bytes), too large to red-team; NOT approving, needs a human"
     local big; big="$(receipt_path "$repo" "$number" "$sha")"; mkdir -p "$(dirname "$big")"
     jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" \
-      --argjson bytes "$diff_bytes" --arg identity "$review_identity" --arg base "$forge_base_sha" --arg diff_base "$base_sha" \
-      '{repo:$repo, number:$number, head_sha:$sha, decision:"too_large", posted:false, diff_bytes:$bytes, reviewed_at:$at, review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$big"
+      --argjson bytes "$diff_bytes" --argjson files "$files_count" --arg identity "$review_identity" --arg base "$forge_base_sha" --arg diff_base "$base_sha" \
+      --arg reviewer "$me" \
+      '{repo:$repo, number:$number, head_sha:$sha, decision:"too_large", posted:false, diff_bytes:$bytes, files:$files, reviewed_at:$at, reviewer_login:$reviewer, review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$big"
     return 0
   fi
   # A repository restricted to one email domain: any commit outside it holds before the agent runs,
@@ -792,14 +854,14 @@ review_one() { # owner/name number dry-run force include-drafts
       say "$tag: commits not all @$domain ($(paste -sd, <<<"$foreign")); NOT approving, needs a human"
       jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" \
         --arg domain "$domain" --arg foreign "$foreign" --arg identity "$review_identity" \
-        --arg base "$forge_base_sha" --arg diff_base "$base_sha" \
+        --arg base "$forge_base_sha" --arg diff_base "$base_sha" --arg reviewer "$me" \
         '{repo:$repo, number:$number, head_sha:$sha, decision:"author_domain", posted:false,
           author_domain:$domain, foreign_emails:($foreign | split("\n")), reviewed_at:$at,
-          review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$receipt"
+          reviewer_login:$reviewer, review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$receipt"
       return 0
     fi
   fi
-  say "$tag: reviewing ${sha:0:12} ($(wc -l <"$d/files.txt") files, $(wc -c <"$d/diff.patch") bytes of diff)"
+  say "$tag: reviewing ${sha:0:12} ($files_count files, $diff_bytes bytes of diff)"
 
   # The gate before the agent: a head the quality gate blocks cannot be approved
   # whatever the review concludes, so it holds with the gate's reason and the
@@ -883,12 +945,13 @@ review_one() { # owner/name number dry-run force include-drafts
     fi
   fi
   jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$forge_base_sha" --arg diff_base "$base_sha" \
-    --arg decision "$decision" --argjson verdict "$verdict" --arg model "$model" --argjson cost "$cost" --arg identity "$review_identity" \
+    --arg decision "$decision" --argjson verdict "$verdict" --arg model "$model" --argjson cost "$cost" --arg identity "$review_identity" --arg reviewer "$me" \
     --argjson posted "$posted" --arg code "$post_code" --argjson dry "$([ "$dry" = 1 ] && echo true || echo false)" \
-    --arg at "$(date -u +%FT%TZ)" \
+    --arg at "$(date -u +%FT%TZ)" --argjson diff_bytes "$diff_bytes" --argjson files "$files_count" \
     --arg origin "$origin" \
     '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, diff_base_sha:$diff_base, decision:$decision, posted:$posted,
-      post_http:$code, dry_run:$dry, model:$model, cost_usd:$cost, reviewed_at:$at, origin:$origin, verdict:$verdict,review_identity:$identity}' | store_receipt "$receipt"
+      post_http:$code, dry_run:$dry, model:$model, cost_usd:$cost, reviewed_at:$at, origin:$origin,
+      diff_bytes:$diff_bytes, files:$files, verdict:$verdict, reviewer_login:$reviewer, review_identity:$identity}' | store_receipt "$receipt"
 }
 
 # --- heartbeat -----------------------------------------------------------------------------------
