@@ -63,26 +63,21 @@ Some findings ask for a decision only the repository's owner can make: a policy 
 lowers deliberately, a rule the owner has decided to accept here. The agent is right to hold such a
 head, and wrong to hold it once the owner has answered.
 
-So when a review's only blocking findings are that nobody has recorded an owner decision, the
-approvals on the exact head are re-read at the moment of publication. An approval on that head
-whose body states a decision ("Owner decision: ...", or an owner sign-off), by a login that may
-record one for that repository, answers those findings: they stay in the published review, each one
-carrying the login, the time and the owner's own words that answered it, and the head is approved
-only when nothing else holds it.
+A same-head effective approval with an explicit `Owner decision: ...` line may
+be included as context in the published review when its account is a configured
+decision author. PR authors and controller/merger identities are excluded.
+The namespace owner and `REDTEAM_OWNER_DECISION_AUTHORS` remain site configuration;
+this is an attribution filter, not authority to waive review findings.
 
-Who may record one is site configuration, like every other login in this controller: the account
-that owns a repository's namespace always may, and anybody else has to be named in
-`REDTEAM_OWNER_DECISION_AUTHORS`. An unlisted approval answers nothing, however it is worded, and
-neither does an approval on another head, a dismissed one, or one that states no decision.
+The controller preserves the independent verdict and every finding's severity.
+No phrase, approval or owner statement clears a high/critical finding, changes
+branch protection or authorizes a merge. A changed requirement needs source and
+policy review; a held review needs fresh independent evaluation. The published
+review and receipt carry the statement without claiming that it cleared a gate.
 
-What a decision never clears: a hold this controller imposes mechanically — a failing quality
-gate, a committed private key, an unreviewable binary — and the rule that a contribution is never
-approved here. Those are not questions an owner was asked.
-
-Reading the approvals at publication rather than at the start of the review is the whole point. A
-review that loaded the pull request seconds before the approval landed used to publish a hold on a
-finding the owner had already answered, leaving no way forward but switching branch protection off
-or pushing an empty commit to force a re-review.
+Review-progress check runs are published only for an internal, non-dry attempt.
+The same explicit capability gates start, diff and terminal/error-trap updates;
+contributed reviews remain advice and dry runs create no review check runs.
 
 ## Contributed pull requests
 

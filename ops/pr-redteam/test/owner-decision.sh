@@ -73,18 +73,30 @@ out="$(owner_decision "$(detail root APPROVED "$sha" 'Owner decision: accepted.'
 out="$(owner_decision "$(detail root CHANGES_REQUESTED "$sha" 'Owner decision: accepted.' true)" root/deploy "$sha")"
 [ -z "$out" ] && ok "only an approval records a decision" || bad "changes requested: '$out'"
 
+out="$(owner_decision "$(detail root APPROVED "$sha" 'Owner decision: accept.' true | jq '.summary.author="root"')" root/deploy "$sha")"
+[[ -z "$out" ]] && ok "the PR author supplies no owner decision context" || bad "author decision: $out"
+out="$(REDTEAM_OWNER_DECISION_AUTHORS=pragent owner_decision "$(detail pragent APPROVED "$sha" 'Owner decision: accept.' true)" root/deploy "$sha")"
+[[ -z "$out" ]] && ok "the controller supplies no decision context" || bad "controller decision: $out"
+
 decision="$(owner_decision "$(detail root APPROVED "$sha" 'Owner decision: accepting the ratchet drop.' true)" root/deploy "$sha")"
 
 # --- what it answers -----------------------------------------------------------------------------
 out="$(satisfy "$held" "$decision")"
-[ "$(jq -r .verdict <<<"$out")" = approve ] && ok "the hold lifts when the owner's question was the only one" \
-  || bad "hold not lifted: $out"
+[ "$(jq -r .verdict <<<"$out")" = block ] && ok "a decision never auto-lifts the independent hold" \
+  || bad "hold was changed: $out"
 [ "$(jq '.findings | length' <<<"$out")" = 1 ] && ok "the finding stays in the review" \
   || bad "finding dropped: $out"
-[ "$(jq -r '.findings[0].severity' <<<"$out")" = low ] && ok "the answered finding reads as answered" \
+[ "$(jq -r '.findings[0].severity' <<<"$out")" = high ] && ok "the independent finding severity is preserved" \
   || bad "severity: $out"
-[[ "$(jq -r '.findings[0].detail' <<<"$out")" == *"Satisfied: root recorded an owner decision"* ]] \
-  && ok "the finding says which decision answered it" || bad "detail: $out"
+[[ "$(jq -r '.summary' <<<"$out")" == *"clears no finding or gate"* ]] \
+  && ok "decision is explicitly context only" || bad "context missing: $out"
+critical="$(jq '.findings[0].severity="critical" | .findings[0].detail += " needs owner sign-off"' <<<"$held")"
+out="$(satisfy "$critical" "$decision")"
+[[ "$(jq -r .verdict <<<"$out")" == block && "$(jq -r '.findings[0].severity' <<<"$out")" == critical ]] \
+  && ok "critical owner-signoff findings are never downgraded" || bad "critical waived: $out"
+# A phrase or a negated reference is not the explicit decision marker.
+out="$(owner_decision "$(detail root APPROVED "$sha" 'There is no owner decision here.' true)" root/deploy "$sha")"
+[[ -z "$out" ]] && ok "prose is not a decision marker" || bad "prose matched: $out"
 
 out="$(satisfy "$held_plus" "$decision")"
 [ "$(jq -r .verdict <<<"$out")" = block ] && ok "another high finding still holds the head" \
@@ -96,7 +108,7 @@ out="$(satisfy "$held_plus" "$decision")"
 out="$(body "$(satisfy "$held" "$decision")" approve "$sha" internal "$decision")"
 [[ "$out" == *"Owner decision recorded."* ]] && ok "the review names the decision it acted on" \
   || bad "body misses the decision: $out"
-[[ "$out" == *"No recorded owner decision"* ]] && ok "the review still lists what was cleared" \
+[[ "$out" == *"No recorded owner decision"* ]] && ok "the review preserves the unchanged finding" \
   || bad "body hides the finding: $out"
 
 ((fail == 0))

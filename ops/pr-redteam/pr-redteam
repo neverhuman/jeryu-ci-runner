@@ -347,12 +347,18 @@ owner_decision_author() { # owner/name login
 # approval with no stated decision is an approval, not a decision.
 owner_decision_in_detail() { # pr-detail-json owner/name sha
   local candidates candidate login
-  candidates="$(jq -c --arg sha "$3" '
-    (.reviews // [])
-    | map(select((.effective // false) == true
-                 and ((.state // "") | ascii_upcase) == "APPROVED"
-                 and (.head_sha // "") == $sha
-                 and (((.body_markdown // "") | ascii_downcase) | test("owner decision|owner sign-?off"))))
+  candidates="$(jq -c --arg sha "$3" --arg reviewer "${me:-pragent}" '
+    (.summary.author // .author // "") as $author
+    | (.reviews // [])
+    | map(select(
+        (.author // "") != $author and (.author // "") != $reviewer
+        and (.author // "") != "jain-merge-bot"
+        and (.effective // false) == true
+        and ((.state // "") | ascii_upcase) == "APPROVED"
+        and (.head_sha // "") == $sha
+        and ((.body_markdown // "") | split("\n")
+          | any(startswith("Owner decision: ") and length > 16))
+      ))
     | sort_by(.submitted_at // "") | reverse | .[]' <<<"$1" 2>/dev/null)" || return 0
   while IFS= read -r candidate; do
     [ -n "$candidate" ] || continue
@@ -381,27 +387,14 @@ owner_decision_asks() { # verdict-json -> how many findings ask for one
        | test("owner decision|owner sign-?off"))] | length' <<<"$1" 2>/dev/null || echo 0
 }
 
-# Answer those findings with the decision, and lift the hold when nothing else holds the head.
-# The findings stay in the review, with the decision that answered them written into each one: a
-# record that hides what it cleared is not a record. Any other high or critical finding keeps the
-# block, so this can only ever clear the one question it is about.
+# An owner statement is review context, never an automated waiver. Preserve the
+# independent verdict and every finding's severity, including critical/high
+# findings that happen to mention an owner decision.
 satisfy_owner_decision() { # verdict-json decision-json
   jq -c --argjson d "$2" '
-    def asks: (((.title // "") + " " + (.detail // "")) | ascii_downcase)
-      | test("owner decision|owner sign-?off");
-    .findings = [.findings[]?
-      | if asks then
-          .severity = "low"
-          | .detail = ((.detail // "") + " Satisfied: " + $d.login
-                       + " recorded an owner decision on this exact head at " + $d.at
-                       + " — \"" + $d.excerpt + "\".")
-        else . end]
-    | if ([.findings[]? | select(.severity == "critical" or .severity == "high")] | length) == 0
-      then .verdict = "approve"
-           | .summary = ((.summary // "") + " " + $d.login
-                         + " recorded an owner decision on this exact head, which answers the "
-                         + "findings that asked for one; nothing else holds this head.")
-      else . end' <<<"$1"
+    .summary = ((.summary // "") + " " + $d.login
+      + " recorded a decision on this exact head at " + $d.at
+      + "; it is context for independent review and clears no finding or gate.")' <<<"$1"
 }
 
 # A draft is skipped on every pass until somebody marks it ready, so saying so
@@ -699,8 +692,8 @@ render_body() { # verdict-json decision sha origin [owner-decision-json]
      else empty end),
     (if $owner == null then empty else
        ("**Owner decision recorded.** " + $owner.login + " approved this exact head at "
-        + $owner.at + " with a stated decision, which answers the findings below that asked for "
-        + "one. They stay listed: a decision that hides what it cleared is not a record.", "")
+        + $owner.at + " with a stated decision. This is context for independent review; "
+        + "the verdict, finding severities and merge gates are unchanged.", "")
      end),
     (if (.findings | length) == 0 then "No findings."
      else ("| | Finding | Where |", "|---|---|---|",
@@ -810,7 +803,7 @@ finish_review_attempt() { # latest receipt, attempt history, repo, number, sha, 
   fi
   cat "$receipt" | store_receipt "$history"
   decision="$(jq -r .decision "$receipt")"
-  (review_check_done "$receipt" "$repo" "$number" "$sha" "$started") || true
+  (review_check_done "$receipt" "$repo" "$number" "$sha" "$started" "${8:-0}") || true
   (report_review_cost "$receipt" "$work" "$repo" "$number" "$sha" "$started") || true
   (report_review_findings "$receipt" "$repo" "$number" "$sha") || true
   beat_done "$repo" "$number" "$sha" "$decision" "$started"
@@ -829,6 +822,7 @@ review_check_payload() { # repo number sha status conclusion-or-null title summa
 
 review_check_post() { # repo payload
   local repo="$1" payload="$2"
+  [ "${3:-0}" = 1 ] || return 0
   api POST "/api/v3/repos/$repo/check-runs" "$payload"
   case "$code" in
     200|201) ;;
@@ -840,14 +834,14 @@ review_check_start() { # repo number sha reviewer-login
   local summary
   summary="Reviewer: $4. Review identity: $review_identity. Preparing exact-head review; measuring diff."
   review_check_post "$1" "$(review_check_payload "$1" "$2" "$3" in_progress "" \
-    "pr-redteam review running" "$summary" "$summary")"
+    "pr-redteam review running" "$summary" "$summary")" "${5:-0}"
 }
 
 review_check_diff() { # repo number sha files bytes reviewer-login
   local summary
   summary="Reviewer: $6. Review identity: $review_identity. Diff: $4 files, $5 bytes."
   review_check_post "$1" "$(review_check_payload "$1" "$2" "$3" in_progress "" \
-    "pr-redteam review running" "$summary" "$summary")"
+    "pr-redteam review running" "$summary" "$summary")" "${7:-0}"
 }
 
 review_check_done() { # receipt repo number sha started-epoch
@@ -872,7 +866,7 @@ review_check_done() { # receipt repo number sha started-epoch
     ] | join(" ")' "$receipt" 2>/dev/null || echo "Decision: $decision. Elapsed: $seconds seconds.")"
   text="$(jq -r '.verdict.summary // .reason // empty' "$receipt" 2>/dev/null || true)"
   [ -n "$text" ] || text="$summary"
-  review_check_post "$repo" "$(review_check_payload "$repo" "$number" "$sha" completed "$conclusion" "$title" "$summary" "$text")"
+  review_check_post "$repo" "$(review_check_payload "$repo" "$number" "$sha" completed "$conclusion" "$title" "$summary" "$text")" "${6:-0}"
 }
 
 review_one() { # owner/name number dry-run force include-drafts
@@ -900,7 +894,8 @@ review_one() { # owner/name number dry-run force include-drafts
   head_ref="$(jq -r .head_ref <<<"$row")"; base_ref="$(jq -r .base_ref <<<"$row")"
   origin="$(pr_origin "$row")"
 
-  local started_at receipt history work
+  local started_at receipt history work check_publish=0
+  if [ "$dry" = 0 ] && [ "$origin" = internal ]; then check_publish=1; fi
   started_at="$(date +%s)"
   receipt="$(receipt_path "$repo" "$number" "$sha")"
   mkdir -p "$(dirname "$receipt")" "$state/attempts/$repo"
@@ -919,11 +914,11 @@ review_one() { # owner/name number dry-run force include-drafts
     --arg at "$(date -u +%FT%TZ)" --argjson pid "$BASHPID" --arg identity "$review_identity" --arg reviewer "$me" \
     '{repo:$repo,number:$number,head_sha:$sha,base_sha:$base,decision:"reviewing",posted:false,started_at:$at,pid:$pid,reviewer_login:$reviewer,review_identity:$identity}' \
     | store_receipt "$receipt"
-  review_check_start "$repo" "$number" "$sha" "$me"
-  trap 'finish_review_attempt "$receipt" "$history" "$repo" "$number" "$sha" "$started_at" "$work"; trap - RETURN EXIT INT TERM' RETURN
+  review_check_start "$repo" "$number" "$sha" "$me" "$check_publish"
+  trap 'finish_review_attempt "$receipt" "$history" "$repo" "$number" "$sha" "$started_at" "$work" "$check_publish"; trap - RETURN EXIT INT TERM' RETURN
   trap 'exit 143' TERM
   trap 'exit 130' INT
-  trap 'finish_review_attempt "$receipt" "$history" "$repo" "$number" "$sha" "$started_at" "$work"' EXIT
+  trap 'finish_review_attempt "$receipt" "$history" "$repo" "$number" "$sha" "$started_at" "$work" "$check_publish"' EXIT
   beat_start "$repo" "$number" "$sha"
 
   rm -rf "$work"; mkdir -p "$work/review/checkout" "$work/empty"
@@ -979,7 +974,7 @@ review_one() { # owner/name number dry-run force include-drafts
   git -C "$cache" archive "$sha" | tar -x -C "$d/checkout"
   signals "$d"
   local diff_bytes files_count; diff_bytes="$(wc -c <"$d/diff.patch")"; files_count="$(wc -l <"$d/files.txt")"
-  review_check_diff "$repo" "$number" "$sha" "$files_count" "$diff_bytes" "$me"
+  review_check_diff "$repo" "$number" "$sha" "$files_count" "$diff_bytes" "$me" "$check_publish"
   if [ "$diff_bytes" -gt "$max_diff_bytes" ]; then
     say "$tag: diff is $diff_bytes bytes (> $max_diff_bytes), too large to red-team; NOT approving, needs a human"
     local big; big="$(receipt_path "$repo" "$number" "$sha")"; mkdir -p "$(dirname "$big")"
@@ -1079,12 +1074,7 @@ review_one() { # owner/name number dry-run force include-drafts
     owner_decision="$(owner_decision_on_head "$repo" "$number" "$sha")"
     if [ -n "$owner_decision" ]; then
       verdict="$(satisfy_owner_decision "$verdict" "$owner_decision")"
-      if [ "$(jq -r .verdict <<<"$verdict")" = approve ]; then
-        decision=approve
-        say "$tag: $(jq -r .login <<<"$owner_decision") recorded an owner decision on ${sha:0:12}; the findings that asked for one are satisfied"
-      else
-        say "$tag: $(jq -r .login <<<"$owner_decision") recorded an owner decision on ${sha:0:12}, but other findings still hold this head"
-      fi
+      say "$tag: $(jq -r .login <<<"$owner_decision") recorded decision context on ${sha:0:12}; the independent hold is unchanged"
     fi
   fi
   local body; body="$(render_body "$verdict" "$decision" "$sha" "$origin" "$owner_decision")"

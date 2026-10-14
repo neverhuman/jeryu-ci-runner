@@ -114,7 +114,8 @@ jq -r .body_markdown <<< "$(tail -1 "$t/posts")" | grep -q 'maintainer on the co
 grep -q 'contributed — not landed from here' "$t/controller.log"
 # The contribution was reviewed on the small purse, not the family's own.
 grep -A1 -Fx -- '--max-budget-usd' "$t/model-argv" | tail -1 | grep -qx 2
-echo 'ok a clean contributed review is advice, and nothing merges it'
+[[ ! -e "$t/check-runs" ]]
+echo 'ok a clean contributed review is advice, creates no check run, and nothing merges it'
 
 # Its one review per head is spent: a second pass costs nothing and still merges nothing.
 pass

@@ -347,7 +347,15 @@ echo 'ok missing base branch recorded once, never retried'
 [[ ! -e "$t/events" ]]
 advance
 touch "$t/model-cost"
+checks_before_dry="$(count "$t/check-runs")"
 "$here/pr-redteam" _review 1 0 0 jeryu/fixture 1 >> "$t/controller.log" 2>&1
+[[ "$(count "$t/check-runs")" == "$checks_before_dry" ]]
+# The error/completion trap has the same deny capability as a successful dry run.
+advance
+touch "$t/model-fail"
+"$here/pr-redteam" _review 1 0 0 jeryu/fixture 1 >> "$t/controller.log" 2>&1
+[[ "$(count "$t/check-runs")" == "$checks_before_dry" ]]
+rm "$t/model-fail"
 [[ ! -e "$t/events" ]]
 review
 [[ "$(count "$t/events")" == 1 ]]
