@@ -39,6 +39,10 @@ cat > /dev/null; data=''
 while (($#)); do [[ "$1" != --data ]] || data="$2"; shift; done
 printf '%s\n' "$data" >> "$HEARTBEAT_SENT"
 problems="$(jq -r -f "$HEARTBEAT_CONTRACT" <<<"$data")"
+# OLD_FORGE: a forge whose contract predates `code` and `tools`.
+if [[ -n "${OLD_FORGE:-}" ]]; then
+  problems+="$(jq -r 'if has("code") or has("tools") then "beat: unknown field code/tools" else empty end' <<<"$data")"
+fi
 if [[ -n "$problems" ]]; then
   printf '%s\n' "$problems" >> "$HEARTBEAT_REFUSED"
   printf '{"message":"the request body is not valid JSON for this route"}\n422'
@@ -71,13 +75,15 @@ echo 'ok the fixture refuses the slot key'
 
 # An install is a `git archive` export: source-commit carries the exported commit.
 "$real_git" init -q -b main "$t/repo"
-cp -R "$src" "$t/repo/pr-redteam-src"
+mkdir -p "$t/repo/ops"
+cp -R "$src" "$t/repo/ops/pr-redteam"
+"$real_git" -C "$t/repo" remote add origin https://forge.invalid/git/jeryu/jeryu-ci-runner.git
 g() { "$real_git" -C "$t/repo" -c user.name=fixture -c user.email=fixture@example.invalid "$@"; }
 g add .; g commit -qm fixture
 commit="$(g rev-parse HEAD)"
 mkdir -p "$t/export"
-g archive "$commit" pr-redteam-src | tar -x -C "$t/export"
-[[ "$(cat "$t/export/pr-redteam-src/source-commit")" == "$commit" ]]
+g archive "$commit" | tar -x -C "$t/export"
+[[ "$(cat "$t/export/ops/pr-redteam/source-commit")" == "$commit" ]]
 
 # A busy slot 0, a finished review on slot 1 whose receipt decision the forge has no word for, and
 # the CLI version the last review measured.
@@ -90,7 +96,7 @@ jq -nc '{repo:"jeryu/jeryu-web", pr:8, sha:"89abcdef0123456789abcdef0123456789ab
          recipe:"redteam-review", conclusion:"base_missing", seconds:3, finished_at:"2026-10-14T14:00:00Z"}' \
   > "$t/state/beats/last-1.json"
 printf '9.9.9\n' > "$t/state/beats/claude-version"
-beat "$t/export/pr-redteam-src"
+beat "$t/export/ops/pr-redteam"
 accepted
 row0="$(sed -n 1p "$t/sent")"; row1="$(sed -n 2p "$t/sent")"
 jq -e '.current == {repo:"jeryu/jeryu-web", pr:7, sha:"0123456789abcdef0123456789abcdef01234567",
@@ -103,18 +109,38 @@ jq -e --arg c "$commit" '.code.commit == $c' <<<"$row1" >/dev/null
 jq -e '.tools == [{name:"claude", version:"9.9.9"}]' <<<"$row0" >/dev/null
 echo 'ok code is the exported commit and tools is the measured CLI'
 
-# A clean git checkout reports its HEAD; a modified one, and a copy with no record, report no code.
-beat "$t/repo/pr-redteam-src"
+# A clean git checkout of this repository reports its HEAD; a modified one, a checkout of another
+# repository, and a copy with no record report no code, and no `tools` before the first review.
+beat "$t/repo/ops/pr-redteam"
 accepted
 jq -e --arg c "$commit" '.code.commit == $c' <<<"$(sed -n 1p "$t/sent")" >/dev/null
-printf '# local edit\n' >> "$t/repo/pr-redteam-src/prompt.md"
-beat "$t/repo/pr-redteam-src"
+"$real_git" -C "$t/repo" remote set-url origin https://forge.invalid/git/acme/other.git
+beat "$t/repo/ops/pr-redteam"
+accepted
+jq -e 'has("code") | not' <<<"$(sed -n 1p "$t/sent")" >/dev/null
+"$real_git" -C "$t/repo" remote set-url origin https://forge.invalid/git/jeryu/jeryu-ci-runner.git
+printf '# local edit\n' >> "$t/repo/ops/pr-redteam/prompt.md"
+beat "$t/repo/ops/pr-redteam"
 accepted
 jq -e 'has("code") | not' <<<"$(sed -n 1p "$t/sent")" >/dev/null
 cp -R "$src" "$t/plain"
 rm -f "$t/state/beats/claude-version"
 beat "$t/plain"
 accepted
-jq -e '(has("code") | not) and .tools == []' <<<"$(sed -n 1p "$t/sent")" >/dev/null
+jq -e '(has("code") | not) and (has("tools") | not)' <<<"$(sed -n 1p "$t/sent")" >/dev/null
 echo 'ok unknown code is left out'
+
+# A forge that predates `tools` or `code` refuses the beat with 422: the beat is sent again without
+# `tools`, then without `code`, each refusal is logged once, and the other slots skip them.
+printf '9.9.9\n' > "$t/state/beats/claude-version"
+: > "$t/sent"; : > "$t/refused"
+HEARTBEAT_SENT="$t/sent" HEARTBEAT_REFUSED="$t/refused" HEARTBEAT_CONTRACT="$t/contract.jq" OLD_FORGE=1 \
+  PATH="$t/bin:$PATH" JERYU_BASE=https://forge.invalid JERYU_TOKEN_FILE="$t/token" \
+  REDTEAM_STATE="$t/state" REDTEAM_RUNNER_ID=fixture/redteam REDTEAM_JOBS=2 \
+  "$t/export/ops/pr-redteam/pr-redteam" heartbeat > "$t/out" 2>&1
+[[ "$(grep -c . "$t/sent")" == 4 ]] || { echo "expected three tries then one beat: $(cat "$t/sent")" >&2; exit 1; }
+[[ "$(grep -c 'heartbeat tools refused (422)' "$t/out")" == 1 && "$(grep -c 'heartbeat code refused (422)' "$t/out")" == 1 ]]
+! grep -q 'heartbeat refused for' "$t/out"
+jq -se '.[2:] | all((has("code") or has("tools")) | not)' "$t/sent" >/dev/null
+echo 'ok an older forge gets the beat without tools, then without code'
 echo 'HEARTBEAT CONTRACT PASS'

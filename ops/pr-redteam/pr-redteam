@@ -943,14 +943,17 @@ forge_last() { # last-file JSON -> GateRunnerResult JSON, or null
 
 # The code this reviewer runs, as RunnerCode: this repository and the commit the running source came
 # from. An install is a `git archive` export, which writes the commit into source-commit (see
-# .gitattributes: export-subst); a git checkout answers for itself when its ops/pr-redteam is
-# unmodified. Anything else is unknown, and the optional field is left out rather than guessed.
+# .gitattributes: export-subst); a git checkout of this repository (its `origin` ends in
+# /jeryu/jeryu-ci-runner and this directory is its ops/pr-redteam) answers for itself when its
+# ops/pr-redteam is unmodified. Anything else is unknown, and the optional field is left out rather
+# than guessed.
 runner_code() { # -> RunnerCode JSON, or null
   local commit
   commit="$(head -c 64 "$here/source-commit" 2>/dev/null | tr -d '[:space:]' || true)"
   if ! [[ "$commit" =~ ^[0-9a-f]{40}$ ]]; then
     commit=""
-    if git -C "$here" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    if [ "$(git -C "$here" rev-parse --show-toplevel 2>/dev/null)/ops/pr-redteam" = "$here" ] \
+        && [[ "$(git -C "$here" remote get-url origin 2>/dev/null)" =~ /jeryu/jeryu-ci-runner(\.git)?$ ]] \
         && git -C "$here" diff --quiet HEAD -- . 2>/dev/null \
         && [ -z "$(git -C "$here" ls-files --others --exclude-standard -- . 2>/dev/null)" ]; then
       commit="$(git -C "$here" rev-parse HEAD 2>/dev/null || true)"
@@ -969,6 +972,11 @@ runner_tools() { # -> RunnerTool JSON array
   local version
   version="$(head -c 100 "$beats/claude-version" 2>/dev/null | tr -d '[:cntrl:]' || true)"
   jq -nc --arg version "$version" 'if $version == "" then [] else [{name: "claude", version: $version}] end'
+}
+
+heartbeat_post() { # payload code-json tools-json; `tools` and `code` only when known
+  api POST "/api/v1/runners/heartbeat" "$(jq -c --argjson code "$2" --argjson tools "$3" \
+    '. + (if $tools == [] then {} else {tools: $tools} end) + (if $code == null then {} else {code: $code} end)' <<<"$1")"
 }
 
 # One beat per reviewer slot. The first keeps the old runner id so its history carries on; the
@@ -1004,14 +1012,26 @@ heartbeat() {
     payload="$(jq -nc --arg id "$id" --arg host "$runner_host" \
       --argjson slot "$i" --argjson current "$current" --argjson last "$last" \
       --argjson labels "$labels" --argjson poke "$poke_last" \
-      --argjson code "$code_json" --argjson tools "$tools_json" \
       '{runnerId: $id, host: $host, slot: $slot, labels: $labels, current: $current,
-        last: $last, tools: $tools} + (if $code == null then {} else {code: $code} end)
-        + (if $slot == 0 and $poke != null then {poke:$poke} else {} end)')"
-    api POST "/api/v1/runners/heartbeat" "$payload"
-    if [ "$code" = 422 ] && [ "$poke_last" != null ]; then
-      api POST "/api/v1/runners/heartbeat" "$(jq -c 'del(.poke)' <<<"$payload")"
-    fi
+        last: $last} + (if $slot == 0 and $poke != null then {poke:$poke} else {} end)')"
+    # A forge that predates an optional field refuses the whole beat with 422. Like the pr-gate
+    # runner, retry without `poke`, then without `tools`, then without `code`; a refused `tools` or
+    # `code` is logged once and left out of the remaining beats of this run.
+    heartbeat_post "$payload" "$code_json" "$tools_json"
+    while [ "$code" = 422 ]; do
+      if jq -e 'has("poke")' <<<"$payload" >/dev/null; then
+        payload="$(jq -c 'del(.poke)' <<<"$payload")"
+      elif [ "$tools_json" != '[]' ]; then
+        say "heartbeat tools refused (422); retrying without them"
+        tools_json='[]'
+      elif [ "$code_json" != null ]; then
+        say "heartbeat code refused (422); retrying without it"
+        code_json=null
+      else
+        break
+      fi
+      heartbeat_post "$payload" "$code_json" "$tools_json"
+    done
     if [ "$code" = 000 ]; then
       say "heartbeat refused for $id (no answer): $body"
     elif ! jq -e '.accepted == true' <<<"$body" >/dev/null 2>&1; then
@@ -1481,25 +1501,29 @@ fix_todo_pass() ( # dry; serialize independently of the caller run lock
 # jankurai/proof without a result is waited for, not reviewed), and before `ready` existed nothing
 # else woke the reviewer: the head waited for the five-minute timer. So a ready, unreviewed head (no
 # receipt file for it) whose `review` key is used up gets one more key, `ready`, once the forge's
-# merge passport for that exact head has no required-context blocker (failing, queued, running or
-# not run). That costs one pull-request read per such head, at most poke_ready_reads per poke.
+# merge passport for that exact head is blocked only by its missing approval or a requested change.
+# That costs one pull-request read per such head, at most poke_ready_reads per poke, and none while
+# a review pass is running (it could not be started then anyway).
 poke_ready_reads=4
 
-# 0 when the forge's merge passport for this exact head lists no blocker about required contexts.
+# 0 when the forge's merge passport for this exact head is blocked only by what a review itself
+# settles: the missing approval and a requested change. Any other blocker, including one this
+# source does not know, reads as "not green yet" and starts nothing; the five-minute timer remains.
 required_contexts_green() { # owner/name number sha
   api GET "/api/v1/repos/${1/\//%2F}/pulls/$2"
   [ "$code" = 200 ] || return 1
   jq -e --arg sha "$3" '
     .merge_passport as $p
     | $p != null and $p.head_sha == $sha
-      and (($p.blockers // []) | all(((.code // "") | test("checks")) == false
-                                     and ((.message // "") | test("^Required context")) == false))' \
+      and (($p.blockers // []) | all(.code == "passport_blocked_approvals"
+                                     or .code == "passport_blocked_changes_requested"))' \
     <<<"$body" >/dev/null 2>&1
 }
 
 poke() { # dry
   local dry="$1" me row repo number sha key why="" seen="$state/poke-seen" age=unknown receipt reviewed epoch unit
-  local reads=0
+  local reads=0 review_running=0
+  ! systemctl --user is-active --quiet pr-redteam.service || review_running=1
   me="$(whoami_login)"
   while IFS= read -r row; do
     repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
@@ -1511,6 +1535,7 @@ poke() { # dry
       if [ -f "$seen" ] && grep -qxF "$key" "$seen"; then
         # Already poked for this head. Once more, only if it is still unreviewed and its gate is green.
         key="ready $repo#$number $sha"
+        [ "$review_running" = 0 ] || continue
         [ ! -e "$(receipt_path "$repo" "$number" "$sha")" ] || continue
         ! grep -qxF "$key" "$seen" || continue
         [ "$reads" -lt "$poke_ready_reads" ] || continue

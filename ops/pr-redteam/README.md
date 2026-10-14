@@ -161,16 +161,19 @@ that contract's fields before sending, and a receipt decision the forge has no
 reviewer conclusion for (`base_missing`, `author_domain`, `advice`) is sent as
 `hold` with the decision in `reason`. A beat also names the code it runs,
 `code: {repo, commit}`: the commit comes from `source-commit`, which
-`git archive` fills in (`export-subst`), or from a git checkout whose
-`ops/pr-redteam` is unmodified; otherwise `code` is left out. `tools` lists the
-`claude` CLI version the last review measured. `poke` runs every 30 seconds from
+`git archive` fills in (`export-subst`), or from a git checkout of this
+repository whose `ops/pr-redteam` is unmodified; otherwise `code` is left out. `tools` lists the
+`claude` CLI version the last review measured, and is left out before the
+first review. `poke` runs every 30 seconds from
 `pr-redteam-poke.timer`. Unreviewed heads start `pr-redteam.service` early. A
 head's `review` poke is usually used up while its required gate is still
 running, and that pass can leave it with no receipt (a jankurai/proof without a
 result is waited for). Such a head, still open, ready and with no receipt, gets
-one more poke, `ready`, once the forge's merge passport for that exact head has
-no required-context blocker; that check reads at most four pull requests per
-poke.
+one more poke, `ready`, once the forge's merge passport for that exact head is
+blocked only by its missing approval or a requested change (any other or
+unknown blocker starts nothing); that check reads at most four pull requests
+per poke, and none while a review pass is running. A forge that refuses `tools`
+or `code` with 422 gets the beat again without them, as the pr-gate runner does.
 Landable approvals start `pr-redteam-merge@owner:repo:PR:head.service`, even while
 other reviews are running. The instance scopes landing to that repository, PR
 and exact reviewed head; operator `--repo`/`--pr` filters therefore remain in

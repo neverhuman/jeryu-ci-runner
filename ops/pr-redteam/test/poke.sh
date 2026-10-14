@@ -86,6 +86,7 @@ case "$url" in
     # required context, is a blocker.
     blockers='[]'
     [[ ! -e "$MERGE_FIXTURE/proof-pending" ]] || blockers='[{"code":"passport_blocked_pending_checks","message":"Required context `jankurai/proof` is queued or running."}]'
+    [[ ! -e "$MERGE_FIXTURE/unknown-blocker" ]] || blockers='[{"code":"passport_blocked_something_new","message":"A blocker this source does not know."}]'
     [[ ! -e "$MERGE_FIXTURE/required-failing" ]] || blockers='[{"code":"passport_blocked_checks","message":"Required context `jeryu-deploy/required` is failing."}]'
     row | jq -c --argjson b "$blockers" '. + {merge_passport:{head_sha:.head_sha, blockers:$b}}'; printf '\n200' ;;
   */pulls/107/checks) checks ;;
@@ -141,19 +142,18 @@ rm -f "$t/state/poke-seen"
 poke
 [[ "$(starts)" == 1 ]]
 grep -q 'poke: starting a pass now (review jeryu/fixture#107' "$t/controller.log"
-# While that pass runs, the still-unreviewed head starts nothing and uses up no key.
+# While that pass runs, the still-unreviewed head starts nothing, reads nothing and uses up no key.
+reads() { grep -c '/pulls/107 ' "$t/requests" || true; }
 touch "$t/pass-active"
-poke
+before="$(reads)"; poke
 rm "$t/pass-active"
-[[ "$(starts)" == 1 ]]
-grep -q 'poke: pass already running (ready jeryu/fixture#107' "$t/controller.log"
+[[ "$(starts)" == 1 && "$(reads)" == "$before" ]]
 ! grep -q '^ready ' "$t/state/poke-seen"
 echo 'ok an unreviewed head starts one pass'
 
 # That pass found jankurai/proof still running and left the head with no receipt. The used-up
-# `review` key does not strand it: once the passport for the head has no required-context blocker,
-# one `ready` poke starts a pass. Each such poke reads the pull request once.
-reads() { grep -c '/pulls/107 ' "$t/requests" || true; }
+# `review` key does not strand it: once the passport for the head is blocked only by the missing
+# approval (an unknown blocker counts as not green), one `ready` poke starts a pass. Each such poke reads the pull request once.
 touch "$t/proof-pending"
 pass
 grep -q 'waiting for jankurai/proof' "$t/controller.log"
@@ -163,7 +163,10 @@ before="$(reads)"; poke
 rm "$t/proof-pending"; touch "$t/required-failing"
 poke
 [[ "$(starts)" == 1 ]]
-rm "$t/required-failing"
+rm "$t/required-failing"; touch "$t/unknown-blocker"
+poke
+[[ "$(starts)" == 1 ]]
+rm "$t/unknown-blocker"
 poke --dry-run
 grep -q 'poke: would start a pass (ready jeryu/fixture#107' "$t/controller.log"
 [[ "$(starts)" == 1 ]]
