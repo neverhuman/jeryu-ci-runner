@@ -946,7 +946,8 @@ forge_last() { # last-file JSON -> GateRunnerResult JSON, or null
 # .gitattributes: export-subst); a git checkout of this repository (its `origin` ends in
 # /jeryu/jeryu-ci-runner and this directory is its ops/pr-redteam) answers for itself when its
 # ops/pr-redteam is unmodified. Anything else is unknown, and the optional field is left out rather
-# than guessed.
+# than guessed. This is the installation's own report for people reading /runners, not an
+# attestation: whoever controls the install directory controls what it says.
 runner_code() { # -> RunnerCode JSON, or null
   local commit
   commit="$(head -c 64 "$here/source-commit" 2>/dev/null | tr -d '[:space:]' || true)"
@@ -1022,10 +1023,10 @@ heartbeat() {
       if jq -e 'has("poke")' <<<"$payload" >/dev/null; then
         payload="$(jq -c 'del(.poke)' <<<"$payload")"
       elif [ "$tools_json" != '[]' ]; then
-        say "heartbeat tools refused (422); retrying without them"
+        say "heartbeat tools refused (422: $(jq -c '.message // .' <<<"$body" 2>/dev/null | head -c 160)); retrying without them"
         tools_json='[]'
       elif [ "$code_json" != null ]; then
-        say "heartbeat code refused (422); retrying without it"
+        say "heartbeat code refused (422: $(jq -c '.message // .' <<<"$body" 2>/dev/null | head -c 160)); retrying without it"
         code_json=null
       else
         break
@@ -1510,6 +1511,7 @@ poke_ready_reads=4
 # settles: the missing approval and a requested change. Any other blocker, including one this
 # source does not know, reads as "not green yet" and starts nothing; the five-minute timer remains.
 required_contexts_green() { # owner/name number sha
+  [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$2" =~ ^[1-9][0-9]*$ && "$3" =~ ^[0-9a-f]{40}$ ]] || return 1
   api GET "/api/v1/repos/${1/\//%2F}/pulls/$2"
   [ "$code" = 200 ] || return 1
   jq -e --arg sha "$3" '

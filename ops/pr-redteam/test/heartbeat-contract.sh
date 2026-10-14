@@ -139,7 +139,8 @@ HEARTBEAT_SENT="$t/sent" HEARTBEAT_REFUSED="$t/refused" HEARTBEAT_CONTRACT="$t/c
   REDTEAM_STATE="$t/state" REDTEAM_RUNNER_ID=fixture/redteam REDTEAM_JOBS=2 \
   "$t/export/ops/pr-redteam/pr-redteam" heartbeat > "$t/out" 2>&1
 [[ "$(grep -c . "$t/sent")" == 4 ]] || { echo "expected three tries then one beat: $(cat "$t/sent")" >&2; exit 1; }
-[[ "$(grep -c 'heartbeat tools refused (422)' "$t/out")" == 1 && "$(grep -c 'heartbeat code refused (422)' "$t/out")" == 1 ]]
+[[ "$(grep -c 'heartbeat tools refused (422' "$t/out")" == 1 && "$(grep -c 'heartbeat code refused (422' "$t/out")" == 1 ]]
+grep -q 'heartbeat tools refused (422: "the request body is not valid JSON for this route")' "$t/out"
 ! grep -q 'heartbeat refused for' "$t/out"
 jq -se '.[2:] | all((has("code") or has("tools")) | not)' "$t/sent" >/dev/null
 echo 'ok an older forge gets the beat without tools, then without code'
