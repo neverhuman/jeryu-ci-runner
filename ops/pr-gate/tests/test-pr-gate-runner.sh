@@ -10,6 +10,29 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)
 fixture=$(mktemp -d)
 trap 'rm -rf -- "$fixture"' EXIT
 mkdir -p "$fixture/tools" "$fixture/runtime" "$fixture/vendor"
+# The recipe is synthetic and never compiles Rust. Give the child runner its own home and
+# small toolchain, so each real input fingerprint binds these fixtures instead of repeatedly
+# hashing the developer's installed compilers and user tools. Keep the production fingerprint
+# code intact: mutations below must still invalidate receipts. test-pr-gate-state.sh also
+# exercises the real host/toolchain enumeration and its failure paths.
+mkdir -p "$fixture/home/.local/bin" "$fixture/home/.cargo" "$fixture/home/.rustup" "$fixture/toolchain/bin"
+runner_env=(env HOME="$fixture/home" CARGO_HOME="$fixture/home/.cargo" RUSTUP_HOME="$fixture/home/.rustup")
+printf '#!/bin/sh\nexit 0\n' >"$fixture/home/.local/bin/fixture-helper"
+chmod +x "$fixture/home/.local/bin/fixture-helper"
+for tool in rustc cargo; do
+  printf '#!/usr/bin/env bash\n[[ "$*" == --version ]] || exit 64\nprintf "%%s\\n" "%s fixture-1"\n' "$tool" \
+    >"$fixture/toolchain/bin/$tool"
+done
+cat >"$fixture/tools/rustup" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+  'which rustc'|'which cargo') printf '%s/toolchain/bin/%s\n' "$FAKE_FORGE" "$2";;
+  'component list --toolchain toolchain --installed') printf 'rustc-fixture\ncargo-fixture\n';;
+  *) printf 'unexpected fixture rustup invocation: %s\n' "$*" >&2; exit 64;;
+esac
+SH
+chmod +x "$fixture/toolchain/bin/"*
 real_git=$(command -v git)
 printf '%s\n' "$real_git" >"$fixture/real-git"
 git init -q --initial-branch=main "$fixture/source"
@@ -190,10 +213,10 @@ export GATE_RUNNER_RUNTIME_TOOLS="$fixture/runtime" GATE_RUNNER_NATIVE_VENDOR="$
 export GATE_RUNNER_REPOS=acme/fixture GATE_RUNNER_FAMILY=fixture GATE_RUNNER_SCCACHE=""
 export GATE_RUNNER_SLOT=0   # the tree path the assertions read
 export GATE_RUNNER_REGATE_SETTLE=0   # re-gate coalescing is exercised on its own at the end
-export PATH="$fixture/tools:$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+export PATH="$fixture/tools:$fixture/toolchain/bin:/usr/bin:/bin"
 invoke() {
   runner_exit=0
-  bash "$script_dir/pr-gate-runner.sh" "$@" >"$fixture/runner.log" 2>&1 || runner_exit=$?
+  "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" "$@" >"$fixture/runner.log" 2>&1 || runner_exit=$?
 }
 count() { cat "$fixture/executions" 2>/dev/null || printf 'none\n'; }
 # Every count assertion says what actually happened; a bare [[ ]] left no trace of the runner's own
@@ -213,6 +236,9 @@ invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 expect_count 1
 jq -se 'last.state=="success"' "$fixture/statuses.jsonl" >/dev/null
+jq -e --arg root "$fixture/toolchain/bin" '.toolchain_paths == [$root + "/rustc", $root + "/cargo"]' \
+  "$fixture/runner/attempts/acme-fixture-$(cat "$fixture/head")/last-result.json" >/dev/null \
+  || { printf 'the runner did not bind the fixture toolchain\n' >&2; exit 1; }
 invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 expect_count 1
@@ -676,7 +702,7 @@ regate() { # requested_at
 }
 regate 2026-10-04T09:00:00Z
 touch "$mains"   # the family's mains just moved: an automatic re-gate would wait for the burst
-listed=$(GATE_RUNNER_REGATE_SETTLE=3600 bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
+listed=$(GATE_RUNNER_REGATE_SETTLE=3600 "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
 grep -q "^acme fixture 1 $head - 0 " <<<"$listed" \
   || { printf 'a requested re-gate was not claimable:\n%s\n' "$listed" >&2; exit 1; }
 before_count=$(count)
@@ -748,7 +774,7 @@ printf 'no sccache\n' >>"$fixture/source/marker"
 "$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
 before_count=$(count)
 runner_exit=0
-env -u GATE_RUNNER_SCCACHE PATH="$uncached_path" bash "$script_dir/pr-gate-runner.sh" \
+env -u GATE_RUNNER_SCCACHE PATH="$uncached_path" "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" \
   >"$fixture/runner.log" 2>&1 || runner_exit=$?
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 expect_count "$((before_count + 1))"
@@ -864,17 +890,17 @@ mkdir -p "$fixture/roots/acme"
 "$real_git" -C "$fixture/roots/acme/foreign" remote set-url origin https://elsewhere.invalid/git/acme/foreign.git
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
-  PR_GATE_CHECKOUT_ROOT_PATTERN="$fixture/roots/{owner}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1) || {
+  PR_GATE_CHECKOUT_ROOT_PATTERN="$fixture/roots/{owner}" "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1) || {
   printf 'discovery through the checkout-root pattern failed:\n%s\n' "$listed" >&2; exit 1; }
 [[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 [[ "$(cat "$fixture/runner/cache/protected-acme")" == acme/fixture ]]
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOTS="other=/nonexistent acme=$fixture/roots/acme" PR_GATE_CHECKOUT_ROOT_PATTERN="/nonexistent/{owner}" \
-  bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
+  "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
 [[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 rm -f "$fixture/runner/cache/protected-acme"
-listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
+listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
 grep -q 'no checkout root for owner acme' <<<"$listed" || { printf 'a missing checkout root was silent:\n%s\n' "$listed" >&2; exit 1; }
 grep -q 'no PR head needs gating' <<<"$listed"
 printf 'PASS discovery: checkout roots come from the site configuration, and a missing one is named\n'
@@ -883,7 +909,7 @@ printf 'PASS discovery: checkout roots come from the site configuration, and a m
 for missing in PR_GATE_FORGE_URL JERYU_TOKEN_FILE GATE_RUNNER_IDENTITY; do
   grep -v "^$missing=" "$fixture/pr-gate.env" >"$fixture/partial.env"
   runner_exit=0
-  env -u JERYU_TOKEN_FILE PR_GATE_CONFIG="$fixture/partial.env" bash "$script_dir/pr-gate-runner.sh" --list \
+  env -u JERYU_TOKEN_FILE PR_GATE_CONFIG="$fixture/partial.env" "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list \
     >"$fixture/runner.log" 2>&1 || runner_exit=$?
   if [[ "$runner_exit" != 2 ]] || ! grep -q "$missing is not configured" "$fixture/runner.log"; then
     printf 'missing %s was not refused by name (exit %s)\n' "$missing" "$runner_exit" >&2; cat "$fixture/runner.log" >&2; exit 1
@@ -892,7 +918,7 @@ done
 # A bare repository name needs a primary owner to qualify it.
 grep -v '^PR_GATE_PRIMARY_OWNER=' "$fixture/pr-gate.env" >"$fixture/partial.env"
 runner_exit=0
-PR_GATE_CONFIG="$fixture/partial.env" GATE_RUNNER_REPOS=fixture bash "$script_dir/pr-gate-runner.sh" --list \
+PR_GATE_CONFIG="$fixture/partial.env" GATE_RUNNER_REPOS=fixture "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list \
   >"$fixture/runner.log" 2>&1 || runner_exit=$?
 if [[ "$runner_exit" == 0 ]] || ! grep -q 'has no owner and PR_GATE_PRIMARY_OWNER is not configured' "$fixture/runner.log"; then
   printf 'a bare repository name was guessed an owner\n' >&2; cat "$fixture/runner.log" >&2; exit 1
@@ -1022,11 +1048,11 @@ printf 'PASS a forge that refuses the status link gets the same statuses without
 # the first answer that is not a 429 ends it.
 rm -f "$fixture/runner/cache/forge-backoff" "$fixture/rate-limited.log"
 touch "$fixture/rate-limit"
-env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
+env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
 [[ -s "$fixture/runner/cache/forge-backoff" ]] || { printf 'a 429 started no back-off\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 grep -q 'answered 429' "$fixture/runner.log"
 sent=$(wc -l <"$fixture/rate-limited.log")
-env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
+env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
 [[ "$(wc -l <"$fixture/rate-limited.log")" == "$sent" ]] || { printf 'a request went out during the back-off\n' >&2; exit 1; }
 grep -q 'rate limiting this identity' "$fixture/runner.log"
 rm -f "$fixture/rate-limit" "$fixture/runner/cache/forge-backoff"
@@ -1147,6 +1173,25 @@ grep -q 'read without preparing a tree' "$fixture/runner.log"
 rm -f "$fixture/tools/governed-marker"
 export GATE_RUNNER_FAMILY=fixture
 printf 'PASS cheap identity: reuse before preparation claims nothing and never parks the head in recovery\n'
+
+# Isolating the home/toolchain must not turn input hashing into a canned answer. A byte change
+# with the same reported version still invalidates reuse, both for a compiler and a user helper.
+# First bind the restored family/tool set, so each mutation below is the only changed input.
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -e '.outcome == "success"' "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null
+for changed_tool in "$fixture/toolchain/bin/rustc" "$fixture/home/.local/bin/fixture-helper"; do
+  before_count=$(count)
+  printf '# same version, different bytes\n' >>"$changed_tool"
+  invoke
+  [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+  expect_count "$((before_count + 1))"
+  jq -e '.outcome == "success"' "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null
+  invoke
+  [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+  expect_count "$((before_count + 1))"
+done
+printf 'PASS fixture compiler and user-tool byte changes invalidate reuse without a version change\n'
 
 # Mutable execution inputs cannot retain a green verdict for the pre-recipe identity.
 printf 'before\n' >"$fixture/tools/environment-probe"

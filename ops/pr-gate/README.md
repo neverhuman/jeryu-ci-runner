@@ -440,6 +440,13 @@ retention, the locked-crate prefetch's source allowlist, the installer and the d
 Every fixture uses invented names (`acme`, `gate-a`, `example.test`); none reads the host's own site
 file. The repository's `ops/ci/pr-ci.sh` runs it.
 
+The complete-runner protocol suite uses a private child home and small fixture Rust tools: its
+recipe never compiles Rust. This avoids hashing the developer's unrelated user tools and full
+compiler installation on every synthetic dispatch. The runner still computes real content
+fingerprints, and compiler/user-tool byte changes must invalidate reuse even when their version
+strings stay the same. The state suite separately exercises the host enumeration and refusal
+paths with the installed toolchain. No production fingerprint cache or validation is bypassed.
+
 The required gate discovers both the PR-gate and review-controller families with
 checked `required.sh --list` calls before dispatching any suite. A failed, empty,
 invalid or repeated list fails the gate. The shared pool uses
