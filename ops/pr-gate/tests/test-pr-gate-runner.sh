@@ -1405,6 +1405,13 @@ grep -q 'forge answered 503 posting acme/fixture pending' "$fixture/runner.log" 
 expect_count "$((before_count + 1))"
 printf 'PASS a flaky forge 5xx on the pending status is retried and the gate still runs\n'
 
+# The newest status must not be this runner's own success, or the re-verify path posts no pending at all.
+reset_newest_status() {
+  jq -nc --arg sha "$("$real_git" -C "$fixture/source" rev-parse HEAD)" --argjson at "$(( $(wc -l <"$fixture/statuses.jsonl") + 1000 ))" \
+    '{state:"failure",context:"fixture/required",description:"older failure",id:"older",updated_at:$at,sha:$sha,creator:{login:"runner-bot"}}' \
+    >>"$fixture/statuses.jsonl"
+}
+reset_newest_status
 printf '%s\n' -1 >"$fixture/forge-5xx"
 : >"$fixture/forge-5xx.log"
 before_count=$(count)
@@ -1418,6 +1425,7 @@ printf '0\n' >"$fixture/forge-5xx"
 rm -f "$fixture/forge-5xx"
 printf 'PASS a persistent forge 5xx stops after the bounded retries without gating\n'
 
+reset_newest_status
 # Now with the forge refusing pending but accepting the error status posted after the retries.
 printf '3\n' >"$fixture/forge-5xx"
 invoke --repo acme/fixture --pr 1
