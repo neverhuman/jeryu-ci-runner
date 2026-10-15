@@ -184,6 +184,15 @@ case "$method $url" in
     if [[ -f "$FAKE_FORGE/reject-terminal" && "$(jq -r '.state' <<<"$payload")" != pending ]]; then
       printf '{"message":"publication denied"}\n403'; exit
     fi
+    # forge-5xx holds how many more status posts answer 503 before the forge recovers (-1: never).
+    if [[ -f "$FAKE_FORGE/forge-5xx" ]]; then
+      read -r left <"$FAKE_FORGE/forge-5xx"
+      printf '%s\n' "$url $(jq -r '.state' <<<"$payload")" >>"$FAKE_FORGE/forge-5xx.log"
+      if ((left != 0)) && [[ "$(jq -r '.state' <<<"$payload")" != error || "$left" == -1 ]]; then
+        ((left < 0)) || printf '%s\n' "$((left - 1))" >"$FAKE_FORGE/forge-5xx"
+        printf '{"message":"upstream unavailable"}\n503'; exit
+      fi
+    fi
     count=0
     [[ ! -f "$FAKE_FORGE/statuses.jsonl" ]] || count=$(wc -l <"$FAKE_FORGE/statuses.jsonl")
     # The forge records the token's identity as the creator, as jeryu does (commit_status creator).
@@ -1383,3 +1392,40 @@ invoke
 expect_count "$((before_count + 2))"
 jq -se 'last.state == "failure"' "$fixture/statuses.jsonl" >/dev/null
 printf 'PASS an already-upstream patch targeting another base runs the failing recipe and honours a requested re-gate\n'
+
+# A forge 5xx is the forge failing, not a verdict: the runner retries the status post a bounded number
+# of times, and when the forge stays down says so with an error status that the next tick gates past.
+export PR_GATE_STATUS_ATTEMPTS=3 PR_GATE_STATUS_RETRY_SLEEP=0
+before_count=$(count)
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+printf '2\n' >"$fixture/forge-5xx"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q 'forge answered 503 posting acme/fixture pending' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+printf 'PASS a flaky forge 5xx on the pending status is retried and the gate still runs\n'
+
+printf '%s\n' -1 >"$fixture/forge-5xx"
+: >"$fixture/forge-5xx.log"
+before_count=$(count)
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" != 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$before_count"
+[[ "$(grep -c ' pending$' "$fixture/forge-5xx.log")" == 3 ]] || { cat "$fixture/forge-5xx.log"; exit 1; }
+grep -q 'answered 503' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
+printf '0\n' >"$fixture/forge-5xx"
+rm -f "$fixture/forge-5xx"
+printf 'PASS a persistent forge 5xx stops after the bounded retries without gating\n'
+
+# Now with the forge refusing pending but accepting the error status posted after the retries.
+printf '3\n' >"$fixture/forge-5xx"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" != 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -se '[.[-3:][] | select(.state == "error" and (.description | test("forge answered 503 posting pending")))] | length == 1' \
+  "$fixture/statuses.jsonl" >/dev/null || { tail -3 "$fixture/statuses.jsonl" >&2; exit 1; }
+rm -f "$fixture/forge-5xx"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+printf 'PASS an exhausted forge 5xx leaves a visible error status and the next tick gates the head\n'

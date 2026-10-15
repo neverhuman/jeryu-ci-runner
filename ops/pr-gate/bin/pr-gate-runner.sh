@@ -272,16 +272,42 @@ api() { # method path [json]
 
 # The link (target_url) is a convenience and never decides a gate: a forge that refuses it (422) gets
 # the same status again without it, as the heartbeat retries without fields an older forge refuses.
+#
+# A 5xx (or no answer at all, 000) is the forge failing, not a verdict on the gate. The post is tried
+# up to PR_GATE_STATUS_ATTEMPTS times (default 4, at most 10), PR_GATE_STATUS_RETRY_SLEEP seconds apart
+# (default 5, at most 60). If the forge is still down, one best-effort `error` status says so on the
+# PR before the runner gives up; it names no inputs, so the next tick gates the head again instead of
+# reusing or holding it. A refusal that is not a 5xx (4xx) is a fault of this runner and dies at once.
+STATUS_ATTEMPTS="${PR_GATE_STATUS_ATTEMPTS:-4}"
+[[ "$STATUS_ATTEMPTS" =~ ^[0-9]+$ ]] && ((STATUS_ATTEMPTS >= 1 && STATUS_ATTEMPTS <= 10)) || STATUS_ATTEMPTS=4
+STATUS_RETRY_SLEEP="${PR_GATE_STATUS_RETRY_SLEEP:-5}"
+[[ "$STATUS_RETRY_SLEEP" =~ ^[0-9]+$ ]] && ((STATUS_RETRY_SLEEP <= 60)) || STATUS_RETRY_SLEEP=5
 post_status() { # owner repo sha state description [target_url]
-  local url=${6:-}
+  local url=${6:-} attempt=1 failed_code failed_body
   while :; do
     api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg s "$4" --arg c "$(gate_status_context "$1" "$2")" \
       --arg d "$5" --arg u "$url" '{state: $s, context: $c, description: $d} + (if $u == "" then {} else {target_url: $u} end)')"
-    [[ "$code" == 422 && -n "$url" ]] || break
-    say "status link refused (422); posting $1/$2 $4 without it"
-    url=""
+    if [[ "$code" == 422 && -n "$url" ]]; then
+      say "status link refused (422); posting $1/$2 $4 without it"
+      url=""
+      continue
+    fi
+    if [[ "$code" =~ ^(5[0-9][0-9]|000)$ ]] && ((attempt < STATUS_ATTEMPTS)); then
+      say "forge answered $code posting $1/$2 $4 on $3; retry $attempt of $((STATUS_ATTEMPTS - 1)) in ${STATUS_RETRY_SLEEP}s"
+      attempt=$((attempt + 1))
+      sleep "$STATUS_RETRY_SLEEP"
+      continue
+    fi
+    break
   done
-  [[ "$code" == 201 ]] || die "posting $1/$2 $(gate_status_context "$1" "$2")=$4 on $3 answered $code: $body"
+  [[ "$code" == 201 ]] && return 0
+  failed_code=$code failed_body=$body
+  if [[ "$code" =~ ^(5[0-9][0-9]|000)$ && "$4" != error ]]; then
+    api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg c "$(gate_status_context "$1" "$2")" \
+      --arg d "$MARKER: the forge answered $failed_code posting $4; the gate retries on the next tick" \
+      '{state: "error", context: $c, description: $d}')"
+  fi
+  die "posting $1/$2 $(gate_status_context "$1" "$2")=$4 on $3 answered $failed_code: $failed_body"
 }
 
 main_health_is_current_green() { # status-snapshot
