@@ -338,6 +338,50 @@ git -C "$cache_source" commit -qam changed-recipe
 [[ "$cache_key" != "$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")" ]]
 printf 'PASS cache identity permits source edits but binds recipe files, compiler bytes, lock and sibling identities\n'
 
+# The shared store: a key match seeds a physical copy, a mismatch or an empty store builds cold, a
+# publish replaces the current version, and pruning keeps any version a reader is still copying.
+store="$scratch/golden/acme/fixture"
+key_a=$(printf a | sha256sum | cut -c1-64) key_b=$(printf b | sha256sum | cut -c1-64)
+seed_into="$scratch/golden-slot/build-cache"
+mkdir -p "$seed_into"
+if gate_golden_seed "$store" "$key_a" "$seed_into" >/dev/null; then printf 'an empty store seeded a cache\n' >&2; exit 1; fi
+mkdir -p "$scratch/golden-build/one/debug/deps" "$scratch/golden-build/one/debug/.fingerprint/crate-1"
+printf 'one\n' >"$scratch/golden-build/one/artifact"
+for n in $(seq 1 200); do printf '%s\n' "$n" >"$scratch/golden-build/one/debug/deps/lib$n.rlib"; done
+printf 'fp\n' >"$scratch/golden-build/one/debug/.fingerprint/crate-1/lib-crate"
+ln -s deps/lib1.rlib "$scratch/golden-build/one/debug/latest"
+touch -d '2026-01-02 03:04:05' "$scratch/golden-build/one/debug/deps/lib7.rlib" "$scratch/golden-build/one/debug/.fingerprint/crate-1/lib-crate"
+gate_golden_publish "$store" "$key_a" "$scratch/golden-build/one" v1
+[[ ! -e "$scratch/golden-build/one" && "$(cat "$store/current")" == "v1 $key_a" ]]
+[[ "$(gate_golden_seed "$store" "$key_a" "$seed_into")" == v1 && -f "$seed_into/artifact" && ! -L "$seed_into" ]]
+# Every file, every mtime (cargo's freshness), and symlinks as symlinks.
+[[ "$(find "$seed_into" -type f | wc -l)" == 202 && -L "$seed_into/debug/latest" \
+   && "$(readlink "$seed_into/debug/latest")" == deps/lib1.rlib ]]
+for f in debug/deps/lib7.rlib debug/.fingerprint/crate-1/lib-crate debug/deps/lib150.rlib; do
+  [[ "$(stat -c %Y "$seed_into/$f")" == "$(stat -c %Y "$store/versions/v1/$f")" ]] \
+    || { printf 'seeding changed the mtime of %s\n' "$f" >&2; exit 1; }
+done
+# The copy is the slot's own: writing to it never reaches the published version.
+printf 'slot-only\n' >>"$seed_into/artifact"
+[[ "$(cat "$store/versions/v1/artifact")" == one ]]
+if gate_golden_seed "$store" "$key_b" "$seed_into" >/dev/null; then printf 'a different key seeded a cache\n' >&2; exit 1; fi
+# A reader holding v1 keeps it through the next publish; once released, the next publish prunes it.
+exec {reader}>>"$store/versions/v1.lock"; flock -s "$reader"
+mkdir -p "$scratch/golden-build/two"; printf 'two\n' >"$scratch/golden-build/two/artifact"
+gate_golden_publish "$store" "$key_b" "$scratch/golden-build/two" v2
+[[ "$(cat "$store/current")" == "v2 $key_b" && -d "$store/versions/v1" ]]
+exec {reader}>&-
+mkdir -p "$scratch/golden-build/three"
+gate_golden_publish "$store" "$key_b" "$scratch/golden-build/three" v3
+[[ ! -e "$store/versions/v1" && ! -e "$store/versions/v2" && -d "$store/versions/v3" ]]
+# A symlink is never published, and a version name is never reused.
+ln -s "$scratch/golden-build/elsewhere" "$scratch/golden-build/link"
+if gate_golden_publish "$store" "$key_b" "$scratch/golden-build/link" v4; then printf 'a symlinked cache was published\n' >&2; exit 1; fi
+mkdir -p "$scratch/golden-build/again"
+if gate_golden_publish "$store" "$key_b" "$scratch/golden-build/again" v3; then printf 'a version was overwritten\n' >&2; exit 1; fi
+[[ "$(cat "$store/current")" == "v3 $key_b" ]]
+printf 'PASS shared build cache: key-matched physical seeds, atomic publish, pruning spares versions being copied\n'
+
 # A slot tree holds exactly the gate's family and repository: a repository synced for an earlier gate
 # made the same head fingerprint differently on every slot (12 passes in an hour, 2026-09-18).
 strays="$scratch/strays"

@@ -87,6 +87,9 @@ if [[ -n "${JERYU_CI_BUILD_CACHE_DIR:-}" ]]; then
   # Absolute, and exactly this checkout's cache: a cargo step run from a subdirectory must not grow a
   # nested target/ of its own.
   [[ "$JERYU_CI_BUILD_CACHE_DIR" == "$PWD/target/build-cache" && -d target/build-cache && ! -L target/build-cache ]] || exit 35
+  # What the shared store seeded is visible before the recipe writes anything of its own.
+  [[ ! -f "$fixture_root/expect-seeded" || -f "$JERYU_CI_BUILD_CACHE_DIR/seeded-marker" ]] || exit 37
+  [[ ! -f "$fixture_root/expect-cold" || ! -e "$JERYU_CI_BUILD_CACHE_DIR/seeded-marker" ]] || exit 38
   printf 'ordinary build artifact\n' >"$JERYU_CI_BUILD_CACHE_DIR/artifact"
   [[ ! -f "$fixture_root/fail-build-cache" ]] || exit 36
 fi
@@ -1253,41 +1256,72 @@ for changed_tool in "$fixture/toolchain/bin/rustc" "$fixture/home/.local/bin/fix
 done
 printf 'PASS fixture compiler and user-tool byte changes invalidate reuse without a version change\n'
 
-# Only the explicitly separated ordinary-build directory survives a successful opted-in gate.
+# One shared ordinary-build cache per repository. Only a green merge-queue (or main-health) gate
+# publishes it; a pull-request head reads it but never writes it; no slot keeps a copy between gates.
 export PR_GATE_BUILD_CACHE_REPOS=acme/fixture
+target="$fixture/runner/tree/fixture/target"
+store="$fixture/runner/build-cache/acme/fixture"
+queue_gate() { # a fresh replay on refs/queue/main/1, gated through the queue
+  local qsha
+  queued_n=$((${queued_n:-0} + 1))
+  "$real_git" -C "$fixture/source" checkout -q -B "cache-queue-$queued_n" main
+  printf 'replay %s\n' "$queued_n" >"$fixture/source/queued"
+  "$real_git" -C "$fixture/source" add queued
+  "$real_git" -C "$fixture/source" commit -qm "cache queue replay $queued_n"
+  qsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+  "$real_git" -C "$fixture/source" push -q -f "$fixture/source.git" "HEAD:refs/queue/main/1"
+  "$real_git" -C "$fixture/source" checkout -q main
+  queue_entry "$qsha" refs/queue/main/1
+  invoke
+  rm -f "$fixture/queue.json"
+  [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+}
+new_head
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
-target="$fixture/runner/tree/fixture/target"
-stamp="$fixture/runner/cache/build-target/0/acme/fixture"
-[[ -f "$target/build-cache/artifact" && -s "$stamp" ]]
-printf 'keep\n' >"$target/build-cache/ordinary-cache"
+grep -q 'builds cold: no shared build cache' "$fixture/runner.log"
+[[ ! -e "$store/current" && ! -e "$target/build-cache" ]] \
+  || { printf 'a pull-request head wrote the shared cache or kept a slot copy\n' >&2; ls -laR "$store" "$target" >&2; exit 1; }
+queue_gate
+grep -q 'published acme/fixture build cache' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
+read -r published _ <"$store/current"
+[[ -f "$store/versions/$published/artifact" && ! -e "$target/build-cache" ]]
+printf 'seeded\n' >"$store/versions/$published/seeded-marker"
 mkdir -p "$target/llvm-cov-target" "$target/proof"
 touch "$target/llvm-cov-target/stale.profraw" "$target/proof/report.json"
 new_head
-invoke
+touch "$fixture/expect-seeded"
+invoke --repo acme/fixture --pr 1
+rm -f "$fixture/expect-seeded"
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
-[[ -f "$target/build-cache/ordinary-cache" && ! -e "$target/llvm-cov-target" && ! -e "$target/proof" ]]
+jq -e '.outcome == "success"' "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null \
+  || { printf 'a seeded pull-request gate did not see the shared cache\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+grep -q "seeded acme/fixture build cache from shared version $published" "$fixture/runner.log"
+[[ ! -e "$target/llvm-cov-target" && ! -e "$target/proof" && "$(cat "$store/current")" == "$published "* ]]
+# Changed tool bytes change the key: the next gate builds cold even though a version exists.
 printf 'changed compiler bytes\n' >"$fixture/tools/cache-tool-change"
-invoke
+new_head
+touch "$fixture/expect-cold"
+invoke --repo acme/fixture --pr 1
+rm -f "$fixture/expect-cold" "$fixture/tools/cache-tool-change"
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
-[[ ! -e "$target/build-cache/ordinary-cache" && -s "$stamp" ]]
-rm -f "$fixture/tools/cache-tool-change"
+jq -e '.outcome == "success"' "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null
+grep -q 'builds cold: no shared build cache' "$fixture/runner.log"
+# A failed queue gate publishes nothing; the store keeps its version and the slot copy is gone.
 touch "$fixture/fail-build-cache"
-invoke --repo acme/fixture --pr 1
-[[ "$runner_exit" == 0 && ! -e "$stamp" ]]
-jq -e '.outcome == "failure"' "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null
+queue_gate
 rm -f "$fixture/fail-build-cache"
-touch "$target/build-cache/failed-output"
-invoke --repo acme/fixture --pr 1
-[[ "$runner_exit" == 0 && ! -e "$target/build-cache/failed-output" && -s "$stamp" ]]
-rm -f "$stamp"  # no authorization after an interrupted attempt
-touch "$target/build-cache/interrupted-output"
-invoke --repo acme/fixture --pr 1
-[[ "$runner_exit" == 0 && ! -e "$target/build-cache/interrupted-output" && -s "$stamp" ]]
+[[ "$(cat "$store/current")" == "$published "* && ! -e "$target/build-cache" ]] \
+  || { printf 'a failed queue gate changed the shared cache\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+# The next green queue gate replaces the version, and the old one is pruned.
+queue_gate
+read -r republished _ <"$store/current"
+[[ "$republished" != "$published" && ! -e "$store/versions/$published" && -d "$store/versions/$republished" ]]
 unset PR_GATE_BUILD_CACHE_REPOS
+new_head
 invoke
-[[ "$runner_exit" == 0 && ! -e "$target/build-cache" && ! -e "$stamp" ]]
-printf 'PASS ordinary build cache survives source changes; proof/coverage, changed tools, failed and interrupted outputs do not\n'
+[[ "$runner_exit" == 0 && ! -e "$target/build-cache" ]]
+printf 'PASS shared build cache: queue gates publish, pull-request heads only read, keys bind tools, failures publish nothing\n'
 
 # Mutable execution inputs cannot retain a green verdict for the pre-recipe identity.
 printf 'before\n' >"$fixture/tools/environment-probe"

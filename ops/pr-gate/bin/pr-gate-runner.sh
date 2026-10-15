@@ -118,6 +118,8 @@ VENDOR="$(pr_gate_path "${GATE_RUNNER_NATIVE_VENDOR:-}")"
 VENDOR_REPOS="${PR_GATE_NATIVE_VENDOR_REPOS:-}"
 VENDOR_INPUT_REPOS="${PR_GATE_NATIVE_VENDOR_INPUT_REPOS:-}"
 RUNTIME_TOOLS="${GATE_RUNNER_RUNTIME_TOOLS:-$HOME_DIR/runtime-tools}"
+# The shared ordinary-build cache store (see gate_golden_seed). Same filesystem as the slot trees.
+BUILD_CACHE_STORE="${GATE_RUNNER_BUILD_CACHE_STORE:-$HOME_DIR/build-cache}"
 # Owners whose family tree gets the runtime tools at <tree>/target/runtime-tools.
 RUNTIME_TOOLS_OWNERS="${PR_GATE_RUNTIME_TOOLS_OWNERS:-}"
 IDENTITY="${GATE_RUNNER_IDENTITY:-}"
@@ -1096,20 +1098,20 @@ for pattern in $SHARED_TARGETS; do
     shared_target="$HOME_DIR/targets/$owner/$repo"; break
   fi
 done
+# Ordinary-build cache: one store per repository shared by every slot (gate_golden_* in
+# pr-gate-state.sh). A slot never keeps a cache of its own between gates; it copies the store's
+# current version in once the gate's cache key is known (below), and its copy is published or
+# deleted when the gate ends. Per-slot authorizations from before the store are retired here.
 build_cache=0
-build_cache_stamp="$HOME_DIR/cache/build-target/$SLOT/$owner/$repo"
+build_cache_store="$BUILD_CACHE_STORE/$owner/$repo"
+rm -rf -- "${HOME_DIR:?}/cache/build-target/$SLOT"
 if ((sandbox == 0)) && pr_gate_listed "${PR_GATE_BUILD_CACHE_REPOS:-}" "$owner/$repo"; then
   [[ -z "$shared_target" ]] || die "PR_GATE_BUILD_CACHE_REPOS cannot overlap GATE_RUNNER_SHARED_TARGETS"
   build_cache=1
 fi
-retain_build_cache=0
-if ((build_cache)) && [[ -f "$build_cache_stamp" ]] && grep -qxE '[0-9a-f]{64}' "$build_cache_stamp"; then
-  retain_build_cache=1
-fi
-((build_cache)) || rm -f -- "$build_cache_stamp"
 if [[ -z "$shared_target" ]]; then
-  gate_prepare_target "$run/$repo/target" "$retain_build_cache" || die "cannot prepare physical target for $owner/$repo"
-  say "$owner/$repo has fresh outputs in its own tree (retained ordinary build cache: $retain_build_cache)"
+  gate_prepare_target "$run/$repo/target" 0 || die "cannot prepare physical target for $owner/$repo"
+  say "$owner/$repo has fresh outputs in its own tree"
 elif [[ -d "$run/$repo/target" && ! -L "$run/$repo/target" ]]; then
   if [[ ! -e "$shared_target" ]]; then
     mv "$run/$repo/target" "$shared_target"   # first gate of this repo keeps its warm build
@@ -1183,12 +1185,13 @@ esac
 build_cache_key=""
 if ((build_cache)); then
   build_cache_key=$(gate_build_cache_key "$identity" "$repo" "$run/$repo") || die "cannot bind $owner/$repo build cache"
-  if [[ "$build_cache_key" != "$(cat "$build_cache_stamp" 2>/dev/null || true)" ]]; then
-    rm -rf -- "$run/$repo/target/build-cache"
+  mkdir -p "$run/$repo/target/build-cache"
+  seed_started=$(date +%s)
+  if seeded=$(gate_golden_seed "$build_cache_store" "$build_cache_key" "$run/$repo/target/build-cache"); then
+    say "seeded $owner/$repo build cache from shared version $seeded in $(( $(date +%s) - seed_started ))s"
+  else
+    say "$owner/$repo builds cold: no shared build cache for this key"
   fi
-  mkdir -p "$run/$repo/target/build-cache" "$(dirname "$build_cache_stamp")"
-  # Until a completed, successful gate reauthorizes it, interrupted/failed outputs are disposable.
-  rm -f -- "$build_cache_stamp"
 fi
 # A head moving during preparation must not run under the earlier admission. A queue commit is still
 # admitted only while its entry is building at the same sha.
@@ -1446,8 +1449,20 @@ if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" \
   state=inputs_changed
 fi
 gate_finish "$state" "$worker_exit" "$log"
-if ((build_cache)) && [[ "$state" == success ]]; then
-  printf '%s\n' "$build_cache_key" | gate_atomic "$build_cache_stamp" || say "could not retain $owner/$repo build cache"
+# Only an approved commit on its way to main feeds the shared cache: a green merge-queue replay or a
+# green main-health gate. A pull-request head is unreviewed until it is queued, so its outputs are
+# read from the store but never written to it. Every other outcome deletes the slot's copy, which
+# also keeps the disk to one cache per repository plus one per busy slot.
+if ((build_cache)); then
+  if [[ "$state" == success ]] && { [[ "$qref" =~ ^refs/queue/ ]] || ((main_health)); }; then
+    if gate_golden_publish "$build_cache_store" "$build_cache_key" "$run/$repo/target/build-cache" \
+        "$(jq -r '.id' "$gate_receipt")"; then
+      say "published $owner/$repo build cache as the shared version for its key"
+    else
+      say "could not publish $owner/$repo build cache; the store keeps its current version"
+    fi
+  fi
+  rm -rf -- "$run/$repo/target/build-cache"
 fi
 gate_publish || die "terminal $state saved; publication recovery required in $gate_receipt"
 seconds=$(( $(date +%s) - started_s ))

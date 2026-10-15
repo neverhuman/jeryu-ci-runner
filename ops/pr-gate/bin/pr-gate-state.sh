@@ -96,6 +96,80 @@ gate_build_cache_key() { # inputs-json gated-repository-name checkout
     | sha256sum | cut -c1-64
 }
 
+# One ordinary-build cache per repository, shared by every slot (the "golden" store):
+#   <store>/current               "<version> <cache key>", replaced atomically
+#   <store>/versions/<version>/   a published cache, never written after it is published
+#   <store>/versions/<version>.lock  shared-locked while a gate copies the version out
+# A gate copies the current version into its own physical target/build-cache when the key matches,
+# builds there, and either publishes the result (a green merge-queue or main-health gate: commits
+# already approved and landing) or deletes it. Nothing a slot writes is visible to another slot
+# until it is published, and a published version is only ever copied, never linked, so a later
+# gate cannot write through it. Readers and the cleanup coordinate through the version's lock: a
+# reader that finds its version gone builds cold, which is slower and never wrong.
+# A physical copy that keeps every mtime (cargo's freshness reads them) and copies symlinks as
+# symlinks. Files go 16 at a time: a single cp of a 3.5G jeryu-deploy cache that was not in the page
+# cache took 38s on a gate host under load, the parallel copy 2-5s (0.5-1s once cached).
+gate_copy_tree() { # source destination
+  local source=$1 destination=$2 jobs=${GATE_RUNNER_CACHE_COPY_JOBS:-16}
+  [[ "$jobs" =~ ^[1-9][0-9]*$ ]] || return 1
+  mkdir -p -- "$destination" || return
+  (cd -- "$source" && find . -mindepth 1 -type d -print0) | (cd -- "$destination" && xargs -0r mkdir -p --) || return
+  (cd -- "$source" && find . -type f -print0) \
+    | (cd -- "$source" && xargs -0r -P "$jobs" -n 64 cp -a --parents -t "$destination" --) || return
+  (cd -- "$source" && find . -type l -print0) \
+    | (cd -- "$source" && xargs -0r cp -a --parents -t "$destination" --) || return
+  # The directories were created before their files; give them their source mtimes too.
+  (cd -- "$source" && find . -type d -print0) \
+    | (cd -- "$source" && xargs -0r -I{} touch -h -c -r {} -- "$destination/{}")
+}
+
+gate_golden_seed() { # store key destination -> prints the seeded version, or fails (cold)
+  local store=$1 key=$2 destination=$3 version current_key lock fd
+  [[ -f "$store/current" ]] || return 1
+  read -r version current_key <"$store/current" || return 1
+  [[ "$version" =~ ^[A-Za-z0-9._-]+$ && "$current_key" =~ ^[0-9a-f]{64}$ && "$current_key" == "$key" ]] || return 1
+  lock="$store/versions/$version.lock"
+  exec {fd}>>"$lock" || return 1
+  if ! flock -s "$fd"; then exec {fd}>&-; return 1; fi
+  if [[ ! -d "$store/versions/$version" || -L "$store/versions/$version" ]]; then exec {fd}>&-; return 1; fi
+  rm -rf -- "$destination" || { exec {fd}>&-; return 1; }
+  if ! gate_copy_tree "$store/versions/$version" "$destination"; then
+    exec {fd}>&-
+    rm -rf -- "$destination"; mkdir -p -- "$destination"
+    return 1
+  fi
+  exec {fd}>&-
+  printf '%s\n' "$version"
+}
+
+gate_golden_publish() { # store key source version
+  local store=$1 key=$2 source=$3 version=$4
+  [[ "$key" =~ ^[0-9a-f]{64}$ && "$version" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  [[ -d "$source" && ! -L "$source" ]] || return 1
+  mkdir -p -- "$store/versions" || return
+  [[ ! -e "$store/versions/$version" ]] || return 1
+  # Same filesystem as the slot trees: a rename, not a copy.
+  mv -T -- "$source" "$store/versions/$version" || return
+  printf '%s %s\n' "$version" "$key" | gate_atomic "$store/current" || return
+  gate_golden_prune "$store"
+}
+
+# Remove every version but the current one that no gate is copying right now.
+gate_golden_prune() { # store
+  local store=$1 current="" entry version fd
+  [[ -f "$store/current" ]] && read -r current _ <"$store/current"
+  for entry in "$store"/versions/*; do
+    [[ -d "$entry" && ! -L "$entry" ]] || continue
+    version=$(basename -- "$entry")
+    [[ "$version" != "$current" ]] || continue
+    exec {fd}>>"$store/versions/$version.lock" || continue
+    if flock -n -x "$fd"; then
+      rm -rf -- "$entry" && rm -f -- "$store/versions/$version.lock"
+    fi
+    exec {fd}>&-
+  done
+}
+
 # Evidence repositories are read by exact tag/commit/tree from outside a gate's family (a docs
 # repository reading another owner's release evidence, say). Keep a bare <name>.git of each beside
 # the family checkouts: it has no .git subdirectory, so gate_detach_strays leaves it alone. A refresh

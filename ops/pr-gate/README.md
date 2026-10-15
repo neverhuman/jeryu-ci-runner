@@ -128,13 +128,27 @@ starts fresh. Never put instrumentation or gate evidence inside `build-cache`. T
 a complete recipe audit and cold/warm qualification before enrollment; the runner cannot classify
 arbitrary files a recipe writes. Installing the feature enables no repository automatically.
 
-Only a completed successful gate authorizes reuse. Tool, runner, configuration, recipe, lock or
-sibling-source identity changes discard it; an ordinary change to the gated repository's source
-can reuse it. Cargo still checks source freshness, and the runner stamps tracked files on checkout.
-An interrupted, failed or input-changing attempt leaves no authorization for its cache. Contributions
-get a clean target and no cache variable, and revoke any prior authorization for that slot/repository.
-Opting out restores fully clean targets. Symlinked cache directories and overlap with
-`GATE_RUNNER_SHARED_TARGETS` are refused. No cross-slot cache or extra repository lock is introduced.
+One cache per repository is shared by every slot, in `GATE_RUNNER_BUILD_CACHE_STORE`
+(default `<runner home>/build-cache/<owner>/<repo>`): a `current` file naming a published version
+and its cache key, and the versions themselves. When a gate's cache key matches `current`, the
+runner copies that version into the slot's physical `target/build-cache` before the recipe runs
+(a parallel copy that keeps mtimes, never a link, so the gate cannot write into the published
+version; 2-5s for a 3.5-4.4G cache read from disk on a loaded gate host). When the gate ends
+the slot's copy is either published or deleted; no slot keeps a cache between gates, so the disk
+holds one cache per repository plus one per busy slot.
+
+Only a green **merge-queue** gate or a green **main-health** gate publishes: commits that are
+approved and landing on main. A pull-request head is unreviewed until it is queued, so it reads the
+shared cache and never writes it. Contributions get a clean target and no cache variable, and the
+store lives outside the slot tree a sandbox sees. Publishing is a rename onto the store's filesystem
+and an atomic replacement of `current`; older versions are pruned unless a gate is still copying
+them (each version has a lock a reader holds while copying). Tool, runner, configuration, recipe,
+lock or sibling-source identity changes change the key, and a gate whose key matches no version
+builds cold. Cargo still checks source freshness, and the runner stamps tracked files on checkout.
+
+The store is not a boundary against an internal recipe: internal gates run as the gate user, who
+can write the store, the sccache directory and this runner's state. What the publication rule
+controls is which outputs the runner itself promotes to every slot.
 
 ## Starting a gate when the head appears
 
