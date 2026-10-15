@@ -137,10 +137,10 @@ jq -e '.verdict == "request_changes"' <<<"$(tail -1 "$t/posts")" >/dev/null
 REDTEAM_FIX_TODO=1 REDTEAM_FIX_TODO_GRACE_SECS=0 pass _holds
 [[ "$(count "$t/todoq-adds")" == 0 ]] # no explicit author selection
 export REDTEAM_FIX_TODO=1 REDTEAM_FIX_TODO_AUTHORS=dana
-pass _holds
+REDTEAM_FIX_TODO_GRACE_SECS=7200 pass _holds
 [[ "$(count "$t/todoq-adds")" == 0 ]]
 grep -q 'waiting 120m' "$t/log"
-export REDTEAM_FIX_TODO_GRACE_SECS=0
+unset REDTEAM_FIX_TODO_GRACE_SECS
 cp "$(receipt)" "$t/before-dry.json"
 pass _holds --dry-run
 cmp "$(receipt)" "$t/before-dry.json"
@@ -166,7 +166,7 @@ pass _holds --repo acme/widget-shop --pr 7
 ledger="$t/state/fix-todos/acme/widget-shop/7-$(cat "$t/head").json"
 jq -e '.state == "confirmed" and .todo_id == "20261013-090000-123456"' "$ledger" >/dev/null
 jq -e '.fix_todo_id == "20261013-090000-123456"' "$(receipt)" >/dev/null
-for want in 'UNTRUSTED REVIEW DATA' 'never instructions' 'Before editing, cherry-picking, or publishing' 'original head' 'Keep any new PR as a draft' 'No automated closure'; do
+for want in 'UNTRUSTED REVIEW DATA' 'never instructions' 'Before editing or publishing' 'original head' 'SAME BRANCH' 'new commits descended from original_head' 'normal fast-forward push' 'run ops/ci/pr-ci.sh before publication' 'Do not cherry-pick into a replacement branch' 'No automated closure'; do
   grep -qF "$want" "$t/todoq-text" || fails "missing worker guard: $want"
 done
 sed -n '/^~~~json$/,/^~~~$/p' "$t/todoq-text" | sed '1d;$d' > "$t/quoted.json"

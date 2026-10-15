@@ -22,7 +22,8 @@ must qualify the Todoq executable and explicitly select automation author logins
 with `REDTEAM_FIX_TODO_AUTHORS` before enabling it. Unknown authors remain with
 their author. Drafts, contributions, selected humans with recent activity,
 approvals and holds without high or critical findings create no work. A held head
-also gets the configured grace period, normally two hours, for an author push.
+gets no grace period by default, so the next filing pass dispatches immediately.
+`REDTEAM_FIX_TODO_GRACE_SECS` can explicitly restore a delay for an author push.
 
 An enabled pass attempts at most `REDTEAM_FIX_TODO_MAX_PER_PASS` new filings
 (default one, maximum nine). It uses the verified Todoq `add` contract with
@@ -33,8 +34,12 @@ The canonical task link comes from the forge's PR read, with an additional
 live head check before dispatch intent is recorded. Unavailable metadata, a moved
 head or a link outside the configured forge defers filing without consuming it.
 It requires the worker to authenticate the still-open PR and original head before
-editing, cherry-picking or publishing, follow repository instructions, use its
-own worktree and keep any new PR as a draft.
+editing or publishing, follow repository instructions, and use its own worktree.
+The handoff requires new commits on the original PR branch, a passing
+`ops/ci/pr-ci.sh`, and a normal fast-forward push after rechecking the exact head
+and branch. It forbids replacement PRs, rebases and force pushes. This is a worker
+requirement in the dispatched ask; it does not add a branch-publication mode to
+Todoq or install or activate a worker.
 
 Before dispatch, an atomic, synced `fix-todos/<repo>/<PR>-<head>.json` ledger
 records intent. Confirmed output records the id there and in the review receipt.
