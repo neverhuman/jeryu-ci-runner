@@ -174,15 +174,21 @@ review_format=1
 
 # A receipt counts as "already reviewed" only for the same review inputs: the review format above,
 # the prompt, the verdict schema and validator, the exact CLI bytes, the model, the CLI pin and the
-# size/domain limits. Hosted approval alone does not establish that match. This script's own bytes
-# are not hashed: plumbing (heartbeat, poke, merge pass, logging) does not change a review, and
-# hashing it re-reviewed every open PR at its unchanged head on every reinstall. A change that does
+# size/domain limits. Hosted approval alone does not establish that match. Nothing about the
+# installation itself is hashed: neither this script's own bytes (plumbing -- heartbeat, poke, merge
+# pass, logging -- does not change a review) nor where the install puts its files, because hashing
+# either re-reviewed every open PR at its unchanged head on every reinstall. A change that does
 # affect a review must bump review_format, which requalifies every receipt.
-review_input_identity() {
+review_input_identity() { # [path-bound]
   {
     printf 'review-format %s\n' "$review_format"
     (cd "$here" && sha256sum prompt.md verdict.schema.json validate-verdict.jq)
-    if [[ -f "$claude_bin" ]]; then sha256sum "$claude_bin"; else printf 'cli-unavailable\n'; fi
+    # The CLI by its bytes alone, never sha256sum's path column: an install that relocates the
+    # binary hands the agent the same CLI. `path-bound` reproduces the identity receipts carry from
+    # before that, so those receipts survive this change (see accept_identities below).
+    if [[ -f "$claude_bin" ]]; then
+      if [[ "${1:-}" == path-bound ]]; then sha256sum "$claude_bin"; else sha256sum <"$claude_bin"; fi
+    else printf 'cli-unavailable\n'; fi
     printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes" "${author_domains[*]}" "${owner_decision_authors[*]}"
   } | sha256sum | cut -c1-64
 }
@@ -192,8 +198,10 @@ review_identity="$(review_input_identity)"
 # reviewed" in skip_reason, and nowhere else: it carries receipts across a release that changed only
 # plumbing but moved the identity (such as the release that stopped hashing this script). Entries
 # must be exact 64-character lowercase hex; anything else is logged and ignored. A review published
-# by this process always records the current identity, never an accepted one.
-accept_identities=()
+# by this process always records the current identity, never an accepted one. The path-bound form
+# of the current inputs is accepted without being listed: it is the same prompt, schema, validator,
+# CLI bytes, model, pin and limits, recorded when the CLI's path was still hashed with its bytes.
+accept_identities=("$(review_input_identity path-bound)")
 for accepted in ${REDTEAM_ACCEPT_IDENTITIES:-}; do
   if [[ "$accepted" =~ ^[0-9a-f]{64}$ ]]; then
     accept_identities+=("$accepted")

@@ -43,10 +43,10 @@ copy() { # dir
   cp -p "$here/pr-redteam" "$here/prompt.md" "$here/verdict.schema.json" "$here/validate-verdict.jq" \
     "$here/claude-cli.version" "$1/"
 }
-run() { # dir command…
+run() { # dir command…  (REDTEAM_CLAUDE defaults to the fixture CLI; CLAUDE overrides its path)
   local dir="$1"; shift
   IDENTITY_FIXTURE="$t" PATH="$t/bin:$PATH" JERYU_BASE=https://forge.invalid JERYU_TOKEN_FILE="$t/token" \
-    REDTEAM_STATE="$t/state" REDTEAM_FAMILIES=all REDTEAM_CLAUDE="$t/claude" REDTEAM_MODEL=fixture-model \
+    REDTEAM_STATE="$t/state" REDTEAM_FAMILIES=all REDTEAM_CLAUDE="${CLAUDE:-$t/claude}" REDTEAM_MODEL=fixture-model \
     "$dir/pr-redteam" "$@"
 }
 fail() { echo "$*" >&2; exit 1; }
@@ -95,6 +95,38 @@ grep -qF "ignoring REDTEAM_ACCEPT_IDENTITIES entry ${original^^}" "$t/out" || { 
 REDTEAM_ACCEPT_IDENTITIES="${original^^} ${original:0:63}" run "$t/b" list > "$t/out" 2>&1
 grep -qF 'queue [family widgets] acme/widget-shop#7' "$t/out" || { cat "$t/out" >&2; fail 'a malformed accepted identity was honored'; }
 echo 'ok REDTEAM_ACCEPT_IDENTITIES carries a receipt across an identity change'
+
+# A reinstall is a fresh export in a new directory, from another commit of this repository, and it
+# may put the CLI somewhere else. With the same prompt, schema, validator, model, pin and limits
+# none of that is a verdict input: the identity holds, the approved head stays approved and the pass
+# queues nothing.
+copy "$t/reinstall"
+printf '\n# the next release of the merge pass\nmerge_note=1\n' >> "$t/reinstall/pr-redteam"
+printf '%s\n' 0123456789abcdef0123456789abcdef01234567 > "$t/reinstall/source-commit"
+cp -p "$t/claude" "$t/relocated-claude"
+[[ "$(CLAUDE="$t/relocated-claude" run "$t/reinstall" identity)" == "$original" ]] \
+  || fail 'a reinstall in a new directory, from another commit, with a relocated CLI moved the review identity'
+CLAUDE="$t/relocated-claude" run "$t/reinstall" list > "$t/out" 2>&1
+grep -qF 'skip acme/widget-shop#7 — already reviewed' "$t/out" || { cat "$t/out" >&2; fail 'a reinstall did not reuse the approved head'; }
+! grep -qF 'queue ' "$t/out" || { cat "$t/out" >&2; fail 'a reinstall queued a review of an unchanged approved head'; }
+echo 'ok a reinstall keeps an approved head approved and queues nothing'
+
+# Receipts written while the CLI was hashed together with its path are reused for the same inputs,
+# so the release that took the path out of the identity re-reviews nothing. "$t/old" stands in for
+# that controller: its identity function hashes the CLI the way that release did.
+copy "$t/old"
+sed -i 's|^\( *\)if \[\[ "${1:-}" == path-bound \]\]; then sha256sum "$claude_bin"; else sha256sum <"$claude_bin"; fi$|\1sha256sum "$claude_bin"|' "$t/old/pr-redteam"
+! grep -qF 'sha256sum <"$claude_bin"' "$t/old/pr-redteam" \
+  || fail 'the byte-only CLI hash was not replaced in the stand-in controller'
+path_bound="$(run "$t/old" identity)"
+[[ "$path_bound" =~ ^[0-9a-f]{64}$ && "$path_bound" != "$original" ]] || fail "unexpected path-bound identity: $path_bound"
+jq -n --arg sha "$head" --arg base "$base" --arg identity "$path_bound" \
+  '{repo:"acme/widget-shop",number:7,head_sha:$sha,base_sha:$base,decision:"approve",posted:true,review_identity:$identity}' \
+  > "$receipt"
+run "$t/a" list > "$t/out" 2>&1
+grep -qF 'skip acme/widget-shop#7 — already reviewed' "$t/out" || { cat "$t/out" >&2; fail 'a receipt from the path-bound identity was not reused'; }
+! grep -qF 'queue ' "$t/out" || { cat "$t/out" >&2; fail 'a receipt from the path-bound identity queued a re-review'; }
+echo 'ok receipts from before the CLI path left the identity are still reused'
 
 [[ ! -e "$t/danger" ]] || { cat "$t/danger" >&2; fail 'list wrote to the forge'; }
 echo 'REVIEW IDENTITY PASS'

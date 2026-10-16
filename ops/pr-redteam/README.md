@@ -284,18 +284,24 @@ approval. Operators should investigate pending claims when no worker owns them.
 Every receipt records `review_identity`, a sha256 over the review inputs: the
 `review_format` constant in `pr-redteam`, `prompt.md`, `verdict.schema.json`,
 `validate-verdict.jq`, the bytes of the `claude` CLI, the model, the CLI pin,
-`REDTEAM_MAX_DIFF_BYTES`, `REDTEAM_MAX_BLOB_BYTES` and `REDTEAM_AUTHOR_DOMAINS`.
+`REDTEAM_MAX_DIFF_BYTES`, `REDTEAM_MAX_BLOB_BYTES`, `REDTEAM_AUTHOR_DOMAINS` and
+`REDTEAM_OWNER_DECISION_AUTHORS`.
 A head counts as already reviewed only when its receipt carries the current
 identity (and the same base), so a review is reused only for the same review
 inputs; any change to them re-reviews every open PR at its unchanged head.
 `./pr-redteam identity` prints the current value.
 
-The script's own bytes are not part of the identity. A release that only changes
-plumbing (heartbeat, poke, merge pass, logging) keeps every receipt and does not
-re-review unchanged heads. A change to the script that alters what the agent
-sees or how its verdict becomes a decision -- diff, description or context
+Nothing about the installation is part of the identity: not the script's own
+bytes, not the commit it was exported from, and not where the install puts its
+files or the CLI. A release that only changes plumbing (heartbeat, poke, merge
+pass, logging) keeps every receipt, so reinstalling it -- a new export in a new
+directory, from a new commit, even with the CLI moved -- re-reviews nothing and
+leaves every posted approval valid. A change to the script that alters what the
+agent sees or how its verdict becomes a decision -- diff, description or context
 construction, the mechanical holds, the verdict-to-decision mapping, the
 rendered review -- must bump `review_format` in the same commit.
+`test/review-identity.sh` holds this: a reinstall with an unchanged prompt,
+schema and model keeps an approved head approved and queues nothing.
 
 `REDTEAM_ACCEPT_IDENTITIES` (space-separated, empty by default; set it in
 `site.env` so the review pass and poke agree) lists earlier identities whose
@@ -306,6 +312,18 @@ before reinstalling (`jq -r .review_identity <receipt>`), list it here, and
 remove it once the heads it covers have moved on. Entries that are not 64
 lowercase hex characters are logged and ignored. Only the "already reviewed"
 decision reads this list; a new review always records the current identity.
+Receipts from before the CLI's path was taken out of the identity are reused
+without being listed, for the same inputs.
+
+When a change does move the identity, the wave of re-reviews it queues is the
+operator's to pace: `REDTEAM_FAMILIES` narrows a pass to named forge families
+("all", the default, covers every repository including those with no family),
+and `REDTEAM_PRIORITY_FAMILIES` reviews the named families first and makes the
+rest wait for a pass where those have nothing left. Setting `REDTEAM_FAMILIES`
+to one family in `site.env` spends on that family only; widening it later
+reviews the rest at whatever head they then have, rather than paying for every
+open PR in the family at once. Set both in `site.env`, so the review pass and
+poke agree.
 
 ## Before the first contribution
 

@@ -77,6 +77,9 @@ echo 'ok the fixture refuses the slot key'
 "$real_git" init -q -b main "$t/repo"
 mkdir -p "$t/repo/ops"
 cp -R "$src" "$t/repo/ops/pr-redteam"
+# This suite also runs from an installed export, whose source-commit already names a commit. Put the
+# export-subst template back so the fixture repository's archive carries the fixture commit.
+printf '%s\n' '$Format:%H$' > "$t/repo/ops/pr-redteam/source-commit"
 "$real_git" -C "$t/repo" remote add origin https://forge.invalid/git/jeryu/jeryu-ci-runner.git
 g() { "$real_git" -C "$t/repo" -c user.name=fixture -c user.email=fixture@example.invalid "$@"; }
 g add .; g commit -qm fixture
@@ -124,6 +127,8 @@ beat "$t/repo/ops/pr-redteam"
 accepted
 jq -e 'has("code") | not' <<<"$(sed -n 1p "$t/sent")" >/dev/null
 cp -R "$src" "$t/plain"
+# A copy with no record of where it came from: from an export, drop the commit it carries.
+rm -f "$t/plain/source-commit"
 rm -f "$t/state/beats/claude-version"
 beat "$t/plain"
 accepted
