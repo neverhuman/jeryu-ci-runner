@@ -85,16 +85,23 @@ gate_prepare_target() { # target-dir retain-build-cache(0|1)
 
 # Ordinary Cargo reuse binds what cargo cannot see for itself: the bytes of the compiler and every
 # tool on the recipe's PATH, the host packages, the governed tools, this runner's own code and the
-# execution kind (the `tools` and `versions` of the gate inputs). Everything cargo does see -- the
-# gated repository's and its siblings' sources, Cargo.toml, Cargo.lock, features and profiles -- is
-# left to cargo's own freshness check, and the runner stamps every tracked file of every checkout
-# before a gate, so workspace and sibling crates rebuild and only dependencies are reused. The first
-# key (ece9a76) also bound every sibling's main, the lock and the recipe files: on jeryu-deploy no
-# gate after the shared store landed ever matched it (11 of 11 cold, 2026-10-15), because a merge
-# anywhere in the family or a pull request opened before a recipe change on main moved the key.
-# A stale cache costs a rebuild, never a wrong result; the store still only takes landing commits.
-gate_build_cache_key() { # inputs-json [gated-repository-name] [checkout] (both kept for callers)
-  jq -cS '{tools: (.tools // ""), versions: (.versions // ""), execution_kind: (.execution_kind // "")}' "$1" \
+# execution kind (the `tools`, `versions` and `execution_kind` of the gate inputs), plus the gated
+# checkout's cargo configuration and toolchain pin (`.cargo/`, `rust-toolchain[.toml]`): `[env]`
+# values reach build scripts that may not declare rerun-if-env-changed. Everything cargo does see --
+# sources, siblings, Cargo.toml, Cargo.lock, features and profiles -- is left to cargo's own
+# freshness check, and the runner stamps every tracked file of every checkout before a gate, so
+# workspace and sibling crates rebuild and only dependencies are reused. The first key (ece9a76)
+# also bound every sibling's main, the lock and all recipe files: on jeryu-deploy no gate after the
+# shared store landed matched it (11 of 11 cold, 2026-10-15). A key cannot be computed from inputs
+# missing the tool identity: an empty identity would collapse every gate onto one key.
+gate_build_cache_key() { # inputs-json gated-repository-name checkout
+  local cargo_config
+  jq -e '(.tools | type == "string" and length > 0) and (.versions | type == "string")
+         and (.execution_kind | type == "string" and length > 0)' "$1" >/dev/null || return 1
+  cargo_config=$(git -C "$3" ls-tree -r HEAD -- .cargo rust-toolchain rust-toolchain.toml \
+    | sha256sum | cut -c1-64) || return
+  jq -cS --arg repo "$2" --arg cargo "$cargo_config" \
+    '{repository: $repo, tools, versions, execution_kind, cargo_config: $cargo}' "$1" \
     | sha256sum | cut -c1-64
 }
 
@@ -144,10 +151,20 @@ gate_golden_seed() { # store key destination -> prints the seeded version, or fa
   printf '%s\n' "$version"
 }
 
+# A cache only grows: with no lock in the key, each landing gate seeds the current version, adds this
+# head's dependencies and republishes, and cargo never evicts. Past GATE_RUNNER_BUILD_CACHE_MAX_MB
+# (default 12288) the version is not published and `current` is withdrawn, so the next landing gate
+# builds cold and publishes a fresh, small cache. Returns 2 in that case.
 gate_golden_publish() { # store key source version
-  local store=$1 key=$2 source=$3 version=$4
-  [[ "$key" =~ ^[0-9a-f]{64}$ && "$version" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  local store=$1 key=$2 source=$3 version=$4 limit_mb=${GATE_RUNNER_BUILD_CACHE_MAX_MB:-12288} size_kb
+  [[ "$key" =~ ^[0-9a-f]{64}$ && "$version" =~ ^[A-Za-z0-9._-]+$ && "$limit_mb" =~ ^[1-9][0-9]*$ ]] || return 1
   [[ -d "$source" && ! -L "$source" ]] || return 1
+  size_kb=$(du -sk -- "$source" | cut -f1) || return
+  if ((size_kb > limit_mb * 1024)); then
+    rm -f -- "$store/current"
+    gate_golden_prune "$store"
+    return 2
+  fi
   mkdir -p -- "$store/versions" || return
   [[ ! -e "$store/versions/$version" ]] || return 1
   # Same filesystem as the slot trees: a rename, not a copy.

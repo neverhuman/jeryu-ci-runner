@@ -1423,7 +1423,8 @@ root_env=()
 for var in $WORKER_ROOT_VARS; do root_env+=("$var=$worker_root"); done
 # Absolute: a recipe step that runs cargo from a subdirectory must still use the one cache this
 # runner prepares and revokes, never create a nested target/ that survives between gates.
-((build_cache == 0)) || root_env+=(JERYU_CI_BUILD_CACHE_DIR="$worker_root/$repo/target/build-cache")
+# Incremental state is never reused across gates, whether or not sccache is present to pin it.
+((build_cache == 0)) || root_env+=(JERYU_CI_BUILD_CACHE_DIR="$worker_root/$repo/target/build-cache" CARGO_INCREMENTAL=0)
 if ((sandbox)); then
   # The sandbox contract: <command> <tree-root> <repo> <recipe...>. The site's command puts the tree
   # root in an ephemeral, network-restricted VM or container at that same path, enters <repo> there
@@ -1481,12 +1482,14 @@ gate_finish "$state" "$worker_exit" "$log"
 # also keeps the disk to one cache per repository plus one per busy slot.
 if ((build_cache)); then
   if [[ "$state" == success ]] && { [[ "$qref" =~ ^refs/queue/ ]] || ((main_health)); }; then
-    if gate_golden_publish "$build_cache_store" "$build_cache_key" "$run/$repo/target/build-cache" \
-        "$(jq -r '.id' "$gate_receipt")"; then
-      say "published $owner/$repo build cache as the shared version for its key"
-    else
-      say "could not publish $owner/$repo build cache; the store keeps its current version"
-    fi
+    publish_rc=0
+    gate_golden_publish "$build_cache_store" "$build_cache_key" "$run/$repo/target/build-cache" \
+      "$(jq -r '.id' "$gate_receipt")" || publish_rc=$?
+    case "$publish_rc" in
+      0) say "published $owner/$repo build cache as the shared version for its key";;
+      2) say "$owner/$repo build cache is over the size limit; withdrawn, the next landing gate starts it fresh";;
+      *) say "could not publish $owner/$repo build cache; the store keeps its current version";;
+    esac
   fi
   rm -rf -- "$run/$repo/target/build-cache"
 fi

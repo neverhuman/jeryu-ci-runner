@@ -341,7 +341,22 @@ for change in '.tools="compiler-b"' '.versions="rustc 1.96.0"' '.execution_kind=
   jq "$change" "$scratch/cache-inputs.json" >"$scratch/cache-changed.json"
   [[ "$cache_key" != "$(gate_build_cache_key "$scratch/cache-changed.json" fixture "$cache_source")" ]]
 done
-printf 'PASS cache identity binds compiler, tool and host bytes only; sources, siblings, lock and recipe are cargo'"'"'s to check\n'
+# Cargo configuration and the toolchain pin do move it: [env] reaches build scripts cargo may not rerun.
+mkdir -p "$cache_source/.cargo"; printf '[env]\nFIXTURE = "a"\n' >"$cache_source/.cargo/config.toml"
+git -C "$cache_source" add .cargo; git -C "$cache_source" commit -qm cargo-config
+[[ "$cache_key" != "$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")" ]]
+cargo_key=$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")
+printf '[toolchain]\nchannel = "1.95.0"\n' >"$cache_source/rust-toolchain.toml"
+git -C "$cache_source" add rust-toolchain.toml; git -C "$cache_source" commit -qm toolchain
+[[ "$cargo_key" != "$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")" ]]
+# Inputs without the tool identity get no key at all, never a shared constant one.
+for drop in 'del(.tools)' '.tools=""' 'del(.execution_kind)' 'del(.versions)'; do
+  jq "$drop" "$scratch/cache-inputs.json" >"$scratch/cache-changed.json"
+  if gate_build_cache_key "$scratch/cache-changed.json" fixture "$cache_source" >/dev/null; then
+    printf 'a key was computed without the tool identity (%s)\n' "$drop" >&2; exit 1
+  fi
+done
+printf 'PASS cache identity binds compiler, tool, host and cargo-config bytes; sources, siblings, lock and recipe are cargo'"'"'s to check\n'
 
 # The shared store: a key match seeds a physical copy, a mismatch or an empty store builds cold, a
 # publish replaces the current version, and pruning keeps any version a reader is still copying.
@@ -385,7 +400,12 @@ if gate_golden_publish "$store" "$key_b" "$scratch/golden-build/link" v4; then p
 mkdir -p "$scratch/golden-build/again"
 if gate_golden_publish "$store" "$key_b" "$scratch/golden-build/again" v3; then printf 'a version was overwritten\n' >&2; exit 1; fi
 [[ "$(cat "$store/current")" == "v3 $key_b" ]]
-printf 'PASS shared build cache: key-matched physical seeds, atomic publish, pruning spares versions being copied\n'
+# Over the size limit: nothing is published and current is withdrawn, so the next landing gate starts fresh.
+mkdir -p "$scratch/golden-build/big"; head -c 3145728 /dev/zero >"$scratch/golden-build/big/blob"
+rc=0; GATE_RUNNER_BUILD_CACHE_MAX_MB=2 gate_golden_publish "$store" "$key_b" "$scratch/golden-build/big" v5 || rc=$?
+[[ "$rc" == 2 && ! -e "$store/current" && ! -e "$store/versions/v5" && ! -e "$store/versions/v3" ]]
+if gate_golden_seed "$store" "$key_b" "$seed_into" >/dev/null; then printf 'a withdrawn cache seeded\n' >&2; exit 1; fi
+printf 'PASS shared build cache: key-matched physical seeds, atomic publish, pruning spares versions being copied, size limit resets\n'
 
 # A slot tree holds exactly the gate's family and repository: a repository synced for an earlier gate
 # made the same head fingerprint differently on every slot (12 passes in an hour, 2026-09-18).

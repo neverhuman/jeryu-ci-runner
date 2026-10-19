@@ -142,12 +142,20 @@ approved and landing on main. A pull-request head is unreviewed until it is queu
 shared cache and never writes it. Contributions get a clean target and no cache variable, and the
 store lives outside the slot tree a sandbox sees. Publishing is a rename onto the store's filesystem
 and an atomic replacement of `current`; older versions are pruned unless a gate is still copying
-them (each version has a lock a reader holds while copying). The key binds only what cargo cannot see for itself:
-compiler and tool bytes, host packages, governed tools, this runner's code and the execution kind.
-Sources, siblings, `Cargo.toml`, `Cargo.lock` and recipe files are cargo's to check (the runner
-stamps every tracked file on checkout, so workspace and sibling crates rebuild and dependencies are
-reused); a stale cache costs a rebuild, never a wrong result. A gate whose key matches no version
-builds cold.
+them (each version has a lock a reader holds while copying). The key binds what cargo cannot see for itself:
+compiler and tool bytes, host packages, governed tools, this runner's code, the execution kind, and
+the gated checkout's `.cargo/` and `rust-toolchain[.toml]` (cargo `[env]` reaches build scripts that
+may not declare `rerun-if-env-changed`). Sources, siblings, `Cargo.toml`, `Cargo.lock` and recipe
+files are left to cargo's freshness check: the runner stamps every tracked file on checkout, so
+workspace and sibling crates rebuild and dependencies are reused. Inputs without the tool identity
+get no key. A gate whose key matches no version builds cold. The cache is for cargo's own output
+only; a recipe must not keep anything else in `JERYU_CI_BUILD_CACHE_DIR`, which it also receives
+with `CARGO_INCREMENTAL=0`, and should refuse any value other than its checkout's physical
+`target/build-cache`.
+
+A cache only grows (cargo never evicts, and the lock is not in the key), so a version larger than
+`GATE_RUNNER_BUILD_CACHE_MAX_MB` (default 12288) is not published and `current` is withdrawn: the
+next landing gate builds cold and publishes a fresh cache.
 
 The store is not a boundary against an internal recipe: internal gates run as the gate user, who
 can write the store, the sccache directory and this runner's state. What the publication rule
