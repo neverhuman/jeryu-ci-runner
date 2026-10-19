@@ -142,9 +142,12 @@ approved and landing on main. A pull-request head is unreviewed until it is queu
 shared cache and never writes it. Contributions get a clean target and no cache variable, and the
 store lives outside the slot tree a sandbox sees. Publishing is a rename onto the store's filesystem
 and an atomic replacement of `current`; older versions are pruned unless a gate is still copying
-them (each version has a lock a reader holds while copying). Tool, runner, configuration, recipe,
-lock or sibling-source identity changes change the key, and a gate whose key matches no version
-builds cold. Cargo still checks source freshness, and the runner stamps tracked files on checkout.
+them (each version has a lock a reader holds while copying). The key binds only what cargo cannot see for itself:
+compiler and tool bytes, host packages, governed tools, this runner's code and the execution kind.
+Sources, siblings, `Cargo.toml`, `Cargo.lock` and recipe files are cargo's to check (the runner
+stamps every tracked file on checkout, so workspace and sibling crates rebuild and dependencies are
+reused); a stale cache costs a rebuild, never a wrong result. A gate whose key matches no version
+builds cold.
 
 The store is not a boundary against an internal recipe: internal gates run as the gate user, who
 can write the store, the sccache directory and this runner's state. What the publication rule

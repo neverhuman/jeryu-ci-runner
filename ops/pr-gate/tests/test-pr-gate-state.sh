@@ -325,18 +325,23 @@ git -C "$cache_source" config user.email fixture@example.invalid
 printf 'original recipe\n' >"$cache_source/Justfile"
 git -C "$cache_source" add Justfile
 git -C "$cache_source" commit -qm recipe
-printf '%s\n' '{"tools":"compiler-a","sources":[{"repository":"fixture","head":"a","tree":"b","cargo_lock_sha256":"lock"},{"repository":"tool","head":"c","tree":"d"}]}' >"$scratch/cache-inputs.json"
+printf '%s\n' '{"tools":"compiler-a","versions":"rustc 1.95.0","execution_kind":"operator-unsealed","sources":[{"repository":"fixture","head":"a","tree":"b","cargo_lock_sha256":"lock"},{"repository":"tool","head":"c","tree":"d"}]}' >"$scratch/cache-inputs.json"
 cache_key=$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")
-jq '.sources[0].head="changed" | .sources[0].tree="changed"' "$scratch/cache-inputs.json" >"$scratch/cache-changed.json"
-[[ "$cache_key" == "$(gate_build_cache_key "$scratch/cache-changed.json" fixture "$cache_source")" ]]
-for change in '.tools="compiler-b"' '.sources[0].cargo_lock_sha256="new-lock"' '.sources[1].head="new-sibling"'; do
+# What cargo checks for itself never moves the key: the gated head, a sibling's main, the lock, and
+# the recipe files.
+for change in '.sources[0].head="changed" | .sources[0].tree="changed"' '.sources[0].cargo_lock_sha256="new-lock"' '.sources[1].head="new-sibling"'; do
   jq "$change" "$scratch/cache-inputs.json" >"$scratch/cache-changed.json"
-  [[ "$cache_key" != "$(gate_build_cache_key "$scratch/cache-changed.json" fixture "$cache_source")" ]]
+  [[ "$cache_key" == "$(gate_build_cache_key "$scratch/cache-changed.json" fixture "$cache_source")" ]]
 done
 printf 'changed recipe\n' >"$cache_source/Justfile"
 git -C "$cache_source" commit -qam changed-recipe
-[[ "$cache_key" != "$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")" ]]
-printf 'PASS cache identity permits source edits but binds recipe files, compiler bytes, lock and sibling identities\n'
+[[ "$cache_key" == "$(gate_build_cache_key "$scratch/cache-inputs.json" fixture "$cache_source")" ]]
+# What it cannot see always does: compiler and tool bytes, reported versions, the execution kind.
+for change in '.tools="compiler-b"' '.versions="rustc 1.96.0"' '.execution_kind="contributed-sandbox"'; do
+  jq "$change" "$scratch/cache-inputs.json" >"$scratch/cache-changed.json"
+  [[ "$cache_key" != "$(gate_build_cache_key "$scratch/cache-changed.json" fixture "$cache_source")" ]]
+done
+printf 'PASS cache identity binds compiler, tool and host bytes only; sources, siblings, lock and recipe are cargo'"'"'s to check\n'
 
 # The shared store: a key match seeds a physical copy, a mismatch or an empty store builds cold, a
 # publish replaces the current version, and pruning keeps any version a reader is still copying.

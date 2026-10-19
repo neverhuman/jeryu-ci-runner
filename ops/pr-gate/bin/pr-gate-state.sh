@@ -83,16 +83,18 @@ gate_prepare_target() { # target-dir retain-build-cache(0|1)
   fi
 }
 
-# Ordinary Cargo reuse binds tools, policy, recipe and dependency identities. The gated repository's
-# own head/tree may change: Cargo checks source freshness, and sync_repo stamps all tracked files.
-# Its lock and origin remain bound. Other sibling heads stay bound (they may supply build helpers).
-gate_build_cache_key() { # inputs-json gated-repository-name checkout
-  local recipe_files
-  recipe_files=$(git -C "$3" ls-tree -r HEAD -- Justfile justfile ops/ci ops/ci-kit ops/pr-gate \
-    .jeryu .github/workflows .forgejo/workflows .gitea/workflows agent policies .cargo \
-    Cargo.toml rust-toolchain rust-toolchain.toml | sha256sum | cut -c1-64) || return
-  jq -cS --arg repo "$2" --arg files "$recipe_files" \
-    '(.sources |= map(if .repository == $repo then del(.head,.tree) else . end)) | .recipe_files=$files' "$1" \
+# Ordinary Cargo reuse binds what cargo cannot see for itself: the bytes of the compiler and every
+# tool on the recipe's PATH, the host packages, the governed tools, this runner's own code and the
+# execution kind (the `tools` and `versions` of the gate inputs). Everything cargo does see -- the
+# gated repository's and its siblings' sources, Cargo.toml, Cargo.lock, features and profiles -- is
+# left to cargo's own freshness check, and the runner stamps every tracked file of every checkout
+# before a gate, so workspace and sibling crates rebuild and only dependencies are reused. The first
+# key (ece9a76) also bound every sibling's main, the lock and the recipe files: on jeryu-deploy no
+# gate after the shared store landed ever matched it (11 of 11 cold, 2026-10-15), because a merge
+# anywhere in the family or a pull request opened before a recipe change on main moved the key.
+# A stale cache costs a rebuild, never a wrong result; the store still only takes landing commits.
+gate_build_cache_key() { # inputs-json [gated-repository-name] [checkout] (both kept for callers)
+  jq -cS '{tools: (.tools // ""), versions: (.versions // ""), execution_kind: (.execution_kind // "")}' "$1" \
     | sha256sum | cut -c1-64
 }
 
