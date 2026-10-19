@@ -47,6 +47,20 @@ fi
 echo "[pr-ci] offline regression suites (PR gate runner + review controller)" >&2
 bash ops/ci/run-suites.sh --list ops/pr-gate/tests/required.sh ops/pr-redteam/test/required.sh
 
+# Ordinary compilation -- cargo check, the contract-drift tests, the workspace test build and the
+# sandbox matrix's static cargo test/run -- builds in the gate runner's retained per-slot cache when
+# the gate host offers one (JERYU_CI_BUILD_CACHE_DIR; ops/pr-gate/README.md, "Reusing ordinary
+# compilation without retaining proof"). This recipe measures nothing from a build directory: there
+# is no coverage or profile build, and every report it writes (.jankurai/, target/jankurai/,
+# target/security/, target/artifact-support/) names target/ literally, so it stays outside the
+# cache. The runner retains the cache only after a green gate and discards it when tools, recipe or
+# Cargo.lock change; cargo still checks every source file's freshness. Unset (a laptop, another
+# host), cargo builds into target/ as before.
+if [ -n "${JERYU_CI_BUILD_CACHE_DIR:-}" ]; then
+  export CARGO_TARGET_DIR="${JERYU_CI_BUILD_CACHE_DIR}"
+  echo "[pr-ci] ordinary compilation in ${CARGO_TARGET_DIR} (the gate runner's build cache)" >&2
+fi
+
 echo "[pr-ci] (jobs=$JOBS) standard lanes" >&2
 JERYU_SPLIT_FULL_CHECK=1 bash ops/ci/check.sh
 just contract-drift
