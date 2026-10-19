@@ -10,10 +10,18 @@
 #   pr-redteam poke [--dry-run]            start a pass now if a new head needs review, an unreviewed
 #                                          head's required gate went green, or an approval became
 #                                          landable (30-second timer; never reviews or merges)
+#   pr-redteam rearm owner/name N          review the next head of a PR that reached the hold cap
 #
 # Each open PR is reviewed at its exact head by a read-only agent. Confirmed high or critical
 # security/correctness findings block, and every explicit block verdict is honored. Invalid or
 # contradictory output publishes nothing. Every finding is preserved in the review and receipt.
+#
+# Two agent holds, then a person: after REDTEAM_HOLD_CAP agent holds on one PR (across heads), its
+# later heads get no agent review until a maintainer runs `pr-redteam rearm` (or an operator runs
+# `run --force`). The mechanical holds (quality gate, a committed private key, unpinned blobs) still
+# run on them and still hold; a head none of them holds gets no review, a final `capped` receipt
+# and one `pr.skipped` event on the PR's timeline. Nothing capped is ever approved or merged.
+# Mechanical holds do not count toward the cap, and neither do holds recorded before it existed.
 #
 # The quality gate comes first: where the base branch requires `jankurai/proof`, a head whose proof
 # fails or failed to score is held with that reason and no agent budget is spent on it. Nothing here
@@ -122,6 +130,8 @@
 #   REDTEAM_QUEUE_REWORK   REDTEAM_FIX_TODO     file p1 rework when the merge queue refuses an
 #                          approved head it cannot replay onto the base tip; the same selected
 #                          authors, family and durable ledger as the held-review handoff
+#   REDTEAM_HOLD_CAP       2                    agent holds per PR before its later heads wait for a
+#                          person (`pr-redteam rearm`); 0 turns the cap off
 #   REDTEAM_TODOQ          todoq                owner-qualified Todoq executable
 #   REDTEAM_HUMAN_AUTHORS  (none)               selected humans also get a recent-activity refusal
 #   REDTEAM_OWNER_DECISION_AUTHORS (none)       logins whose approval on the exact head counts as a
@@ -654,6 +664,94 @@ contributed_review_hold() { # owner/name number sha
   fi
 }
 
+# --- the hold cap ---------------------------------------------------------------------------------
+
+# A hold is the last resort, not the start of a loop. An author who answers each hold with another
+# push gets every push fully re-reviewed, and held again, at the cost of a review each time. After
+# REDTEAM_HOLD_CAP agent holds on one PR its later heads get no agent review: the mechanical checks
+# (quality gate, private key, unpinned blobs) still run and still hold, and a head none of them
+# holds is recorded as `capped` and left for a person, with no review posted. A maintainer runs
+# `pr-redteam rearm owner/name N` to have the agent review again and the count start again; an
+# operator's `run --force` reviews a capped head once. What holds a head is unchanged: a confirmed
+# high or critical finding still holds it, whatever the count.
+hold_cap="${REDTEAM_HOLD_CAP:-2}"
+if ! [[ "$hold_cap" =~ ^[0-9]+$ ]]; then
+  echo "pr-redteam: ignoring REDTEAM_HOLD_CAP=${hold_cap:0:40}: not a whole number; using 2" >&2
+  hold_cap=2
+fi
+
+rearm_path() { echo "$state/rearm/${1/\//_}-$2"; } # owner/name number
+
+# Posted agent holds on this PR across its heads, optionally leaving one head out. Only an agent's
+# block counts: a quality-gate, unpinned-blob or private-key hold is mechanical and a push that fixes
+# it deserves its review. A receipt without `hold_kind` does not count: it was recorded before the
+# cap existed, so installing the cap never parks a PR that is already mid-review. Contributed PRs
+# have their own spend caps and do not count.
+agent_hold_total() { # owner/name number [head-sha to leave out] -> count
+  local files=() f total
+  for f in "$state/receipts/$1/$2-"*.json; do
+    [ -s "$f" ] && [ "$f" != "$state/receipts/$1/$2-${3:-}.json" ] && files+=("$f")
+  done
+  [ ${#files[@]} -gt 0 ] || { echo 0; return; }
+  if ! total="$(jq -s '
+      map(select(type == "object" and .decision == "hold" and .posted == true and .dry_run != true
+                 and (.origin // "internal") != "contributed" and .hold_kind == "agent")) | length' \
+      "${files[@]}" 2>/dev/null)" || ! [[ "$total" =~ ^[0-9]+$ ]]; then
+    echo "pr-redteam: $1#$2: unreadable receipts; counting its agent holds as 0" >&2
+    total=0
+  fi
+  echo "$total"
+}
+
+# The agent holds that count toward the cap: the total less what was counted at the last rearm.
+agent_hold_count() { # owner/name number [head-sha to leave out] -> count
+  local total rearmed
+  total="$(agent_hold_total "$@")"
+  rearmed="$(jq -r '.holds // 0' "$(rearm_path "$1" "$2")" 2>/dev/null || echo 0)"
+  [[ "$rearmed" =~ ^[0-9]+$ ]] || rearmed=0
+  echo $(( total > rearmed ? total - rearmed : 0 ))
+}
+
+# Why this head gets no agent review under the hold cap, or empty. The head's own receipt is left out
+# of the count: a head that was itself the cap's last hold is re-reviewed like any other when its
+# review identity changes, and a `capped` receipt for it does not move the count either way.
+hold_cap_reason() { # owner/name number sha
+  local holds
+  [ "$hold_cap" -gt 0 ] || return 0
+  holds="$(agent_hold_count "$1" "$2" "$3")"
+  [ "$holds" -ge "$hold_cap" ] || return 0
+  echo "held $holds times; a person decides (pr-redteam rearm $1 $2)"
+}
+
+# A capped head is said where its author looks: one `pr.skipped` event, posted when its `capped`
+# receipt is recorded, with an event_id the forge keeps once per head. Best-effort.
+report_hold_cap_skip() { # owner/name number sha holds
+  local repo="$1" number="$2" sha="$3" holds="$4"
+  api POST /api/v1/events "$(jq -nc --arg repo "$repo" --argjson pr "$number" --arg sha "$sha" \
+    --argjson holds "$holds" \
+    '{event_id: "pr-redteam:\($sha):hold-cap", source: "pr-redteam", kind: "pr.skipped",
+      actor: "pr-redteam", repo: $repo, pr: $pr, sha: $sha, outcome: "skipped",
+      summary: "pr-redteam skipped \($repo)#\($pr): held \($holds) times; a person decides (pr-redteam rearm \($repo) \($pr))",
+      detail: {automation: "pr-redteam", skipped: "hold_cap", holds: $holds}}')"
+  case "$code" in
+    200|201) ;;
+    *) say "could not report the hold-cap skip of $repo#$number on its timeline ($code)" ;;
+  esac
+}
+
+# A maintainer's decision to have the agent review again: record the total this PR has now, so the
+# count starts again from here. The marker is replaced atomically. Reads nothing from the forge.
+rearm() { # owner/name number
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$ && "$2" =~ ^[1-9][0-9]*$ ]] \
+    || die "usage: rearm owner/name N"
+  local total
+  total="$(agent_hold_total "$1" "$2")"
+  mkdir -p "$state/rearm"
+  jq -n --arg repo "$1" --argjson number "$2" --argjson holds "$total" --arg at "$(date -u +%FT%TZ)" \
+    '{repo: $repo, number: $number, holds: $holds, rearmed_at: $at}' | store_receipt "$(rearm_path "$1" "$2")"
+  say "$1#$2: rearmed after $total agent hold(s); the next head is reviewed"
+}
+
 # Why a row would be skipped, or empty when it should be reviewed.
 skip_reason() { # row me include_drafts force
   local row="$1" me="$2" drafts="$3" force="$4" repo number sha receipt reason
@@ -669,9 +767,14 @@ skip_reason() { # row me include_drafts force
   if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" --argjson identities "$reusable_identities" --arg base "$(jq -r .base_sha <<< "$row")" \
       '(.review_identity as $id | $identities | any(. == $id)) and .base_sha == $base
        and (.posted == true or .decision == "base_missing" or .decision == "author_domain"
-            or .decision == "placeholder_author"
+            or .decision == "placeholder_author" or .decision == "capped"
             or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
     case "$(jq -r .decision "$receipt")" in
+      capped)
+        # Final for this head while the cap stands; a rearm lets the agent review it.
+        reason="$(hold_cap_reason "$repo" "$number" "$sha")"
+        [ -z "$reason" ] || { echo "$reason"; return; }
+        return ;;
       base_missing) echo "$(jq -r '.base_ref // "the base branch"' "$receipt") does not exist yet; a person creates it" ;;
       author_domain) echo "commits at ${sha:0:12} are not all @$(jq -r .author_domain "$receipt"); a person reviews it" ;;
       placeholder_author) echo "commits at ${sha:0:12} carry a placeholder identity; a person reviews it" ;;
@@ -1669,10 +1772,21 @@ signals() { # review-dir
   } >"$d/signals.txt"
 }
 
-render_body() { # verdict-json decision sha origin [owner-decision-json]
+render_body() { # verdict-json decision sha origin [owner-decision-json hold-kind hold-number capped]
   jq -r --arg decision "$2" --arg sha "$3" --arg model "$model" --arg origin "${4:-internal}" \
-    --argjson owner "${5:-null}" '
+    --argjson owner "${5:-null}" --arg kind "${6:-}" --argjson k "${7:-0}" --argjson cap "$hold_cap" \
+    --argjson capped "${8:-0}" '
     def sev_icon: {"critical":"🔴","high":"🟠","medium":"🟡","low":"⚪"}[.] // "•";
+    (if $decision != "hold" or $origin == "contributed" then "a new push is re-reviewed"
+     elif $kind == "agent" and $cap > 0 and $k >= $cap then
+       "hold \(if $k > $cap then "\($k) (limit \($cap))" else "\($k) of \($cap)" end): this PR is now left for a person; later pushes are not reviewed automatically until a maintainer runs `pr-redteam rearm`"
+     elif $kind == "agent" and $cap > 0 then
+       "hold \($k) of \($cap): a new push is re-reviewed; after \($cap) holds this PR is left for a person"
+     elif $capped == 1 then
+       "mechanical hold at the hold limit: a push that clears it gets the mechanical checks only; a person decides (`pr-redteam rearm`)"
+     elif $kind == "agent" then "a new push is re-reviewed"
+     else "mechanical hold, not counted toward the hold limit: a push that clears it is re-reviewed" end) as $next
+    |
     (if $origin == "contributed" then "**Red team: advice on a contributed pull request.**"
      elif $decision == "approve" then "**Red team: approved.**"
      else "**Red team: HOLD — changes or further review required.**" end),
@@ -1695,7 +1809,7 @@ render_body() { # verdict-json decision sha origin [owner-decision-json]
             | "| \(.severity | sev_icon) \(.severity) | **\(.title | gsub("\\|";"\\|"))** — \(.detail | gsub("\n";" ") | gsub("\\|";"\\|")) | `\(.file)\(if .line then ":\(.line)" else "" end)` |"))
      end),
     "",
-    "<sub>pr-redteam · read-only agent (\($model)) · exact head `\($sha[0:12])` · a new push is re-reviewed</sub>"
+    "<sub>pr-redteam · read-only agent (\($model)) · exact head `\($sha[0:12])` · \($next)</sub>"
   ' <<<"$1"
 }
 
@@ -1848,7 +1962,7 @@ review_check_done() { # receipt repo number sha started-epoch
     waiting_gate) conclusion=neutral; title="pr-redteam review awaits proof" ;;
     approve) conclusion=success; title="pr-redteam approved" ;;
     advice) conclusion=neutral; title="pr-redteam posted advice" ;;
-    hold|too_large|author_domain|placeholder_author|base_missing) conclusion=action_required; title="pr-redteam holds" ;;
+    hold|too_large|author_domain|placeholder_author|base_missing|capped) conclusion=action_required; title="pr-redteam holds" ;;
     interrupted) conclusion=cancelled; title="pr-redteam interrupted" ;;
     *) conclusion=failure; title="pr-redteam review failed" ;;
   esac
@@ -1912,6 +2026,12 @@ review_one() { # owner/name number dry-run force include-drafts
           "$state/pending/$repo/$number.json" >/dev/null 2>&1; then
     say "$tag: review computed; waiting for jankurai/proof — $gate_reason"
     return 0
+  fi
+  # Computed before admission replaces this head's receipt; the count leaves this head out anyway.
+  # An operator's --force reviews a capped head with the agent.
+  local cap_reason=""
+  if [ "$origin" != contributed ] && [ "$force" != 1 ]; then
+    cap_reason="$(hold_cap_reason "$repo" "$number" "$sha")"
   fi
 
   local started_at receipt history work check_publish=0
@@ -2051,11 +2171,22 @@ review_one() { # owner/name number dry-run force include-drafts
   # A hold this controller imposes mechanically, rather than one the agent reasoned to. An owner's
   # decision never clears one: the quality gate, a committed key and an unreviewable blob are not
   # questions an owner was asked.
-  local verdict mechanical_hold=0 pending_cost=null
+  # hold_kind says who held: `agent` for the reviewer's own block, and `gate`, `blob` or `secret` for
+  # the mechanical holds. Only agent holds count toward REDTEAM_HOLD_CAP (agent_hold_count).
+  local verdict mechanical_hold=0 pending_cost=null hold_kind=""
   if [ -n "$gate_reason" ] && [ "$proof_pending" = 0 ]; then
     mechanical_hold=1
+    hold_kind=gate
     say "$tag: quality gate holds ${sha:0:12} — $gate_reason"
     verdict="$(quality_gate_verdict "$gate_reason")"
+  elif [ -n "$cap_reason" ]; then
+    # At the hold cap the agent is not asked again; the mechanical checks below still hold. A head
+    # none of them holds is recorded as `capped` and gets no review at all, never an approval.
+    say "$tag: $cap_reason — no agent review; mechanical checks only"
+    verdict="$(jq -nc --arg reason "$cap_reason" \
+      '{verdict: "approve", findings: [],
+        summary: ("The agent did not review this head: this pull request was " + $reason
+                  + ". A mechanical check holds it.")}')"
   else
     local agent_cap="$budget" agent_rc=0
     [ "$origin" != contributed ] || agent_cap="$contributed_budget"
@@ -2120,12 +2251,20 @@ review_one() { # owner/name number dry-run force include-drafts
   local decision
   case "$(jq -r .verdict <<<"$verdict")" in
     approve) decision=approve ;;
-    block) decision=hold ;;
+    block) decision=hold; [ -n "$hold_kind" ] || hold_kind=agent ;;
     *) say "$tag: unexpected verdict after validation, NOT approving"; return 0 ;;
   esac
   if grep -qE '^\+.*-----BEGIN [A-Z ]*PRIVATE KEY-----' "$d/diff.patch"; then
     decision=hold
     mechanical_hold=1
+    if [ -z "$hold_kind" ]; then
+      hold_kind=secret
+      # The agent did not block (or did not run), so the review names the reason itself.
+      verdict="$(jq -c '.verdict = "block" | .findings = ([{severity: "critical",
+        title: "Committed private key", file: "(diff)",
+        detail: "An added line carries a PEM private key header. pr-redteam holds this mechanically, whatever the agent concluded: remove the key from the history and rotate it.",
+        evidence: "-----BEGIN ... PRIVATE KEY-----"}] + .findings)' <<<"$verdict")"
+    fi
   fi
   # Unreviewable payloads hold mechanically. The agent cannot open a binary, and its severity for
   # "a blob I can't inspect" was seen to flip between runs on the same file; this rule cannot.
@@ -2139,6 +2278,7 @@ review_one() { # owner/name number dry-run force include-drafts
   if [ -n "$blobs" ]; then
     decision=hold
     mechanical_hold=1
+    [ -n "$hold_kind" ] || hold_kind=blob
     verdict="$(jq -c --slurpfile b <(printf '%s\n' "$blobs") '.verdict = "block" | .findings =
       ([$b[] | {severity: "critical", title: "Unpinned binary or archive (\(.size) bytes)", file: .path,
         detail: "Adds or changes a \(.size)-byte binary/archive that cannot be reviewed as text, and nothing in the diff pins its sha256. pr-redteam holds these mechanically, whatever the agent concluded: record the digest in a checked manifest or verification step, or fetch the artifact from a verified source.",
@@ -2157,7 +2297,29 @@ review_one() { # owner/name number dry-run force include-drafts
       say "$tag: $(jq -r .login <<<"$owner_decision") recorded decision context on ${sha:0:12}; the independent hold is unchanged"
     fi
   fi
-  local body; body="$(render_body "$verdict" "$decision" "$sha" "$origin" "$owner_decision")"
+  # A capped head that no mechanical check holds: no review is posted, and the `capped` receipt makes
+  # this head final until a rearm, so neither passes nor pokes come back to it. The merge pass only
+  # lands `approve` receipts, so nothing capped can merge.
+  if [ -n "$cap_reason" ] && [ "$decision" = approve ]; then
+    if [ "$dry" = 1 ]; then say "$tag: DRY RUN capped — $cap_reason (would post nothing)"; return 0; fi
+    local holds; holds="$(agent_hold_count "$repo" "$number" "$sha")"
+    jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$forge_base_sha" \
+      --arg diff_base "$base_sha" --arg at "$(date -u +%FT%TZ)" --arg identity "$review_identity" \
+      --argjson holds "$holds" --arg reason "$cap_reason" --arg origin "$origin" --arg reviewer "$me" \
+      '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, diff_base_sha:$diff_base,
+        decision:"capped", posted:false, holds:$holds, reason:$reason, origin:$origin,
+        reviewed_at:$at, reviewer_login:$reviewer, review_identity:$identity}' | store_receipt "$receipt"
+    say "$tag: capped at ${sha:0:12} — $cap_reason; no review posted"
+    report_hold_cap_skip "$repo" "$number" "$sha" "$holds"
+    return 0
+  fi
+  # The footer says where this PR stands: which agent hold this is out of the cap. This head's own
+  # receipt is not in the count.
+  local hold_number=0
+  if [ "$decision" = hold ] && [ "$hold_kind" = agent ] && [ "$origin" != contributed ]; then
+    hold_number=$(( $(agent_hold_count "$repo" "$number" "$sha") + 1 ))
+  fi
+  local body; body="$(render_body "$verdict" "$decision" "$sha" "$origin" "$owner_decision" "$hold_kind" "$hold_number" "$([ -n "$cap_reason" ] && echo 1 || echo 0)")"
   # The latest receipt was admitted before the worker started.
   local cost; cost="$(jq -r '.total_cost_usd // null' "$work/agent.json" 2>/dev/null || true)"
   # A reused result names what computing it cost; that spend was already reported once, on the
@@ -2188,9 +2350,9 @@ review_one() { # owner/name number dry-run force include-drafts
     --arg decision "$decision" --argjson verdict "$verdict" --arg model "$model" --argjson cost "$cost" --arg identity "$review_identity" --arg reviewer "$me" \
     --argjson posted "$posted" --arg code "$post_code" --argjson dry "$([ "$dry" = 1 ] && echo true || echo false)" \
     --arg at "$(date -u +%FT%TZ)" --argjson diff_bytes "$diff_bytes" --argjson files "$files_count" \
-    --arg origin "$origin" --argjson owner_decision "${owner_decision:-null}" \
+    --arg origin "$origin" --argjson owner_decision "${owner_decision:-null}" --arg kind "$hold_kind" \
     '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, diff_base_sha:$diff_base, decision:$decision, posted:$posted,
-      owner_decision:$owner_decision,
+      owner_decision:$owner_decision, hold_kind:(if $kind == "" then null else $kind end),
       post_http:$code, dry_run:$dry, model:$model, cost_usd:$cost, reviewed_at:$at, origin:$origin,
       diff_bytes:$diff_bytes, files:$files, verdict:$verdict, reviewer_login:$reviewer, review_identity:$identity}' | store_receipt "$receipt"
 }
@@ -2262,9 +2424,9 @@ forge_current() { # current-file JSON -> GateRunnerTask JSON, or null
 }
 # The forge accepts only approve, hold, failed, interrupted, publication_rejected and too_large as a
 # reviewer's conclusion. The other receipt decisions are reviews left for a person (a missing base
-# branch, commit emails outside the required domain, a placeholder commit identity) or posted only
-# as advice (a contributed pull request): each is reported as `hold`, with its receipt decision in
-# `reason`.
+# branch, commit emails outside the required domain, a placeholder commit identity, a PR at the hold
+# cap) or posted only as advice (a contributed pull request): each is reported as `hold`, with its
+# receipt decision in `reason`.
 forge_last() { # last-file JSON -> GateRunnerResult JSON, or null
   jq -c 'if type == "object" then
       (.conclusion // "") as $decision
@@ -2272,7 +2434,8 @@ forge_last() { # last-file JSON -> GateRunnerResult JSON, or null
         base_missing: "base_missing: the base branch does not exist yet; a person creates it",
         author_domain: "author_domain: commit emails are outside the required domain; a person reviews it",
         placeholder_author: "placeholder_author: commits carry the git default placeholder identity; a person reviews it",
-        advice: "advice: contributed pull request, reviewed as advice; a maintainer decides"} | .[$decision]) as $why
+        advice: "advice: contributed pull request, reviewed as advice; a maintainer decides",
+        capped: "capped: held to the cap; no agent review, a person decides"} | .[$decision]) as $why
       | {repo, pr, sha, recipe, conclusion, seconds, finished_at}
         + (if $why == null then {} else {conclusion: "hold", reason: $why} end)
     else null end'
@@ -3059,7 +3222,7 @@ while [ $# -gt 0 ]; do
     --jobs) jobs="$2"; shift ;;
     --repo) only_repo="$2"; shift ;;
     --pr) only_pr="$2"; shift ;;
-    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _owner_decision ] || [ "$cmd" = _owner_satisfy ] || [ "$cmd" = _owner_body ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = _holds ] || [ "$cmd" = show ] || die "unknown option $1"; break ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _owner_decision ] || [ "$cmd" = _owner_satisfy ] || [ "$cmd" = _owner_body ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = _holds ] || [ "$cmd" = show ] || [ "$cmd" = rearm ] || die "unknown option $1"; break ;;
   esac
   shift
 done
@@ -3114,6 +3277,9 @@ case "$cmd" in
     [[ "$1" =~ ^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([1-9][0-9]*):([0-9a-f]{40})$ ]] || die "invalid merge scope"
     only_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; only_pr="${BASH_REMATCH[3]}"; only_sha="${BASH_REMATCH[4]}"
     merge_pass "$dry" ;;
+  rearm) # let the next head of a PR at the hold cap be reviewed; reads nothing from the forge
+    [ $# = 2 ] || die "usage: rearm owner/name N"
+    rearm "$1" "$2" ;;
   _holds) # internal/testing: the opt-in held-pull-request fix filing pass alone
     fix_todo_pass "$dry" ;;
   _gate) # internal/testing: pr-detail.json checks.json -> "hold|wait<TAB>reason" (no forge calls)
@@ -3140,5 +3306,5 @@ case "$cmd" in
     [ $# = 2 ] || die "usage: show owner/name N"
     ls -t "$state/receipts/$1/$2"-*.json 2>/dev/null | head -1 | xargs -r jq . || die "no receipt for $1#$2"
     ;;
-  *) sed -n '2,6p' "$self" >&2; exit 2 ;;
+  *) sed -n '2,13p' "$self" >&2; exit 2 ;;
 esac

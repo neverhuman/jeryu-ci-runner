@@ -99,6 +99,26 @@ Review-progress check runs are published only for an internal, non-dry attempt.
 The same explicit capability gates start, diff and terminal/error-trap updates;
 contributed reviews remain advice and dry runs create no review check runs.
 
+## Two holds, then a person
+
+What holds a head does not change: a confirmed high or critical finding still holds it. What changes
+is how often the agent is asked. An author who answers each hold with another push gets every push
+fully re-reviewed, and often held again. After `REDTEAM_HOLD_CAP` agent holds on one pull request
+(default 2, across its heads; `0` turns the cap off), its later heads get no agent review:
+
+- The mechanical holds still run and still hold: the quality gate, a committed private key, an
+  unpinned blob. They do not count toward the cap.
+- A head none of them holds gets a final `capped` receipt, no posted review and one `pr.skipped`
+  event on the PR's timeline. Nothing capped is approved or merged.
+- The review footer says where a PR stands (`hold 1 of 2`, then `hold 2 of 2: this PR is now left
+  for a person`).
+- `./pr-redteam rearm owner/name N` lets the agent review the next head and starts the count again;
+  an operator's `run --force` reviews a capped head once.
+
+Only holds recorded with `hold_kind: "agent"` count, so holds from before the cap existed never
+park a pull request on install. Installing it keeps every receipt valid: `review_format` is
+unchanged, because a head reviewed before the cap was decided exactly as it would be now.
+
 ## Contributed pull requests
 
 The GitHub repositories are read-only mirrors of the forge. An outside contributor opens a pull
@@ -380,6 +400,7 @@ activation approval.
 ./pr-redteam identity
 ./pr-redteam heartbeat
 ./pr-redteam poke --dry-run
+./pr-redteam rearm acme/widget-web 16
 ```
 
 `run` reviews, then lands what it approved, then performs the disabled-by-default
@@ -389,7 +410,7 @@ as long as it runs, so `/runners` shows `REDTEAM_JOBS` rows (`<id>`, `<id>-2` â€
 instead of one row for the whole pass. Each beat follows the forge's runner contract, which refuses a
 beat with any field it does not define: `current` and `last` are cut down to
 that contract's fields before sending, and a receipt decision the forge has no
-reviewer conclusion for (`base_missing`, `author_domain`, `placeholder_author`, `advice`) is sent as
+reviewer conclusion for (`base_missing`, `author_domain`, `placeholder_author`, `advice`, `capped`) is sent as
 `hold` with the decision in `reason`. A beat also names the code it runs,
 `code: {repo, commit}`: the commit comes from `source-commit`, which
 `git archive` fills in (`export-subst`), or from a git checkout of this

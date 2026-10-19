@@ -125,6 +125,8 @@ export PUBLISH_FIXTURE="$t" FIXTURE_REAL_GIT="$real_git"
 export PATH="$t/bin:$PATH" JERYU_TOKEN_FILE="$t/token" REDTEAM_MERGE_TOKEN_FILE="$t/token"
 export REDTEAM_STATE="$t/state" REDTEAM_CLAUDE="$t/bin/model" REDTEAM_CLAUDE_VERSION=9.9.9 REDTEAM_TIMEOUT=10
 export JERYU_BASE=https://forge.invalid
+# This suite publishes holds on head after head; the hold cap is hold-cap.sh's subject, not this one's.
+export REDTEAM_HOLD_CAP=0
 review() { "$here/pr-redteam" _review 0 0 0 jeryu/fixture 1 >> "$t/controller.log" 2>&1; }
 receipt() { printf '%s/state/receipts/jeryu/fixture/1-%s.json\n' "$t" "$(cat "$t/head")"; }
 count() { if [[ -f "$1" ]]; then wc -l < "$1"; else echo 0; fi; }
