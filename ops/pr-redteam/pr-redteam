@@ -47,11 +47,12 @@
 # An owner's recorded decision is read, not guessed. When a review's only blocking findings are
 # that nobody has recorded an owner decision, the approvals on the exact head are re-read at the
 # moment of publication: a repository owner's approval on that head whose body says "Owner
-# decision" satisfies those findings, the findings stay in the published review, and the head is
-# approved only if nothing else holds it. A mechanical hold (the quality gate, a committed private
-# key, an unreviewable binary) is never satisfied this way, and a contribution is still never
-# approved here. Re-reading at publication is the point: a review that loaded the pull request
-# seconds before the approval landed used to hold on a finding the owner had already answered.
+# decision" is noted in the published review as context. It is never a waiver: the findings keep
+# their severity, the verdict stays a request for changes, and the head is held until the review
+# itself no longer blocks it. A mechanical hold (the quality gate, a committed private key, an
+# unreviewable binary) is never touched, and a contribution is still never approved here.
+# Re-reading at publication keeps the note current for a review that loaded the pull request
+# seconds before the approval landed.
 #
 # What it never does: tag, waive, post statuses, or approve a PR whose author is the token's
 # own identity (the forge forbids self-approval). If the agent errors, times out or returns
@@ -763,12 +764,12 @@ report_review_cost() { # receipt work repo number sha started-epoch
 # request's previous head had findings this head no longer shows, each of those is a
 # `review.resolved` with outcome `caught`: the reviewer saw the code change. The forge writes
 # `caught` or `not_acted` for what is left when the pull request merges. Findings are posted for a
-# published verdict only, never for a dry run, and not for the quality gate's own hold (a
+# published verdict only (the forge accepted the review), never for a dry run, and not for the quality gate's own hold (a
 # `(whole repository)` finding, which is a gate result rather than something review found); ids are per head and index, so a retry is a no-op.
 # Best-effort.
 report_review_findings() { # receipt repo number sha
-  local receipt="$1" repo="$2" number="$3" sha="$4" prior previous events
-  jq -e '.dry_run == true or (.verdict | type) != "object"' "$receipt" >/dev/null 2>&1 && return 0
+  local receipt="$1" repo="$2" number="$3" sha="$4" prior previous events live
+  jq -e '.dry_run == true or .posted != true or (.verdict | type) != "object"' "$receipt" >/dev/null 2>&1 && return 0
   events="$(jq -c --arg repo "$repo" --argjson pr "$number" --arg sha "$sha" '
     [.verdict.findings // [] | to_entries[] | .key as $n | .value as $f
      | select($f.file != "(whole repository)")
@@ -779,7 +780,10 @@ report_review_findings() { # receipt repo number sha
         detail: {reviewer_kind: "agent", severity: $f.severity, title: $f.title,
                  path: $f.file, line: ($f.line // null)}}]' "$receipt" 2>/dev/null)" || return 0
   prior="$(ls -t "$state/receipts/$repo/$number"-*.json 2>/dev/null | grep -v -- "-$sha.json$" | head -1 || true)"
-  if [[ -n "$prior" ]]; then
+  # Receipt time is not commit order: a re-review of an older head must not report the newer
+  # head's findings as resolved. Only the pull request's live head is compared with its prior.
+  live="$(pr_row "$repo" "$number" 2>/dev/null | jq -r .head_sha 2>/dev/null || true)"
+  if [[ -n "$prior" && "$live" == "$sha" ]]; then
     previous="${prior##*/$number-}"; previous="${previous%.json}"
     events="$(jq -c --slurpfile p "$prior" --argjson found "$events" --arg repo "$repo" --argjson pr "$number" \
       --arg sha "$sha" --arg old "$previous" '

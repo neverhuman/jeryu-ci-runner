@@ -391,6 +391,18 @@ jq -s -e --arg old "${finding_sha:0:12}" '.[-1].events | length == 1 and .[0].ki
   and (.[0].event_id | length <= 64)' "$t/events" > /dev/null
 echo 'ok findings reported per head, and resolved once a later head drops them'
 
+# A verdict the forge refused to publish reports no findings, and re-reviewing a head that is no
+# longer the pull request's head reports nothing resolved.
+printf '{"verdict":"approve","summary":"fixture review complete","findings":[{"severity":"low","title":"stale","file":"README.md","line":2,"detail":"d","evidence":"e"}]}\n' > "$t/verdict"
+advance
+touch "$t/reject"
+before="$(count "$t/events")"
+review
+rm "$t/reject"
+jq -e '.posted == false' "$(receipt)" > /dev/null
+! tail -n +"$((before + 1))" "$t/events" | grep -q review.finding
+echo 'ok no findings reported for a review the forge refused'
+
 # A full pass over a head this tool did not approve lands nothing and rewrites no branch, even with
 # a merger credential present. Landing an approved head is test/merge-pass.sh.
 "$here/pr-redteam" run --repo jeryu/fixture --pr 1 >> "$t/controller.log" 2>&1
