@@ -148,6 +148,14 @@ what the controller approves; who may push is still the forge's decision.
 Changing the rules changes the review identity (see "Review identity and
 reinstalls" below), so existing receipts requalify.
 
+Independently of that setting and in every repository, a head any of whose
+commits is authored or committed by git's own placeholder identity (`Your Name`,
+`you@example.com`) is held once per head with a `placeholder_author` receipt,
+before any agent budget is spent. The provenance of the exact commit a
+maintainer approves has to be readable from the log, and an unconfigured git
+writes a name that says nothing. This decides only whether a head is reviewed,
+so it does not move `review_format`: a head already reviewed keeps its receipt.
+
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,
@@ -190,7 +198,7 @@ as long as it runs, so `/runners` shows `REDTEAM_JOBS` rows (`<id>`, `<id>-2` â€
 instead of one row for the whole pass. Each beat follows the forge's runner contract, which refuses a
 beat with any field it does not define: `current` and `last` are cut down to
 that contract's fields before sending, and a receipt decision the forge has no
-reviewer conclusion for (`base_missing`, `author_domain`, `advice`) is sent as
+reviewer conclusion for (`base_missing`, `author_domain`, `placeholder_author`, `advice`) is sent as
 `hold` with the decision in `reason`. A beat also names the code it runs,
 `code: {repo, commit}`: the commit comes from `source-commit`, which
 `git archive` fills in (`export-subst`), or from a git checkout of this

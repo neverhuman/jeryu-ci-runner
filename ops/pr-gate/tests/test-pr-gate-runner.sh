@@ -902,6 +902,23 @@ grep -q 'release guard is present; skipping main-health' "$fixture/runner.log"
 rm -f "$guard"
 printf 'PASS main-health: posts a distinct context, skips unchanged green main, runs on demand and respects the release guard\n'
 
+# A main-health pass takes the repository pr-gate-wake.sh woke it for from its own hint file, so a
+# pass woken by a push to one repository cannot spend the pull-request slots' hint instead.
+printf 'acme/fixture 1 %s pr-head -\n' "$(cat "$fixture/head" 2>/dev/null || printf -- -)" \
+  >"$fixture/runner/cache/wake-dispatch"
+printf 'acme/fixture - - push %s\n' "$(date -u -d '-30 seconds' +%FT%TZ)" \
+  >"$fixture/runner/cache/wake-main-dispatch"
+invoke --main-health
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q 'woken for acme/fixture (push)' "$fixture/runner.log" \
+  || { printf 'the main-health pass did not take its own wake-up\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+[[ ! -s "$fixture/runner/cache/wake-main-dispatch" ]] \
+  || { printf 'the main-health wake-up line was not taken\n' >&2; exit 1; }
+[[ -s "$fixture/runner/cache/wake-dispatch" ]] \
+  || { printf 'the main-health pass took a pull-request hint\n' >&2; exit 1; }
+: >"$fixture/runner/cache/wake-dispatch"
+printf 'PASS a main-health pass reads its own wake-up hints and leaves the pull-request ones alone\n'
+
 # Discovery reads each owner's checkout root from the site configuration: an explicit
 # PR_GATE_CHECKOUT_ROOTS entry, else PR_GATE_CHECKOUT_ROOT_PATTERN with {owner} replaced, and keeps
 # the checkouts whose origin is that owner's repository on the forge and whose main requires the context.

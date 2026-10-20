@@ -180,7 +180,8 @@ starts an idle slot the moment it learns a head can be gated, from two sources:
 
 Before starting any slot, the waker saves every new head hint as one line of
 `~/gate-runner/cache/wake-dispatch` (`<owner/repo> <number|-> <sha|-> <source> <when|->`). The runner
-takes one line per tick and gates that head first of the pull-request heads its own pass found --
+takes one line per tick -- a main-health pass from `cache/wake-main-dispatch` instead, so the two
+never take each other's lines -- and gates that head first of the pull-request heads its own pass found --
 merge-queue entries still come first, each being one gate from landing -- and dates the queue wait
 from `<when>`. The line decides nothing else: the tick still lists, chooses, claims and gates heads
 by the ordinary rules, which is what keeps the slot timers a sufficient fallback. Hints survive busy
@@ -216,7 +217,12 @@ default branch, so main is gated when it moves instead of at the next timer tick
 the pass gates whatever main is by then (newest head wins) under the same slot lock, which keeps it
 to one gate per repository, and a slot that is mid-pass is left to finish. A push that found every
 slot busy is kept in `cache/wake-main-pending` and woken on a later look, because the fallback behind
-main-health is its own far-apart timer. A red main SHA is gated again on the next pass (only a green
+main-health is its own far-apart timer. That memory is one file per repository, and the woken slot is
+handed the repository in `cache/wake-main-dispatch` (`<owner/repo> - - push <when|->`), which the
+main-health pass takes one line of and gates first of its candidates: a pass builds candidates across
+every gated repository and gates one of them, so a single host-wide bit let a pass that gated another
+repository forget a push nothing had looked at. A repository's kept push is dropped only once a slot
+has been started for it. A red main SHA is gated again on the next pass (only a green
 one is skipped), which is what tells a flake -- the same commit failing and then passing -- from a
 defect that stays red; jeryu folds both out of the `main.status` events the heartbeat posts
 (jeryu-deploy: `GET /api/v1/main-health`), and a failed attempt's event names the failing tests the

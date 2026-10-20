@@ -357,7 +357,10 @@ heartbeat() { # [current-gate-json]
 # ---------------------------------------------------------------------------
 # The head this slot was woken for. pr-gate-wake.sh starts an idle slot the moment the forge says a
 # head became gateable, and leaves the head it started that slot for in cache/wake-dispatch as
-# "<owner/repo> <number|-> <sha|-> <source> <when|->". One line is taken per tick.
+# "<owner/repo> <number|-> <sha|-> <source> <when|->". One line is taken per tick. A main-health pass
+# reads cache/wake-main-dispatch instead, where a pushed default branch is a line naming the
+# repository only ("<owner/repo> - - push <when>"): what moved its main is not a pull request, and
+# whatever its main is by the time the pass runs is what that pass gates.
 #
 # It decides nothing: this tick still lists, chooses, claims and gates heads by the rules below. It
 # only puts that head first of the pull-request heads this pass found -- so a woken slot gates what
@@ -369,6 +372,9 @@ heartbeat() { # [current-gate-json]
 # timers behind it have long since covered that head.
 # ---------------------------------------------------------------------------
 DISPATCH="$HOME_DIR/cache/wake-dispatch"
+# A main-health pass reads its own file: a push to a default branch names a repository and no pull
+# request, and the two must not take each other's lines.
+((main_health == 0)) || DISPATCH="$HOME_DIR/cache/wake-main-dispatch"
 DISPATCH_TTL="${GATE_RUNNER_DISPATCH_TTL:-600}"
 [[ "$DISPATCH_TTL" =~ ^[0-9]+$ ]] || die "GATE_RUNNER_DISPATCH_TTL must be a whole number of seconds"
 ISO_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?(Z|[+-][0-9]{2}:?[0-9]{2})$'
@@ -557,10 +563,11 @@ gate_contribution_refusal() { # owner repo number head-sha
 # 1-2. choose the next head
 candidates=()
 [[ -z "$only_repo" ]] || only_repo="$(qualify "$only_repo")"
-# A scheduled tick takes the head pr-gate-wake.sh woke this slot for, if it left one. --repo/--pr is
-# somebody naming a head themselves, and a main-health pass gates no pull request, so neither reads
-# one; a tick that only lists leaves it for the tick that will gate it.
-[[ -n "$only_repo" || "$main_health" == 1 || "$list" == 1 ]] || dispatch_take
+# A scheduled tick takes the head pr-gate-wake.sh woke this slot for, if it left one; a main-health
+# pass takes the repository whose default branch moved, from its own file. --repo/--pr is somebody
+# naming a head themselves, so it reads none; a tick that only lists leaves the line for the tick
+# that will gate it.
+[[ -n "$only_repo" || "$list" == 1 ]] || dispatch_take
 for qualified in $REPOS; do
   qualified="$(qualify "$qualified")"
   [[ -z "$only_repo" || "$qualified" == "$only_repo" ]] || continue

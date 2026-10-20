@@ -41,6 +41,8 @@ case "\$*" in
   *is-active*) n=\${3#pr-gate-runner@}; n=\${n%.service}; if [[ -e "$fx/busy-\$n" ]]; then echo active; else echo inactive; exit 3; fi;;
   *start*) printf '%s\n' "\$*" >>"$fx/started.log"
     [[ ! -f "$fx/reject-start" ]] || exit 1
+    # A started service is busy until its pass ends, which is what keeps a second wake-up off it.
+    case "\$*" in *pr-gate-main-health@*) u="\${@: -1}"; : >"$fx/busy-\${u%.service}";; esac
     cat "$fx/home/cache/wake-dispatch" >>"$fx/dispatch-at-start.log";;
 esac
 SH
@@ -340,43 +342,76 @@ for _ in 1 2 3; do poll=0 run; done
 must 'a 500 is not retried each tick' test "$(grep -c gate-wanted "$fx/curl.log")" == 1
 printf 'PASS a failing signal route is paused, not retried every second\n'
 
-# A push to the default branch also starts a main-health slot (the gate on the new head); a push to
-# any other branch does not.
+# A push to the default branch also starts a main-health slot (the gate on the new head), and tells
+# it which repository it was started for; a push to any other branch does not.
 reset_home
-printf 'acme/acme-a\n' >"$fx/home/cache/protected-acme"
-pushed() { # seq ref
-  printf '{"seq":%s,"signals":[{"seq":%s,"repo":"acme/acme-a","ref_name":"%s","sha":"%s","source":"push","at":"2026-10-08T09:00:00Z"}]}' \
-    "$1" "$1" "$2" "$A1" >"$fx/forge/wanted.json"
+printf 'acme/acme-a\nacme/acme-b\n' >"$fx/home/cache/protected-acme"
+pushed() { # seq repo ref
+  printf '{"seq":%s,"signals":[{"seq":%s,"repo":"%s","ref_name":"%s","sha":"%s","source":"push","at":"2026-10-08T09:00:00Z"}]}' \
+    "$1" "$1" "$2" "$3" "$A1" >"$fx/forge/wanted.json"
 }
-pushed 10 refs/heads/main
+main_pending() { ls "$fx/home/cache/wake-main-pending" 2>/dev/null | tr '\n' ' '; }
+main_dispatch() { cat "$fx/home/cache/wake-main-dispatch" 2>/dev/null || true; }
+# A started slot is busy until its pass ends, as the real units are.
+main_health_idle() { rm -f "$fx"/busy-pr-gate-main-health@*; }
+pushed 10 acme/acme-a refs/heads/main
 GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
-pushed 11 refs/heads/main
+pushed 11 acme/acme-a refs/heads/main
 GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
 must 'a push to main wakes a main-health slot' grep -qx -- '--user start --no-block pr-gate-main-health@5.service' "$fx/started.log"
-: >"$fx/started.log"
-pushed 12 refs/heads/feature-x
+must 'the slot is told which repository' test "$(main_dispatch)" == "acme/acme-a - - push 2026-10-08T09:00:00Z"
+must 'a push a slot has is kept no longer' test "$(main_pending)" == ""
+main_health_idle
+pushed 12 acme/acme-a refs/heads/feature-x
 GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
 must 'a push to another branch wakes none' test "$(grep -c main-health "$fx/started.log" || true)" == 0
-printf 'PASS a push to the default branch wakes a main-health slot, a feature branch does not\n'
+printf 'PASS a push to the default branch wakes a main-health slot for that repository\n'
 
 # A push that finds the main-health slot busy is remembered and woken on a later look: the fallback
-# behind main-health is its own far-apart timer, so a forgotten push would leave main ungated.
+# behind main-health is its own far-apart timer, so a forgotten push would leave main ungated. The
+# memory is per repository, so a pass started for one repository cannot forget a push to another: a
+# main-health pass builds candidates across every gated repository and gates one of them.
+: >"$fx/home/cache/wake-main-dispatch"
 : >"$fx/busy-pr-gate-main-health@5"
-pushed 13 refs/heads/main
+pushed 13 acme/acme-a refs/heads/main
 GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
 must 'a busy slot starts nothing' test "$(grep -c main-health "$fx/started.log" || true)" == 0
-must 'the push is kept' test -e "$fx/home/cache/wake-main-pending"
-rm -f "$fx/busy-pr-gate-main-health@5"
-pushed 14 refs/heads/feature-x
+must 'the push is kept under its repository' test "$(main_pending)" == "acme-acme-a "
+pushed 14 acme/acme-b refs/heads/main
+GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
+must 'a second repository is kept beside it' test "$(main_pending)" == "acme-acme-a acme-acme-b "
+main_health_idle
+pushed 15 acme/acme-a refs/heads/feature-x
 GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
 must 'the kept push is woken on the next look' \
   grep -qx -- '--user start --no-block pr-gate-main-health@5.service' "$fx/started.log"
-must 'and then forgotten' test ! -e "$fx/home/cache/wake-main-pending"
+must 'the woken pass is told which repository' test "$(main_dispatch)" == "acme/acme-a - - push 2026-10-08T09:00:00Z"
+must 'only the repository a slot was started for is forgotten' test "$(main_pending)" == "acme-acme-b "
+main_health_idle
+pushed 16 acme/acme-a refs/heads/feature-x
+GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
+must 'the other repository is woken on a later look' \
+  test "$(main_dispatch | tail -1)" == "acme/acme-b - - push 2026-10-08T09:00:00Z"
+must 'and then forgotten' test "$(main_pending)" == ""
+printf 'PASS a push kept for one repository is woken for that repository and for no other\n'
+
+# A push kept by an earlier wake script is a single file naming no repository, so every gated
+# repository is looked at once rather than losing the push.
+main_health_idle
+: >"$fx/home/cache/wake-main-dispatch"
+rm -rf -- "$fx/home/cache/wake-main-pending"; : >"$fx/home/cache/wake-main-pending"
+pushed 17 acme/acme-a refs/heads/feature-x
+GATE_RUNNER_MAIN_HEALTH_SLOTS=5 run
+must 'the idle slot takes the first gated repository' test "$(main_dispatch)" == "acme/acme-a - - push -"
+must 'and the rest are kept for a later look' test "$(main_pending)" == "acme-acme-b "
+printf 'PASS a push kept with no repository name looks at every gated repository\n'
+
 # A host that runs no main-health slot keeps nothing to retry.
-pushed 15 refs/heads/main
+main_health_idle
+pushed 18 acme/acme-a refs/heads/main
 GATE_RUNNER_MAIN_HEALTH_SLOTS=' ' run
 must 'no main-health slot, nothing kept' test ! -e "$fx/home/cache/wake-main-pending"
-printf 'PASS a push that found every main-health slot busy is gated on a later look\n'
+printf 'PASS a host with no main-health slot keeps no push\n'
 
 # 429: the shared back-off honours Retry-After, makes no request while it lasts, and ends on success.
 reset_home

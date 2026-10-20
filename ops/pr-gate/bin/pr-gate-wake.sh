@@ -33,9 +33,11 @@
 # including when all slots are busy, so the next scheduled tick retains their priority.
 #
 # A woken slot is told which head it was woken for: one line per new head in
-# cache/wake-dispatch, as "<owner/repo> <number|-> <sha|-> <source> <when>". The runner takes one
-# line per tick and gates that head first of the ones its own pass found, and dates the queue wait
-# its gate.log event reports from <when>. The line decides nothing -- the runner chooses, claims and
+# cache/wake-dispatch, as "<owner/repo> <number|-> <sha|-> <source> <when>", and one line per pushed
+# default branch in cache/wake-main-dispatch (a main-health slot reads its own file, so a main-health
+# pass never takes a pull request's hint). The runner takes one line per tick and gates that head,
+# or that repository's main, first of the ones its own pass found, and dates the queue wait its
+# gate.log event reports from <when>. The line decides nothing -- the runner chooses, claims and
 # gates heads by its own rules -- so a line nobody took, or one taken by a slot that then found
 # better work, costs nothing but today's latency.
 #
@@ -69,8 +71,13 @@ STATE="$HOME_DIR/cache/wake-heads"
 SEQ="$HOME_DIR/cache/wake-seq"
 # The heads handed to the slots this script started; the runner takes one line per tick.
 DISPATCH="$HOME_DIR/cache/wake-dispatch"
-# A push to a default branch that found every main-health slot busy, to retry on the next look.
+# Pushes to a default branch that found every main-health slot busy, to retry on the next look: one
+# file per repository, named "<owner>-<repo>" and holding "<owner/repo> <when|->". It is per
+# repository because a main-health pass gates the repositories its own order reaches, so a slot woken
+# for a push to one repository can spend its pass on another.
 MAIN_PENDING="$HOME_DIR/cache/wake-main-pending"
+# The repositories handed to the main-health slots this script started; the pass takes one line.
+MAIN_DISPATCH="$HOME_DIR/cache/wake-main-dispatch"
 # Signal deduplication is local to this look and names a concrete PR, never just a pushed SHA.
 # Longest the open-PR view may go unread while the signal is working. It costs one list per gated
 # repository, so it is read on a short period rather than on every look.
@@ -121,7 +128,8 @@ watch="${watch# }"
 token="$(cat "$TOKEN_FILE")"
 [[ "$token" =~ ^[A-Za-z0-9._~+/-]+=*$ ]] || { printf 'wake credential has an invalid bearer-token shape\n' >&2; exit 2; }
 auth="$(mktemp)"; now="$(mktemp)"; heads="$(mktemp)"; signalled="$(mktemp)"
-trap 'rm -f -- "$auth" "$now" "$heads" "$signalled"' EXIT
+mains="$(mktemp)"; mainhint="$(mktemp)"
+trap 'rm -f -- "$auth" "$now" "$heads" "$signalled" "$mains" "$mainhint"' EXIT
 chmod 0600 "$auth"
 printf 'header = "Authorization: Bearer %s"\n' "$token" >"$auth"
 unset token
@@ -141,49 +149,87 @@ get() { # path [max-time] -> $body, $code. A 429 starts the shared back-off; whi
 # Append a batch atomically under the reader's lock. Keep the newest DISPATCH_KEEP lines; this is
 # bounded priority, not execution authority or a work journal. The runner drops expired/moved heads.
 DISPATCH_KEEP=64
-dispatch_add() { # heads-file
-  local heads="$1" kept
+dispatch_add() { # dispatch-file heads-file
+  local file="$1" heads="$2" kept
   [[ -s "$heads" ]] || return 0
-  exec 5>"$DISPATCH.lock" || return 1
+  exec 5>"$file.lock" || return 1
   flock -w 2 5 || { exec 5>&-; return 1; }
-  kept=$({ [[ ! -f "$DISPATCH" ]] || cat "$DISPATCH"; cat "$heads"; } | tail -n "$DISPATCH_KEEP") || return 1
-  printf '%s\n' "$kept" >"$DISPATCH.tmp" && mv -f -- "$DISPATCH.tmp" "$DISPATCH" || return 1
+  kept=$({ [[ ! -f "$file" ]] || cat "$file"; cat "$heads"; } | tail -n "$DISPATCH_KEEP") || return 1
+  printf '%s\n' "$kept" >"$file.tmp" && mv -f -- "$file.tmp" "$file" || return 1
   exec 5>&-
 }
 
-# Start one idle main-health slot when $1 pushes landed on a default branch. This only says WHEN: the
+# Start one idle main-health slot per repository whose default branch moved. This only says WHEN: the
 # slot gates whatever main is by then (newest head wins), under the repository lock that keeps it to
 # one gate per repository, and a slot already running is left to finish its pass.
 #
 # A push that finds every main-health slot busy IS remembered (cache/wake-main-pending) and retried
 # on later looks, unlike a pull-request signal: the fallback behind main-health is its own timer,
 # which runs far apart, so a forgotten push would leave main ungated until then. The memory is one
-# bit -- the next pass gates whatever main is by then -- and a host with no main-health slot at all
-# keeps nothing.
-wake_main_health() { # count
-  local want="$1" n slots woke=() slot_state
+# bit per repository -- the next pass started for it gates whatever its main is by then -- and a host
+# with no main-health slot at all keeps nothing. Per repository, because a pass builds candidates
+# across every gated repository and gates one of them: a single host-wide bit let a pass that gated
+# another repository clear a push nothing had looked at, leaving that main ungated until the far-apart
+# timer. The repository is handed to the slot in cache/wake-main-dispatch, which puts it first of that
+# pass's candidates and decides nothing else.
+main_pending_key() { # owner/repo -> the name of the file holding its kept push
+  [[ "$1" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ ]] || return 1
+  printf '%s' "${1%%/*}-${1#*/}"
+}
+
+wake_main_health() { # pushed-file, one "<owner/repo> <when>" line per pushed default branch
+  local pushed="$1" n slots woke=() slot_state repo at key f pushes started
+  pushes="$(grep -c . "$pushed" 2>/dev/null || true)"
   slots="${GATE_RUNNER_MAIN_HEALTH_SLOTS:-$(systemctl --user list-units --no-legend --plain --state=active 'pr-gate-main-health@*.timer' \
     | sed -n 's/^pr-gate-main-health@\([0-9]\+\)\.timer.*/\1/p' | sort -n | tr '\n' ' ' || true)}"
   if [[ -z "${slots// /}" ]]; then
-    rm -f -- "$MAIN_PENDING"
-    ((want > 0)) && say "$want default-branch push(es); this host runs no main-health slot"
+    rm -rf -- "$MAIN_PENDING"
+    ((pushes > 0)) && say "$pushes default-branch push(es); this host runs no main-health slot"
     return 0
   fi
-  [[ ! -e "$MAIN_PENDING" ]] || want=$((want + 1))
-  ((want > 0)) || return 0
-  for n in $slots; do
-    ((${#woke[@]} < 1)) || break
-    slot_state="$(systemctl --user is-active "pr-gate-main-health@$n.service" 2>/dev/null || true)"
-    [[ "$slot_state" == inactive || "$slot_state" == failed ]] || continue
-    systemctl --user start --no-block "pr-gate-main-health@$n.service" || continue
-    woke+=("$n")
-  done
-  if ((${#woke[@]} > 0)); then
+  # A plain file where the directory belongs is a push kept by an earlier wake script, which named no
+  # repository: every gated repository is marked instead, and a main that is already green costs its
+  # pass one cheap skip rather than a gate.
+  if [[ -f "$MAIN_PENDING" ]]; then
     rm -f -- "$MAIN_PENDING"
-  else
-    : >"$MAIN_PENDING"
+    mkdir -p "$MAIN_PENDING"
+    for repo in $watch; do
+      key="$(main_pending_key "$repo")" || continue
+      printf '%s -\n' "$repo" >"$MAIN_PENDING/$key"
+    done
+    say 'a kept push names no repository; looking at every gated repository once'
   fi
-  say "$want default-branch push(es); main-health slot(s) woken: ${woke[*]:-none idle, kept for the next look}"
+  mkdir -p "$MAIN_PENDING"
+  while read -r repo at; do
+    if ! key="$(main_pending_key "$repo")"; then
+      say "ignoring a default-branch push for a malformed repository name: $repo"; continue
+    fi
+    # The time only dates the gate's queue wait, and the runner refuses a hint line it cannot read,
+    # so a time the forge spells in some other way is kept as "-" rather than losing the push.
+    [[ "$at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.+Z-]{1,24}$ ]] || at=-
+    printf '%s %s\n' "$repo" "$at" >"$MAIN_PENDING/$key"
+  done <"$pushed"
+  for f in "$MAIN_PENDING"/*; do
+    [[ -f "$f" ]] || continue
+    read -r repo at <"$f" || continue
+    main_pending_key "$repo" >/dev/null || { rm -f -- "$f"; continue; }
+    started=""
+    for n in $slots; do
+      slot_state="$(systemctl --user is-active "pr-gate-main-health@$n.service" 2>/dev/null || true)"
+      [[ "$slot_state" == inactive || "$slot_state" == failed ]] || continue
+      # The hint is saved before the service starts, so a fast-starting pass finds it.
+      printf '%s - - push %s\n' "$repo" "${at:--}" >"$mainhint"
+      dispatch_add "$MAIN_DISPATCH" "$mainhint" \
+        || { say "cannot retain a main-health wake-up hint; keeping the push to $repo"; break; }
+      systemctl --user start --no-block "pr-gate-main-health@$n.service" || break
+      started="$n"; break
+    done
+    # The push is forgotten only once a slot was started for that repository; one that started
+    # nothing is kept for the next look.
+    [[ -z "$started" ]] || { rm -f -- "$f"; woke+=("$repo (slot $started)"); }
+  done
+  ((pushes > 0)) || ((${#woke[@]} > 0)) || return 0
+  say "$pushes default-branch push(es); main-health woken for: ${woke[*]:-none idle, kept for the next look}"
 }
 
 # Start up to $1 idle slots and say what it did. Idle is: the slot's timer is active (so neither
@@ -193,7 +239,7 @@ wake_main_health() { # count
 wake_slots() { # count what [heads-file]
   local want="$1" what="$2" heads="${3:-}" n slot_state woke=() slots
   ((want > 0)) || return 0
-  [[ -z "$heads" ]] || dispatch_add "$heads" || {
+  [[ -z "$heads" ]] || dispatch_add "$DISPATCH" "$heads" || {
     say 'cannot retain wake-up hints; leaving this view unacknowledged'
     return 1
   }
@@ -239,15 +285,16 @@ if ! signal_paused; then
     # A push to the default branch also wakes a main-health slot: that is the gate on the new head,
     # so a red main surfaces when it happens and not at the next main-health timer tick. Called on
     # every look with the signal, so a push that found the slots busy is retried.
-    main_pushes=0
+    : >"$mains"
     if [[ -n "$after" ]] && ((seq >= after)); then
+      # One line per pushed repository, carrying the newest push time this signal reported for it.
       # shellcheck disable=SC2086
-      main_pushes="$(jq -r '[.signals[]? | select(.repo | IN($ARGS.positional[]))
-        | select(.source == "push" and ((.ref_name // "") | test("^(refs/heads/)?(main|master)$")))] | length' \
-        <<<"$body" --args $watch)"
-      [[ "$main_pushes" =~ ^[0-9]+$ ]] || main_pushes=0
+      jq -r '[.signals[]? | select(.repo | IN($ARGS.positional[]))
+        | select(.source == "push" and ((.ref_name // "") | test("^(refs/heads/)?(main|master)$")))]
+        | group_by(.repo)[] | max_by(.at) | "\(.repo) \(.at // "-")"' \
+        <<<"$body" --args $watch >"$mains"
     fi
-    wake_main_health "$main_pushes"
+    wake_main_health "$mains"
     printf '%s\n' "$seq" >"$SEQ.tmp" && mv -f -- "$SEQ.tmp" "$SEQ"
     signal=1
   else

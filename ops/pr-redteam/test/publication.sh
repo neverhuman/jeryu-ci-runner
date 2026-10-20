@@ -264,6 +264,29 @@ jq -e '.decision == "author_domain" and .foreign_emails == ["x@notexample.invali
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
 echo 'ok author domain held before the model, matching domain reviewed'
 
+# Git's own placeholder identity holds the head in every repository, with no domain configured, once
+# per head and before the model runs: the log of the commit a maintainer approves says nothing.
+model_calls="$(count "$t/model-calls")"; accepted_before="$(count "$t/accepted")"
+named_head="$(cat "$t/head")"
+printf 'unsigned\n' >> "$t/repo/README.md"
+fixture_git -C "$t/repo" -c 'user.name=Your Name' -c user.email=you@example.com commit -qam placeholder
+g rev-parse HEAD > "$t/head"
+review
+jq -e '.decision == "placeholder_author" and .posted == false
+  and (.placeholder_commits | length == 1)
+  and (.placeholder_commits[0] | endswith("Your Name <you@example.com>"))' "$(receipt)" > /dev/null
+attempts="$(find "$t/state/attempts" -type f | wc -l)"
+review
+[[ "$(find "$t/state/attempts" -type f | wc -l)" == "$attempts" ]]
+[[ "$(count "$t/model-calls")" == "$model_calls" && "$(count "$t/accepted")" == "$accepted_before" ]]
+# A head whose commits all name a person is reviewed as usual.
+g reset -q --hard "$named_head"; g rev-parse HEAD > "$t/head"
+advance
+review
+jq -e '.decision != "placeholder_author" and .posted == true' "$(receipt)" > /dev/null
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+echo 'ok a placeholder commit identity holds before the model, with no domain configured'
+
 # A new base also invalidates the previous exact-head review receipt.
 model_calls="$(count "$t/model-calls")"
 g branch -f main "$(cat "$t/head")"

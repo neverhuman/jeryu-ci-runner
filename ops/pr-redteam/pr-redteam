@@ -54,6 +54,12 @@
 # Re-reading at publication keeps the note current for a review that loaded the pull request
 # seconds before the approval landed.
 #
+# A head whose commits carry git's own placeholder identity (`Your Name`, `you@example.com`) is held
+# for a person before any agent budget is spent, in every repository and with no configuration: the
+# log of the exact head a maintainer must approve then says nothing about who wrote it, and this
+# tool's approval would be the only thing standing behind it. `REDTEAM_AUTHOR_DOMAINS` is the
+# per-repository form of the same rule.
+#
 # What it never does: tag, waive, post statuses, or approve a PR whose author is the token's
 # own identity (the forge forbids self-approval). If the agent errors, times out or returns
 # something unparseable, the PR is left alone and retried on the next run — a failed review is never
@@ -509,10 +515,12 @@ skip_reason() { # row me include_drafts force
   if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" --argjson identities "$reusable_identities" --arg base "$(jq -r .base_sha <<< "$row")" \
       '(.review_identity as $id | $identities | any(. == $id)) and .base_sha == $base
        and (.posted == true or .decision == "base_missing" or .decision == "author_domain"
+            or .decision == "placeholder_author"
             or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
     case "$(jq -r .decision "$receipt")" in
       base_missing) echo "$(jq -r '.base_ref // "the base branch"' "$receipt") does not exist yet; a person creates it" ;;
       author_domain) echo "commits at ${sha:0:12} are not all @$(jq -r .author_domain "$receipt"); a person reviews it" ;;
+      placeholder_author) echo "commits at ${sha:0:12} carry a placeholder identity; a person reviews it" ;;
       *) echo "already reviewed at ${sha:0:12} ($(jq -r .decision "$receipt"))" ;;
     esac
     return
@@ -533,6 +541,24 @@ foreign_emails() { # git-dir base head domain
   git -C "$1" log --format='%ae%n%ce' "$2..$3" | sort -u | while IFS= read -r email; do
     [[ "${email,,}" == *"@${4,,}" && "${email%@*}" != *@* ]] || printf '%s\n' "$email"
   done
+}
+
+# Commits in base..head whose author or committer is git's own placeholder identity, one
+# "<sha12> <name> <email>" per line. A maintainer approving a head reads who wrote it from the log,
+# and `Your Name <you@example.com>` is what an unconfigured git writes there: it says nothing, so the
+# head is left to a person rather than reviewed as if its provenance were known.
+placeholder_identities() { # git-dir base head
+  local sha an ae cn ce who name email
+  git -C "$1" log --format='%H%x09%an%x09%ae%x09%cn%x09%ce' "$2..$3" \
+    | while IFS=$'\t' read -r sha an ae cn ce; do
+        for who in "$an|$ae" "$cn|$ce"; do
+          name="${who%%|*}" email="${who#*|}"
+          case "${name,,}|${email,,}" in
+            'your name|'*|*'|you@example.com')
+              printf '%s %s <%s>\n' "${sha:0:12}" "$name" "$email"; break ;;
+          esac
+        done
+      done
 }
 
 # Branch names the forge has for one repository, one `refs/heads/...` per line.
@@ -862,7 +888,7 @@ review_check_done() { # receipt repo number sha started-epoch
   case "$decision" in
     approve) conclusion=success; title="pr-redteam approved" ;;
     advice) conclusion=neutral; title="pr-redteam posted advice" ;;
-    hold|too_large|author_domain|base_missing) conclusion=action_required; title="pr-redteam holds" ;;
+    hold|too_large|author_domain|placeholder_author|base_missing) conclusion=action_required; title="pr-redteam holds" ;;
     interrupted) conclusion=cancelled; title="pr-redteam interrupted" ;;
     *) conclusion=failure; title="pr-redteam review failed" ;;
   esac
@@ -1011,6 +1037,21 @@ review_one() { # owner/name number dry-run force include-drafts
           reviewer_login:$reviewer, review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$receipt"
       return 0
     fi
+  fi
+  # A commit whose author is git's placeholder identity holds the same way, in every repository: the
+  # provenance of the exact head a maintainer must approve cannot be read from the log at all. It
+  # does not move review_format: it only decides whether a head is reviewed, never what a review
+  # concludes, and a head already reviewed keeps the receipt it has.
+  local placeholders; placeholders="$(placeholder_identities "$cache" "$base_sha" "$sha")"
+  if [ -n "$placeholders" ]; then
+    say "$tag: placeholder commit identities ($(paste -sd, <<<"$placeholders")); NOT approving, needs a human"
+    jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" \
+      --arg placeholders "$placeholders" --arg identity "$review_identity" \
+      --arg base "$forge_base_sha" --arg diff_base "$base_sha" --arg reviewer "$me" \
+      '{repo:$repo, number:$number, head_sha:$sha, decision:"placeholder_author", posted:false,
+        placeholder_commits:($placeholders | split("\n")), reviewed_at:$at,
+        reviewer_login:$reviewer, review_identity:$identity, base_sha:$base, diff_base_sha:$diff_base}' | store_receipt "$receipt"
+    return 0
   fi
   say "$tag: reviewing ${sha:0:12} ($files_count files, $diff_bytes bytes of diff)"
 
@@ -1192,13 +1233,15 @@ forge_current() { # current-file JSON -> GateRunnerTask JSON, or null
 }
 # The forge accepts only approve, hold, failed, interrupted, publication_rejected and too_large as a
 # reviewer's conclusion. The other receipt decisions are reviews left for a person (a missing base
-# branch, commit emails outside the required domain) or posted only as advice (a contributed pull
-# request): each is reported as `hold`, with its receipt decision in `reason`.
+# branch, commit emails outside the required domain, a placeholder commit identity) or posted only
+# as advice (a contributed pull request): each is reported as `hold`, with its receipt decision in
+# `reason`.
 forge_last() { # last-file JSON -> GateRunnerResult JSON, or null
   jq -c 'if type == "object" then
       (.conclusion // "") as $decision
       | ({base_missing: "base_missing: the base branch does not exist yet; a person creates it",
         author_domain: "author_domain: commit emails are outside the required domain; a person reviews it",
+        placeholder_author: "placeholder_author: commits carry the git default placeholder identity; a person reviews it",
         advice: "advice: contributed pull request, reviewed as advice; a maintainer decides"} | .[$decision]) as $why
       | {repo, pr, sha, recipe, conclusion, seconds, finished_at}
         + (if $why == null then {} else {conclusion: "hold", reason: $why} end)
