@@ -111,5 +111,15 @@ out="$(body "$(satisfy "$held" "$decision")" approve "$sha" internal "$decision"
 [[ "$out" == *"No recorded owner decision"* ]] && ok "the review preserves the unchanged finding" \
   || bad "body hides the finding: $out"
 
+# A pipe in a finding must be escaped with one backslash, or the table row breaks.
+pipe='{"severity":"low","title":"Swallowed failure a || b","file":"ops/x.sh","line":3,"detail":"Runs `make || true` so a failure is hidden."}'
+piped="{\"verdict\":\"block\",\"summary\":\"s\",\"findings\":[$pipe]}"
+out="$(body "$piped" block "$sha" internal null)"
+row="$(grep -F 'Swallowed failure' <<<"$out")"
+[[ "$row" == *'a \|\| b'* && "$row" != *'\\|'* ]] && ok "a pipe is escaped with a single backslash" || bad "pipe escape: $row"
+unescaped="$(sed 's/\\|//g' <<<"$row" | tr -cd '|' | wc -c)"
+[ "$unescaped" = 4 ] && ok "a finding with || renders as one table row" || bad "row has $unescaped cell pipes: $row"
+[ "$(grep -c 'Swallowed failure' <<<"$out")" = 1 ] || bad "finding spans several lines"
+
 ((fail == 0))
 echo 'OWNER DECISION PASS'

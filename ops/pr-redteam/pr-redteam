@@ -706,7 +706,7 @@ render_body() { # verdict-json decision sha origin [owner-decision-json]
     (if (.findings | length) == 0 then "No findings."
      else ("| | Finding | Where |", "|---|---|---|",
            (.findings | sort_by({"critical":0,"high":1,"medium":2,"low":3}[.severity])[]
-            | "| \(.severity | sev_icon) \(.severity) | **\(.title | gsub("\\|";"\\\\|"))** — \(.detail | gsub("\n";" ") | gsub("\\|";"\\\\|")) | `\(.file)\(if .line then ":\(.line)" else "" end)` |"))
+            | "| \(.severity | sev_icon) \(.severity) | **\(.title | gsub("\\|";"\\|"))** — \(.detail | gsub("\n";" ") | gsub("\\|";"\\|")) | `\(.file)\(if .line then ":\(.line)" else "" end)` |"))
      end),
     "",
     "<sub>pr-redteam · read-only agent (\($model)) · exact head `\($sha[0:12])` · a new push is re-reviewed</sub>"
