@@ -8,7 +8,10 @@ use jeryu_runner_core::job::JobRequest;
 use jeryu_runner_core::sandbox::SandboxPlan;
 use jeryu_runner_oci::{AgentSessionPlan, ContainerLifecycle, plan_agent_session};
 
-use crate::workcell::{WorkcellClaimRequest, WorkcellError, WorkcellLease, WorkcellManager};
+use crate::workcell::{
+    REASON_EPOCH_FENCED, REASON_STARTUP_REBASE_FAILED, WorkcellClaimRequest, WorkcellError,
+    WorkcellLease, WorkcellManager,
+};
 
 /// One pre-warmed cell: a workcell id paired with the detached container that
 /// backs it. The id is exactly the container's `jeryu.workcell=<id>` label, so
@@ -99,8 +102,8 @@ impl WarmPool {
 
     /// Replace the pool ledger's claim fence with the runner lifetimes the
     /// daemon admitted; see [`WorkcellManager::sync_runner_fence`]. A draining
-    /// runner is admitted only to repair from a snapshot, so it claims no warm
-    /// cell.
+    /// runner is admitted only to hold and repair in-flight work, so it claims
+    /// no warm cell.
     pub fn sync_runner_fence(
         &mut self,
         admitted: impl IntoIterator<Item = (String, crate::workcell::AdmittedRunner)>,
@@ -192,38 +195,40 @@ impl WarmPool {
 
     /// Settle the entry a refused claim popped, then refill, and return the
     /// claim's own refusal so the caller can still tell a fence from a block.
-    /// What happens to the container follows the refusal's cause, never a
-    /// re-read of ledger state:
+    /// What happens to the container follows the refusal's cause and, for a
+    /// diverged pool, whether the ledger shows a live lease for it:
     ///
-    /// - `workcell_epoch_fenced`: the fence is checked before anything else, so
-    ///   the cell is untouched and its container goes back to the front of the
-    ///   pool (if the ledger still queues it; otherwise the entry is dropped).
-    /// - `workcell_startup_rebase_failed`: the ledger consumed the cell and
-    ///   blocked it. Its container was never handed to an agent, so it holds no
-    ///   workspace or evidence; the Blocked lease is the record of the failure
-    ///   (main ref, shas, reason). The idle container is removed rather than
-    ///   left running with no handle.
-    /// - any other refusal (`workcell_claim_denied`): the pool and ledger have
-    ///   diverged and the cell may back a live session, so the container is
-    ///   never destroyed here. The entry leaves the pool and `reap_orphans`
-    ///   settles the container against the active-lease ledger.
+    /// - an epoch fence, while the ledger still queues the cell: the fence is
+    ///   checked before anything else, so the cell is untouched and its
+    ///   container goes back to the front of the pool.
+    /// - a failed startup rebase: the ledger consumed the cell and blocked it.
+    ///   Its container was never handed to an agent, so it holds no workspace
+    ///   or evidence; the Blocked lease is the record of the failure (main
+    ///   ref, shas, reason). The idle container is removed.
+    /// - any other refusal (a fence the ledger no longer queues the cell for,
+    ///   or a claim denial): the pool and ledger have diverged. The container
+    ///   is kept only while the ledger shows a live lease (claimed, held or
+    ///   repairing) for its cell, since a session may be using it; otherwise
+    ///   nothing backs it and it is removed now, so refusals never strand
+    ///   containers until the next daemon restart's `reap_orphans`.
     ///
     /// A failed removal or refill is appended to the refusal, never replaces it.
     fn give_back_refused(&mut self, entry: WarmEntry, err: WorkcellError) -> RunnerError {
         let mut message = err.message().to_string();
-        match err.reason {
-            "workcell_epoch_fenced" if self.manager.is_ready_queued(&entry.workcell_id) => {
-                self.warm.push_front(entry);
+        let reason = err.reason;
+        let requeue =
+            reason == REASON_EPOCH_FENCED && self.manager.is_ready_queued(&entry.workcell_id);
+        if requeue {
+            self.warm.push_front(entry);
+        } else if reason == REASON_STARTUP_REBASE_FAILED
+            || !self.manager.has_live_lease(&entry.workcell_id)
+        {
+            if let Err(remove) = self.runtime.remove(&entry.container_id) {
+                message.push_str(&format!(
+                    "; removing idle container {} of the refused cell also failed: {remove}",
+                    entry.container_id
+                ));
             }
-            "workcell_startup_rebase_failed" => {
-                if let Err(remove) = self.runtime.remove(&entry.container_id) {
-                    message.push_str(&format!(
-                        "; removing idle container {} of the blocked cell also failed: {remove}",
-                        entry.container_id
-                    ));
-                }
-            }
-            _ => {}
         }
         // Restore steady-state depth even when the claimed cell blocks on a
         // failed startup rebase, so the next session still reuses a warm cell.
@@ -752,5 +757,63 @@ mod tests {
         );
         assert!(!pool.warm_container_ids().contains(&front.container_id));
         assert_eq!(pool.warm_depth(), 1, "the pool refills");
+    }
+
+    // A refusal for a cell that backs no live lease must not strand its
+    // container: a released cell is denied, and its container is removed on
+    // every replay, so the runtime stays at the pool depth however many
+    // refusals arrive before the next restart's reap.
+    #[test]
+    fn refusals_for_a_cell_with_no_live_lease_strand_no_container() {
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = synced(WarmPool::new(fake.clone(), 1).expect("warm the pool"));
+        for attempt in 0..8 {
+            let front = pool.warm.front().cloned().expect("a warm entry");
+            pool.manager
+                .claim_ready(
+                    &front.workcell_id,
+                    session_claim("agent-17", &format!("held-{attempt}"), 9).claim,
+                )
+                .expect("claimed outside the pool");
+            pool.manager
+                .release(&front.workcell_id, 9)
+                .expect("release");
+
+            let err = pool
+                .claim(session_claim("agent-18", &format!("run-7{attempt}"), 9))
+                .expect_err("the popped cell is released");
+            assert_eq!(err.code(), "workcell_claim_denied");
+            assert!(
+                !pool.warm_container_ids().contains(&front.container_id),
+                "the released cell's container left the pool"
+            );
+            assert_eq!(
+                fake.list_workcells().expect("list").len(),
+                pool.warm_depth(),
+                "no container outlives its refused cell"
+            );
+        }
+    }
+
+    // A fenced claim whose cell the ledger no longer queues is a divergence
+    // too: nothing backs the container, so it is removed rather than dropped.
+    #[test]
+    fn a_fence_for_a_cell_the_ledger_no_longer_queues_removes_its_container() {
+        let fake = Arc::new(FakeContainerRuntime::default());
+        let mut pool = WarmPool::new(fake.clone(), 1).expect("warm the pool");
+        let front = pool.warm.front().cloned().expect("a warm entry");
+        pool.manager.dequeue_ready_for_test(&front.workcell_id);
+
+        let err = pool
+            .claim(session_claim("agent-19", "run-19", 9))
+            .expect_err("an unsynced pool fences");
+        assert_eq!(err.code(), "workcell_epoch_fenced");
+        assert!(fake.lifecycle_ops().contains(&LifecycleOp::Remove {
+            container_id: front.container_id.clone()
+        }));
+        assert_eq!(
+            fake.list_workcells().expect("list").len(),
+            pool.warm_depth()
+        );
     }
 }

@@ -52,6 +52,11 @@ const REPAIR_STATE_FIXES: &[&str] = &[
     "start live repair only after the workcell is in the held state",
 ];
 
+/// Stable `reason` codes, for callers that branch on the kind of refusal.
+const REASON_CLAIM_DENIED: &str = "workcell_claim_denied";
+pub(crate) const REASON_STARTUP_REBASE_FAILED: &str = "workcell_startup_rebase_failed";
+pub(crate) const REASON_EPOCH_FENCED: &str = "workcell_epoch_fenced";
+
 impl WorkcellError {
     fn new(
         purpose: &'static str,
@@ -74,7 +79,7 @@ impl WorkcellError {
     pub(super) fn claim_denied(message: impl Into<String>) -> Self {
         Self::new(
             "claim a ready workcell",
-            "workcell_claim_denied",
+            REASON_CLAIM_DENIED,
             CLAIM_FIXES,
             "docs/testing.md#workcells",
             "rerun cargo test -p jeryu-runnerd workcell --jobs 40",
@@ -85,7 +90,7 @@ impl WorkcellError {
     pub(super) fn startup_rebase_failed(message: impl Into<String>) -> Self {
         Self::new(
             "fetch main and rebase the workcell",
-            "workcell_startup_rebase_failed",
+            REASON_STARTUP_REBASE_FAILED,
             STARTUP_REBASE_FIXES,
             "docs/testing.md#workcells",
             "rerun cargo test -p jeryu-runnerd workcell --jobs 40",
@@ -151,7 +156,7 @@ impl WorkcellError {
     pub(super) fn epoch_fenced(message: impl Into<String>) -> Self {
         Self::new(
             "fence outdated workcell epochs",
-            "workcell_epoch_fenced",
+            REASON_EPOCH_FENCED,
             EPOCH_FENCE_FIXES,
             "docs/boundaries.md#workcells",
             "rerun cargo test -p jeryu-runnerd workcell --jobs 40",

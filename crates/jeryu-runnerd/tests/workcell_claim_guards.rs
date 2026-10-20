@@ -302,12 +302,12 @@ fn freeze_repair_cell(
         .expect("freeze the repair cell's failed run")
 }
 
-// Draining stops every fresh cell: a draining runner's claim and failed-tree
-// hold are both fenced before a ready cell is consumed or a cell minted. The
-// one thing it may still do is repair from a snapshot of in-flight work it
-// froze while active.
+// Draining stops every fresh claim: it is fenced before a ready cell is
+// consumed or a cell minted. The registry lets in-flight work finish, so a
+// draining runner may still hold its failed tree and repair from a snapshot,
+// at its current epoch only.
 #[test]
-fn a_draining_runner_repairs_existing_in_flight_work_but_holds_and_claims_nothing() {
+fn a_draining_runner_holds_and_repairs_in_flight_work_but_claims_nothing() {
     let (mut fleet, epoch) = fleet();
     let mut ledger = WorkcellManager::with_warm_pool(1);
     let held = fleet
@@ -325,16 +325,18 @@ fn a_draining_runner_repairs_existing_in_flight_work_but_holds_and_claims_nothin
     assert_eq!(ready_before, 1, "the warm pool has a ready cell to lose");
     let cells_before = ledger.workcells().len();
     let fenced = fleet
-        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-31", epoch))
-        .expect_err("a draining runner holds no new failed tree");
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-31", epoch - 1))
+        .expect_err("draining admits a hold only at the current epoch");
     assert_eq!(fenced.reason, "workcell_epoch_fenced");
-    assert!(
-        fenced.message().contains("draining"),
-        "{}",
-        fenced.message()
-    );
     assert_eq!(ledger.ready_count(), ready_before, "no warm cell consumed");
     assert_eq!(ledger.workcells().len(), cells_before, "no cell minted");
+    let held_while_draining = fleet
+        .hold_failed_tree(&mut ledger, hold_request("agent-anvil-31", epoch))
+        .expect("a draining runner holds the failed tree of its in-flight work");
+    assert_eq!(held_while_draining.state, WorkcellState::Held);
+    assert_eq!(held_while_draining.admitted_runner_epoch, epoch);
+    let ready_before = ledger.ready_count();
+    let cells_before = ledger.workcells().len();
 
     let fenced = fleet
         .claim_workcell(&mut ledger, claim_request("agent-anvil-32", epoch))

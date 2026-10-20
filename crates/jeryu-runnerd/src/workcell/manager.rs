@@ -52,8 +52,8 @@ impl WorkcellManager {
     /// table also prunes it: a runner the registry no longer admits (reaped,
     /// never registered, re-registered at a new epoch) loses its entry and is
     /// fenced. A [`RunnerAdmission::Draining`] runner is fenced from every
-    /// claim, hold and warm cell; it may only repair from a snapshot of its
-    /// existing in-flight work.
+    /// fresh claim and warm cell; it may still hold a failed tree and repair
+    /// from a snapshot, the in-flight work the registry lets it finish.
     pub fn sync_runner_fence(
         &mut self,
         admitted: impl IntoIterator<Item = (String, AdmittedRunner)>,
@@ -148,6 +148,25 @@ impl WorkcellManager {
                 .cells
                 .get(workcell_id)
                 .is_some_and(|cell| matches!(cell.state, WorkcellState::Ready))
+    }
+
+    /// True while `workcell_id` backs live work: a claimed, held or repairing
+    /// cell. A container of any other cell (unknown, ready, blocked,
+    /// released) backs no session.
+    pub(crate) fn has_live_lease(&self, workcell_id: &str) -> bool {
+        self.cells.get(workcell_id).is_some_and(|cell| {
+            matches!(
+                cell.state,
+                WorkcellState::Claimed | WorkcellState::Held | WorkcellState::Repairing
+            )
+        })
+    }
+
+    /// Drop `workcell_id` from the ready queue, leaving its cell Ready, to
+    /// reproduce a pool and ledger that diverged.
+    #[cfg(test)]
+    pub(crate) fn dequeue_ready_for_test(&mut self, workcell_id: &str) {
+        self.ready_queue.retain(|id| id != workcell_id);
     }
 
     /// Claim the ready cell with this exact id — the warm pool has already paired
@@ -438,11 +457,14 @@ impl WorkcellManager {
             &failure_log_digest,
             &self.forbidden_token_values,
         )?;
-        // Holding a failed tree takes a ready cell or mints a fresh one, so it
-        // is fenced as a fresh claim: only an active runner at its exact
-        // epoch holds, and a draining runner is refused before any cell is
-        // consumed or minted.
-        let mut lease = self.claim(claim)?;
+        // Holding a failed tree preserves the failure of work the runner
+        // already started, which a draining runner may finish. It is fenced
+        // like a repair: active or draining at exactly the epoch the daemon
+        // issued, refused before any cell is consumed or minted otherwise. A
+        // fresh claim still refuses a draining runner.
+        self.require_repair_epoch(&claim.runner_id, claim.runner_epoch)?;
+        let admitted = claim.runner_epoch;
+        let mut lease = self.claim_unfenced(claim, admitted)?;
         let workcell_id = lease.workcell_id.clone();
         let cell = self
             .cells
@@ -632,7 +654,7 @@ impl WorkcellManager {
 
     /// Refuse a fresh claim unless the runner is active at exactly the epoch
     /// the daemon issued it. A draining runner takes no fresh cell, which
-    /// covers claims, warm cells and holds of a failed tree.
+    /// covers claims and warm cells.
     fn require_claim_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
         match self.require_admitted_epoch(runner_id, runner_epoch)? {
             RunnerAdmission::Active => Ok(()),
@@ -642,9 +664,10 @@ impl WorkcellManager {
         }
     }
 
-    /// Refuse a repair from a frozen snapshot unless the runner is active or
-    /// draining at exactly the epoch the daemon issued it. This is the only
-    /// path a draining runner is admitted to.
+    /// Refuse in-flight work (a hold of a failed tree or a repair from a
+    /// frozen snapshot) unless the runner is active or draining at exactly the
+    /// epoch the daemon issued it. These are the only paths a draining runner
+    /// is admitted to.
     fn require_repair_epoch(&self, runner_id: &str, runner_epoch: u64) -> WorkcellResult<()> {
         self.require_admitted_epoch(runner_id, runner_epoch)
             .map(|_| ())

@@ -1,8 +1,8 @@
 //! The fleet is the authority for work-cell claim epochs: every claim entry
 //! point here first syncs the ledger's fence from the node registry, so a
 //! fresh claim is admitted only at the epoch the registry issued to an active
-//! node; repair from a snapshot of existing in-flight work is also admitted
-//! at a draining node's epoch, and nothing else is.
+//! node; holding a failed tree and repairing from a snapshot of in-flight
+//! work are also admitted at a draining node's epoch, and nothing else is.
 
 use jeryu_runner_core::error::RunnerResult;
 use jeryu_runner_registry::NodeState;
@@ -29,8 +29,8 @@ impl RunnerFleet {
     }
 
     /// The work-cell fence for every runner lifetime the registry still
-    /// admits: active nodes for any claim, draining nodes only to repair from
-    /// a snapshot of existing in-flight work (the registry documents that a
+    /// admits: active nodes for any claim, draining nodes only to hold a failed
+    /// tree or repair from a snapshot of in-flight work (the registry documents that a
     /// draining node's in-flight work may finish, and that it takes no new
     /// work). A registering node has no in-flight work yet, and a reaped
     /// dead node or a re-registered node's earlier epochs are not listed, so
@@ -67,9 +67,9 @@ impl RunnerFleet {
         ledger.claim(request)
     }
 
-    /// Hold a failed tree in a fresh cell, fenced like
-    /// [`Self::claim_workcell`]: it takes a ready cell or mints one, so a
-    /// draining runner is refused.
+    /// Hold a failed tree in a cell, fenced on the runner's current lifetime
+    /// (active or draining) like [`Self::repair_workcell`]: a draining runner
+    /// may finish its in-flight work, but takes no fresh claim.
     pub fn hold_failed_tree(
         &self,
         ledger: &mut WorkcellManager,

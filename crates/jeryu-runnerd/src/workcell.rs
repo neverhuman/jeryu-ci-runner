@@ -11,6 +11,7 @@ mod manager;
 mod model;
 
 use archive::{is_within_any_root, validate_archive_entry, validate_export_path};
+pub(crate) use error::{REASON_EPOCH_FENCED, REASON_STARTUP_REBASE_FAILED};
 
 use jeryu_runner_core::credguard::{
     deny_credential_material, deny_token_values, guard_write_destination,
