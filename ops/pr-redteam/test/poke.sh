@@ -153,13 +153,13 @@ rm "$t/pass-active"
 ! grep -q '^ready ' "$t/state/poke-seen"
 echo 'ok an unreviewed head starts one pass'
 
-# That pass found jankurai/proof still running and left the head with no receipt. The used-up
+# That pass computed the review while proof ran and left a waiting receipt. The used-up
 # `review` key does not strand it: once the passport for the head is blocked only by the missing
 # approval (an unknown blocker counts as not green), one `ready` poke starts a pass. Each such poke reads the pull request once.
 touch "$t/proof-pending"
 pass
 grep -q 'waiting for jankurai/proof' "$t/controller.log"
-[[ ! -e "$t/state/receipts/jeryu/fixture/107-$(cat "$t/head").json" ]]
+jq -e '.decision == "waiting_gate" and .posted == false' "$t/state/receipts/jeryu/fixture/107-$(cat "$t/head").json" >/dev/null
 before="$(reads)"; poke
 [[ "$(starts)" == 1 && "$(( $(reads) - before ))" == 1 ]]
 rm "$t/proof-pending"; touch "$t/required-failing"

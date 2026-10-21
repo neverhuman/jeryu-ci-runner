@@ -18,8 +18,8 @@
 # The quality gate comes first: where the base branch requires `jankurai/proof`, a head whose proof
 # fails or failed to score is held with that reason and no agent budget is spent on it. Nothing here
 # can approve such a head, and the forge refuses an approval on one anyway. A proof that is queued,
-# running or has not started yet is no verdict: that head is left untouched and reviewed by a later
-# pass, once the proof has a result.
+# running or has not started yet admits an internal review alongside the gate. Its validated result
+# is saved for a later pass; publication still requires the proof to pass.
 #
 # pr-redteam also lands what it approved. After the review pass, every open PR this tool approved
 # at its current head is merged as the merger identity, once the forge itself says it can merge
@@ -1749,6 +1749,7 @@ review_check_done() { # receipt repo number sha started-epoch
   local receipt="$1" repo="$2" number="$3" sha="$4" started="$5" decision conclusion title summary text seconds
   decision="$(jq -r '.decision // "failed"' "$receipt" 2>/dev/null || echo failed)"
   case "$decision" in
+    waiting_gate) conclusion=neutral; title="pr-redteam review awaits proof" ;;
     approve) conclusion=success; title="pr-redteam approved" ;;
     advice) conclusion=neutral; title="pr-redteam posted advice" ;;
     hold|too_large|author_domain|placeholder_author|base_missing) conclusion=action_required; title="pr-redteam holds" ;;
@@ -1781,14 +1782,11 @@ review_one() { # owner/name number dry-run force include-drafts
   reason="$(skip_reason "$row" "$me" "$drafts" "$force")"
   [ -z "$reason" ] || { say "$tag: skip — $reason"; return 0; }
 
-  # The quality gate is read once per attempt, before anything is recorded: a proof with no result
-  # yet leaves this head untouched — no receipt, no post, no agent — so the next pass or poke
-  # reviews it as soon as the proof has one. The reasons that are a verdict hold below.
-  local gate_reason
+  # Compute internal reviews while proof runs. Publication still rechecks the gate.
+  local gate_reason proof_pending=0
   gate_reason="$(jankurai_gate_hold "$repo" "$number")"
   if [ -n "$gate_reason" ] && proof_without_result "$gate_reason"; then
-    say "$tag: waiting for jankurai/proof — $gate_reason"
-    return 0
+    proof_pending=1
   fi
   # A release pin bump whose required contexts have no result yet waits for them, bounded, the
   # same way: no receipt, no post, no agent (see pin_wait_reason).
@@ -1802,12 +1800,17 @@ review_one() { # owner/name number dry-run force include-drafts
   sha="$(jq -r .head_sha <<<"$row")"; base_sha="$(jq -r .base_sha <<<"$row")"
   head_ref="$(jq -r .head_ref <<<"$row")"; base_ref="$(jq -r .base_ref <<<"$row")"
   origin="$(pr_origin "$row")"
+  # Contributions have a one-attempt spend cap; retain their existing admission rule.
+  if [ "$proof_pending" = 1 ] && [ "$origin" = contributed ]; then
+    say "$tag: waiting for jankurai/proof — $gate_reason"
+    return 0
+  fi
 
   local started_at receipt history work check_publish=0
   if [ "$dry" = 0 ] && [ "$origin" = internal ]; then check_publish=1; fi
   started_at="$(date +%s)"
   receipt="$(receipt_path "$repo" "$number" "$sha")"
-  mkdir -p "$(dirname "$receipt")" "$state/attempts/$repo"
+  mkdir -p "$(dirname "$receipt")" "$state/attempts/$repo" "$state/pending/$repo"
   # Flush newly created receipt/attempt parents before admitting the worker.
   sync -f "$state"
   # A pending receipt after acquiring the exclusive lock is a recovery obligation.
@@ -1870,7 +1873,9 @@ review_one() { # owner/name number dry-run force include-drafts
   # read (pr_description). pr.json never carries it: description.md is its one place.
   local text
   text="$(pr_description "$repo" "$number")"
-  jq 'del(.body, .description, .available_actions)' <<<"$row" >"$d/pr.json"
+  # Gate and approval state are not review evidence and must not invalidate a
+  # computed result when proof finishes. The publication and merge paths read them live.
+  jq 'del(.body, .description, .available_actions, .mergeable, .merge_passport, .passport_hash, .review, .checks)' <<<"$row" >"$d/pr.json"
   jq -r --arg text "$text" '"# \(.title)\n\n\($text)"' <<<"$row" >"$d/description.md"
   git -C "$cache" log --stat --format='commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%B' "$base_sha..$sha" >"$d/log.txt"
   git -C "$cache" diff --stat=200 "$base_sha...$sha" >"$d/stat.txt"
@@ -1935,14 +1940,13 @@ review_one() { # owner/name number dry-run force include-drafts
   fi
   say "$tag: reviewing ${sha:0:12} ($files_count files, $diff_bytes bytes of diff)"
 
-  # The gate before the agent: a head the quality gate blocks cannot be approved
-  # whatever the review concludes, so it holds with the gate's reason and the
-  # per-PR agent budget is not spent on it.
+  # A known failed proof holds before spending review budget. Pending proof admits
+  # an internal review; its result cannot publish until a fresh gate read passes.
   # A hold this controller imposes mechanically, rather than one the agent reasoned to. An owner's
   # decision never clears one: the quality gate, a committed key and an unreviewable blob are not
   # questions an owner was asked.
   local verdict mechanical_hold=0
-  if [ -n "$gate_reason" ]; then
+  if [ -n "$gate_reason" ] && [ "$proof_pending" = 0 ]; then
     mechanical_hold=1
     say "$tag: quality gate holds ${sha:0:12} — $gate_reason"
     verdict="$(jq -nc --arg reason "$gate_reason" \
@@ -1958,7 +1962,30 @@ review_one() { # owner/name number dry-run force include-drafts
   else
     local agent_cap="$budget" agent_rc=0
     [ "$origin" != contributed ] || agent_cap="$contributed_budget"
-    verdict="$(run_agent "$d" "$tag" "$sha" "$work" "$origin" "$agent_cap")" || agent_rc=$?
+    local pending_file="$state/pending/$repo/$number.json" pending_key
+    pending_key="$(
+      printf '%s\n' "$review_identity" "$sha" "$base_sha" "$origin"
+      sha256sum <"$d/pr.json"
+      sha256sum <"$d/description.md"
+    )"
+    pending_key="$(printf '%s' "$pending_key" | sha256sum | cut -c1-64)"
+    verdict=""
+    if [ "$force" = 0 ] && [ "$dry" = 0 ] && [ "$origin" = internal ] \
+       && [ -f "$pending_file" ] && [ ! -L "$pending_file" ] \
+       && review_output_safe "$pending_file"; then
+      verdict="$(jq -ce --arg key "$pending_key" 'select(.key == $key) | .verdict' "$pending_file" || true)"
+      if [ -n "$verdict" ]; then
+        verdict="$(jq -nc --argjson v "$verdict" \
+          '{type:"result",subtype:"success",is_error:false,structured_output:$v}' | \
+          jq --slurpfile schema "$here/verdict.schema.json" -cse \
+          -f "$here/validate-verdict.jq" 2>/dev/null || true)"
+      fi
+    fi
+    if [ -z "$verdict" ]; then
+      verdict="$(run_agent "$d" "$tag" "$sha" "$work" "$origin" "$agent_cap")" || agent_rc=$?
+    else
+      say "$tag: reusing review computed while proof was pending"
+    fi
     # A contributed head's one review is spent the moment the agent ran, whatever it returned:
     # a result nobody can publish still cost money, and retrying it every pass would cost more.
     if [ "$origin" = contributed ]; then
@@ -1966,6 +1993,20 @@ review_one() { # owner/name number dry-run force include-drafts
         "$(jq -r '.total_cost_usd // 0' "$work/agent.json" 2>/dev/null || echo 0)"
     fi
     ((agent_rc == 0)) || return 0
+    if [ "$origin" = internal ] && [ "$dry" = 0 ]; then
+      # One replaceable result per PR, atomically saved before yielding the worker.
+      # Bind all mutable agent context as well as the exact diff and review inputs.
+      gate_reason="$(jankurai_gate_hold "$repo" "$number")"
+      if [ -n "$gate_reason" ]; then
+        jq -nc --arg key "$pending_key" --argjson verdict "$verdict" \
+          '{key:$key,verdict:$verdict}' | store_receipt "$pending_file"
+        say "$tag: review computed; waiting for jankurai/proof — $gate_reason"
+        jq --arg reason "$gate_reason" --arg at "$(date -u +%FT%TZ)" \
+          '.decision="waiting_gate" | .posted=false | .reason=$reason | .reviewed_at=$at' \
+          "$receipt" | store_receipt "$receipt"
+        return 0
+      fi
+    fi
   fi
 
   # Decision: approve only on an explicit, validated `approve`; a validated `block` holds. Nothing
@@ -2119,7 +2160,8 @@ forge_current() { # current-file JSON -> GateRunnerTask JSON, or null
 forge_last() { # last-file JSON -> GateRunnerResult JSON, or null
   jq -c 'if type == "object" then
       (.conclusion // "") as $decision
-      | ({base_missing: "base_missing: the base branch does not exist yet; a person creates it",
+      | ({waiting_gate: "waiting_gate: review computed, proof has not passed",
+        base_missing: "base_missing: the base branch does not exist yet; a person creates it",
         author_domain: "author_domain: commit emails are outside the required domain; a person reviews it",
         placeholder_author: "placeholder_author: commits carry the git default placeholder identity; a person reviews it",
         advice: "advice: contributed pull request, reviewed as advice; a maintainer decides"} | .[$decision]) as $why
@@ -2851,7 +2893,10 @@ poke() { # dry
         # Already poked for this head. Once more, only if it is still unreviewed and its gate is green.
         key="ready $repo#$number $sha"
         [ "$review_running" = 0 ] || continue
-        [ ! -e "$(receipt_path "$repo" "$number" "$sha")" ] || continue
+        receipt="$(receipt_path "$repo" "$number" "$sha")"
+        if [ -e "$receipt" ]; then
+          jq -e '.decision == "waiting_gate"' "$receipt" >/dev/null || continue
+        fi
         ! grep -qxF "$key" "$seen" || continue
         [ "$reads" -lt "$poke_ready_reads" ] || continue
         reads=$((reads + 1))

@@ -9,8 +9,13 @@ Where the base branch requires `jankurai/proof`, the quality gate comes first: a
 head whose proof fails or failed to score is held with that reason before any
 agent budget is spent, and nothing here can approve it. A proof the forge has
 queued, is running, or has not started is not a verdict on the head: that head
-gets no review and no receipt, and a later pass reviews it once the proof has a
-result. Repositories
+gets an internal review while the gate runs. Its validated model result is saved
+atomically (one pending result per PR), bound to the head, diff base, review
+identity and PR context. A later pass reuses that result and rechecks proof before
+publication. A changed head, base, context or review identity invalidates it;
+`--force` also bypasses reuse. Pending receipts have `decision: waiting_gate`
+and never count as approvals. Contributions retain their existing admission rule
+because they have a one-attempt spend cap. Repositories
 outside the gate's rollout are unaffected — their proof is reported, not
 required. `ops/ci/jankurai-gate.sh` is the same verdict, run locally before the
 pull request exists.
@@ -374,8 +379,8 @@ repository whose `ops/pr-redteam` is unmodified; otherwise `code` is left out. `
 first review. `poke` runs every 30 seconds from
 `pr-redteam-poke.timer`. Unreviewed heads start `pr-redteam.service` early. A
 head's `review` poke is usually used up while its required gate is still
-running, and that pass can leave it with no receipt (a jankurai/proof without a
-result is waited for). Such a head, still open, ready and with no receipt, gets
+running. Such a head, still open and ready, with no receipt or a `waiting_gate`
+receipt, gets
 one more poke, `ready`, once the forge's merge passport for that exact head is
 blocked only by its missing approval or a requested change (any other or
 unknown blocker starts nothing); that check reads at most four pull requests

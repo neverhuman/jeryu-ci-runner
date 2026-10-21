@@ -327,26 +327,57 @@ review
 jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
 echo 'ok failing required proof held without a review, cleared proof approved'
 
-# A proof the forge has queued but not finished is not a verdict on this head: nothing is
-# recorded, nothing is posted, no review budget is spent, and the same head is reviewed and
-# approved by a later pass once the proof is out of the way. No new commit is needed.
+# Pending proof admits the independent review, but no publication. A subsequent
+# process reuses its exact-input result after proof succeeds, without another model call.
 advance
 touch "$t/gate-pending"
 model_calls="$(count "$t/model-calls")"; posts_before="$(count "$t/posts")"
-attempts="$(find "$t/state/attempts" -type f | wc -l)"
 review
-[[ ! -e "$(receipt)" ]]
-[[ "$(find "$t/state/attempts" -type f | wc -l)" == "$attempts" ]]
-[[ "$(count "$t/model-calls")" == "$model_calls" && "$(count "$t/posts")" == "$posts_before" ]]
+jq -e '.posted == false and .decision == "waiting_gate"' "$(receipt)" >/dev/null
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" && "$(count "$t/posts")" == "$posts_before" ]]
 grep -q 'waiting for jankurai/proof' "$t/controller.log"
 review
-[[ ! -e "$(receipt)" ]]
-[[ "$(count "$t/model-calls")" == "$model_calls" && "$(count "$t/posts")" == "$posts_before" ]]
+jq -e '.posted == false and .decision == "waiting_gate"' "$(receipt)" >/dev/null
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" && "$(count "$t/posts")" == "$posts_before" ]]
 rm "$t/gate-pending"
 review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
 jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
-echo 'ok pending proof waited for, same head reviewed and approved once it has a result'
+echo 'ok review runs during pending proof and is reused after green without early publication'
+
+# A push while proof is pending invalidates the saved review.
+advance
+touch "$t/gate-pending"
+review
+model_calls="$(count "$t/model-calls")"
+advance
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+jq -e '.posted == false and .decision == "waiting_gate"' "$(receipt)" >/dev/null
+rm "$t/gate-pending"
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+jq -e '.posted == true and .decision == "approve"' "$(receipt)" >/dev/null
+
+# Review-input changes and unsafe cached data cannot reuse a pending verdict.
+advance
+touch "$t/gate-pending"
+review
+model_calls="$(count "$t/model-calls")"
+REDTEAM_MODEL=fixture-new-model review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 2))" ]]
+pending="$t/state/pending/jeryu/fixture/1.json"
+jq --rawfile secret "$t/token" '.verdict.summary=$secret' "$pending" > "$t/unsafe-pending"
+mv "$t/unsafe-pending" "$pending"
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 3))" ]]
+rm "$t/gate-pending"
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 3))" ]]
+jq -e '.posted == true and .decision == "approve"' "$(receipt)" >/dev/null
+echo 'ok changed review identity and unsafe cached verdict both require a fresh review'
 
 # A base branch the forge does not have yet is recorded once and not retried: no model call, no
 # publication, and no second attempt for the same head however many passes run.
