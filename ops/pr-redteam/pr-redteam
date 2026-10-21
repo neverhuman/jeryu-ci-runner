@@ -19,8 +19,9 @@
 # Two agent holds, then a person: after REDTEAM_HOLD_CAP agent holds on one PR (across heads), its
 # later heads get no agent review until a maintainer runs `pr-redteam rearm` (or an operator runs
 # `run --force`). The mechanical holds (quality gate, a committed private key, unpinned blobs) still
-# run on them and still hold; a head none of them holds gets no review, a final `capped` receipt
-# and one `pr.skipped` event on the PR's timeline. Nothing capped is ever approved or merged.
+# run on them and still hold; a head none of them holds gets no agent review but a blocking review
+# naming the cap, a final `capped` receipt and one `pr.skipped` event on the PR's timeline. Nothing
+# capped is ever approved or merged: the hold stands until a rearm has the agent review the head.
 # Mechanical holds do not count toward the cap, and neither do holds recorded before it existed.
 #
 # The quality gate comes first: where the base branch requires `jankurai/proof`, a head whose proof
@@ -670,7 +671,8 @@ contributed_review_hold() { # owner/name number sha
 # push gets every push fully re-reviewed, and held again, at the cost of a review each time. After
 # REDTEAM_HOLD_CAP agent holds on one PR its later heads get no agent review: the mechanical checks
 # (quality gate, private key, unpinned blobs) still run and still hold, and a head none of them
-# holds is recorded as `capped` and left for a person, with no review posted. A maintainer runs
+# holds is recorded as `capped` and left for a person, under a blocking review that only a rearm can
+# lift (an approval alone never merges a head the agent did not see). A maintainer runs
 # `pr-redteam rearm owner/name N` to have the agent review again and the count start again; an
 # operator's `run --force` reviews a capped head once. What holds a head is unchanged: a confirmed
 # high or critical finding still holds it, whatever the count.
@@ -767,7 +769,7 @@ skip_reason() { # row me include_drafts force
   if [ "$force" != 1 ] && [ -s "$receipt" ] && jq -e --argjson max "$max_diff_bytes" --argjson identities "$reusable_identities" --arg base "$(jq -r .base_sha <<< "$row")" \
       '(.review_identity as $id | $identities | any(. == $id)) and .base_sha == $base
        and (.posted == true or .decision == "base_missing" or .decision == "author_domain"
-            or .decision == "placeholder_author" or .decision == "capped"
+            or .decision == "placeholder_author"
             or (.decision == "too_large" and .diff_bytes > $max))' "$receipt" >/dev/null 2>&1; then
     case "$(jq -r .decision "$receipt")" in
       capped)
@@ -1772,6 +1774,22 @@ signals() { # review-dir
   } >"$d/signals.txt"
 }
 
+# The blocking review a capped head gets: why the agent did not review it, and the one way it moves.
+capped_body() { # owner/name number sha holds
+  jq -rn --arg repo "$1" --arg number "$2" --arg sha "$3" --arg holds "$4" --arg cap "$hold_cap" '
+    "**Red team: HOLD — this pull request reached the hold cap; a person decides.**",
+    "",
+    ("The agent did not review this head: the pull request was held \($holds) times (limit \($cap)). "
+     + "The mechanical checks ran and none holds it, but a head the agent has not reviewed does not "
+     + "merge, so this review blocks it until it is reviewed."),
+    "",
+    ("To move it: a person reads this exact head, then a maintainer runs `pr-redteam rearm \($repo) "
+     + "\($number)` and the next pass reviews it with the agent (an operator can also run "
+     + "`pr-redteam run --force`). An approval alone does not clear this hold."),
+    "",
+    "<sub>pr-redteam · hold cap · exact head `\($sha[0:12])`</sub>"'
+}
+
 render_body() { # verdict-json decision sha origin [owner-decision-json hold-kind hold-number capped]
   jq -r --arg decision "$2" --arg sha "$3" --arg model "$model" --arg origin "${4:-internal}" \
     --argjson owner "${5:-null}" --arg kind "${6:-}" --argjson k "${7:-0}" --argjson cap "$hold_cap" \
@@ -2181,7 +2199,8 @@ review_one() { # owner/name number dry-run force include-drafts
     verdict="$(quality_gate_verdict "$gate_reason")"
   elif [ -n "$cap_reason" ]; then
     # At the hold cap the agent is not asked again; the mechanical checks below still hold. A head
-    # none of them holds is recorded as `capped` and gets no review at all, never an approval.
+    # none of them holds is recorded as `capped`: no agent review and never an approval, but a
+    # blocking review that names the cap.
     say "$tag: $cap_reason — no agent review; mechanical checks only"
     verdict="$(jq -nc --arg reason "$cap_reason" \
       '{verdict: "approve", findings: [],
@@ -2297,20 +2316,34 @@ review_one() { # owner/name number dry-run force include-drafts
       say "$tag: $(jq -r .login <<<"$owner_decision") recorded decision context on ${sha:0:12}; the independent hold is unchanged"
     fi
   fi
-  # A capped head that no mechanical check holds: no review is posted, and the `capped` receipt makes
-  # this head final until a rearm, so neither passes nor pokes come back to it. The merge pass only
-  # lands `approve` receipts, so nothing capped can merge.
+  # A capped head that no mechanical check holds gets no agent review, but it is not left open: a
+  # blocking review is posted on this exact head, so the forge refuses to merge it on a person's
+  # approval alone, whatever the branch protection requires. Only this reviewer can clear its own
+  # hold, and it does so only by reviewing the head after a maintainer's `pr-redteam rearm`, so a
+  # head the agent never saw cannot land. Once posted, the `capped` receipt makes the head final
+  # until a rearm; a post that failed is retried on the next pass.
   if [ -n "$cap_reason" ] && [ "$decision" = approve ]; then
-    if [ "$dry" = 1 ]; then say "$tag: DRY RUN capped — $cap_reason (would post nothing)"; return 0; fi
-    local holds; holds="$(agent_hold_count "$repo" "$number" "$sha")"
+    if [ "$dry" = 1 ]; then say "$tag: DRY RUN capped — $cap_reason (would post a blocking review)"; return 0; fi
+    local holds cap_body cap_posted=false cap_code=""
+    holds="$(agent_hold_count "$repo" "$number" "$sha")"
+    cap_body="$(capped_body "$repo" "$number" "$sha" "$holds")"
+    api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/reviews" "$(jq -n --arg sha "$sha" --arg b "$cap_body" \
+      '{verdict: "request_changes", expected_head_sha: $sha, body_markdown: $b, thread_comments: []}')"
+    cap_code="$code"
+    if [[ "$code" == 2* ]]; then
+      cap_posted=true
+      say "$tag: capped at ${sha:0:12} — $cap_reason; posted a blocking review"
+    else
+      say "$tag: capped at ${sha:0:12}; posting its blocking review answered $code, retry next run"
+    fi
     jq -n --arg repo "$repo" --argjson number "$number" --arg sha "$sha" --arg base "$forge_base_sha" \
       --arg diff_base "$base_sha" --arg at "$(date -u +%FT%TZ)" --arg identity "$review_identity" \
       --argjson holds "$holds" --arg reason "$cap_reason" --arg origin "$origin" --arg reviewer "$me" \
+      --argjson posted "$cap_posted" --arg code "$cap_code" \
       '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, diff_base_sha:$diff_base,
-        decision:"capped", posted:false, holds:$holds, reason:$reason, origin:$origin,
+        decision:"capped", posted:$posted, post_http:$code, holds:$holds, reason:$reason, origin:$origin,
         reviewed_at:$at, reviewer_login:$reviewer, review_identity:$identity}' | store_receipt "$receipt"
-    say "$tag: capped at ${sha:0:12} — $cap_reason; no review posted"
-    report_hold_cap_skip "$repo" "$number" "$sha" "$holds"
+    [ "$cap_posted" = true ] && report_hold_cap_skip "$repo" "$number" "$sha" "$holds"
     return 0
   fi
   # The footer says where this PR stands: which agent hold this is out of the cap. This head's own

@@ -68,7 +68,10 @@ case "$url" in
     row | jq -c --argjson b "$blockers" '{summary: ., merge_passport:{head_sha:.head_sha, blockers:$b}, passport_hash}'
     printf '\n200' ;;
   */pulls/7/checks) printf '{"checks":[]}\n200' ;;
-  */pulls/7/reviews) jq -c . <<< "$data" >> "$CAP_FIXTURE/posts"; printf '{"ok":true}\n201' ;;
+  */pulls/7/reviews)
+    # The forge refuses reviews while reviews-failing exists.
+    [[ ! -e "$CAP_FIXTURE/reviews-failing" ]] || { printf '{"error":"unavailable"}\n503'; exit 0; }
+    jq -c . <<< "$data" >> "$CAP_FIXTURE/posts"; printf '{"ok":true}\n201' ;;
   */api/v1/events) printf '%s\n' "$data" >> "$CAP_FIXTURE/events"; printf '{"ok":true,"seqs":[1]}\n201' ;;
   */check-runs) printf '{"id":1}\n201' ;;
   *) printf 'forbidden API %s\n' "$url" >> "$CAP_FIXTURE/danger"; exit 98 ;;
@@ -146,16 +149,21 @@ pass
 echo 'ok an agent hold counts, and the footer counts holds against the cap'
 
 # The third head gets no agent review. Poke may start one pass for it (its mechanical checks are
-# due); none holds it, so it gets a final `capped` receipt, no review and one pr.skipped event, and
-# neither later passes nor pokes come back to it.
+# due); none holds it, so it gets a blocking review naming the cap (never an approval), a final
+# `capped` receipt and one pr.skipped event, and neither later passes nor pokes come back to it.
 advance
 calls="$(count "$t/model-calls")"; posts="$(count "$t/posts")"
 starts() { grep -c 'start --no-block pr-redteam.service' "$t/systemctl" 2>/dev/null || true; }
 "$here/pr-redteam" poke >> "$t/log" 2>&1
 [[ "$(starts)" == 1 ]] || fails 'poke did not start the mechanical checks of a new capped head'
 pass
-[[ "$(count "$t/model-calls")" == "$calls" && "$(count "$t/posts")" == "$posts" ]] || fails 'a capped head was reviewed'
-jq -e '.decision == "capped" and .posted == false and .holds == 2' "$(receipt)" >/dev/null || fails 'no capped receipt'
+[[ "$(count "$t/model-calls")" == "$calls" ]] || fails 'the agent reviewed a capped head'
+[[ "$(count "$t/posts")" == "$((posts + 1))" ]] || fails 'a capped head did not get exactly one blocking review'
+jq -e --arg sha "$(cat "$t/head")" '.verdict == "request_changes" and .expected_head_sha == $sha
+    and (.body_markdown | contains("reached the hold cap") and contains("pr-redteam rearm acme/widget-shop 7")
+         and contains("An approval alone does not clear this hold"))' <<<"$(tail -1 "$t/posts")" >/dev/null \
+  || fails "capped review: $(tail -1 "$t/posts")"
+jq -e '.decision == "capped" and .posted == true and .holds == 2' "$(receipt)" >/dev/null || fails 'no capped receipt'
 grep -qF 'held 2 times; a person decides (pr-redteam rearm acme/widget-shop 7)' "$t/log" || fails 'cap reason not logged'
 jq -s -e --arg sha "$(cat "$t/head")" 'map(select(.kind == "pr.skipped")) | length == 1 and (.[0] |
     .event_id == "pr-redteam:\($sha):hold-cap" and (.event_id | length) <= 64 and .sha == $sha
@@ -164,7 +172,8 @@ jq -s -e --arg sha "$(cat "$t/head")" 'map(select(.kind == "pr.skipped")) | leng
   || fails "pr.skipped event: $(cat "$t/events")"
 pass
 grep -qF 'skip acme/widget-shop#7 — held 2 times; a person decides' "$t/log" || fails 'capped receipt not final'
-[[ "$(count "$t/model-calls")" == "$calls" && "$(jq -s 'map(select(.kind == "pr.skipped")) | length' "$t/events")" == 1 ]] \
+[[ "$(count "$t/model-calls")" == "$calls" && "$(count "$t/posts")" == "$((posts + 1))" \
+   && "$(jq -s 'map(select(.kind == "pr.skipped")) | length' "$t/events")" == 1 ]] \
   || fails 'a second pass on a capped head did more work'
 "$here/pr-redteam" poke >> "$t/log" 2>&1; "$here/pr-redteam" poke >> "$t/log" 2>&1
 [[ "$(starts)" == 1 ]] || fails 'poke loops on a capped head'
@@ -173,7 +182,23 @@ REDTEAM_MERGE_TOKEN_FILE="$t/token" "$here/pr-redteam" _merge > "$t/merge.log" 2
 cat "$t/merge.log" >> "$t/log"
 ! grep -q 'merge pass skipped' "$t/merge.log" || fails 'the merge pass did not run'
 ! grep -q '/merge\|/queue' "$t/requests" || fails 'the merge pass touched a capped head'
-echo 'ok a clean capped head gets no review, a final capped receipt, one timeline event, and no merge'
+echo 'ok a clean capped head gets no agent review, one blocking review, a final capped receipt, one timeline event, and no merge'
+
+# A capped head whose blocking review could not be posted is not final: the next pass posts it.
+advance
+calls="$(count "$t/model-calls")"; posts="$(count "$t/posts")"
+touch "$t/reviews-failing"
+pass
+rm -f "$t/reviews-failing"
+jq -e '.decision == "capped" and .posted == false and .post_http == "503"' "$(receipt)" >/dev/null \
+  || fails "failed capped post receipt: $(cat "$(receipt)")"
+[[ "$(count "$t/posts")" == "$posts" ]] || fails 'a refused capped review was recorded as posted'
+pass
+[[ "$(count "$t/model-calls")" == "$calls" ]] || fails 'the retry asked the agent'
+[[ "$(count "$t/posts")" == "$((posts + 1))" ]] || fails 'the capped review was not retried'
+jq -e '.decision == "capped" and .posted == true' "$(receipt)" >/dev/null || fails 'retried capped receipt not final'
+jq -e '.verdict == "request_changes"' <<<"$(tail -1 "$t/posts")" >/dev/null || fails 'retry posted a non-blocking review'
+echo 'ok a capped head whose blocking review was refused is retried on the next pass, without the agent'
 
 # At the cap a committed private key still holds, mechanically, with no agent.
 # The header is assembled at run time so this source carries no key-shaped line.

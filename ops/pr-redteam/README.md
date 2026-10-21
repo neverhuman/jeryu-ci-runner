@@ -108,8 +108,11 @@ fully re-reviewed, and often held again. After `REDTEAM_HOLD_CAP` agent holds on
 
 - The mechanical holds still run and still hold: the quality gate, a committed private key, an
   unpinned blob. They do not count toward the cap.
-- A head none of them holds gets a final `capped` receipt, no posted review and one `pr.skipped`
-  event on the PR's timeline. Nothing capped is approved or merged.
+- A head none of them holds gets a blocking (request-changes) review that names the cap, a final
+  `capped` receipt and one `pr.skipped` event on the PR's timeline. Nothing capped is approved or
+  merged: the forge lets only the reviewer that requested changes clear them, so a person's
+  approval alone cannot land a head the agent never reviewed, whatever the branch protection.
+  If posting the review fails, the next pass posts it again.
 - The review footer says where a PR stands (`hold 1 of 2`, then `hold 2 of 2: this PR is now left
   for a person`).
 - `./pr-redteam rearm owner/name N` lets the agent review the next head and starts the count again;
