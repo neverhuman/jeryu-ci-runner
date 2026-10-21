@@ -445,13 +445,14 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
 1. claim at most `PR_GATE_AUDIT_MAX` (default 1) jobs as `<short host>/jankurai-audit`
    (`POST /api/v1/jankurai-audits/claim`), unless the shared back-off says wait;
 2. admit only the repositories this host serves (`GATE_RUNNER_REPOS`, else every repository of
-   `GATE_RUNNER_OWNERS`, as the slots and the wake timer choose them), and in them only reviewed code: a
+   `GATE_RUNNER_OWNERS`, as the slots and the wake timer choose them). Bound tickets follow the
+   admission contract below. For unbound tickets, admit only reviewed code: a
    job for `main` whose head the clone's own `main` reaches (the ticket's word is not enough), or the
    head of an open pull request the forge marks `origin:internal` (`PR_GATE_INTERNAL_LABEL`; every page
    of open pull requests is read, and a label may sit on the row or under its summary). A contribution (`origin:contributed`), a head no open
    pull request holds, or a forge that cannot answer is left alone -- like the slots, this host checks
    out nothing of a contribution. A job left alone is not refused on the forge (there is no route for
-   that); its claim lapses with its lease;
+   that on the unbound contract); its claim lapses with its lease;
 3. clone the head under the gate home (`audit-work/`, swept at the start of each pass) with the gate's own credential (through a git credential
    helper that reads the token file; it is in no argv, environment or clone config);
 4. make the tree safe to audit and give it trusted metadata. Everything the auditor reads besides the
@@ -526,9 +527,16 @@ the bound contract; an older forge keeps everything above unchanged.
   (`PR_GATE_AUDIT_TOOLS`, a host path set on the unit; default `~/.jeryu/tools`). Each one is checked on
   its own installation receipt -- binary digest, `jankurai --version`, `test_mode` false, signature
   verified, governed -- and the verified digests are what the claim offers
-  (`capabilities: {jankurai: [...], sandbox: false}`) and what the heartbeat's `tools` lists. No
+  (`capabilities: {jankurai: [...], sandbox: <configured>}`) and what the heartbeat's `tools` lists. No
   release-specific verifier is involved, so an auditor release reaches this host without a pr-gate or
   consumer change.
+- **Admission follows the ticket**, including personal-agent heads absent from local discovery.
+  Contributed jobs use `PR_GATE_SANDBOX_COMMAND` with the same tree-root/repo/argv contract as
+  contributed recipes, an empty host environment and a digest-checked copy of the assigned auditor.
+  The sandbox must expose only that disposable tree and supply the auditor runtime. Without a
+  resolvable command, the claim advertises `sandbox: false` and contributions are handed back.
+  See the [ADR 0003 addendum](../../docs/adr/0003-audit-admission-addendum.md) for the boundary and
+  fixture proof; the live host probe is a separate owner step.
 - **Each job names its auditor** (`auditor`: manifest revision and digest, version, target, binary and
   signer digests), its `metadata_commit` and `policy_sha256`, its `origin` and its `purpose` (`proof` or
   `qualification`). Before anything is checked out, the assigned auditor must be staged here and match

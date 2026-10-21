@@ -29,10 +29,8 @@
 #   generated verifier installed beside this script (pr-gate-ensure-jankurai.sh). A job left alone
 #   lapses with its lease.
 #
-# Only reviewed code is checked out here. A job for main, or for the head of an open pull request the
-# forge marks origin:internal (PR_GATE_INTERNAL_LABEL; a bound job carries its origin), is audited; a
-# contribution, a head no open pull request holds, or a forge that cannot say, is left alone -- this
-# host checks out nothing of a contribution, exactly as the gate slots do not.
+# Bound tickets admit every served head regardless of pushing clone. Contributions require the
+# site's sandbox command; unbound tickets retain the internal-PR admission contract.
 #
 # Each pass beats once as "<short host>/jankurai-audit" (label jankurai-audit) so /runners shows the
 # auditor beside the slots: `current` while an audit runs (state running, then publishing; kept alive
@@ -96,6 +94,19 @@ OWNERS="${GATE_RUNNER_OWNERS:-}"
 [[ "$REPOS" != auto || -n "${OWNERS// }" ]] || not_configured "GATE_RUNNER_OWNERS (or GATE_RUNNER_REPOS)"
 INTERNAL_LABEL="${PR_GATE_INTERNAL_LABEL:-origin:internal}"
 CONTRIBUTED_LABEL="${PR_GATE_CONTRIBUTED_LABEL:-origin:contributed}"
+# Reuse the gate recipe sandbox contract: command tree-root repo recipe... .
+SANDBOX_COMMAND="${PR_GATE_SANDBOX_COMMAND:-}"
+SANDBOX_PATH="${PR_GATE_SANDBOX_PATH:-/usr/local/bin:/usr/bin:/bin}"
+sandbox_ready=false
+sandbox_cmd=()
+read -r -a sandbox_cmd <<<"$SANDBOX_COMMAND"
+if ((${#sandbox_cmd[@]})); then
+  sandbox_executable="$(PATH="$SANDBOX_PATH" command -v "${sandbox_cmd[0]}" || true)"
+  if [[ "$sandbox_executable" == /* && -f "$sandbox_executable" && -x "$sandbox_executable" ]]; then
+    sandbox_cmd[0]=$sandbox_executable
+    sandbox_ready=true
+  fi
+fi
 for tool in curl jq git sha256sum timeout flock; do command -v "$tool" >/dev/null || { say "$tool is required"; exit 2; }; done
 
 [[ -f "$TOKEN_FILE" && ! -L "$TOKEN_FILE" && "$(stat -c '%a' "$TOKEN_FILE")" == 600 ]] \
@@ -297,8 +308,8 @@ fi
 # --- claim ---------------------------------------------------------------------------------------
 if (($(backoff_remaining) > 0)); then say "the forge asked this host to back off; nothing claimed"; exit 0; fi
 if ((BOUND)); then
-  printf '%s\n' "${STAGED[@]}" | jq -R . | jq -cs --arg id "$RUNNER_ID" --argjson max "$MAX" \
-    '{runner_id: $id, max: $max, capabilities: {jankurai: ., sandbox: false}}' >"$WORK_DIR/claim.json"
+  printf '%s\n' "${STAGED[@]}" | jq -R . | jq -cs --arg id "$RUNNER_ID" --argjson max "$MAX" --argjson sandbox "$sandbox_ready" \
+    '{runner_id: $id, max: $max, capabilities: {jankurai: ., sandbox: $sandbox}}' >"$WORK_DIR/claim.json"
 else
   jq -cn --arg id "$RUNNER_ID" --argjson max "$MAX" '{runner_id: $id, max: $max}' >"$WORK_DIR/claim.json"
 fi
@@ -399,8 +410,7 @@ prepare_tree() {
     | xargs -0 -r "${git_auth[@]}" git -C "$root" update-index --assume-unchanged -- || return 1
 }
 
-# admission OWNER REPO BRANCH HEAD [ORIGIN]: nothing when the head is reviewed code this host may check
-# out; else why not, as "<release reason>|<explanation>". main is reviewed by protection (checked after
+# admission OWNER REPO BRANCH HEAD [ORIGIN]: nothing when this host can audit the ticket; else why not, as "<release reason>|<explanation>". main is reviewed by protection (checked after
 # the clone, against the clone's own main). A bound job carries the forge's word on its origin; an
 # unbound one must be held by an open pull request the forge marks internal (jeryu's own rows label
 # every pull request internal or contributed, set by the importer, never by the author). Anything the
@@ -414,7 +424,7 @@ admission() {
     pr_gate_listed "$OWNERS" "$owner" || { printf 'not-served-by-this-host|%s is not an owner this host serves' "$owner"; return; }
   fi
   if ((BOUND)); then
-    [[ "$origin" == internal ]] || printf 'contributed|a contribution (origin %s): the gate host checks out nothing of it' "${origin:-unknown}"
+    [[ "$origin" == internal || "$sandbox_ready" == true ]] || printf 'contributed|a contribution (origin %s): the gate host checks out nothing of it' "${origin:-unknown}"
     return
   fi
   [[ "$branch" != main ]] || return 0
@@ -445,7 +455,7 @@ release() {
 audit_one() { # ticket-json
   local t=$1 owner repo branch head base mode job="" purpose=proof origin="" mcommit="" psha="" auditor="null"
   local a_sha="" a_ver="" a_target="" a_signer="" receipt="" bin
-  local started=$SECONDS src="$WORK_DIR/src" out="$WORK_DIR/report.json" request="$WORK_DIR/request.json" exit_code=0
+  local started=$SECONDS src="$WORK_DIR/tree/src" out="$WORK_DIR/tree/report.json" request="$WORK_DIR/request.json" exit_code=0
   owner="$(jq -r '.owner // "" | tostring' <<<"$t")" repo="$(jq -r '.repo // "" | tostring' <<<"$t")"
   branch="$(jq -r '.branch // "" | tostring' <<<"$t")" head="$(jq -r '.head // "" | tostring' <<<"$t")"
   base="$(jq -r '.base // "" | tostring' <<<"$t")" mode="$(jq -r '.mode // "" | tostring' <<<"$t")"
@@ -505,7 +515,8 @@ audit_one() { # ticket-json
   fi
   say "$owner/$repo@$head ($branch, $([[ $mode == full ]] && echo "whole tree" || echo "vs $base")$( ((BOUND)) && echo ", job $job, $purpose, jankurai $a_ver"))"
   beat_start "$owner/$repo" "$head"
-  rm -rf -- "$src" "$out"
+  rm -rf -- "$WORK_DIR/tree"
+  mkdir -p "$WORK_DIR/tree"
   if ! "${git_auth[@]}" git clone -q --no-checkout "$BASE/git/$owner/$repo.git" "$src" 2>&1; then
     beat_finish "$owner/$repo" "$head" failed "$((SECONDS - started))" "clone failed"; return 0
   fi
@@ -554,18 +565,35 @@ audit_one() { # ticket-json
     [[ "$receipt" == staged-digest-missing ]] && receipt="tool-gone"
     refuse "$receipt" "the assigned auditor changed or vanished after the claim"; return 0
   fi
-  ( cd "$src" && "${audit_env[@]}" timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$bin" "${args[@]}" ) \
-    >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
+  if [[ "$origin" == contributed ]]; then
+    # Only this disposable tree is mounted. Authentication files and the host installation stay
+    # outside it; the verified auditor is copied beside (never into) the untrusted source tree.
+    cp -- "$bin" "$WORK_DIR/tree/auditor"
+    chmod 0555 "$WORK_DIR/tree/auditor"
+    if [[ "$(sha256sum <"$WORK_DIR/tree/auditor" | cut -c1-64)" != "$a_sha" ]]; then
+      refuse verifier-mismatch "the sandbox auditor copy differs from the assignment"; return 0
+    fi
+    ( cd "$src"; exec 9>&-
+      exec env -i PATH="$SANDBOX_PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 PR_GATE_SANDBOX=1 \
+        timeout --kill-after=30s "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 \
+        "${sandbox_cmd[@]}" "$WORK_DIR/tree" src \
+        "${audit_env[@]}" "$WORK_DIR/tree/auditor" "${args[@]}"
+    ) >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
+  else
+    ( cd "$src" && "${audit_env[@]}" timeout "$AUDIT_TIMEOUT" nice -n 10 ionice -c 3 "$bin" "${args[@]}" ) \
+      >"$WORK_DIR/audit.log" 2>&1 || exit_code=$?
+  fi
   # The auditor's output can quote the head; only a bounded, printable tail reaches the journal.
   tail -n 3 "$WORK_DIR/audit.log" | LC_ALL=C tr -cd '[:print:]\n' | cut -c1-200 | sed 's/^/  /' || true
 
   local conclusion=scored reason=""
   ((exit_code == 0)) || { conclusion="tool-failed"; reason="jankurai exited $exit_code"; }
-  if jq -e 'type == "object"' "$out" >/dev/null 2>&1; then
+  if [[ -f "$out" && ! -L "$out" ]] && jq -e 'type == "object"' "$out" >/dev/null 2>&1; then
     # Unbound, the report names the policy it was scored by; bound, the binding itself does.
     ((BOUND)) || { jq --arg source "$policy_source" --arg sha "$(sha256sum "$WORK_DIR/policy.toml" | cut -d' ' -f1)" \
       '. + {jeryu_audit_policy: {source: $source, sha256: $sha}}' "$out" >"$out.tmp" && mv -f -- "$out.tmp" "$out"; }
   else
+    rm -f -- "$out"
     printf 'null\n' >"$out"
   fi
   if ((BOUND)); then

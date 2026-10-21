@@ -490,6 +490,55 @@ run
 must 'a ticket with no auditor binding is handed back as malformed' test "$(released)" == 'job-bad malformed-ticket'
 printf 'PASS contributions and malformed bound tickets are handed back without a clone\n'
 
+# The site's sandbox adapter owns isolation; this fixture proves the production handoff contract
+# and runs the same assigned auditor on the prepared tree, without network or a live forge.
+cat >"$fx/bin/audit-sandbox" <<SH
+#!/usr/bin/env bash
+set -eu
+[[ -z "\${JERYU_TOKEN_FILE:-}\${GATE_RUNNER_IDENTITY:-}\${HOME:-}\${GIT_CONFIG_VALUE_1:-}" ]]
+[[ ! -e /proc/\$\$/fd/9 ]]
+root=\$1; repo=\$2; shift 2
+[[ "\$repo" == src && "\$PWD" == "\$root/src" ]]
+[[ ! -e "\$root/token" && ! -e "\$root/audit-auth" ]]
+[[ "\$(find "\$root" -type f -exec grep -l AUDIT-TOKEN-5c1e {} + | wc -l)" == 0 ]]
+printf '%s\n' "\$root" >"$fx/sandbox.seen"
+[[ ! -e "$fx/sandbox-fails" ]] || exit 7
+exec "\$@"
+SH
+chmod +x "$fx/bin/audit-sandbox"
+printf 'PR_GATE_SANDBOX_COMMAND=%s\nPR_GATE_SANDBOX_PATH=%s\n' "$fx/bin/audit-sandbox" "$fx/bin:/usr/bin:/bin" >>"$fx/pr-gate.env"
+before=$(scores)
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")" contributed proof "$SSHA" 9.9.9 contrib/gh-42
+run
+must 'a configured sandbox is advertised with the staged digest' test "$(jq -c .capabilities "$fx/forge/claim-body.json")" == "{\"jankurai\":[\"$SSHA\"],\"sandbox\":true}"
+must 'a contributed ticket is audited and submitted' test "$(scores)" == "$((before + 1))"
+must 'the sandbox command received the clean environment and tree' test -s "$fx/sandbox.seen"
+must 'the contribution proof binds the exact head and job' test "$(last_score | jq -r '[.branch,.head_sha,.job_id,.report.score,.tool_exit] | join(" ")')" == "contrib/gh-42 $h1 job-${h1:0:8} 91 0"
+must 'the sandbox runs the copied assigned auditor' test "$(tail -n 1 "$fx/jankurai-bin.log")" == "$(cat "$fx/sandbox.seen")/auditor"
+must 'the contribution still uses the trusted policy' grep -qx 'minimum_score = 90' "$fx/policy.seen"
+# Failure cannot fall through to a host execution or reuse the preceding report.
+touch "$fx/sandbox-fails"
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")" contributed
+run
+must 'sandbox failure submits no score evidence' test "$(last_score | jq -c '[.tool_exit,.report]')" == '[7,null]'
+must 'sandbox failure is visible' test "$(last_beat | jq -r .last.conclusion)" == tool-failed
+rm -f "$fx/sandbox-fails"
+# No PR row and no discovered clone: the bound forge ticket alone admits a personal-agent head.
+: >"$fx/curl.log"
+bticket orphanpr "$b7" "$h7" "$b7" "$DEFAULT_SHA" internal proof "$SSHA" 9.9.9 personal/agent
+run
+must 'a personal-agent head uses the exact ticket' test "$(last_score | jq -r '[.branch,.head_sha,.job_id,.report.score] | join(" ")')" == "personal/agent $h7 job-${h7:0:8} 91"
+must 'bound admission does not consult PR discovery' test "$(grep -c '/pulls?' "$fx/curl.log" || true)" == 0
+bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")" contributed
+jq '.tickets[0].owner = "outside"' "$fx/forge/claim.json" >"$fx/forge/claim.tmp"
+mv "$fx/forge/claim.tmp" "$fx/forge/claim.json"
+: >"$fx/git-helper.log"; before=$(scores)
+run
+must 'sandbox capability does not widen repository scope' test "$(released | cut -d' ' -f2)" == not-served-by-this-host
+must 'an outside contribution is not cloned or scored' test ! -s "$fx/git-helper.log"
+must 'an outside contribution produces no evidence' test "$(scores)" == "$before"
+printf 'PASS bound contributed and personal-agent heads get exact-head proof; sandbox failures stay failures\n'
+
 printf '202\n' >"$fx/forge/score.status"
 printf '{"job_id":"j","recorded_as":"qualification","qualification":"q-1"}\n' >"$fx/forge/score.body"
 bticket lowers "$b1" "$h1" "$b1" "$(polsha lowers "$b1")" internal qualification
