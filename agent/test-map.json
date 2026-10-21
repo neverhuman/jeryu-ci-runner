@@ -40,6 +40,11 @@
       "lane": "score",
       "purpose": "verify release notes stay routed through the score lane"
     },
+    "CONTRIBUTING.md": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify contributor and security policy docs ship with the checked tree"
+    },
     "Cargo.lock": {
       "command": "just check",
       "lane": "check",
@@ -65,6 +70,11 @@
       "lane": "check",
       "purpose": "verify root navigation remains current"
     },
+    "SECURITY.md": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify contributor and security policy docs ship with the checked tree"
+    },
     "VERSION": {
       "command": "just fast && just check && just security && just score",
       "lane": "ci",
@@ -74,6 +84,11 @@
       "command": "just score",
       "lane": "score",
       "purpose": "verify agent metadata parses and routes proof lanes"
+    },
+    "agent/tool-adoption.toml": {
+      "command": "just score",
+      "lane": "score",
+      "purpose": "verify Jankurai tool-adoption catalog coverage"
     },
     "bins/jeryu-ci-bin/": {
       "command": "just check",
@@ -115,11 +130,6 @@
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "crates/jeryu-test-support/": {
-      "command": "just check",
-      "lane": "check",
-      "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
-    },
     "crates/jeryu-cache-policy/": {
       "command": "just check",
       "lane": "check",
@@ -149,6 +159,11 @@
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+    },
+    "crates/jeryu-guestd/": {
+      "command": "just check && cargo build --locked -p jeryu-guestd --target x86_64-unknown-linux-musl",
+      "lane": "check",
+      "purpose": "verify the unprivileged guest supervisor and statically linked VM entrypoint; live KVM execution requires separate qualification"
     },
     "crates/jeryu-phase7-cli/": {
       "command": "just check",
@@ -195,6 +210,16 @@
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
+    "crates/jeryu-test-support/": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+    },
+    "db/": {
+      "command": "just check && just score",
+      "lane": "check",
+      "purpose": "verify documented data boundary policy remains routed"
+    },
     "deny.toml": {
       "command": "just security",
       "lane": "security",
@@ -210,25 +235,35 @@
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
+    "images/agent-microvm/": {
+      "command": "just check && cargo test --locked -p jeryu-runner-protocol && cargo test --locked -p jeryu-runner-microvm --lib",
+      "lane": "check",
+      "purpose": "verify test/production image custody and mock declarations; real KVM qualification is separate"
+    },
     "images/agent-sandbox/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
+    },
+    "ops/": {
+      "command": "just fast && just check && just security && just score",
+      "lane": "ci",
+      "purpose": "verify host CI wrappers, security gates, and evidence stay reproducible"
     },
     "ops/agent-sandbox/": {
       "command": "just check",
       "lane": "check",
       "purpose": "verify jeryu-ci-runner owned source remains build-addressable"
     },
-    "ops/ci/": {
-      "command": "just fast && just check && just security && just score",
-      "lane": "ci",
-      "purpose": "verify host CI wrappers and fail-closed security gates"
-    },
     "ops/ci-kit/": {
       "command": "just fast && just check && just security && just score",
       "lane": "ci",
       "purpose": "verify the canonical ci-kit is sealed, the vendored ops/ci/kit copy matches its pin, and the kit selftest passes"
+    },
+    "ops/ci/": {
+      "command": "just fast && just check && just security && just score",
+      "lane": "ci",
+      "purpose": "verify host CI wrappers and fail-closed security gates"
     },
     "ops/git-hooks/": {
       "command": "just fast && just check && just score",
@@ -260,15 +295,15 @@
       "lane": "check",
       "purpose": "verify local Rust toolchain metadata remains pinned"
     },
-    "scripts/": {
-      "command": "just check",
-      "lane": "check",
-      "purpose": "verify helper scripts parse and stay locally reproducible"
-    },
     "schemas/": {
       "command": "just contract-drift",
       "lane": "contract",
       "purpose": "verify checked wire schema cannot drift from Rust serde shapes"
+    },
+    "scripts/": {
+      "command": "just check",
+      "lane": "check",
+      "purpose": "verify helper scripts parse and stay locally reproducible"
     },
     "tests/": {
       "command": "just check && just score",
@@ -299,31 +334,6 @@
       "command": "just security",
       "lane": "security",
       "purpose": "verify the canonical security lane and its evidence"
-    },
-    "agent/tool-adoption.toml": {
-      "command": "just score",
-      "lane": "score",
-      "purpose": "verify Jankurai tool-adoption catalog coverage"
-    },
-    "db/": {
-      "command": "just check && just score",
-      "lane": "check",
-      "purpose": "verify documented data boundary policy remains routed"
-    },
-    "ops/": {
-      "command": "just fast && just check && just security && just score",
-      "lane": "ci",
-      "purpose": "verify host CI wrappers, security gates, and evidence stay reproducible"
-    },
-    "crates/jeryu-guestd/": {
-      "command": "just check && cargo build --locked -p jeryu-guestd --target x86_64-unknown-linux-musl",
-      "lane": "check",
-      "purpose": "verify the unprivileged guest supervisor and statically linked VM entrypoint; live KVM execution requires separate qualification"
-    },
-    "images/agent-microvm/": {
-      "command": "just check && cargo test --locked -p jeryu-runner-protocol && cargo test --locked -p jeryu-runner-microvm --lib",
-      "lane": "check",
-      "purpose": "verify test/production image custody and mock declarations; real KVM qualification is separate"
     }
   },
   "workspace": "jeryu-ci-runner"
