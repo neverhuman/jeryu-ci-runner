@@ -866,3 +866,32 @@ grep -q 'did not keep the inputs digest' "$scratch/short.err" || { printf 'a dro
 exec 6>&-
 unset IDENTITY
 printf 'PASS a forge that drops the inputs digest is reported\n'
+
+# Proof base: the recipe variable is the site's per owner; a PR's base branch is data that is checked,
+# then fetched into the tree as origin/<base>; main needs no fetch; a missing base fails with a reason.
+# shellcheck source=ops/pr-gate/bin/pr-gate-config.sh
+source "$script_dir/pr-gate-config.sh"
+# shellcheck disable=SC2034  # read by gate_proof_base_var
+PR_GATE_PROOF_BASE_VARS='acme=ACME_PROOF_BASE_REF other=-bad'
+[[ "$(gate_proof_base_var acme)" == ACME_PROOF_BASE_REF ]] || { printf 'proof base variable not read from site config\n' >&2; exit 1; }
+[[ -z "$(gate_proof_base_var unlisted)" ]] || { printf 'unlisted owner got a proof base variable\n' >&2; exit 1; }
+gate_proof_base_var other >/dev/null && { printf 'a bad variable name was accepted\n' >&2; exit 1; }
+for ok in main release/v10.1.6-jope; do
+  [[ "$(gate_base_branch "$ok")" == "$ok" ]] || { printf 'rejected base branch %s\n' "$ok" >&2; exit 1; }
+done
+for bad in '' -x ../x a..b a//b a/ 'a b' 'x.lock' 'a/.hidden'; do
+  if gate_base_branch "$bad" >/dev/null; then printf 'accepted base branch %q\n' "$bad" >&2; exit 1; fi
+done
+pb="$scratch/proofbase"
+git init -q --initial-branch=main "$pb/src"
+git -C "$pb/src" -c user.name=F -c user.email=f@example.invalid commit -q --allow-empty -m one
+git -C "$pb/src" checkout -q -b release/v1
+git -C "$pb/src" -c user.name=F -c user.email=f@example.invalid commit -q --allow-empty -m rel
+git clone -q --no-checkout "$pb/src" "$pb/tree"
+gate_fetch_base "$pb/tree" "$pb/src" main
+gate_fetch_base "$pb/tree" "$pb/src" release/v1
+[[ "$(git -C "$pb/tree" rev-parse refs/remotes/origin/release/v1)" == "$(git -C "$pb/src" rev-parse release/v1)" ]] \
+  || { printf 'release base not fetched as origin/<base>\n' >&2; exit 1; }
+if gate_fetch_base "$pb/tree" "$pb/src" release/missing 2>"$pb/err"; then printf 'a missing base was accepted\n' >&2; exit 1; fi
+grep -q 'release/missing could not be fetched' "$pb/err" || { printf 'missing base gave no clear error\n' >&2; exit 1; }
+printf 'PASS proof base: main keeps origin/main, a release line gets origin/<base>, a missing base fails clearly\n'

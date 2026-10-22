@@ -1235,7 +1235,7 @@ if ((build_cache)); then
 fi
 # A head moving during preparation must not run under the earlier admission. A queue commit is still
 # admitted only while its entry is building at the same sha.
-checks_url=""
+checks_url="" base_branch=""
 if [[ "$main_health" == 1 ]]; then
   api GET "/api/v3/repos/$owner/$repo/branches/main"
   [[ "$code" == 200 ]] || die "cannot refresh main before admission ($code)"
@@ -1249,18 +1249,41 @@ elif [[ "$qref" == - ]]; then
   # The checks page of exactly this pull request, from the forge's answer for it just now. A queue
   # commit and main-health link nothing: no PR checks page shows their sha.
   checks_url=$(gate_checks_url "$owner" "$repo" "$number" "$body")
+  base_branch="$(jq -r '.base.ref // ""' <<<"$body")"
 else
   api GET "/api/v1/merge-queue?state=building"
   [[ "$code" == 200 ]] || die "cannot refresh the merge queue before admission ($code)"
   admitted=0
   jq -e --arg r "$owner/$repo" --argjson n "$number" --arg s "$sha" \
     'any(.entries[]?; .repo == $r and (.number|tonumber) == $n and .queue_sha == $s)' <<<"$body" >/dev/null && admitted=1
+  # refs/queue/<base>/<n>: the entry's own base branch.
+  base_branch="${qref#refs/queue/}"; base_branch="${base_branch%/*}"
 fi
 if ((admitted == 0)); then
   say "head changed or PR closed before admission (or its queue entry moved): $owner/$repo#$number"
   rm -f -- "$identity" "$status_snapshot"
   exec 6>&-; exec 7>&-
   continue
+fi
+# The proof base. A recipe compares against a base ref that defaults to origin/main, which a release
+# line does not descend from. When the site names that variable for this owner, the recipe gets
+# origin/<the PR's base branch>, fetched into this tree; a base that cannot be had fails the gate here
+# with that reason rather than inside the recipe. main-health and owners with no variable are unchanged.
+proof_base_env=()
+proof_base_var="$(gate_proof_base_var "$owner")" || die "PR_GATE_PROOF_BASE_VARS: $owner's entry is not a variable name"
+base_err=""
+# A forge that does not report the base leaves the recipe's own default, as it did before.
+if [[ -n "$proof_base_var" && "$main_health" == 0 && -n "$base_branch" ]]; then
+  if ! base_branch="$(gate_base_branch "$base_branch")" \
+      || ! base_err="$(gate_fetch_base "$run/$repo" "$BASE/git/$owner/$repo.git" "$base_branch" 2>&1)"; then
+    base_err="${base_err:-base branch of $owner/$repo#$number is not a usable branch name}"
+    say "$owner/$repo#$number: $base_err"
+    post_status "$owner" "$repo" "$sha" failure "no gate: proof base unavailable: ${base_err:0:120} ($MARKER)"
+    rm -f -- "$identity" "$status_snapshot"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
+  proof_base_env=("$proof_base_var=origin/$base_branch")
 fi
 gate_begin "$identity"
 : "${gate_attempt_dir:?}"
@@ -1435,6 +1458,7 @@ cache_env=()
 [[ -z "$SCCACHE" ]] || cache_env=(RUSTC_WRAPPER="$SCCACHE" CARGO_INCREMENTAL=0 "${sccache_env[@]}")
 root_env=()
 for var in $WORKER_ROOT_VARS; do root_env+=("$var=$worker_root"); done
+root_env+=("${proof_base_env[@]}")
 # Absolute: a recipe step that runs cargo from a subdirectory must still use the one cache this
 # runner prepares and revokes, never create a nested target/ that survives between gates.
 # Incremental state is never reused across gates, whether or not sccache is present to pin it.

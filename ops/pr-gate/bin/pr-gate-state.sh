@@ -26,6 +26,38 @@ gate_main_health_context() {
   printf '%s/main-health' "$2"
 }
 
+# The recipe variable that names the proof base for OWNER's repositories, read from the site's
+# PR_GATE_PROOF_BASE_VARS (owner=VARIABLE words), or nothing when the owner has none configured.
+gate_proof_base_var() { # owner
+  local var
+  var="$(pr_gate_lookup "${PR_GATE_PROOF_BASE_VARS:-}" "$1")" || return 0
+  [[ "$var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || return 1
+  printf '%s' "$var"
+}
+
+# A pull request's base branch as a ref the runner may put in argv: what a PR names is data, so it is
+# checked here and never interpreted. Fails (prints nothing) for anything else.
+gate_base_branch() { # branch
+  local b=$1
+  [[ "$b" =~ ^[A-Za-z0-9_][A-Za-z0-9._/-]*$ && "$b" != *..* && "$b" != */ && "$b" != *//* \
+     && "$b" != *.lock && "$b" != *.lock/* && "$b" != */.* ]] || return 1
+  printf '%s' "$b"
+}
+
+# Fetch BRANCH of the hosted repository into the tree as origin/BRANCH, so a recipe that compares
+# against it finds it. main is already there (sync_repo). Fails with a message on stderr when the
+# branch is missing from the forge.
+gate_fetch_base() { # tree url branch
+  local out
+  [[ "$3" != main ]] || return 0
+  if ! out="$(git -C "$1" fetch --quiet "$2" "+refs/heads/$3:refs/remotes/origin/$3" 2>&1)"; then
+    printf 'base branch %s could not be fetched: %s\n' "$3" "$out" >&2
+    return 1
+  fi
+  git -C "$1" rev-parse --verify --quiet "refs/remotes/origin/$3^{commit}" >/dev/null \
+    || { printf 'base branch %s is missing from the gate tree\n' "$3" >&2; return 1; }
+}
+
 gate_status_context() {
   if [[ "${GATE_CONTEXT_KIND:-required}" == main-health ]]; then
     gate_main_health_context "$1" "$2"
