@@ -902,6 +902,7 @@ gate_self_modification_note() { # receipt
 gate_publish() {
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
   local steps_dir="" steps_end="" status_payload check_payload proof_base
+  local check_state title changed="" step_state
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -910,6 +911,26 @@ gate_publish() {
   # used the forge slug; never relabel their old evidence as the corrected gate.
   context=$(jq -er '.inputs.required_context // (.repo + "/required")' "$gate_receipt") || return
   case "$outcome" in success) state=success;; failure|timed_out) state=failure;; *) state=error;; esac
+  check_state=$state
+  step_state=failure
+  [[ "$exit_code" != 0 ]] || step_state=success
+  title="Operator gate $outcome (exit $exit_code)"
+  if [[ "$outcome" == inputs_changed ]]; then
+    changed=$(jq -r '[.inputs.sources[]? as $before | .after_inputs.sources[]?
+      | select(.repository == $before.repository and .head != $before.head)
+      | select(.repository | test("^[A-Za-z0-9._-]+$"))
+      | select((.head | test("^[0-9a-f]{40}$")) and ($before.head | test("^[0-9a-f]{40}$")))
+      | "\(.repository): \($before.head) -> \(.head)"] | join("; ")' "$gate_receipt")
+    changed=${changed:-tools, fixtures, or working-tree inputs changed}
+    title="Passed, but inputs changed during the run ($changed); re-running"
+    if jq -e '(.inputs_changed_count // 1) >= 3' "$gate_receipt" >/dev/null; then
+      title="Passed, but inputs changed during the run ($changed); stopped after two re-runs; explicit re-gate required"
+    fi
+    if [[ "$exit_code" == 0 ]]; then
+      check_state=neutral
+      if jq -e '(.inputs_changed_count // 1) < 3' "$gate_receipt" >/dev/null; then state=pending; fi
+    else title="Recipe failed (exit $exit_code); ${title#Passed, but }"; fi
+  fi
   log=$(jq -r '.log // ""' "$gate_receipt")
   checks_url=$(jq -r '.checks_url // ""' "$gate_receipt")
   # The attempt's step checklist (pr-gate-progress.sh). steps.end is written when the worker ends; an
@@ -932,7 +953,7 @@ gate_publish() {
   if jq -e '(.gate_input_paths // []) | length > 0' "$gate_receipt" >/dev/null; then
     review="; gate inputs changed: extra review required"
   fi
-  if [[ "$state" != success && -f "$log" ]]; then cause=$(gate_failure_cause "$log"); fi
+  if [[ "$step_state" != success && -f "$log" ]]; then cause=$(gate_failure_cause "$log"); fi
   # The input identity's digest goes on the status, so a runner on any host can tell that a result
   # proves exactly the inputs it would gate (see gate_decision). A receipt without inputs names none.
   inputs=""
@@ -974,12 +995,13 @@ gate_publish() {
     steps=""
     if [[ -n "$steps_dir" && -f "$steps_dir/steps.tsv" ]]; then
       steps=$(gate_progress_summary "$steps_dir/steps.tsv" "" "$steps_dir/step-sources" \
-        "$( [[ "$state" == success ]] && printf success || printf failure)" \
+        "$step_state" \
         "${steps_end:-$(tail -n 1 "$steps_dir/steps.tsv" | cut -f1)}" "$cause")
     fi
-    check_payload=$(jq -nc --arg sha "$sha" --arg state "$state" \
-      --arg title "Operator gate $outcome (exit $exit_code)${cause:+: $cause}" \
-      --arg summary "${steps:+$steps
+    check_payload=$(jq -nc --arg sha "$sha" --arg state "$check_state" \
+      --arg title "$title${cause:+: $cause}" \
+      --arg summary "${changed:+$title
+}${steps:+$steps
 }Attempt $id; log sha256 $digest; $kind${note:+; changes its own gate}$review" \
       --arg note "$note" \
       '{name:"pr-gate-runner",head_sha:$sha,status:"completed",conclusion:(if $state=="error" then "failure" else $state end),

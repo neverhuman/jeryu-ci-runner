@@ -772,3 +772,16 @@ Times are first-seen, polled every 2 s.
 median time over its green attempts (all with `--all`), with p90, max, share of the total and run
 count: the numbers for deciding whether a long, low-value step should leave the required gate. It
 runs on the gate host and reads the real step text.
+
+Passing recipes whose execution inputs change produce a neutral check run with a
+passed-with-changed-inputs explanation; completed steps remain green. The receipt
+retains the observed after-input identity and names repository head changes. The
+required status stays pending while the slot immediately retries that head ahead
+of its other candidates. After two consecutive automatic re-runs, it reports an
+error requiring an explicit re-gate. The receipt counter survives tick restarts.
+An explicit PR invocation or forge re-gate request starts a new bounded chain.
+
+Sibling sources already run from the slot checkouts selected during preparation.
+A remote main moving alone does not change those checked-out inputs during a run.
+The runner still verifies every executed checkout and tool after the recipe; it
+does not accept mutations to siblings as proof of the original snapshot.

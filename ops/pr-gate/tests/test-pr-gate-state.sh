@@ -37,6 +37,25 @@ gate_decision "$identity" 0 "$statuses"
 jq -e '.exit_code==0 and .outcome=="success" and .terminal' "$gate_receipt" >/dev/null
 printf 'PASS success uses process exit, verified log and current publication\n'
 
+# Drift reports carry the actual repository transition, even when recovered later.
+owner=acme repo=fixture
+exec 6>&-
+gate_lock "acme-fixture-$sha"
+gate_begin "$identity"
+gate_update --arg before "$sha" --arg after "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" \
+  '.inputs.sources=[{repository:"sibling",head:$before}] |
+   .after_inputs={sources:[{repository:"sibling",head:$after}]} | .inputs_changed_count=1'
+printf 'coverage ok: fixture\n' >"$gate_attempt_dir/build.log"
+printf '100\tnpm test:coverage\n' >"$gate_attempt_dir/steps.tsv"
+printf '110\n' >"$gate_attempt_dir/steps.end"
+gate_finish inputs_changed 0 "$gate_attempt_dir/build.log"
+gate_publish
+jq -se --arg before "$sha" 'last | .conclusion == "neutral" and
+  (.output.summary | contains("sibling: " + $before + " -> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")) and
+  (.output.summary | contains("✗") | not) and (.output.title | endswith("re-running"))' "$scratch/published.jsonl" >/dev/null
+jq -se '.[-2].state == "pending"' "$scratch/published.jsonl" >/dev/null
+printf 'PASS changed-input receipt publishes the moved repository and passing steps\n'
+
 jq '.statuses += [{context:"fixture/required",state:"failure",id:"newer",created_at:"2026-09-18T00:00:00Z"}]' \
   "$statuses" >"$scratch/overridden.json"
 gate_decision "$identity" 0 "$scratch/overridden.json"

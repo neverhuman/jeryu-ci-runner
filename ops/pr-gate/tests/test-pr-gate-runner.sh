@@ -1368,12 +1368,23 @@ printf 'PASS shared build cache: queue gates publish, pull-request heads only re
 # Mutable execution inputs cannot retain a green verdict for the pre-recipe identity.
 printf 'before\n' >"$fixture/tools/environment-probe"
 touch "$fixture/mutate-tool"
+before_count=$(count)
+rm -f "$fixture/check-runs.jsonl"
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
 jq -e '.terminal and .outcome == "inputs_changed" and .exit_code == 0' "$receipt" >/dev/null
 jq -se 'last.state == "error"' "$fixture/statuses.jsonl" >/dev/null
-printf 'PASS recipe input drift records inputs_changed despite a passing process exit\n'
+expect_count "$((before_count + 3))"
+jq -e '.inputs_changed_count == 3' "$receipt" >/dev/null
+jq -se '[.[] | select(.status == "completed")] | length == 3 and
+  all(.[]; .conclusion == "neutral" and (.output.summary | contains("Passed, but inputs changed during the run"))
+    and (.output.summary | contains("✗") | not)) and
+  (.[0].output.title | endswith("re-running")) and
+  (.[2].output.title | contains("stopped after two re-runs"))' "$fixture/check-runs.jsonl" >/dev/null
+invoke
+expect_count "$((before_count + 3))"
+printf 'PASS passing input drift is neutral, retries immediately twice, and stays bounded across ticks\n'
 
 # Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.
 rm -f "$fixture/mutate-tool"

@@ -1028,6 +1028,7 @@ if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # first one with forge reuse off, so this host's own receipt replaces the adoption one head per idle tick.
 forge_adopted=()
 GATE_FORGE_REUSE=1
+immediate_retry=0
 while :; do
 for candidate in "${candidates[@]}"; do
 read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
@@ -1037,7 +1038,7 @@ read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
    && ( "$cbase" == - || "$cbase" == '!' || "$cbase" =~ ^\*[0-9]+$ || "$cbase" == "$(gate_base_branch "$cbase")" ) \
    && "$contributed" =~ ^[01]$ && ( "$ready" == - || "$ready" =~ ^[^[:space:]]+\|[a-z-]+$ ) ]] \
   || die "invalid repository or head in dispatch"
-if [[ "$qref" == - && -z "$only_pr" ]] && gate_queue_arrived; then
+if [[ "$qref" == - && -z "$only_pr" && "$immediate_retry" == 0 ]] && gate_queue_arrived; then
   heartbeat
   exit 0
 fi
@@ -1112,6 +1113,19 @@ if ! gate_recover; then
   exec 6>&-; exec 7>&-
   continue
 fi
+
+# Retain the chain length across ticks and publication recovery. An explicit request
+# starts a new chain; the immediate loop retains the previous attempt's count.
+inputs_changed_count=0
+if [[ -f "$gate_key_dir/last-result.json" ]] && { [[ -z "$only_pr" ]] || ((immediate_retry)); }; then
+  inputs_changed_count=$(jq -r 'if .outcome == "inputs_changed" then (.inputs_changed_count // 1) else 0 end' "$gate_key_dir/last-result.json")
+fi
+if ((inputs_changed_count >= 3)) && ! gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
+  say "hold $owner/$repo@$sha: inputs changed after two automatic re-runs; explicit re-gate required"
+  exec 6>&-; exec 7>&-
+  continue
+fi
+((inputs_changed_count < 3)) || inputs_changed_count=0
 
 # 3. the family's canonical mains
 family="$FAMILY"
@@ -1621,6 +1635,7 @@ if ((admitted == 0)); then
   continue
 fi
 gate_begin "$identity"
+gate_update --argjson count "$inputs_changed_count" '.inputs_changed_count=$count'
 : "${gate_attempt_dir:?}"
 # Why this head is proved against main although its base is another branch, for its status.
 [[ -z "$pb_note" ]] || gate_update --arg note "$pb_note" '.proof_base_note=$note' \
@@ -1863,6 +1878,10 @@ after_inputs="$gate_attempt_dir/after-inputs.json"
 if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" \
   || ! jq -e --slurpfile after "$after_inputs" '.inputs == $after[0]' "$gate_receipt" >/dev/null; then
   state=inputs_changed
+  gate_update --argjson count "$((inputs_changed_count + 1))" '.inputs_changed_count=$count'
+  if jq -e 'type == "object"' "$after_inputs" >/dev/null 2>&1; then
+    gate_update --slurpfile after "$after_inputs" '.after_inputs=$after[0]'
+  fi
 fi
 gate_finish "$state" "$worker_exit" "$log"
 # Only an approved commit on its way to main feeds the shared cache: a green merge-queue replay or a
@@ -1894,6 +1913,14 @@ say "recorded $owner/$repo $(gate_status_context "$owner" "$repo")=$state; exit 
 # Attempt evidence is retained with its log, including active and unpublished results.
 # Age does not discharge a recovery obligation. Preservation-aware retention must be
 # qualified separately before any journal or legacy log is removed.
+if [[ "$state" == inputs_changed ]] && ((inputs_changed_count < 2)); then
+  say "inputs changed: immediately re-queuing $owner/$repo@$sha ahead of other candidates"
+  candidates=("$candidate")
+  immediate_retry=1
+  gate_receipt=""
+  exec 6>&-; exec 7>&-
+  continue 2
+fi
 # A recorded red result is the runner doing its job, not a fault: exit 0 so systemd does
 # not show a healthy slot as failed. Runner faults still die non-zero.
 exit 0
