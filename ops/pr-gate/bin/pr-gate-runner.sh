@@ -61,9 +61,16 @@
 #   --repo/--pr  gate this PR now, even if it already has a runner status
 #   --main-health  gate protected main and post <repo>/main-health
 #   --list       print what the next tick would gate and exit
+#   --preflight  (alone) read-only release check: stale slot index locks, pinned-tool drift, each
+#                family main's latest <repo>/required; exit 1 on a finding (pr-gate-preflight.sh)
 # ---------------------------------------------------------------------------
 set -euo pipefail
 GATE_RUNNER_SCRIPT="$(realpath -- "${BASH_SOURCE[0]}")"
+# Preflight takes no slot lock and posts nothing, so it is handed off before any runner state is touched.
+if [[ "${1:-}" == --preflight ]]; then
+  (($# == 1)) || { printf -- '--preflight takes no other argument\n' >&2; exit 2; }
+  exec bash "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-preflight.sh"
+fi
 # shellcheck source=ops/pr-gate/bin/pr-gate-config.sh
 source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-config.sh"
 pr_gate_load_config

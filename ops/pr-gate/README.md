@@ -202,6 +202,15 @@ request's own (`pr-opened`, `pr-updated`): an unrelated change to a pull request
 measured wait shorter, never invent one. Clocks that disagree record `seconds: null` and keep both
 times rather than a negative wait.
 
+## Release preflight
+
+`pr-gate-runner.sh --preflight` (ADR 0019) is a read-only look before a release. It takes no slot lock,
+writes and posts nothing, and stops asking the forge after `PR_GATE_PREFLIGHT_BUDGET` seconds (default 90).
+It reports `.git/index.lock` files older than `PR_GATE_PREFLIGHT_LOCK_AGE_MIN` (default 120 min) under the
+slot trees; tools in `PR_GATE_PINNED_TOOLS_FILE` (`name package version[,version] [sha256]`) that are
+missing, carry another digest, or whose installed dpkg version is not a reviewed one; and each family
+main's latest `<repo>/required` status. Exit 0: clean; 1: findings; 2: misconfigured.
+
 ## Main health
 
 `pr-gate-runner.sh --main-health` gates each protected repository's current `main` with the same
