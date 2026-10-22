@@ -39,6 +39,14 @@ The review directory (its path is given below) contains:
                      diff you actually read.
 - `signals.txt`    — mechanical pre-scan hits (secret patterns, sensitive paths, binaries). They are
                      leads to verify, not verdicts.
+- `upstream/`      — present only when the change moves a git dependency pin (Cargo.toml `rev`, Cargo.lock
+                     `source`, hosted-pin-refs.tsv). `SUMMARY.txt` gives a status per pin and each pin
+                     directory holds `pin.json`, `log.txt`, `diff.patch` (the crates the dependent
+                     imports), `pulls.json` (each commit's PR, merge state, branch) and `note.txt`. Confirm
+                     the new rev is the merged tip (`merged-tip`) or an ancestor of it (`ancestor-of-tip`)
+                     of the named upstream branch and read the diff. Any other status
+                     (`NOT-ON-BRANCH`, `rev-not-on-forge`, `branch-missing-on-forge`) is unverified
+                     evidence: report it. `branch-unnamed` means no branch was named, so judge from the log.
 - `checkout/`      — the repository at the exact head commit, for context around the diff
 
 You have read-only tools. Read the whole diff. For any change that touches something sensitive, open

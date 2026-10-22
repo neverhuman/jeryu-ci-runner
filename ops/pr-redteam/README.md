@@ -156,6 +156,17 @@ maintainer approves has to be readable from the log, and an unconfigured git
 writes a name that says nothing. This decides only whether a head is reviewed,
 so it does not move `review_format`: a head already reviewed keeps its receipt.
 
+## Upstream evidence for a git-pin bump
+
+When a change moves a git dependency's revision (a `rev =` in Cargo.toml, a `source = "git+...#rev"`
+line in Cargo.lock, or a row of a repository's `hosted-pin-refs.tsv`), the review directory gets
+`upstream/`: `SUMMARY.txt` and, per pin, `pin.json`, `log.txt`, `diff.patch` (the crates the dependent
+names), `pulls.json` (each commit's pull request, merge state and branch) and `note.txt`. Only the
+`/git/<owner>/<name>` path of the source URL is used and the fetch goes to the forge alone. Size and time
+are capped by `REDTEAM_UPSTREAM_MAX_PINS`, `_MAX_BYTES`, `_MAX_COMMITS` and `_FETCH_TIMEOUT`. The
+reviewer confirms the new rev is the merged tip, or an ancestor of it, of the named branch; any other
+status (`NOT-ON-BRANCH`, `rev-not-on-forge`, `branch-missing-on-forge`) is reported as unverified.
+
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,

@@ -62,8 +62,8 @@ echo 'ok plumbing change keeps the review identity'
 
 # review_format is part of the identity.
 copy "$t/b"
-grep -qx 'review_format=1' "$t/b/pr-redteam" || fail 'review_format=1 not found in pr-redteam'
-sed -i 's/^review_format=1$/review_format=2/' "$t/b/pr-redteam"
+grep -qx 'review_format=2' "$t/b/pr-redteam" || fail 'review_format=1 not found in pr-redteam'
+sed -i 's/^review_format=2$/review_format=3/' "$t/b/pr-redteam"
 bumped="$(run "$t/b" identity)"
 [[ "$bumped" =~ ^[0-9a-f]{64}$ && "$bumped" != "$original" ]] || fail 'bumping review_format kept the review identity'
 echo 'ok review_format bump changes the review identity'
