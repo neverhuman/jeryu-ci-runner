@@ -40,13 +40,23 @@ The review directory (its path is given below) contains:
 - `signals.txt`    — mechanical pre-scan hits (secret patterns, sensitive paths, binaries). They are
                      leads to verify, not verdicts.
 - `upstream/`      — present only when the change moves a git dependency pin (Cargo.toml `rev`, Cargo.lock
-                     `source`, hosted-pin-refs.tsv). `SUMMARY.txt` gives a status per pin and each pin
-                     directory holds `pin.json`, `log.txt`, `diff.patch` (the crates the dependent
-                     imports), `pulls.json` (each commit's PR, merge state, branch) and `note.txt`. Confirm
-                     the new rev is the merged tip (`merged-tip`) or an ancestor of it (`ancestor-of-tip`)
-                     of the named upstream branch and read the diff. Any other status
-                     (`NOT-ON-BRANCH`, `rev-not-on-forge`, `branch-missing-on-forge`) is unverified
-                     evidence: report it. `branch-unnamed` means no branch was named, so judge from the log.
+                     `source`, hosted-pin-refs.tsv). `SUMMARY.txt` gives a status per pin; each fetched
+                     pin's directory holds `pin.json`, `log.txt`, `diff.patch` (the crates the dependent
+                     imports), `pulls.json` (each commit's PR, merge state, branch) and `note.txt`.
+                     Only a pin already pinned at the PR's base, on this forge or mapped to it by the
+                     base, is fetched. What each status proves:
+                     `merged-tip` / `ancestor-of-tip` — the new rev is the tip of, or an ancestor of the
+                     tip of, a branch the forge itself reports as the default or as protected
+                     (`pin.json` `checked_branch`, `checked_branch_kind`). These two alone are verified.
+                     `on-unprotected-branch` — the rev is on the branch the change names, which the
+                     forge does not protect: anyone who can push there could have put it there.
+                     `NOT-ON-BRANCH` — on no default, protected or named branch.
+                     `branches-unknown` — the forge did not say which branches are default or protected.
+                     `rev-not-on-forge` — the rev could not be fetched at all.
+                     `new-pin-unverified` — not pinned at the base; nothing was fetched.
+                     `unmapped-host` — not on this forge and not mapped to it; nothing was fetched.
+                     Every unverified status is a fact to report, not proof. Read the diff, and the
+                     truncation notes in `SUMMARY.txt` and `pin.json`: a cut log or diff was not read.
 - `checkout/`      — the repository at the exact head commit, for context around the diff
 
 You have read-only tools. Read the whole diff. For any change that touches something sensitive, open

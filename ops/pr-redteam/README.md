@@ -158,19 +158,40 @@ so it does not move `review_format`: a head already reviewed keeps its receipt.
 
 ## Upstream evidence for a git-pin bump
 
-When a change moves a git dependency's revision (a `rev =` in Cargo.toml, a `source = "git+...#rev"`
-line in Cargo.lock, or a row of a repository's `hosted-pin-refs.tsv`), the review directory gets
-`upstream/`: `SUMMARY.txt` and, per pin, `pin.json`, `log.txt`, `diff.patch` (the crates the dependent
-names), `pulls.json` (each commit's pull request, merge state and branch) and `note.txt`. Only the
-`/git/<owner>/<name>` path of the source URL is used and the fetch goes to the forge alone. Size and time
-are capped by `REDTEAM_UPSTREAM_MAX_PINS`, `_MAX_BYTES`, `_MAX_COMMITS` and `_FETCH_TIMEOUT`. The
-reviewer confirms the new rev is the merged tip, or an ancestor of it, of the named branch; any other
-status (`NOT-ON-BRANCH`, `rev-not-on-forge`, `branch-missing-on-forge`) is reported as unverified.
+When a change moves a git dependency's revision (a `rev =` in Cargo.toml, inline or in a
+`[dependencies.<name>]` table, a `source = "git+...#rev"` line in Cargo.lock, or a row of a
+repository's `hosted-pin-refs.tsv`), the review directory gets `upstream/`: `SUMMARY.txt` and, per
+fetched pin, `pin.json`, `log.txt`, `diff.patch` (the crates the dependent names), `pulls.json` (each
+commit's pull request, merge state and branch) and `note.txt`.
+
+The manifest is the author's text, so it never decides what is fetched or what counts as verified:
+
+- Only a dependency already pinned at the PR's base -- the same file, dependency name and repository
+  -- is fetched. A brand-new pin is reported as `new-pin-unverified` and nothing is fetched.
+- Only the forge named by `JERYU_BASE` is fetched from. A source on another host (a GitHub mirror)
+  counts only through an `insteadOf` mapping to this forge that the base's `.cargo/hosted-gitconfig`
+  already carries; otherwise it is `unmapped-host` and nothing is fetched.
+- Fetches run with no system, global or XDG git configuration, no ambient credential helper and no
+  netrc, and present only the reviewer's own credential.
+- The forge, not the manifest, says which branches count: the repository's default branch and the
+  branches it reports protected. A branch the change names (Cargo `branch`, `?branch=`, or the TSV's
+  support ref) counts only when the forge protects it. `pin.json` records the branch checked, its kind
+  and whether the change named it, the tip and when it was fetched; refs from an earlier run are
+  deleted before each fetch. `pin.json` is written only once the new rev resolves.
+
+Only `merged-tip` and `ancestor-of-tip` are verified. `on-unprotected-branch`, `NOT-ON-BRANCH`,
+`branches-unknown`, `rev-not-on-forge`, `new-pin-unverified` and `unmapped-host` are unverified;
+`SUMMARY.txt` and `prompt.md` say what each proves. Upstream evidence shares the diff's size limit: the
+total across all pins is at most `REDTEAM_UPSTREAM_MAX_BYTES` (default 400000), a quarter of
+`REDTEAM_MAX_DIFF_BYTES`, and what the diff leaves of that limit. `REDTEAM_UPSTREAM_MAX_PINS`,
+`_MAX_COMMITS`, `_MAX_BRANCHES`, `_MAX_PULL_PAGES` and `_FETCH_TIMEOUT` bound the rest. Every cut (bytes,
+commits, pull request pages, pins, protected branches) is noted in `SUMMARY.txt` and `pin.json`, as is
+a pin that moves backwards.
 
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,
-credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, contributed-origin, owner-decision and installation checks. The actual repository required lane
+upstream-evidence, credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, contributed-origin, owner-decision and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
 publication refusal, restart, duplicate dispatch, worker loss and changed heads,
