@@ -12,12 +12,12 @@ trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_manifest_pins upstream_url_map upstream_pins upstream_tag upstream_remote upstream_git \
-    upstream_capped upstream_pin_evidence upstream_evidence; do
+    upstream_capped upstream_drop_refs upstream_pin_evidence upstream_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done
 upstream_max_pins=6 upstream_max_bytes=100000 upstream_max_commits=50 upstream_fetch_timeout=20
-upstream_max_branches=8 upstream_max_pull_pages=10
+upstream_max_branches=8 upstream_max_pull_pages=10 upstream_min_share=1024
 state="$t/state"; me=reviewer
 # The stand-in forge is a directory served over file://; the real upstream_remote builds
 # $base/git/<owner>/<name>.git from it. Manifests name the forge by its host, forge.test.
@@ -34,19 +34,34 @@ EOF
 printf 'machine 127.0.0.1 login ambient password netrcsecret\n' >"$t/home/.netrc"; chmod 600 "$t/home/.netrc"
 export GIT_CONFIG_GLOBAL="$t/ambient.gitconfig" HOME="$t/home" GIT_TERMINAL_PROMPT=0
 
-# The forge API: default branch, branch list with protection, and paged pull requests.
+# The forge API, answering exactly the two repository reads and the pull request listing the
+# evidence code makes, in the shapes the live forge returns (checked against it): the repository
+# read carries default_branch; /refs is an array of {name, sha, kind, protected}. Any other
+# repository path is recorded and fails the suite at the end.
 stub_default=main stub_release_protected=false pulls_more=false stub_pulls='{"items":[]}'
+upstream_ref_rows() { # bare-repo: one {name, sha, kind:"branch", protected:false} per branch
+  git -C "$1" for-each-ref --format='%(refname:strip=2) %(objectname)' refs/heads/ |
+    jq -Rc 'split(" ") | {name: .[0], sha: .[1], kind: "branch", protected: false}' | jq -sc .
+}
 api() {
   echo "$2" >>"$t/api.log"; code=200
+  local r
   case "$2" in
-    */refs) body="$(jq -nc --argjson rp "$stub_release_protected" '[
-        {name: "main", kind: "branch", protected: true},
-        {name: "release/v1", kind: "branch", protected: $rp},
-        {name: "side", kind: "branch", protected: false},
-        {name: "v1", kind: "tag", protected: true}]')" ;;
-    */pulls\?*) body="$(jq -c --argjson more "$pulls_more" '. + {page: {has_more: $more}}' <<<"$stub_pulls")" ;;
-    /api/v1/repos/*) body="$(jq -nc --arg d "$stub_default" '{default_branch: $d}')" ;;
-    *) code=404; body='{}' ;;
+    /api/v1/repos/acme%2Fcore|/api/v1/repos/acme%2Fbig)
+      r="${2#/api/v1/repos/}"; r="${r/\%2F//}"
+      body="$(jq -nc --arg o "${r%%/*}" --arg n "${r#*/}" --arg d "$stub_default" '{
+        api_url: ("https://forge.test/api/v1/repos/" + $o + "/" + $n), archived: false,
+        clone_http_url: ("/git/" + $o + "/" + $n + ".git"), clone_ssh_url: null, default_branch: $d,
+        id: {host: "forge", name: $n, owner: $o}, open_pull_requests: 1, visibility: "private"}')" ;;
+    /api/v1/repos/acme%2Fcore/refs|/api/v1/repos/acme%2Fbig/refs)
+      r="${2#/api/v1/repos/}"; r="${r%/refs}"; r="${r/\%2F//}"
+      body="$(upstream_ref_rows "$t/forge/git/$r.git" | jq -c --argjson rp "$stub_release_protected" '
+        map(if .name == "main" then .protected = true elif .name == "release/v1" then .protected = $rp else . end)
+        + [{name: "v1", sha: "0000000000000000000000000000000000000000", kind: "tag", protected: false}]')" ;;
+    /api/v1/repos/acme%2Fcore/pulls\?state=all\&per_page=100\&page=[0-9]*|/api/v1/repos/acme%2Fbig/pulls\?state=all\&per_page=100\&page=[0-9]*)
+      body="$(jq -c --argjson more "$pulls_more" --argjson p "${2##*page=}" \
+        '. + {total: (.items | length), page: {limit: 100, page: $p, total: (.items | length), has_more: $more}}' <<<"$stub_pulls")" ;;
+    *) echo "$2" >>"$t/api.unexpected"; code=404; body='{"error":{"code":"not_found"}}' ;;
   esac
 }
 
@@ -133,6 +148,11 @@ git -C "$t/forge/git/acme/core.git" update-ref -d refs/heads/side
 inline "$rs" | put Cargo.toml
 o="$(evidence "$b" "$(snap noton)")"
 [ "$(field "$(pin_of "$o" "$rs")" status)" = NOT-ON-BRANCH ] || fail "rev on no checked branch: $(cat "$(pin_of "$o" "$rs")")"
+git -C "$t/forge/git/acme/core.git" update-ref refs/heads/side "$r1"
+inline "$rs" side | put Cargo.toml
+o="$(evidence "$b" "$(snap noton-named)")"; p="$(pin_of "$o" "$rs")"
+[ "$(field "$p" status)" = NOT-ON-BRANCH ] && [ "$(field "$p" checked_branch)" = "" ] && [ "$(field "$p" checked_branch_tip)" = "" ] \
+  || fail "NOT-ON-BRANCH names no checked branch: $(cat "$p")"
 git -C "$t/forge/git/acme/core.git" update-ref refs/heads/side "$rs"
 bogus="$(printf 'f%.0s' {1..40})"; inline "$bogus" main | put Cargo.toml
 o="$(evidence "$b" "$(snap bogus)")"
@@ -222,7 +242,6 @@ o="$(evidence "$b" "$(snap stale)")"; p="$(pin_of "$o" "$r2")"
 [ "$(field "$p" status)" = ancestor-of-tip ] && [ "$(field "$p" checked_branch)" = main ] && [ "$(field "$p" checked_branch_kind)" = protected ] \
   || fail "stale tip: $(cat "$p")"
 jq -e '.notes | map(select(test("branch vanished could not be fetched"))) | length == 1' "$p" >/dev/null || fail "failed fetch noted: $(cat "$p")"
-! git -C "$g" rev-parse -q --verify refs/up/b0 >/dev/null || [ "$(git -C "$g" rev-parse refs/up/b0)" != "$r3" ] || fail "stale ref b0 survived"
 stub_default=main
 ok 'a failed branch fetch deletes the earlier tip instead of reusing it'
 
@@ -240,7 +259,41 @@ pulls_more=false upstream_max_commits=50 upstream_max_pull_pages=10
 grep -q "${r1:0:12}: .*truncated" "$o/upstream/SUMMARY.txt" || fail "summary notes the cut"
 ok 'a backwards pin, a cut commit list and unread pull request pages are noted'
 
+# 12b. A budget too small to hold anything fetches nothing and writes no negative byte count.
+D="$t/dep-size"; b="$(git -C "$D" rev-list --max-parents=0 HEAD)"
+three() { printf '[dependencies]\nacme-core = { git = "https://forge.test/git/acme/core.git", rev = "%s" }\nbig = { git = "https://forge.test/git/acme/big.git", rev = "%s" }\nbig2 = { git = "https://forge.test/git/acme/core.git", rev = "%s", package = "acme-core" }\n' "$1" "$2" "$3"; }
+three "$r1" "$k1" "$r1" | put Cargo.toml; b3="$(snap three-base)"
+three "$r3" "$k2" "$r2" | put Cargo.toml
+o="$(budget=1 evidence "$b3" "$(snap three)")"
+[ "$(grep -cE 'not fetched: its share of the upstream evidence budget \([01] bytes\) is too small' "$o/upstream/SUMMARY.txt")" = 3 ] \
+  || fail "a 1-byte budget across three pins: $(cat "$o/upstream/SUMMARY.txt")"
+[ "$(find "$o/upstream" -mindepth 1 ! -name SUMMARY.txt | wc -l)" = 0 ] || fail "a 1-byte budget fetched something"
+! grep -rqE -- '-[0-9]+ bytes|"bytes": -' "$o/upstream" || fail "a negative byte count was written"
+o="$(budget=5000 evidence "$b3" "$(snap three-b)")"
+! grep -rqE -- 'at -[0-9]|"bytes": -' "$o/upstream" || fail "a negative byte count was written: $(cat "$o"/upstream/*/note.txt)"
+ok 'a budget too small for a pin fetches nothing and no byte count goes negative'
+
+# 12c. Parallel reviews of the same upstream pin share the cache, never a tip. Each pair names a
+# different branch: the default-only review must not read the unprotected branch's tip as main.
+D="$t/dep-fwd"; b="$(git -C "$D" rev-list --max-parents=0 HEAD)"
+inline "$rs" | put Cargo.toml; hA="$(snap par-a)"
+inline "$rs" side | put Cargo.toml; hB="$(snap par-b)"
+for round in 1 2 3 4 5; do
+  oa="$(mktemp -d "$t/par-a-XXXXXX")"; ob="$(mktemp -d "$t/par-b-XXXXXX")"
+  upstream_evidence "$D/.git" "$b" "$hA" "$oa" acme 100000 & pa=$!
+  upstream_evidence "$D/.git" "$b" "$hB" "$ob" acme 100000 & pb=$!
+  wait "$pa"; wait "$pb"
+  [ "$(field "$(pin_of "$oa" "$rs")" status)" = NOT-ON-BRANCH ] && [ "$(field "$(pin_of "$oa" "$rs")" verified)" = false ] \
+    || fail "round $round: a parallel review read another's tip: $(cat "$(pin_of "$oa" "$rs")")"
+  [ "$(field "$(pin_of "$ob" "$rs")" status)" = on-unprotected-branch ] && [ "$(field "$(pin_of "$ob" "$rs")" checked_branch)" = side ] \
+    || fail "round $round: the named-branch review: $(cat "$(pin_of "$ob" "$rs")")"
+done
+[ -z "$(git -C "$state/cache/upstream/acme@core.git" for-each-ref --format='%(refname)' refs/up/ | grep -vx 'refs/up/b[01]')" ] \
+  || fail "a review left its refs behind"
+ok 'parallel reviews of one upstream never see each other'"'"'s tips and leave no refs'
+
 # 13. No moved pin, no upstream/.
+dep plain; inline "$r1" | put Cargo.toml; b2="$(snap base)"
 echo x | put readme; o="$t/plain"; mkdir -p "$o"
 upstream_evidence "$D/.git" "$b2" "$(snap doc)" "$o" acme 100000
 [ ! -e "$o/upstream" ] || fail "no pin moved but upstream/ exists"
@@ -255,6 +308,10 @@ rm -f "$t/ambient-called"
 cred="$(printf 'protocol=https\nhost=forge.test\n\n' | upstream_git credential fill 2>&1)" || fail "credential fill: $cred"
 [ ! -e "$t/ambient-called" ] || fail "an upstream fetch's git invoked the ambient credential helper"
 grep -qx 'password=dummytoken' <<<"$cred" && grep -qx 'username=reviewer' <<<"$cred" || fail "the reviewer credential is not the one presented: $cred"
+other="$(printf 'protocol=https\nhost=other.test\n\n' | upstream_git credential fill 2>&1 || true)"
+! grep -q dummytoken <<<"$other" || fail "the reviewer credential is offered to another host"
+other="$(printf 'protocol=https\nhost=forge.test.other.test\n\n' | upstream_git credential fill 2>&1 || true)"
+! grep -q dummytoken <<<"$other" || fail "the reviewer credential is offered to a lookalike host"
 uphome="$(upstream_git -c 'alias.home=!printf %s "$HOME"' home)"
 [ "$uphome" != "$HOME" ] && [ ! -e "$uphome/.netrc" ] || fail "an upstream fetch can read the ambient netrc"
 [ -z "$(upstream_git config --global --list 2>/dev/null)" ] || fail "an upstream fetch reads the global git configuration"
@@ -264,4 +321,6 @@ o="$(evidence "$b" "$(snap cred)")"
 [ "$(field "$(pin_of "$o" "$r3")" status)" = merged-tip ] && [ ! -e "$t/ambient-called" ] || fail "fetch under the trap"
 ok 'upstream fetches never invoke the ambient credential helper or netrc'
 
+[ ! -s "$t/api.unexpected" ] || fail "the evidence code called forge paths the stub does not model: $(sort -u "$t/api.unexpected")"
+ok 'every forge path called is one the live forge serves in the modelled shape'
 echo "UPSTREAM EVIDENCE PASS"

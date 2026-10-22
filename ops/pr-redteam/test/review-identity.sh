@@ -62,7 +62,7 @@ echo 'ok plumbing change keeps the review identity'
 
 # review_format is part of the identity.
 copy "$t/b"
-grep -qx 'review_format=2' "$t/b/pr-redteam" || fail 'review_format=1 not found in pr-redteam'
+grep -qx 'review_format=2' "$t/b/pr-redteam" || fail 'review_format=2 not found in pr-redteam'
 sed -i 's/^review_format=2$/review_format=3/' "$t/b/pr-redteam"
 bumped="$(run "$t/b" identity)"
 [[ "$bumped" =~ ^[0-9a-f]{64}$ && "$bumped" != "$original" ]] || fail 'bumping review_format kept the review identity'
@@ -75,6 +75,14 @@ prompted="$(run "$t/c" identity)"
 [[ "$prompted" =~ ^[0-9a-f]{64}$ && "$prompted" != "$original" && "$prompted" != "$bumped" ]] \
   || fail 'editing prompt.md kept the review identity'
 echo 'ok prompt change changes the review identity'
+
+# So are the upstream evidence limits: each changes what the agent is shown.
+for limit in REDTEAM_UPSTREAM_MAX_BYTES=1 REDTEAM_UPSTREAM_MAX_PINS=0 REDTEAM_UPSTREAM_MAX_COMMITS=1 \
+    REDTEAM_UPSTREAM_MAX_BRANCHES=1 REDTEAM_UPSTREAM_MAX_PULL_PAGES=1 REDTEAM_UPSTREAM_FETCH_TIMEOUT=1; do
+  limited="$(env "$limit" bash -c "$(declare -f run); t='$t'; run '$t/a' identity")"
+  [[ "$limited" =~ ^[0-9a-f]{64}$ && "$limited" != "$original" ]] || fail "$limit kept the review identity"
+done
+echo 'ok upstream evidence limits change the review identity'
 
 # A posted receipt from an earlier identity is not reused by default…
 receipt="$t/state/receipts/acme/widget-shop/7-$head.json"

@@ -176,14 +176,21 @@ The manifest is the author's text, so it never decides what is fetched or what c
 - The forge, not the manifest, says which branches count: the repository's default branch and the
   branches it reports protected. A branch the change names (Cargo `branch`, `?branch=`, or the TSV's
   support ref) counts only when the forge protects it. `pin.json` records the branch checked, its kind
-  and whether the change named it, the tip and when it was fetched; refs from an earlier run are
-  deleted before each fetch. `pin.json` is written only once the new rev resolves.
+  and whether the change named it, the tip and when it was fetched. `pin.json` is written only once
+  the new rev resolves.
+- Parallel reviews share an upstream's object cache, never its tips: a review fetches into refs of
+  its own (`refs/up/<pid>/`), cleared before the fetch, and fetches, reads tips and decides the
+  status under one lock, deleting its refs before releasing it.
+- The reviewer's credential is offered through a helper scoped to the forge's host that answers
+  only for that host. Upstream commit messages, pull request titles and diffs are untrusted text,
+  like the PR's own.
 
 Only `merged-tip` and `ancestor-of-tip` are verified. `on-unprotected-branch`, `NOT-ON-BRANCH`,
 `branches-unknown`, `rev-not-on-forge`, `new-pin-unverified` and `unmapped-host` are unverified;
 `SUMMARY.txt` and `prompt.md` say what each proves. Upstream evidence shares the diff's size limit: the
 total across all pins is at most `REDTEAM_UPSTREAM_MAX_BYTES` (default 400000), a quarter of
-`REDTEAM_MAX_DIFF_BYTES`, and what the diff leaves of that limit. `REDTEAM_UPSTREAM_MAX_PINS`,
+`REDTEAM_MAX_DIFF_BYTES`, and what the diff leaves of that limit; a pin whose share is under 1024
+bytes is not fetched. `REDTEAM_UPSTREAM_MAX_PINS`,
 `_MAX_COMMITS`, `_MAX_BRANCHES`, `_MAX_PULL_PAGES` and `_FETCH_TIMEOUT` bound the rest. Every cut (bytes,
 commits, pull request pages, pins, protected branches) is noted in `SUMMARY.txt` and `pin.json`, as is
 a pin that moves backwards.
@@ -324,8 +331,8 @@ approval. Operators should investigate pending claims when no worker owns them.
 Every receipt records `review_identity`, a sha256 over the review inputs: the
 `review_format` constant in `pr-redteam`, `prompt.md`, `verdict.schema.json`,
 `validate-verdict.jq`, the bytes of the `claude` CLI, the model, the CLI pin,
-`REDTEAM_MAX_DIFF_BYTES`, `REDTEAM_MAX_BLOB_BYTES`, `REDTEAM_AUTHOR_DOMAINS` and
-`REDTEAM_OWNER_DECISION_AUTHORS`.
+`REDTEAM_MAX_DIFF_BYTES`, `REDTEAM_MAX_BLOB_BYTES`, `REDTEAM_AUTHOR_DOMAINS`,
+`REDTEAM_OWNER_DECISION_AUTHORS` and the `REDTEAM_UPSTREAM_*` limits.
 A head counts as already reviewed only when its receipt carries the current
 identity (and the same base), so a review is reused only for the same review
 inputs; any change to them re-reviews every open PR at its unchanged head.
