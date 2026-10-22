@@ -131,6 +131,34 @@ REDTEAM_REBASE=1` the controller will instead rebase and force-push such a
 branch, leased to the reviewed head; this is off by default because the family's
 no-force rule does not permit it, and an empty rebase is never pushed.
 
+### A queue refusal is filed as rework, not left for a person
+
+The queue refuses an enqueue it cannot replay onto the base tip
+(`queue_conflict`, `queue_mismatch`, `queue_merge_commits`), and preparing the
+replacement pull request then waited for a person: 22 of 186 queue entries were
+refused between 2026-09-19 and 10-15. With the held-review handoff enabled, such
+a refusal instead files one `now`, p1 rework task through the same qualified
+Todoq executable, author selection (`REDTEAM_FIX_TODO_AUTHORS`), family and
+durable ledger, and `REDTEAM_QUEUE_REWORK=0` turns this one off while leaving
+the held-review handoff on. The ask carries the pull request, its original head
+and branch, the base tip the replay was refused against and the conflicting
+paths — read back from the refusal the forge stored, as data, inside the same
+bounded untrusted-evidence fence. It asks for a cherry-pick onto that base tip
+in an isolated worktree, a local run of the repository's required gate, a
+replacement pull request, and a comment on and closure of the original. It
+forbids resolving by `-X ours`/`-X theirs`, force-pushing or rewriting either
+branch, and merging, enqueueing or approving the replacement: the replacement
+goes through the gate and this review like any other pull request, and nothing
+is landed here.
+
+A refusal the forge did not store, a refusal carrying no base commit, a head
+that moved, an unavailable canonical link, and `queue_conflict_queued` — a head
+that conflicts only with an entry queued ahead of it and is simply queued again
+later — all file nothing. The ledger is `queue-rework/<repo>/<PR>-<head>.json`
+under `REDTEAM_STATE` and is written before dispatch, so a refused head files at
+most one task, and an uncertain outcome is retained for the owner to reconcile
+rather than retried. `test/queue-rework.sh` holds all of this.
+
 The controller never tags, waives checks or posts required statuses.
 `REDTEAM_MERGE_TOKEN_FILE` selects the merger credential by path and has no
 default: this source is public, so the path is site configuration. Unset or
@@ -198,7 +226,7 @@ a pin that moves backwards.
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,
-upstream-evidence, credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, contributed-origin, owner-decision and installation checks. The actual repository required lane
+upstream-evidence, credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, queue-rework, contributed-origin, owner-decision and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
 publication refusal, restart, duplicate dispatch, worker loss and changed heads,

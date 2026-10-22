@@ -5,7 +5,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 suites=()
-for suite in description quality-gate draft-skip review-identity verdict-validation binary-payload upstream-evidence credential-transport heartbeat-log heartbeat-contract model-isolation publication merge-pass held-fix-todo contributed poke installation owner-decision; do
+for suite in description quality-gate draft-skip review-identity verdict-validation binary-payload upstream-evidence credential-transport heartbeat-log heartbeat-contract model-isolation publication merge-pass held-fix-todo queue-rework contributed poke installation owner-decision; do
   suites+=("$here/$suite.sh")
 done
 [[ "${1:-}" != --list ]] || { printf '%s\n' "${suites[@]}"; exit 0; }
