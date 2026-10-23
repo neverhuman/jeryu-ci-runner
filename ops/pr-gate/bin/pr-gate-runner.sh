@@ -151,6 +151,15 @@ WORKER_ROOT_VARS="${PR_GATE_WORKER_ROOT_VARS:-}"
 for var in $WORKER_ROOT_VARS; do
   [[ "$var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || { printf 'PR_GATE_WORKER_ROOT_VARS: %s is not a variable name\n' "$var" >&2; exit 2; }
 done
+# A proof-base variable that is also a worker-root variable would silently replace the family root
+# with origin/<base> in the recipe's environment. That is a configuration error, refused at start (a
+# malformed proof-base entry, by contrast, only degrades its own owner; see owner_proof_base_var).
+for word in ${PR_GATE_PROOF_BASE_VARS:-}; do
+  for var in $WORKER_ROOT_VARS; do
+    [[ "${word#*=}" != "$var" ]] \
+      || { printf 'PR_GATE_PROOF_BASE_VARS: %s is also in PR_GATE_WORKER_ROOT_VARS\n' "$var" >&2; exit 2; }
+  done
+done
 # Lockfile sources, besides crates.io, that the locked-crate prefetch may fetch online: URL prefixes
 # as they appear in Cargo.lock (e.g. "git+https://forge.example.test/"). Empty: crates.io only.
 LOCK_SOURCES="${PR_GATE_LOCK_SOURCES:-}"
@@ -357,14 +366,22 @@ candidate_base() { # branch
 # Resolve the proof base of a head whose PR (or queue entry) names REQUESTED as its base: pb_branch and
 # pb_sha (empty for main, which the mirror resolves), and pb_note when it falls back to main. Returns 1,
 # with the reason in pb_note, when the forge cannot answer now.
-resolve_proof_base() { # owner repo requested
+declare -A refs_seen=()
+resolve_proof_base() { # owner repo requested [cached]
   local row default
   pb_branch=main pb_sha="" pb_note=""
   case "$3" in
     -|main) return 0;;
     '!') pb_note="proof base origin/main (the base branch is not a usable name)"; return 0;;
   esac
-  api GET "/api/v1/repos/$1%2F$2/refs"
+  # The listing pass may answer from this tick's earlier read of the same repository; the gate itself
+  # always reads the forge again, right before it claims the head.
+  if [[ -n "${4:-}" && -n "${refs_seen[$1/$2]+set}" ]]; then
+    code=200 body=${refs_seen[$1/$2]}
+  else
+    api GET "/api/v1/repos/$1%2F$2/refs"
+    [[ "$code" != 200 ]] || refs_seen[$1/$2]=$body
+  fi
   if [[ "$code" == 404 ]]; then
     pb_note="proof base origin/main (the forge does not report whether $3 is protected)"; return 0
   fi
@@ -381,13 +398,28 @@ resolve_proof_base() { # owner repo requested
 
 # A head whose proof base cannot be had this tick: leave it, say so, and count. Only the
 # PROOF_BASE_WAIT_CAP-th tick in a row posts a failure (once); a base that comes back gates the head.
-proof_base_wait() { # owner repo sha reason
-  local file="$HOME_DIR/cache/proof-base-wait/$1-$2-$3" n=0 reason=${4//;/,}
-  mkdir -p "${file%/*}"
-  [[ ! -f "$file" ]] || read -r n <"$file" || n=0
-  [[ "$n" =~ ^[0-9]+$ ]] || n=0
-  n=$((n + 1))
-  printf '%s\n' "$n" | gate_atomic "$file" || say "could not count the proof base wait of $1/$2@$3"
+# The count is "<stage> <n>": a resolution that succeeds clears a resolution count, and any tick that
+# gets the base (fetched, or an unchanged head reused or held on inputs that bind it) clears both, so
+# a stale count can never turn one later blip into a red status. Slots share the file under a lock.
+proof_base_count() { # owner repo sha stage(resolve|fetch|clear) -> prints the new count
+  local file="$HOME_DIR/cache/proof-base-wait/$1-$2-$3" stage=$4 kind="" n=0
+  mkdir -p "${file%/*}" || return 1
+  (
+    flock -w 10 3 || exit 1
+    [[ ! -f "$file" ]] || read -r kind n <"$file" || true
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    case "$stage" in
+      clear) rm -f -- "$file"; exit 0;;
+      settle-resolve) [[ "$kind" != resolve ]] || rm -f -- "$file"; exit 0;;
+    esac
+    n=$((n + 1))
+    printf '%s %s\n' "$stage" "$n" | gate_atomic "$file" || exit 1
+    printf '%s' "$n"
+  ) 3>"$file.lock"
+}
+proof_base_wait() { # owner repo sha stage reason
+  local n reason=${5//;/,}
+  n=$(proof_base_count "$1" "$2" "$3" "$4") || { say "could not count the proof base wait of $1/$2@$3"; n=1; }
   if ((n < PROOF_BASE_WAIT_CAP)); then
     say "$1/$2@$3: proof base not available ($reason); leaving it for the next tick, no status posted ($n of $PROOF_BASE_WAIT_CAP)"
   elif ((n == PROOF_BASE_WAIT_CAP)); then
@@ -397,7 +429,33 @@ proof_base_wait() { # owner repo sha reason
     say "$1/$2@$3: proof base still not available after $n ticks ($reason); its failure status stands"
   fi
 }
-proof_base_settled() { rm -f -- "$HOME_DIR/cache/proof-base-wait/$1-$2-$3"; }
+proof_base_settled() { proof_base_count "$1" "$2" "$3" "${4:-clear}" >/dev/null || true; }
+
+# A pull request whose base changed (a retarget) still carries the required status proved against its
+# old base: the forge keys the status by commit. The listing pass therefore compares the newest own
+# success on each head of an owner with a proof-base variable against the base the head would be
+# proved against now, and posts `pending` over a success proved against another base at once -- before
+# any tree is prepared -- so it stops satisfying the new base's protection within one tick.
+retire_stale_base_green() { # owner repo sha requested-base
+  local snapshot newest_base
+  owner_proof_base_var "$1"
+  [[ -n "$pb_var" ]] || return 0
+  api GET "/repos/$1/$2/commits/$3/status"
+  [[ "$code" == 200 ]] || return 0
+  snapshot=$(mktemp "$HOME_DIR/cache/base-status-$SLOT.XXXXXXXX") || return 0
+  printf '%s\n' "$body" >"$snapshot"
+  if owner=$1 repo=$2 gate_newest_is_own_success "$snapshot" \
+      && resolve_proof_base "$1" "$2" "$4" cached; then
+    newest_base=$(gate_status_proof_base "$(jq -r --arg c "$(gate_status_context "$1" "$2")" \
+      '[.statuses[]? | select(.context == $c)] | sort_by(.updated_at // .created_at) | last | .description // ""' "$snapshot")")
+    if [[ "$newest_base" != "$pb_branch" ]]; then
+      say "$1/$2@$3: its success was proved against origin/$newest_base, and it is now proved against origin/$pb_branch; posting pending"
+      post_status "$1" "$2" "$3" pending "its base changed: proved against origin/$newest_base, now waiting to be proved against origin/$pb_branch ($MARKER)"
+    fi
+  fi
+  rm -f -- "$snapshot"
+  return 0
+}
 
 main_health_is_current_green() { # status-snapshot
   jq -e --arg context "$(gate_main_health_context "$owner" "$repo")" --arg marker "$MARKER " '
@@ -721,6 +779,7 @@ for qualified in $REPOS; do
         continue
       fi
     fi
+    retire_stale_base_green "$owner" "$repo" "$sha" "$cbase"
     candidates+=("$owner $repo $number $sha - $contributed $cbase $ready")
   done < <(jq -r '.items[]? | [.number, .head_sha] | @tsv' <<<"$rows" | sort -n)
 done
@@ -768,6 +827,8 @@ if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
         fi
       fi
       # The entry's own base branch, as the forge reports it, is what its replay is proved against.
+      # A forge that does not report it leaves the documented ref shape, refs/queue/<base>/<n>.
+      [[ -n "$qbase" || ! "$qref" =~ ^refs/queue/(.+)/[0-9]+$ ]] || qbase=${BASH_REMATCH[1]}
       queued+=("$owner $repo $number $sha $qref $contributed $(candidate_base "$qbase") $queued_ready")
     done < <(jq -r '.entries[]? | [.repo, (.number|tostring), .queue_sha, .queue_ref, (.base // "")] | @tsv' <<<"$queue_rows")
   else
@@ -781,6 +842,10 @@ fi
 # and was taken only when an unrelated gate ended elsewhere. Ending the tick hands the entry to the
 # next one, which starts within the timer's pause and puts it first. Entries the tick already saw are
 # never counted, so one this runner refuses (its own work, an unreadable origin) cannot end every tick.
+# Whether this head was ever attempted, under any proof base (gate_attempt_key).
+gate_attempted() { # owner repo sha
+  [[ -d "$HOME_DIR/attempts/$1-$2-$3" ]] || compgen -G "$HOME_DIR/attempts/$1-$2-$3.base-*" >/dev/null
+}
 gate_queue_arrived() {
   local qrepo qsha
   api GET "/api/v1/merge-queue?state=building"
@@ -789,7 +854,7 @@ gate_queue_arrived() {
     [[ "$qrepo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$qsha" =~ ^[0-9a-f]{40}$ ]] || continue
     [[ -z "${queue_seen["$qsha"]:-}" && "$gated" == *" $qrepo "* ]] || continue
     [[ -z "$only_repo" || "$qrepo" == "$only_repo" ]] || continue
-    [[ -d "$HOME_DIR/attempts/${qrepo%%/*}-${qrepo#*/}-$qsha" ]] && continue
+    gate_attempted "${qrepo%%/*}" "${qrepo#*/}" "$qsha" && continue
     say "merge-queue entry $qrepo at $qsha arrived during this tick; ending it so the next tick gates it first"
     return 0
   done < <(jq -r '.entries[]? | [.repo, .queue_sha] | @tsv' <<<"$body")
@@ -841,7 +906,7 @@ fresh=() seen_before=()
 for candidate in "${candidates[@]}"; do
   read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
   [[ "$owner" != . && "$owner" != .. && "$repo" != . && "$repo" != .. ]] || die "invalid repository path in dispatch"
-  if [[ ! -d "$HOME_DIR/attempts/$owner-$repo-$sha" ]]; then fresh+=("$candidate"); continue; fi
+  if ! gate_attempted "$owner" "$repo" "$sha"; then fresh+=("$candidate"); continue; fi
   # Somebody asked for this head: it is as urgent as a new one, and coalescing a burst of merges is
   # not a reason to make them wait for it.
   if gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
@@ -905,9 +970,10 @@ if ((main_health == 0)); then
   if [[ -n "$pb_var" ]]; then
     proof_base=1
     if ! resolve_proof_base "$owner" "$repo" "$cbase"; then
-      proof_base_wait "$owner" "$repo" "$sha" "$pb_note"
+      proof_base_wait "$owner" "$repo" "$sha" resolve "$pb_note"
       continue
     fi
+    proof_base_settled "$owner" "$repo" "$sha" settle-resolve
   fi
   if ((proof_base)) && [[ "$pb_branch" != main ]]; then
     GATE_PROOF_BASE=$(gate_proof_base_json "$pb_var" "$pb_branch" "$pb_sha")
@@ -1062,6 +1128,8 @@ if ((retry_wanted == 0)); then
   fi
   rm -f -- "$cheap_identity" "$cheap_statuses"
   if [[ -n "$cheap_action" ]]; then
+    # Reused or held on inputs that bind the proof base: the base was had, so no wait is pending.
+    ((proof_base == 0)) || proof_base_settled "$owner" "$repo" "$sha"
     say "$cheap_action $owner/$repo@$sha: identical verified inputs, read without preparing a tree (a failure re-runs only with --repo <o>/<r> --pr <n>, or changed inputs)"
     exec 6>&-; exec 7>&-
     continue
@@ -1170,16 +1238,20 @@ fi
 sync_repo "$repo" "$sha"
 [[ "$(git -C "$run/$repo" rev-parse HEAD)" == "$sha" ]] || die "could not check out $sha"
 [[ -z "$(git -C "$run/$repo" status --porcelain --ignored=no)" ]] || die "$repo is not clean at $sha"
+# What a head's own changes are read against (self-gate and gate-input paths): protected main, or the
+# protected base it is proved against, so a release line's divergence from main is not its PRs' change.
+gate_base_ref=mirror/main
 # The proof base in the tree as origin/<base>, at exactly the sha the inputs bind. A forge that will not
 # serve it now, or a base that moved since it was resolved, leaves the head for the next tick.
 if ((proof_base)); then
   if ! base_err=$(gate_fetch_base "$run/$repo" "$BASE/git/$owner/$repo.git" "$pb_branch" "$pb_sha" 2>&1); then
-    proof_base_wait "$owner" "$repo" "$sha" "$base_err"
+    proof_base_wait "$owner" "$repo" "$sha" fetch "$base_err"
     exec 6>&-; exec 7>&-
     continue
   fi
   proof_base_settled "$owner" "$repo" "$sha"
   [[ -z "$pb_var" ]] || proof_base_env=("$pb_var=origin/$pb_branch")
+  [[ "$pb_branch" == main ]] || gate_base_ref="origin/$pb_branch"
   say "$owner/$repo@$sha is proved against origin/$pb_branch at ${pb_sha:0:12}${pb_note:+ -- $pb_note}"
 fi
 # Does this head change the gate it is judged by? The recipe below is the head's own, so a diff that
@@ -1190,7 +1262,7 @@ fi
 if [[ "$main_health" == 1 ]]; then
   self_gate_paths=()
 else
-  mapfile -t self_gate_paths < <(gate_definition_paths "$run/$repo" mirror/main "$sha")
+  mapfile -t self_gate_paths < <(gate_definition_paths "$run/$repo" "$gate_base_ref" "$sha")
 fi
 self_gate_json='[]'
 if ((${#self_gate_paths[@]} > 0)); then
@@ -1206,7 +1278,7 @@ if ((sandbox)); then
   while IFS= read -r changed; do
     [[ -n "$changed" ]] || continue
     if pr_gate_listed "$GATE_INPUT_PATHS" "$changed"; then gate_input_touched+=("$changed"); fi
-  done < <(git -C "$run/$repo" diff --name-only mirror/main...HEAD 2>/dev/null)
+  done < <(git -C "$run/$repo" diff --name-only "$gate_base_ref...HEAD" 2>/dev/null)
   ((${#gate_input_touched[@]} == 0)) \
     || say "$owner/$repo#$number changes gate inputs (${gate_input_touched[*]}): extra review required"
 fi

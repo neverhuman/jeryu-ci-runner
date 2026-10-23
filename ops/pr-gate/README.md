@@ -215,24 +215,47 @@ sets it for every pull-request and merge-queue gate of that owner:
 - any other base -- a branch anybody with push access could create -- is proved against `origin/main`
   as before, and the status says why (`proof base origin/main (<base> is not a protected branch)`);
   so does a forge without the ref listing (404);
-- a merge-queue entry uses the `base` its entry reports, never one parsed out of its ref.
+- a merge-queue entry uses the `base` its entry reports (jeryu-deploy `merge_queue.rs`), and only a
+  forge that omits it falls back to the documented ref shape `refs/queue/<base>/<n>`.
 
 The base is part of the result. Its variable, name and resolved sha are in the input identity
 (`proof_base` in `gate_input_render`), so a moved base is a changed input. A base other than `main`
 also has its own attempt and claim-lock key (`<owner>-<repo>-<sha>.base-<name digest>-<base sha>`,
 `gate_attempt_key`); `main` keeps the historical `<owner>-<repo>-<sha>`, so existing journals and
 recovery obligations stay where they are. A head proved against a release line is therefore never
-reused, adopted or kept green for `main`, or the other way round: the required status is keyed by
-commit, so a status proved against another base than the one now being gated gets `pending` posted
-over it, and every status names a base other than `main` (`; proof base origin/<base>`). A pull
-request whose base changes between listing and admission is left for the next tick.
+reused or adopted for `main`, or the other way round, and every status that names a base other than
+`main` says so (`; proof base origin/<base>`).
+
+The required status itself is still one context keyed by commit, which the forge reads without
+knowing the base. So a retarget is handled as early as the runner can see it: each tick's listing
+compares the newest own success on every head of a configured owner with the base that head would be
+proved against now, and posts `pending` over one proved against another base before any tree is
+prepared; keep-green refuses it too, and a pull request whose base changes between listing and
+admission is left for the next tick. A retargeted head can therefore show its old base's green for at
+most one tick (normally seconds, as the retarget wakes a slot). Binding the base into the status the
+forge reads would close that window entirely; that needs the forge, not this runner.
+
+Binding `main`'s sha is a deliberate cost: for a configured owner, every merge to a repository's
+`main` changes the inputs of every open pull request into `main` of that repository, which is then
+gated again (subject to the usual coalescing, `GATE_RUNNER_REGATE_SETTLE`). That is the price of a
+result that names the base it was proved against; owners without an entry are unaffected.
+
+What a head changes about its own gate (the self-gate annotation, a contribution's gate-input paths)
+is read against the protected base it is proved against, so a release line's divergence from `main`
+is not counted as every pull request's own change.
 
 A base the forge cannot answer for right now (a 5xx, a 429, a fetch that fails, a base that moved since
 it was resolved) is not a verdict on the head: it is left for the next tick with no status posted, and
-counted in `cache/proof-base-wait/`. Only the sixth tick in a row posts a failure, once, saying why; a
-base that comes back gates the head and clears the count. A malformed entry in
-`PR_GATE_PROOF_BASE_VARS` leaves that owner on the recipe's own default, says so, and stops nothing
-else. Owners without an entry, and main-health, are unchanged.
+counted in `cache/proof-base-wait/`. Only the sixth tick in a row posts a failure, once, saying why. The
+count is cleared by any tick that gets the base (fetched, or an unchanged head reused or held on inputs
+that bind it), so a stale count never turns one later blip into a red status. A malformed entry in
+`PR_GATE_PROOF_BASE_VARS` leaves that owner on the recipe's own default and says so on every tick; a
+variable that is also in `PR_GATE_WORKER_ROOT_VARS` is refused at start. Owners without an entry, and
+main-health, are unchanged.
+
+Roll a runner with this out to every gate host before adding the setting: a host without it proves a
+release-line head against `origin/main`, its identity differs, and the two hosts would overwrite each
+other's verdict on that head every tick.
 
 ## Release preflight
 
