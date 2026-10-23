@@ -769,6 +769,33 @@ for qualified in $REPOS; do
       say "refusing $owner/$repo $only_branch: $([[ -n "$row" ]] && printf 'the forge does not report it as protected' || printf 'no such branch')"
       branch_refused=1; continue
     fi
+    # Without the owner's proof-base variable the recipe would compare the tip against origin/main,
+    # which a release line does not descend from: the run would prove nothing about the line.
+    owner_proof_base_var "$owner"
+    if [[ -z "$pb_var" ]]; then
+      say "refusing $owner/$repo $only_branch: $owner has no PR_GATE_PROOF_BASE_VARS entry, so its recipe cannot be told the base"
+      branch_refused=1; continue
+    fi
+    # Never prove this runner's own work (see the PR listing below): a branch of its own name.
+    if [[ "$only_branch" == "$IDENTITY/"* ]]; then
+      say "refusing $owner/$repo $only_branch: a branch of $IDENTITY's own, which this runner must not prove"
+      branch_refused=1; continue
+    fi
+    # A tip that already carries this runner's <repo>/required success (a PR or merge-queue gate, or
+    # an earlier pass) has what this mode exists to give it, and is never re-proved over: that green
+    # was proved against the base its own gate used.
+    api GET "/repos/$owner/$repo/commits/${row%% *}/status"
+    if [[ "$code" != 200 ]]; then
+      say "cannot read $owner/$repo $only_branch tip statuses ($code); not gating it"; branch_refused=1; continue
+    fi
+    tip_statuses=$(mktemp "$HOME_DIR/cache/branch-status-$SLOT.XXXXXXXX")
+    printf '%s\n' "$body" >"$tip_statuses"
+    if gate_newest_is_own_success "$tip_statuses"; then
+      rm -f -- "$tip_statuses"
+      say "skip $owner/$repo $only_branch: its tip ${row:0:12} already carries a $(gate_status_context "$owner" "$repo") success"
+      continue
+    fi
+    rm -f -- "$tip_statuses"
     candidates+=("$owner $repo 0 ${row%% *} refs/heads/$only_branch 0 $only_branch -")
     continue
   fi
@@ -989,7 +1016,7 @@ candidates=("${queued[@]}" "${woken[@]}" "${rest[@]}")
 if [[ -n "$only_branch" && -n "$only_repo" ]] && ((branch_refused && ${#candidates[@]} == 0)); then
   die "--branch $only_branch: $only_repo was refused (see above)"
 fi
-if ((${#candidates[@]} == 0)); then ((list)) || heartbeat; say "$([[ "$main_health" == 1 ]] && printf 'no main-health repo needs gating' || printf 'no PR head needs gating')"; exit 0; fi
+if ((${#candidates[@]} == 0)); then ((list)) || heartbeat; say "$(if [[ "$main_health" == 1 ]]; then printf 'no main-health repo needs gating'; elif [[ -n "$only_branch" ]]; then printf 'no %s tip needs gating' "$only_branch"; else printf 'no PR head needs gating'; fi)"; exit 0; fi
 if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # FD7 protects the shared repository target; FD6 protects the full-head journal.
 # FD9 protects this slot's source tree. The timeout supervisor retains all three
@@ -1023,8 +1050,9 @@ if [[ -d "$HOME_DIR/claims/$owner-$repo-$sha" ]]; then
   continue
 fi
 # The proof base of this head (see resolve_proof_base), decided before the claim: a base other than main
-# is part of the attempt key. A branch-tip gate is proved against that branch itself. main's sha is
-# read from the mirror refreshed in step 3, so it is bound below, after that refresh.
+# is part of the attempt key. A branch-tip gate is proved against that branch as it stood before its tip
+# (the tip's first parent, bound once the tree has it). main's sha is read from the mirror refreshed in
+# step 3, so it is bound below, after that refresh.
 GATE_PROOF_BASE="" pb_var="" pb_branch="" pb_sha="" pb_note="" proof_base=0 proof_base_env=()
 if ((main_health == 0)); then
   owner_proof_base_var "$owner"
@@ -1342,6 +1370,27 @@ if ((proof_base)); then
   fi
   proof_base_settled "$owner" "$repo" "$sha"
   [[ -z "$pb_var" ]] || proof_base_env=("$pb_var=origin/$pb_branch")
+  if [[ -n "$only_branch" ]]; then
+    # Proved against the tip itself, every base-relative check would see an empty diff. The tip is
+    # proved as the pull request that made it would have been: against the branch before it, its
+    # first parent, which is on the protected branch's own history. A root commit has none.
+    if ! tip_parent=$(git -C "$run/$repo" rev-parse --verify --quiet "$sha^1"); then
+      say "refusing $owner/$repo $only_branch at $sha: a root commit has no base to be proved against"
+      exec 6>&-; exec 7>&-
+      continue
+    fi
+    # The forge does not say who pushed a tip; a protected branch moves by merge, and a merge authored
+    # or committed as this identity is its own work.
+    if git -C "$run/$repo" log -1 --format='%an%n%cn' "$sha" | grep -qxF -- "$IDENTITY"; then
+      say "refusing $owner/$repo $only_branch at $sha: authored or committed as $IDENTITY, which this runner must not prove"
+      exec 6>&-; exec 7>&-
+      continue
+    fi
+    pb_sha=$tip_parent
+    GATE_PROOF_BASE=$(gate_proof_base_json "$pb_var" "$pb_branch" "$pb_sha")
+    pb_note="proof base origin/$pb_branch before this commit (${pb_sha:0:12})"
+    proof_base_env=("$pb_var=origin/$pb_branch~1")
+  fi
   say "$owner/$repo@$sha is proved against origin/$pb_branch at ${pb_sha:0:12}${pb_note:+ -- $pb_note}"
 fi
 # Does this head change the gate it is judged by? The recipe below is the head's own, so a diff that
@@ -1349,7 +1398,7 @@ fi
 # about to report. It is recorded on the attempt and annotated on the check run (gate_publish); it
 # changes no conclusion, and nothing here reruns the recipe from protected main. mirror/main is that
 # protected main in this tree (sync_repo keeps it there).
-if [[ "$main_health" == 1 || -n "$only_branch" ]]; then
+if [[ "$main_health" == 1 ]]; then
   self_gate_paths=()
 else
   mapfile -t self_gate_paths < <(gate_definition_paths "$run/$repo" mirror/main "$sha")

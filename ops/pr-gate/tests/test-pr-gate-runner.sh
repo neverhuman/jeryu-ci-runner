@@ -1761,28 +1761,68 @@ printf 'PASS proof base: a commit open in two PRs (main and a release line) is p
 PR_GATE_PROOF_BASE_VARS=ACME_SPLIT_ROOT PR_GATE_WORKER_ROOT_VARS=ACME_SPLIT_ROOT invoke --list
 [[ "$runner_exit" == 0 ]] || fail_pb 'a word without = was refused at start'
 
-# --branch: the tip of a protected branch is gated with the normal recipe, proved against that branch,
-# and posted as <repo>/required on the tip; a second pass reuses it; an unprotected branch is refused.
+# --branch: the tip of a protected branch is gated with the normal recipe, proved against the branch as
+# it stood before the tip (its first parent: proved against itself every base-relative check would see
+# an empty diff), and posted as <repo>/required on the tip.
 printf 'main\n' >"$fixture/pr-base-ref"
+relparent=$("$real_git" -C "$fixture/source.git" rev-parse "$relsha^1")
 before_count=$(count) before_statuses=$(wc -l <"$fixture/statuses.jsonl")
 invoke --branch release/v1 --repo acme/fixture
 [[ "$runner_exit" == 0 ]] || fail_pb '--branch: runner failed'
 expect_count "$((before_count + 1))"
 grep -q "preparing acme/fixture release/v1 at $relsha" "$fixture/runner.log" || fail_pb '--branch did not gate the tip'
-[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/release/v1 $relsha" ]] || fail_pb '--branch was not proved against the branch'
-tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" | jq -se --arg s "$relsha" 'all(.sha == $s and .context == "fixture/required")
-  and .[-1].state == "success" and (.[-1].description | test("; inputs [0-9a-f]{64}; proof base origin/release/v1"))' >/dev/null \
-  || fail_pb '--branch did not post <repo>/required on the tip'
-compgen -G "$fixture/runner/attempts/acme-fixture-$relsha.base-*-$relsha/last-result.json" >/dev/null || fail_pb '--branch has no keyed attempt'
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/release/v1~1 $relparent" ]] || fail_pb '--branch was not proved against the branch before its tip'
+tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" | jq -se --arg s "$relsha" --arg p "${relparent:0:12}" 'all(.sha == $s and .context == "fixture/required")
+  and .[-1].state == "success"
+  and (.[-1].description | test("; inputs [0-9a-f]{64}; proof base origin/release/v1 before this commit \\(" + $p + "\\)"))' >/dev/null \
+  || fail_pb '--branch did not post <repo>/required on the tip, naming its base'
+jq -e --arg p "$relparent" '.inputs.proof_base == {variable:"ACME_PROOF_BASE_REF",branch:"release/v1",sha:$p}' \
+  "$(compgen -G "$fixture/runner/attempts/acme-fixture-$relsha.base-*-$relsha/last-result.json")" >/dev/null \
+  || fail_pb '--branch did not bind the parent as its proof base'
+# A tip that already carries a required success is never re-proved over.
 invoke --branch release/v1
-[[ "$runner_exit" == 0 ]] || fail_pb '--branch reuse: runner failed'
+[[ "$runner_exit" == 0 ]] || fail_pb '--branch second pass: runner failed'
 expect_count "$((before_count + 1))"
-grep -q "reuse acme/fixture@$relsha" "$fixture/runner.log" || fail_pb 'an unchanged branch tip was not reused'
+grep -q "skip acme/fixture release/v1: its tip ${relsha:0:12} already carries a fixture/required success" "$fixture/runner.log" \
+  || fail_pb 'a tip with a required success was gated again'
+# A tip authored as the gate identity is its own work: refused, nothing posted.
+"$real_git" -C "$fixture/source" checkout -q release/v1
+printf 'by the gate\n' >>"$fixture/source/release-note"
+"$real_git" -C "$fixture/source" add release-note
+"$real_git" -C "$fixture/source" -c user.name=runner-bot -c user.email=bot@example.invalid commit -qm by-the-gate
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" release/v1
+relsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+refs_json main release/v1
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke --branch release/v1 --repo acme/fixture
+grep -q "authored or committed as runner-bot, which this runner must not prove" "$fixture/runner.log" || fail_pb 'the gate identity proved its own tip'
+expect_count "$((before_count + 1))"
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb 'a refused own tip got a status'
+# A failing tip is held like a PR head's failure: a scheduled pass on identical inputs runs nothing.
+printf 'fail\n' >"$fixture/source/mode"
+"$real_git" -C "$fixture/source" add mode
+"$real_git" -C "$fixture/source" commit -qm release-fails
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" release/v1
+relsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" checkout -q main
+refs_json main release/v1
+invoke --branch release/v1
+expect_count "$((before_count + 2))"
+last_status "$relsha" | jq -e '.state == "failure"' >/dev/null || fail_pb 'a failing tip did not post failure'
+invoke --branch release/v1
+expect_count "$((before_count + 2))"
+grep -q "hold acme/fixture@$relsha" "$fixture/runner.log" || fail_pb 'a failing tip was not held'
+# Refusals: unprotected, an owner without a proof-base variable, and the other modes.
 invoke --branch topic --repo acme/fixture
 [[ "$runner_exit" == 1 ]] || fail_pb 'an unprotected branch was not refused'
 grep -q 'refusing acme/fixture topic: the forge does not report it as protected' "$fixture/runner.log" || fail_pb 'the refusal does not say why'
+PR_GATE_PROOF_BASE_VARS='' invoke --branch release/v1 --repo acme/fixture
+[[ "$runner_exit" == 1 ]] && grep -q 'acme has no PR_GATE_PROOF_BASE_VARS entry' "$fixture/runner.log" \
+  || fail_pb 'an owner without a proof-base variable was gated'
 invoke --branch release/v1 --pr 1
 [[ "$runner_exit" == 2 ]] || fail_pb '--branch with --pr was accepted'
-expect_count "$((before_count + 1))"
+invoke --branch release/v1 --main-health
+[[ "$runner_exit" == 2 ]] || fail_pb '--branch with --main-health was accepted'
+expect_count "$((before_count + 2))"
 unset PR_GATE_PROOF_BASE_VARS
-printf 'PASS --branch: a protected tip is gated as <repo>/required against itself, reused, and an unprotected one refused\n'
+printf 'PASS --branch: a protected tip is proved against the branch before it, posted as <repo>/required, held, never re-proved over, and refused when it may not be\n'

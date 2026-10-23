@@ -296,18 +296,28 @@ see only open heads and `--main-health` only `main`, so
 
 gates the current tip of `<name>`:
 
-- only a branch the forge reports as protected (`GET /api/v1/repos/<owner>%2F<repo>/refs`); anything
-  else -- unprotected, missing, or a forge that cannot answer -- is refused and named, and with
+- only a branch the forge reports as protected (`GET /api/v1/repos/<owner>%2F<repo>/refs`), of an
+  owner with a `PR_GATE_PROOF_BASE_VARS` entry; anything else -- unprotected, missing, a forge that
+  cannot answer, an owner whose recipe cannot be told the base -- is refused and named, and with
   `--repo` the run exits 1. Nothing is posted on a refused branch;
+- never the runner's own work: a branch named `<gate identity>/...`, or a tip authored or committed
+  as the gate identity (the forge does not say who pushed a tip; a protected branch moves by merge),
+  is refused;
+- never over an existing green: a tip that already carries this runner's `<repo>/required` success (a
+  pull-request or merge-queue gate, or an earlier pass) is skipped, because that green was proved
+  against the base its own gate used;
 - with the repository's own recipe (`just required`, else `ops/ci/pr-ci.sh`) in the usual family tree,
-  proved against the branch itself: its `PR_GATE_PROOF_BASE_VARS` variable, when the owner has one, is
-  `origin/<name>`, fetched at exactly the tip;
-- posting `<repo>/required` on the tip commit as the gate identity, with `; proof base origin/<name>`
-  in its description;
-- under the same evidence identity and reuse rules as pull requests: the proof base is in the inputs
-  and the attempt key, an unchanged tip is reused, a failure is held. `--repo` makes the run a retry,
-  as `--main-health --repo` is. The tip is re-read before the recipe runs, and a tip that moved is
-  left for the next run.
+  proved against the branch as it stood before the tip: the proof-base variable is `origin/<name>~1`,
+  the tip's first parent on the protected branch's own history -- what the pull request that made the
+  tip was proved against. Proved against the tip itself, every base-relative check would see an empty
+  diff. A root commit has no base and is refused;
+- posting `<repo>/required` on the tip commit as the gate identity, with
+  `; proof base origin/<name> before this commit (<parent>)` in its description; the self-gate
+  annotation is computed against protected `main`, as for pull requests;
+- under the same evidence identity and reuse rules as pull requests: the base and its resolved sha are
+  in the inputs and the attempt key, and a failure is held. `--repo` makes the run a retry, as
+  `--main-health --repo` is. The tip is re-read before the recipe runs, and a tip that moved is left
+  for the next run.
 
 It takes no wake-up line, reads no merge queue or re-gate requests, never publishes the shared build
 cache, and has no timer: an operator or a release step runs it. `--pr` and `--main-health` are other
