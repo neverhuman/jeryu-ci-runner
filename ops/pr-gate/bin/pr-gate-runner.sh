@@ -360,10 +360,20 @@ owner_proof_base_var() { # owner
 }
 
 # A candidate's base field: "-" when the forge named none, "!" for a name the runner will not use,
-# else the checked branch name.
+# "*N" for a head that is the head of N open pull requests (proved against main, see below), else the
+# checked branch name.
 candidate_base() { # branch
   [[ -n "$1" ]] || { printf -- -; return 0; }
   gate_base_branch "$1" || printf '!'
+}
+
+# The base a merge-queue entry is replayed onto: the entry's own base field, or, from a forge that
+# omits it, the documented ref shape refs/queue/<base>/<n>. The listing and admission both use this,
+# so an entry is admitted for exactly the base it was listed with.
+queue_entry_base() { # base-field queue-ref
+  if [[ -n "$1" ]]; then printf '%s' "$1"
+  elif [[ "$2" =~ ^refs/queue/(.+)/[0-9]+$ ]]; then printf '%s' "${BASH_REMATCH[1]}"
+  fi
 }
 
 # Resolve the proof base of a head whose PR (or queue entry) names REQUESTED as its base: pb_branch and
@@ -375,6 +385,10 @@ resolve_proof_base() { # owner repo requested [cached]
   pb_branch=main pb_sha="" pb_note=""
   case "$3" in
     -|main) return 0;;
+    # One commit open as several pull requests: the forge keys <repo>/required by commit, so whatever
+    # is posted on it answers for every one of them. It is proved against the default branch, the
+    # strictest base, so a green on it always means what main's protection assumes.
+    '*'[0-9]*) pb_note="proved against main: this commit is open in ${3#\*} PRs"; return 0;;
     '!') pb_note="proof base origin/main (the base branch is not a usable name)"; return 0;;
   esac
   # The listing pass may answer from this tick's earlier read of the same repository; the gate itself
@@ -409,15 +423,16 @@ resolve_proof_base() { # owner repo requested [cached]
 # gets the base (fetched, or an unchanged head reused or held on inputs that bind it) clears both, so
 # a stale count can never turn one later blip into a red status. Slots share the file under a lock.
 proof_base_count() { # owner repo sha stage(resolve|fetch|clear) -> prints the new count
-  local file="$HOME_DIR/cache/proof-base-wait/$1-$2-$3" stage=$4 kind="" n=0
+  # Per head and requested base (cbase of the caller): ticks waiting on one base never count for another.
+  local file="$HOME_DIR/cache/proof-base-wait/$1-$2-$3${cbase:+.$(printf '%s' "$cbase" | sha256sum | cut -c1-12)}" stage=$4 kind="" n=0
   mkdir -p "${file%/*}" || return 1
   (
     flock -w 10 3 || exit 1
     [[ ! -f "$file" ]] || read -r kind n <"$file" || true
     [[ "$n" =~ ^[0-9]+$ ]] || n=0
     case "$stage" in
-      clear) rm -f -- "$file"; exit 0;;
-      settle-resolve) [[ "$kind" != resolve ]] || rm -f -- "$file"; exit 0;;
+      clear) rm -f -- "$file" "$file.lock"; exit 0;;
+      settle-resolve) [[ "$kind" != resolve ]] || rm -f -- "$file" "$file.lock"; exit 0;;
     esac
     n=$((n + 1))
     printf '%s %s\n' "$stage" "$n" | gate_atomic "$file" || exit 1
@@ -770,6 +785,9 @@ for qualified in $REPOS; do
     [[ "$code" == 200 && -n "$author" ]] \
       || { say "cannot read $owner/$repo#$number's author ($code); skipping rather than guessing"; continue; }
     cbase="$(candidate_base "$(jq -r '.base.ref // ""' <<<"$body")")"
+    # The same commit is the head of other open pull requests too (any base): see resolve_proof_base.
+    shared=$(jq -r --arg s "$sha" '[.items[]? | select(.head_sha == $s)] | length' <<<"$rows")
+    [[ ! "$shared" =~ ^[0-9]+$ ]] || ((shared < 2)) || cbase="*$shared"
     # Never prove this runner's own work. A proof is only worth the independence of whoever
     # produced it, and gating a head this identity pushed makes the runner both author and
     # witness. --repo/--pr does not override this; it is not a re-run, it is a role.
@@ -843,8 +861,7 @@ if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
       fi
       # The entry's own base branch, as the forge reports it, is what its replay is proved against.
       # A forge that does not report it leaves the documented ref shape, refs/queue/<base>/<n>.
-      [[ -n "$qbase" || ! "$qref" =~ ^refs/queue/(.+)/[0-9]+$ ]] || qbase=${BASH_REMATCH[1]}
-      queued+=("$owner $repo $number $sha $qref $contributed $(candidate_base "$qbase") $queued_ready")
+      queued+=("$owner $repo $number $sha $qref $contributed $(candidate_base "$(queue_entry_base "$qbase" "$qref")") $queued_ready")
     done < <(jq -r '.entries[]? | [.repo, (.number|tostring), .queue_sha, .queue_ref, (.base // "")] | @tsv' <<<"$queue_rows")
   else
     say "merge queue answered $code; gating PR heads only this tick"
@@ -961,7 +978,7 @@ for candidate in "${candidates[@]}"; do
 read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
    && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) \
-   && ( "$cbase" == - || "$cbase" == '!' || "$cbase" == "$(gate_base_branch "$cbase")" ) \
+   && ( "$cbase" == - || "$cbase" == '!' || "$cbase" =~ ^\*[0-9]+$ || "$cbase" == "$(gate_base_branch "$cbase")" ) \
    && "$contributed" =~ ^[01]$ && ( "$ready" == - || "$ready" =~ ^[^[:space:]]+\|[a-z-]+$ ) ]] \
   || die "invalid repository or head in dispatch"
 if [[ "$qref" == - && -z "$only_pr" ]] && gate_queue_arrived; then
@@ -1475,7 +1492,8 @@ elif [[ "$qref" == - ]]; then
   # The checks page of exactly this pull request, from the forge's answer for it just now. A queue
   # commit and main-health link nothing: no PR checks page shows their sha.
   checks_url=$(gate_checks_url "$owner" "$repo" "$number" "$body")
-  if ((proof_base)) && [[ "$(candidate_base "$(jq -r '.base.ref // ""' <<<"$body")")" != "$cbase" ]]; then
+  if ((proof_base)) && [[ "$cbase" != '*'* ]] \
+      && [[ "$(candidate_base "$(jq -r '.base.ref // ""' <<<"$body")")" != "$cbase" ]]; then
     say "$owner/$repo#$number changed its base branch since it was listed"
     admitted=0
   fi
@@ -1483,9 +1501,20 @@ else
   api GET "/api/v1/merge-queue?state=building"
   [[ "$code" == 200 ]] || die "cannot refresh the merge queue before admission ($code)"
   admitted=0
-  jq -e --arg r "$owner/$repo" --argjson n "$number" --arg s "$sha" --arg b "$cbase" --argjson check "$proof_base" \
-    'any(.entries[]?; .repo == $r and (.number|tonumber) == $n and .queue_sha == $s
-         and ($check == 0 or $b == "!" or (.base // "") == (if $b == "-" then "" else $b end)))' <<<"$body" >/dev/null && admitted=1
+  entry=$(jq -r --arg r "$owner/$repo" --argjson n "$number" --arg s "$sha" \
+    'first(.entries[]? | select(.repo == $r and (.number|tonumber) == $n and .queue_sha == $s))
+     | @json' <<<"$body")
+  if [[ -n "$entry" ]]; then
+    # Two reads, not one tab-separated line: an empty base field would collapse into the ref.
+    abase=$(jq -r '.base // ""' <<<"$entry") aref=$(jq -r '.queue_ref // ""' <<<"$entry")
+    # The same base the listing derived (queue_entry_base), from the entry as it is now.
+    if ((proof_base == 0)) || [[ "$cbase" == '!' \
+        || "$(candidate_base "$(queue_entry_base "$abase" "$aref")")" == "$cbase" ]]; then
+      admitted=1
+    else
+      say "merge-queue entry $owner/$repo#$number changed its base since it was listed"
+    fi
+  fi
 fi
 if ((admitted == 0)); then
   say "head changed or PR closed before admission (or its queue entry moved): $owner/$repo#$number"

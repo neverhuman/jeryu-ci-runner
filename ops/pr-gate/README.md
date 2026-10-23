@@ -219,7 +219,20 @@ sets it for every pull-request and merge-queue gate of that owner:
   as before, and the status says why (`proof base origin/main (<base> is not a protected branch)`);
   so does a forge without the ref listing (404);
 - a merge-queue entry uses the `base` its entry reports (jeryu-deploy `merge_queue.rs`), and only a
-  forge that omits it falls back to the documented ref shape `refs/queue/<base>/<n>`.
+  forge that omits it falls back to the documented ref shape `refs/queue/<base>/<n>`; listing and
+  admission derive it the same way, so the entry is admitted for the base it was listed with;
+- a commit that is the head of more than one open pull request is proved against `main`, the
+  default branch, whatever their bases, and its status says so (`proved against main: this commit is
+  open in N PRs`). The forge keys `<repo>/required` by commit, so one result answers for all of those
+  pull requests, and only a proof against `main` means what `main`'s protection assumes. A pull
+  request whose head is its own keeps its release base. Binding the base into the status the forge
+  reads, so one commit can carry a result per base, is a forge-side follow-up.
+
+The ref listing is read as one answer: jeryu serves it unpaginated (`repo_refs` in jeryu-deploy),
+and only rows with `kind: "branch"` count. A configured owner costs two more forge reads per open
+pull request per tick (the head's status and, once per repository, the ref listing) and one ref
+listing per gated head. `--list` lines gained a base field before the ready-at field
+(`owner repo number sha queue-ref contributed base ready`).
 
 The base is part of the result. Its variable, name and resolved sha are in the input identity
 (`proof_base` in `gate_input_render`), so a moved base is a changed input. A base other than `main`
@@ -240,7 +253,8 @@ compares the newest own success on every open head of a configured owner (contri
 since this runs nothing of them) with the base that head would be proved against now, and posts
 `pending` over one proved against another base before any tree is prepared; keep-green refuses it too,
 and a pull request whose base changes between listing and admission is left for the next tick.
-`--list` reads only and retires nothing. A retargeted head can therefore show its old base's green
+`--list` reads only and retires nothing. A contribution is retired too, since that runs nothing of
+it; one no longer allowed to run then stays `pending` until a maintainer allows it again. A retargeted head can therefore show its old base's green
 until the first tick that can read its status and its base from the forge: normally seconds, as the
 retarget wakes a slot, but as long as the forge fails those reads. A refused `pending` is logged and
 never ends the tick. Binding the base into the status the forge reads would close that window

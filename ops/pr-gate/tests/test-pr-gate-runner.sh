@@ -140,7 +140,7 @@ case "$method $url" in
     printf '\n200';;
   'GET '*'/pulls/2')
     jq -nc --arg sha "$(cat "$FAKE_FORGE/head2")" \
-      '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/second"},
+      '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/second"},base:{ref:"main"},
         html_url:"https://forge.invalid/repos/jeryu/acme/fixture/pulls/2",
         created_at:"2026-10-09T18:26:18Z",updated_at:"2026-10-09T18:26:18Z"}'
     printf '\n200';;
@@ -1606,7 +1606,7 @@ invoke
 [[ "$runner_exit" == 0 ]] || fail_pb 'recovered base: runner failed'
 expect_count "$((before_count + 1))"
 last_status "$head" | jq -e '.state == "success"' >/dev/null || fail_pb 'a base that came back did not gate the head'
-[[ ! -e "$fixture/runner/cache/proof-base-wait/acme-fixture-$head" ]] || fail_pb 'the wait count was not cleared'
+! compgen -G "$fixture/runner/cache/proof-base-wait/acme-fixture-$head*" >/dev/null || fail_pb 'the wait count was not cleared'
 # A base the forge lists but will not serve is the same transient: nothing posted.
 jq -c --arg s "$relsha" '. + [{name:"release/v2",sha:$s,kind:"branch",protected:true}]' "$fixture/refs.json" >"$fixture/refs.tmp"
 mv "$fixture/refs.tmp" "$fixture/refs.json"
@@ -1628,7 +1628,7 @@ for n in 1 2 3 4 5; do invoke; done
 rm -f "$fixture/refs-fail"
 invoke
 grep -qE "reuse acme/fixture@$head" "$fixture/runner.log" || fail_pb 'an unchanged head was not reused after the base came back'
-[[ ! -e "$fixture/runner/cache/proof-base-wait/acme-fixture-$head" ]] || fail_pb 'a reuse tick left the wait count'
+! compgen -G "$fixture/runner/cache/proof-base-wait/acme-fixture-$head*" >/dev/null || fail_pb 'a reuse tick left the wait count'
 before_statuses=$(wc -l <"$fixture/statuses.jsonl")
 touch "$fixture/refs-fail"
 invoke
@@ -1663,9 +1663,17 @@ qrel2=$("$real_git" -C "$fixture/source" rev-parse HEAD)
 "$real_git" -C "$fixture/source" checkout -q main
 jq -nc --arg s "$qrel2" --arg h "$head" \
   '{entries:[{repo:"acme/fixture",number:1,queue_ref:"refs/queue/release/v1/1",queue_sha:$s,pr_head_sha:$h}]}' >"$fixture/queue.json"
+before_count=$(count) before_probes=$(wc -l <"$fixture/proof-base.log")
 invoke
 grep -q "preparing acme/fixture#1 at $qrel2 (merge queue refs/queue/release/v1/1)" "$fixture/runner.log" || fail_pb 'the second queue entry was not gated'
+# Admitted, not only prepared: the recipe ran once more, its probe is a new line, and the queue commit
+# got its own result.
+! grep -q 'before admission' "$fixture/runner.log" || fail_pb 'a queue entry without base was refused at admission'
+expect_count "$((before_count + 1))"
+[[ "$(wc -l <"$fixture/proof-base.log")" == "$((before_probes + 1))" ]] || fail_pb 'the queue recipe did not run'
 [[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/release/v1 $relsha" ]] || fail_pb 'a queue entry without base did not use its ref'
+last_status "$qrel2" | jq -e '.state == "success" and (.description | contains("; proof base origin/release/v1"))' >/dev/null \
+  || fail_pb 'the queue commit without base got no result'
 rm -f "$fixture/queue.json"
 printf 'PASS proof base: a merge-queue entry is proved against the base its entry reports, else its ref names\n'
 
@@ -1688,7 +1696,7 @@ invoke
 rm -f "$fixture/refs-429" "$fixture/runner/cache/forge-backoff"
 grep -q 'proof base not available (the forge is rate limiting this identity); leaving it for the next tick, not counted' "$fixture/runner.log" \
   || fail_pb 'a rate-limited ref listing was not left uncounted'
-[[ ! -e "$fixture/runner/cache/proof-base-wait/acme-fixture-$head" ]] || fail_pb 'a rate-limited ref listing was counted'
+! compgen -G "$fixture/runner/cache/proof-base-wait/acme-fixture-$head*" >/dev/null || fail_pb 'a rate-limited ref listing was counted'
 printf 'PASS proof base: a rate limit is waited out and never counted\n'
 
 # Evidence that could not be published under one base, whose base then moved, is discharged as
@@ -1727,6 +1735,27 @@ published=$(wc -l <"$fixture/statuses.jsonl")
 invoke
 [[ "$(wc -l <"$fixture/statuses.jsonl")" == "$published" ]] || fail_pb 'superseded evidence was published later'
 printf 'PASS proof base: unpublished evidence under a base that moved is discharged as superseded, never published\n'
+
+# One commit open as two pull requests, into release/v1 and into main: the status on that commit
+# answers for both, so it is proved against main (the default branch), and says why.
+printf 'release/v1\n' >"$fixture/pr-base-ref"
+cp "$fixture/head" "$fixture/head2"
+before_count=$(count)
+invoke
+[[ "$runner_exit" == 0 ]] || fail_pb 'shared head: runner failed'
+expect_count "$((before_count + 1))"
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/main $("$real_git" -C "$fixture/source.git" rev-parse main)" ]] \
+  || fail_pb 'a commit open in two PRs was not proved against main'
+last_status "$head" | jq -e '.state == "success" and (.description | contains("; proved against main: this commit is open in 2 PRs"))
+  and (.description | contains("proof base origin/release") | not)' >/dev/null || fail_pb 'the shared-head status does not say why it is main'
+compgen -G "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null \
+  && jq -e '.inputs.proof_base.branch == "main"' "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null \
+  || fail_pb 'the shared-head proof base is not main in the inputs'
+# The second PR of the same commit reuses that result: one proof, no flapping between bases.
+invoke
+expect_count "$((before_count + 1))"
+rm -f "$fixture/head2"
+printf 'PASS proof base: a commit open in two PRs (main and a release line) is proved against main and says so\n'
 
 # A word without "=" is malformed, not a collision: it degrades (here: names no owner), never refuses.
 PR_GATE_PROOF_BASE_VARS=ACME_SPLIT_ROOT PR_GATE_WORKER_ROOT_VARS=ACME_SPLIT_ROOT invoke --list

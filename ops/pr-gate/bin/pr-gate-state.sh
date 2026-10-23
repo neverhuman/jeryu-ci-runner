@@ -51,7 +51,7 @@ gate_base_branch() { # branch
 gate_ref_protection() { # refs-json branch
   jq -r --arg b "$2" '
     first((if type == "array" then . else (.refs // .items // []) end)[]?
-          | select((.kind // "branch") == "branch" and .name == $b))
+          | select(.kind == "branch" and .name == $b))
     | "\(.sha // "") \(if .protected == true then "protected" else "unprotected" end)"' <<<"$1" 2>/dev/null \
     | grep -E '^[0-9a-f]{40} (un)?protected$' || true
 }
