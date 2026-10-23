@@ -340,6 +340,41 @@ gate_lock() {
   gate_key_dir="$HOME_DIR/attempts/$key"
 }
 
+# Discharge OWNER/REPO@SHA's unpublished attempts under every key but CURRENT (gate_attempt_key): each
+# such receipt is marked terminal (interrupted, if it never finished) and superseded by CURRENT, with no
+# recovery owed, and its directory is kept as evidence. A key whose lock another slot holds means an
+# attempt of this head is running there: fail, so the caller leaves the head for the next tick.
+gate_discharge_other_keys() { # owner repo sha current-key
+  local dir key receipt rc=0 next
+  for dir in "$HOME_DIR/attempts/$1-$2-$3" "$HOME_DIR/attempts/$1-$2-$3".base-*; do
+    [[ -d "$dir" ]] || continue
+    key=${dir##*/}
+    [[ "$key" != "$4" ]] || continue
+    compgen -G "$dir/*/receipt.json" >/dev/null || continue
+    # Nothing owed there: every receipt is published, or already superseded.
+    jq -se 'all(.[]; (.publication.required_status and .publication.check_run) or (.publication.superseded_by != null))' \
+      "$dir"/*/receipt.json >/dev/null 2>&1 && continue
+    exec 4>"$HOME_DIR/claim-locks/$key.lock" || { rc=1; continue; }
+    if ! flock -n 4; then exec 4>&-; rc=1; continue; fi
+    for receipt in "$dir"/*/receipt.json; do
+      [[ -f "$receipt" ]] || continue
+      next=$(jq --arg by "$4" '
+        if (.publication.required_status and .publication.check_run) or .publication.superseded_by != null then .
+        else (if .terminal then . else .terminal=true | .outcome="interrupted" end)
+          | .publication.superseded_by=("proof base: " + $by) | .recovery_required=null end' "$receipt") \
+        && printf '%s\n' "$next" | gate_atomic "$receipt" || rc=1
+    done
+    [[ ! -f "$dir/last-result.json" ]] || {
+      next=$(jq --arg by "$4" 'if .publication.superseded_by == null and ((.publication.required_status and .publication.check_run) | not)
+        then .publication.superseded_by=("proof base: " + $by) | .recovery_required=null else . end' "$dir/last-result.json") \
+        && printf '%s\n' "$next" | gate_atomic "$dir/last-result.json" || rc=1
+    }
+    printf 'discharged unpublished evidence of %s/%s@%s under %s: superseded by %s\n' "$1" "$2" "${3:0:12}" "$key" "$4" >&2
+    exec 4>&-
+  done
+  return "$rc"
+}
+
 gate_update() {
   local next
   next=$(jq "$@" "$gate_receipt") || return
@@ -775,6 +810,8 @@ gate_decision_local() {
   [[ "$actual" == "$(jq -r '.log_sha256' "$previous")" ]] || return 0
   [[ "$retry" == 0 ]] || return 0
   if ! jq -e '.publication.required_status and .publication.check_run' "$previous" >/dev/null; then
+    # A result discharged under another proof base is never published: gate it again instead.
+    jq -e '.publication.superseded_by != null' "$previous" >/dev/null && return 0
     gate_action=republish
   elif jq -e '.outcome == "success" and .exit_code == 0' "$previous" >/dev/null; then
     # Do not reuse if a later required-context status superseded our publication -- unless that later
@@ -981,6 +1018,9 @@ gate_recover() {
         .publication.superseded_by=$latest | .recovery_required=null' || return
       continue
     fi
+    # Discharged when the head was gated under another proof base (gate_discharge_other_keys): a result
+    # for a base it is no longer proved against is never published.
+    if jq -e '.publication.superseded_by != null' "$receipt" >/dev/null; then continue; fi
     if ! jq -e '.terminal' "$receipt" >/dev/null; then
       gate_finish interrupted null "" 'exclusive descendant lock recovered without a process-exit receipt' || return
     fi

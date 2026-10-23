@@ -211,7 +211,10 @@ sets it for every pull-request and merge-queue gate of that owner:
 
 - a base the forge reports as protected (`GET /api/v1/repos/<owner>%2F<repo>/refs`, whose rows carry
   `{name, sha, kind, protected}`), or the repository's default branch, is proved against as
-  `origin/<base>`, fetched into the gate tree at exactly the sha the forge reported;
+  `origin/<base>`, fetched into the gate tree at exactly the sha the forge reported. On a jeryu forge
+  a branch is protected only when an administrator set a rule for exactly that branch name (rules are
+  keyed by owner, repository and exact branch; there are no pattern rules), so an author cannot make a
+  branch of their own protected by naming it;
 - any other base -- a branch anybody with push access could create -- is proved against `origin/main`
   as before, and the status says why (`proof base origin/main (<base> is not a protected branch)`);
   so does a forge without the ref listing (404);
@@ -224,16 +227,24 @@ also has its own attempt and claim-lock key (`<owner>-<repo>-<sha>.base-<name di
 `gate_attempt_key`); `main` keeps the historical `<owner>-<repo>-<sha>`, so existing journals and
 recovery obligations stay where they are. A head proved against a release line is therefore never
 reused or adopted for `main`, or the other way round, and every status that names a base other than
-`main` says so (`; proof base origin/<base>`).
+`main` says so (`; proof base origin/<base>`). Before a head is gated under one key, its unpublished
+attempts under any other key (its base moved, or it was retargeted) are discharged: each receipt is
+marked superseded by the new key, with no recovery owed, and kept as evidence; such a result is never
+published or republished. A key another slot holds means that head is being gated there, and it is
+left for the next tick. One head can collect an attempt directory per base commit it was proved
+against; size the gate host's attempt store for that before enabling a busy release line.
 
 The required status itself is still one context keyed by commit, which the forge reads without
 knowing the base. So a retarget is handled as early as the runner can see it: each tick's listing
-compares the newest own success on every head of a configured owner with the base that head would be
-proved against now, and posts `pending` over one proved against another base before any tree is
-prepared; keep-green refuses it too, and a pull request whose base changes between listing and
-admission is left for the next tick. A retargeted head can therefore show its old base's green for at
-most one tick (normally seconds, as the retarget wakes a slot). Binding the base into the status the
-forge reads would close that window entirely; that needs the forge, not this runner.
+compares the newest own success on every open head of a configured owner (contributions included,
+since this runs nothing of them) with the base that head would be proved against now, and posts
+`pending` over one proved against another base before any tree is prepared; keep-green refuses it too,
+and a pull request whose base changes between listing and admission is left for the next tick.
+`--list` reads only and retires nothing. A retargeted head can therefore show its old base's green
+until the first tick that can read its status and its base from the forge: normally seconds, as the
+retarget wakes a slot, but as long as the forge fails those reads. A refused `pending` is logged and
+never ends the tick. Binding the base into the status the forge reads would close that window
+entirely; that needs the forge, not this runner.
 
 Binding `main`'s sha is a deliberate cost: for a configured owner, every merge to a repository's
 `main` changes the inputs of every open pull request into `main` of that repository, which is then
@@ -241,14 +252,18 @@ gated again (subject to the usual coalescing, `GATE_RUNNER_REGATE_SETTLE`). That
 result that names the base it was proved against; owners without an entry are unaffected.
 
 What a head changes about its own gate (the self-gate annotation, a contribution's gate-input paths)
-is read against the protected base it is proved against, so a release line's divergence from `main`
-is not counted as every pull request's own change.
+is still read against protected `main`, whatever its proof base: the review signal never depends on a
+base the pull request names. On a release line that diverged from `main` it therefore flags more than
+the pull request's own change, which errs towards review.
 
 A base the forge cannot answer for right now (a 5xx, a 429, a fetch that fails, a base that moved since
 it was resolved) is not a verdict on the head: it is left for the next tick with no status posted, and
 counted in `cache/proof-base-wait/`. Only the sixth tick in a row posts a failure, once, saying why. The
 count is cleared by any tick that gets the base (fetched, or an unchanged head reused or held on inputs
-that bind it), so a stale count never turns one later blip into a red status. A malformed entry in
+that bind it), so a stale count never turns one later blip into a red status. A rate limit (429,
+including this identity's own back-off) is waited out and never counted. For `main` the sha bound is
+the one `sync_repo` put in the tree, so another slot advancing the shared mirror meanwhile is not a
+failure. A malformed entry in
 `PR_GATE_PROOF_BASE_VARS` leaves that owner on the recipe's own default and says so on every tick; a
 variable that is also in `PR_GATE_WORKER_ROOT_VARS` is refused at start. Owners without an entry, and
 main-health, are unchanged.

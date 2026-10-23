@@ -161,6 +161,7 @@ case "$method $url" in
     # The forge's ref listing with each branch's protection: refs.json, refs-fail (a transient 503),
     # or no file at all (a forge without the route).
     if [[ -f "$FAKE_FORGE/refs-fail" ]]; then printf '{"message":"upstream unavailable"}\n503'; exit; fi
+    if [[ -f "$FAKE_FORGE/refs-429" ]]; then printf '{"message":"rate limited"}\n429'; exit; fi
     [[ -f "$FAKE_FORGE/refs.json" ]] || { printf '{"message":"not found"}\n404'; exit; }
     cat "$FAKE_FORGE/refs.json"; printf '\n200';;
   'GET '*'/api/v3/repos/acme/fixture')
@@ -1544,8 +1545,11 @@ tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" | jq -se '.[0].sta
 printf 'PASS proof base: a protected release line is proved against itself, under its own key, never kept green from main\n'
 
 # Retargeted back to main (the exploit in review): the release-line green is neither reused nor kept
-# green; main's proof re-runs and posts pending first.
+# green; main's proof re-runs and posts pending first. --list only reads: it retires nothing.
 printf 'main\n' >"$fixture/pr-base-ref"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+"${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || fail_pb '--list failed'
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb '--list posted a status'
 before_count=$(count) before_statuses=$(wc -l <"$fixture/statuses.jsonl")
 invoke
 [[ "$runner_exit" == 0 ]] || fail_pb 'retarget: runner failed'
@@ -1675,5 +1679,57 @@ PR_GATE_PROOF_BASE_VARS=acme=ACME_SPLIT_ROOT PR_GATE_WORKER_ROOT_VARS=ACME_SPLIT
 [[ "$runner_exit" == 2 ]] && grep -q 'ACME_SPLIT_ROOT is also in PR_GATE_WORKER_ROOT_VARS' "$fixture/runner.log" \
   || fail_pb 'a proof-base variable colliding with a worker-root variable was accepted'
 printf 'PASS proof base: a malformed site entry degrades its owner, not the tick; a colliding one is refused\n'
+
+# A rate-limited ref listing is waited out, never counted towards a failure.
+rm -rf "$fixture/runner/cache/proof-base-wait"
+printf 'release/v1\n' >"$fixture/pr-base-ref"
+touch "$fixture/refs-429"
+invoke
+rm -f "$fixture/refs-429" "$fixture/runner/cache/forge-backoff"
+grep -q 'proof base not available (the forge is rate limiting this identity); leaving it for the next tick, not counted' "$fixture/runner.log" \
+  || fail_pb 'a rate-limited ref listing was not left uncounted'
+[[ ! -e "$fixture/runner/cache/proof-base-wait/acme-fixture-$head" ]] || fail_pb 'a rate-limited ref listing was counted'
+printf 'PASS proof base: a rate limit is waited out and never counted\n'
+
+# Evidence that could not be published under one base, whose base then moved, is discharged as
+# superseded -- kept, never published over the new base's result -- and the head is gated again.
+"$real_git" -C "$fixture/source" checkout -q release/v1
+printf 'release moved once\n' >>"$fixture/source/release-note"
+"$real_git" -C "$fixture/source" add release-note
+"$real_git" -C "$fixture/source" commit -qm release-move-1
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" release/v1
+relsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" checkout -q main
+refs_json main release/v1
+touch "$fixture/reject-terminal"
+invoke
+rm -f "$fixture/reject-terminal"
+[[ "$runner_exit" == 1 ]] || fail_pb 'a rejected publication was not left for recovery'
+old_key=$(cd "$fixture/runner/attempts" && compgen -G "acme-fixture-$head.base-*-$relsha")
+"$real_git" -C "$fixture/source" checkout -q release/v1
+printf 'release moved twice\n' >>"$fixture/source/release-note"
+"$real_git" -C "$fixture/source" add release-note
+"$real_git" -C "$fixture/source" commit -qm release-move-2
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" release/v1
+relsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" checkout -q main
+refs_json main release/v1
+before_count=$(count)
+invoke
+[[ "$runner_exit" == 0 ]] || fail_pb 'a moved base after a rejected publication: runner failed'
+grep -q "discharged unpublished evidence of acme/fixture@${head:0:12} under $old_key" "$fixture/runner.log" || fail_pb 'the old base key was not discharged'
+expect_count "$((before_count + 1))"
+jq -e '.terminal and (.publication.required_status | not) and (.publication.superseded_by | startswith("proof base: "))
+  and .recovery_required == null' "$fixture/runner/attempts/$old_key/last-result.json" >/dev/null || fail_pb 'the old evidence was not recorded as superseded'
+last_status "$head" | jq -e --arg s "$relsha" '.state == "success" and (.description | contains("; proof base origin/release/v1"))' >/dev/null \
+  || fail_pb 'the head was not gated against the moved base'
+published=$(wc -l <"$fixture/statuses.jsonl")
+invoke
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$published" ]] || fail_pb 'superseded evidence was published later'
+printf 'PASS proof base: unpublished evidence under a base that moved is discharged as superseded, never published\n'
+
+# A word without "=" is malformed, not a collision: it degrades (here: names no owner), never refuses.
+PR_GATE_PROOF_BASE_VARS=ACME_SPLIT_ROOT PR_GATE_WORKER_ROOT_VARS=ACME_SPLIT_ROOT invoke --list
+[[ "$runner_exit" == 0 ]] || fail_pb 'a word without = was refused at start'
 
 unset PR_GATE_PROOF_BASE_VARS
