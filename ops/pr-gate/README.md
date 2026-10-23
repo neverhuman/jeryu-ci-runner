@@ -286,6 +286,33 @@ Roll a runner with this out to every gate host before adding the setting: a host
 release-line head against `origin/main`, its identity differs, and the two hosts would overwrite each
 other's verdict on that head every tick.
 
+## Gating a protected branch's tip
+
+A commit that reached a release line without a green gate (merged before release-line PRs could be
+proved at all, say) never gets a hosted `<repo>/required`, and promotion needs one. Pull-request gates
+see only open heads and `--main-health` only `main`, so
+
+    pr-gate-runner.sh --branch <name> [--repo owner/name]
+
+gates the current tip of `<name>`:
+
+- only a branch the forge reports as protected (`GET /api/v1/repos/<owner>%2F<repo>/refs`); anything
+  else -- unprotected, missing, or a forge that cannot answer -- is refused and named, and with
+  `--repo` the run exits 1. Nothing is posted on a refused branch;
+- with the repository's own recipe (`just required`, else `ops/ci/pr-ci.sh`) in the usual family tree,
+  proved against the branch itself: its `PR_GATE_PROOF_BASE_VARS` variable, when the owner has one, is
+  `origin/<name>`, fetched at exactly the tip;
+- posting `<repo>/required` on the tip commit as the gate identity, with `; proof base origin/<name>`
+  in its description;
+- under the same evidence identity and reuse rules as pull requests: the proof base is in the inputs
+  and the attempt key, an unchanged tip is reused, a failure is held. `--repo` makes the run a retry,
+  as `--main-health --repo` is. The tip is re-read before the recipe runs, and a tip that moved is
+  left for the next run.
+
+It takes no wake-up line, reads no merge queue or re-gate requests, never publishes the shared build
+cache, and has no timer: an operator or a release step runs it. `--pr` and `--main-health` are other
+modes and are refused with it.
+
 ## Release preflight
 
 `pr-gate-runner.sh --preflight` (ADR 0019) is a read-only look before a release. It takes no slot lock,

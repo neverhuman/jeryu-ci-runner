@@ -1761,4 +1761,28 @@ printf 'PASS proof base: a commit open in two PRs (main and a release line) is p
 PR_GATE_PROOF_BASE_VARS=ACME_SPLIT_ROOT PR_GATE_WORKER_ROOT_VARS=ACME_SPLIT_ROOT invoke --list
 [[ "$runner_exit" == 0 ]] || fail_pb 'a word without = was refused at start'
 
+# --branch: the tip of a protected branch is gated with the normal recipe, proved against that branch,
+# and posted as <repo>/required on the tip; a second pass reuses it; an unprotected branch is refused.
+printf 'main\n' >"$fixture/pr-base-ref"
+before_count=$(count) before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke --branch release/v1 --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || fail_pb '--branch: runner failed'
+expect_count "$((before_count + 1))"
+grep -q "preparing acme/fixture release/v1 at $relsha" "$fixture/runner.log" || fail_pb '--branch did not gate the tip'
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/release/v1 $relsha" ]] || fail_pb '--branch was not proved against the branch'
+tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" | jq -se --arg s "$relsha" 'all(.sha == $s and .context == "fixture/required")
+  and .[-1].state == "success" and (.[-1].description | test("; inputs [0-9a-f]{64}; proof base origin/release/v1"))' >/dev/null \
+  || fail_pb '--branch did not post <repo>/required on the tip'
+compgen -G "$fixture/runner/attempts/acme-fixture-$relsha.base-*-$relsha/last-result.json" >/dev/null || fail_pb '--branch has no keyed attempt'
+invoke --branch release/v1
+[[ "$runner_exit" == 0 ]] || fail_pb '--branch reuse: runner failed'
+expect_count "$((before_count + 1))"
+grep -q "reuse acme/fixture@$relsha" "$fixture/runner.log" || fail_pb 'an unchanged branch tip was not reused'
+invoke --branch topic --repo acme/fixture
+[[ "$runner_exit" == 1 ]] || fail_pb 'an unprotected branch was not refused'
+grep -q 'refusing acme/fixture topic: the forge does not report it as protected' "$fixture/runner.log" || fail_pb 'the refusal does not say why'
+invoke --branch release/v1 --pr 1
+[[ "$runner_exit" == 2 ]] || fail_pb '--branch with --pr was accepted'
+expect_count "$((before_count + 1))"
 unset PR_GATE_PROOF_BASE_VARS
+printf 'PASS --branch: a protected tip is gated as <repo>/required against itself, reused, and an unprotected one refused\n'

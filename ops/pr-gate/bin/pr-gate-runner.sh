@@ -57,9 +57,11 @@
 # against ../<sibling>), with `just required` when their justfile has it, otherwise the repo's own
 # `bash ops/ci/pr-ci.sh`. An owner whose checkout root holds one product is a single-repo tree.
 #
-# Usage: pr-gate-runner.sh [--repo [OWNER/]R --pr N] [--main-health] [--list]
+# Usage: pr-gate-runner.sh [--repo [OWNER/]R --pr N] [--main-health] [--branch B [--repo R]] [--list]
 #   --repo/--pr  gate this PR now, even if it already has a runner status
 #   --main-health  gate protected main and post <repo>/main-health
+#   --branch B   gate the tip of protected branch B (a release line) and post <repo>/required on it,
+#                proved against B itself; refused for a branch the forge does not report as protected
 #   --list       print what the next tick would gate and exit
 #   --preflight  (alone) read-only release check: stale slot index locks, pinned-tool drift, each
 #                family main's latest <repo>/required; exit 1 on a finding (pr-gate-preflight.sh)
@@ -216,14 +218,21 @@ git_env=(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2
   GIT_CONFIG_KEY_0="$GIT_CONFIG_KEY_0" GIT_CONFIG_VALUE_0=""
   GIT_CONFIG_KEY_1="$GIT_CONFIG_KEY_1" GIT_CONFIG_VALUE_1="$GIT_CONFIG_VALUE_1")
 
-only_repo=""; only_pr=""; list=0; main_health=0
+only_repo=""; only_pr=""; list=0; main_health=0; only_branch=""
 while (($#)); do case "$1" in
   --repo) only_repo="${2:?--repo needs a value}"; shift 2;;
   --pr) only_pr="${2:?--pr needs a number}"; shift 2;;
   --main-health) main_health=1; shift;;
+  --branch) only_branch="${2:?--branch needs a branch name}"; shift 2;;
   --list) list=1; shift;;
   *) printf 'unknown argument: %s\n' "$1" >&2; exit 2;;
 esac; done
+if [[ -n "$only_branch" ]]; then
+  # A protected branch's tip, posted as <repo>/required (see "Gating a protected branch's tip" in the
+  # README). It is neither a pull request nor main-health: --pr and --main-health are other modes.
+  [[ -z "$only_pr" && "$main_health" == 0 ]] || { printf -- '--branch gates a branch tip, not a PR or main-health\n' >&2; exit 2; }
+  gate_base_branch "$only_branch" >/dev/null || { printf -- '--branch: %q is not a usable branch name\n' "$only_branch" >&2; exit 2; }
+fi
 if ((main_health)); then
   [[ -z "$only_pr" ]] || { printf -- '--main-health gates repository main, not a PR\n' >&2; exit 2; }
   export GATE_CONTEXT_KIND=main-health
@@ -742,11 +751,27 @@ candidates=()
 # pass takes the repository whose default branch moved, from its own file. --repo/--pr is somebody
 # naming a head themselves, so it reads none; a tick that only lists leaves the line for the tick
 # that will gate it.
-[[ -n "$only_repo" || "$list" == 1 ]] || dispatch_take
+[[ -n "$only_repo" || -n "$only_branch" || "$list" == 1 ]] || dispatch_take
+branch_refused=0
 for qualified in $REPOS; do
   qualified="$(qualify "$qualified")"
   [[ -z "$only_repo" || "$qualified" == "$only_repo" ]] || continue
   owner="${qualified%%/*}" repo="${qualified#*/}"
+  if [[ -n "$only_branch" ]]; then
+    # Only a branch the forge reports as protected: its tip is reviewed code, as main's is. Anything
+    # else is refused, and the forge's answer is what decides it, never this runner's guess.
+    api GET "/api/v1/repos/$owner%2F$repo/refs"
+    if [[ "$code" != 200 ]]; then
+      say "cannot list $owner/$repo branches ($code); not gating its $only_branch"; branch_refused=1; continue
+    fi
+    row=$(gate_ref_protection "$body" "$only_branch")
+    if [[ "$row" != *" protected" ]]; then
+      say "refusing $owner/$repo $only_branch: $([[ -n "$row" ]] && printf 'the forge does not report it as protected' || printf 'no such branch')"
+      branch_refused=1; continue
+    fi
+    candidates+=("$owner $repo 0 ${row%% *} refs/heads/$only_branch 0 $only_branch -")
+    continue
+  fi
   if ((main_health)); then
     main_sha=""
     api GET "/api/v3/repos/$owner/$repo/branches/main"
@@ -825,7 +850,7 @@ queued=()
 # Every entry this tick saw, admitted or refused, by queue sha: gate_queue_arrived looks only past it.
 declare -A queue_seen=()
 gated=" $(for q in $REPOS; do qualify "$q"; printf ' '; done)"
-if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
+if [[ -z "$only_pr" && -z "$only_branch" && "$main_health" == 0 ]]; then
   api GET "/api/v1/merge-queue?state=building"
   if [[ "$code" == 200 ]]; then
     queue_rows="$body"
@@ -903,7 +928,7 @@ gate_queue_arrived() {
 # so it reads nothing. A request never admits a head the rules above refused (the runner's own work,
 # a closed PR, a moved head): it only decides whether an admitted head is gated again.
 declare -A regate_at=()
-if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
+if [[ -z "$only_pr" && -z "$only_branch" && "$main_health" == 0 ]]; then
   api GET "/api/v1/gate-regate?state=pending"
   if [[ "$code" == 200 ]]; then
     while IFS=$'\t' read -r rrepo rnumber rsha rat; do
@@ -961,6 +986,9 @@ for candidate in "${fresh[@]}" "${seen_before[@]}"; do
 done
 candidates=("${queued[@]}" "${woken[@]}" "${rest[@]}")
 
+if [[ -n "$only_branch" && -n "$only_repo" ]] && ((branch_refused && ${#candidates[@]} == 0)); then
+  die "--branch $only_branch: $only_repo was refused (see above)"
+fi
 if ((${#candidates[@]} == 0)); then ((list)) || heartbeat; say "$([[ "$main_health" == 1 ]] && printf 'no main-health repo needs gating' || printf 'no PR head needs gating')"; exit 0; fi
 if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # FD7 protects the shared repository target; FD6 protects the full-head journal.
@@ -977,7 +1005,8 @@ while :; do
 for candidate in "${candidates[@]}"; do
 read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
-   && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) \
+   && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ \
+        || ( -n "$only_branch" && "$qref" == "refs/heads/$only_branch" ) ) \
    && ( "$cbase" == - || "$cbase" == '!' || "$cbase" =~ ^\*[0-9]+$ || "$cbase" == "$(gate_base_branch "$cbase")" ) \
    && "$contributed" =~ ^[01]$ && ( "$ready" == - || "$ready" =~ ^[^[:space:]]+\|[a-z-]+$ ) ]] \
   || die "invalid repository or head in dispatch"
@@ -994,12 +1023,14 @@ if [[ -d "$HOME_DIR/claims/$owner-$repo-$sha" ]]; then
   continue
 fi
 # The proof base of this head (see resolve_proof_base), decided before the claim: a base other than main
-# is part of the attempt key. main's sha is read from the mirror refreshed in step 3, so it is bound
-# below, after that refresh.
+# is part of the attempt key. A branch-tip gate is proved against that branch itself. main's sha is
+# read from the mirror refreshed in step 3, so it is bound below, after that refresh.
 GATE_PROOF_BASE="" pb_var="" pb_branch="" pb_sha="" pb_note="" proof_base=0 proof_base_env=()
 if ((main_health == 0)); then
   owner_proof_base_var "$owner"
-  if [[ -n "$pb_var" ]]; then
+  if [[ -n "$only_branch" ]]; then
+    proof_base=1 pb_branch=$only_branch pb_sha=$sha
+  elif [[ -n "$pb_var" ]]; then
     proof_base=1
     resolve_rc=0
     resolve_proof_base "$owner" "$repo" "$cbase" || resolve_rc=$?
@@ -1181,7 +1212,11 @@ if ((retry_wanted == 0)); then
     continue
   fi
 fi
-say "preparing $owner/$repo#$number at $sha${qref:+$([[ "$qref" == - ]] || printf ' (merge queue %s)' "$qref")}"
+if [[ -n "$only_branch" ]]; then
+  say "preparing $owner/$repo $only_branch at $sha"
+else
+  say "preparing $owner/$repo#$number at $sha${qref:+$([[ "$qref" == - ]] || printf ' (merge queue %s)' "$qref")}"
+fi
 
 # 5. clean tree
 # One persistent family tree, reset to exact commits for every gate. Build output is the only
@@ -1269,6 +1304,13 @@ if [[ "$main_health" == 1 ]]; then
     exec 6>&-; exec 7>&-
     continue
   fi
+elif [[ -n "$only_branch" ]]; then
+  git -C "$run/$repo" fetch --quiet "$BASE/git/$owner/$repo.git" "+$qref:refs/gate/branch"
+  if [[ "$(git -C "$run/$repo" rev-parse refs/gate/branch)" != "$sha" ]]; then
+    say "$owner/$repo $only_branch moved on from $sha; leaving it for the next tick"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
 elif [[ "$qref" == - ]]; then
   git -C "$run/$repo" fetch --quiet "$BASE/git/$owner/$repo.git" "$sha"
 else
@@ -1307,7 +1349,7 @@ fi
 # about to report. It is recorded on the attempt and annotated on the check run (gate_publish); it
 # changes no conclusion, and nothing here reruns the recipe from protected main. mirror/main is that
 # protected main in this tree (sync_repo keeps it there).
-if [[ "$main_health" == 1 ]]; then
+if [[ "$main_health" == 1 || -n "$only_branch" ]]; then
   self_gate_paths=()
 else
   mapfile -t self_gate_paths < <(gate_definition_paths "$run/$repo" mirror/main "$sha")
@@ -1439,6 +1481,8 @@ api GET "/repos/$owner/$repo/commits/$sha/status"
 [[ "$code" == 200 ]] || die "cannot verify current status for $owner/$repo@$sha ($code)"
 printf '%s\n' "$body" >"$status_snapshot"
 retry=0; [[ -z "$only_pr" && "$main_health" == 0 ]] || retry=1
+# A branch tip named with --repo is gated on demand, as main-health --repo is; a scheduled pass reuses.
+[[ -z "$only_branch" || -z "$only_repo" ]] || retry=1
 # A requested re-gate is a retry of this head: gate_decision must neither reuse its success nor hold
 # its failure.
 regate_now=""
@@ -1484,6 +1528,11 @@ if [[ "$main_health" == 1 ]]; then
   [[ "$code" == 200 ]] || die "cannot refresh main before admission ($code)"
   admitted=0
   [[ "$(jq -r '.commit.sha // .sha // ""' <<<"$body")" == "$sha" ]] && admitted=1
+elif [[ -n "$only_branch" ]]; then
+  api GET "/api/v1/repos/$owner%2F$repo/refs"
+  [[ "$code" == 200 ]] || die "cannot refresh $owner/$repo branches before admission ($code)"
+  admitted=0
+  [[ "$(gate_ref_protection "$body" "$only_branch")" == "$sha protected" ]] && admitted=1
 elif [[ "$qref" == - ]]; then
   api GET "/api/v3/repos/$owner/$repo/pulls/$number"
   [[ "$code" == 200 ]] || die "cannot refresh PR before admission ($code)"
@@ -1596,7 +1645,7 @@ fi
 gate_update --arg url "$checks_url" '.phase="running" | .checks_url=$url'
 started_at="$(date -u +%FT%TZ)" started_s="$(date +%s)"
 gate_kind=pr
-[[ "$main_health" == 0 ]] || gate_kind=main-health
+if [[ "$main_health" == 1 ]]; then gate_kind=main-health; elif [[ -n "$only_branch" ]]; then gate_kind=branch; fi
 heartbeat "$(jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" \
   --arg recipe "$recipe_name" --arg at "$started_at" --arg kind "$gate_kind" \
   '{repo:$repo,pr:$pr,sha:$sha,recipe:$recipe,startedAt:$at,kind:$kind}')"
