@@ -61,6 +61,8 @@ api() {
     /api/v1/repos/acme%2Fcore/pulls\?state=all\&per_page=100\&page=[0-9]*|/api/v1/repos/acme%2Fbig/pulls\?state=all\&per_page=100\&page=[0-9]*)
       body="$(jq -c --argjson more "$pulls_more" --argjson p "${2##*page=}" \
         '. + {total: (.items | length), page: {limit: 100, page: $p, total: (.items | length), has_more: $more}}' <<<"$stub_pulls")" ;;
+    # A repository the forge does not have: the one read a lock entry makes before fetching anything.
+    /api/v1/repos/acme%2Fghost) code=404; body='{"error":{"code":"not_found"}}' ;;
     *) echo "$2" >>"$t/api.unexpected"; code=404; body='{"error":{"code":"not_found"}}' ;;
   esac
 }
@@ -291,6 +293,86 @@ done
 [ -z "$(git -C "$state/cache/upstream/acme@core.git" for-each-ref --format='%(refname)' refs/up/ | grep -vx 'refs/up/b[01]')" ] \
   || fail "a review left its refs behind"
 ok 'parallel reviews of one upstream never see each other'"'"'s tips and leave no refs'
+
+# 12d. Release lock entries: a `[[repo]]` table of a root *.lock.toml names a repository of the
+# dependent's owner, a commit and a tag. The github/jeryu URL fields are never fetch targets.
+tagup() { git -C "$t/forge/git/acme/core.git" -c user.name=t -c user.email=t@t tag "$@"; }
+tagup -a core-v1 -m v1 "$r1"; tagup -a core-v3 -m v3 "$r3"; tagup core-v3-lw "$r3"; tagup -a core-v2 -m v2 "$r2"
+tagup -a core-side -m side "$rs"
+entry() { # repo tag commit dist
+  printf '\n[[repo]]\nrepo = "%s"\ntag = "%s"\ncommit = "%s"\nweb_dist_sha256 = "%s"\ngithub = "https://github.example/evil/%s.git"\njeryu = "http://mirror.invalid/git/evil/%s.git"\nrequired_check = "%s/required"\n' \
+    "$1" "$2" "$3" "$4" "$1" "$1" "$1"
+}
+lockfile() { printf 'schema_version = "1.0.0"\nfamily = "acme"\n\n[nested.engine]\nengine_commit = "%s"\n' "$r1"; }
+dist1="$(printf 'a%.0s' {1..64})" dist3="$(printf 'b%.0s' {1..64})"
+dep lock; { lockfile; entry core core-v1 "$r1" "$dist1"; entry ghost ghost-v1 "$r1" "$dist1"; } | put acme.lock.toml; b="$(snap base)"
+lock_case() { # name: the lock at the head, on stdin -> review dir
+  put acme.lock.toml; evidence "$b" "$(snap "$1")"
+}
+nofetch() { ! grep -q evil "$t/api.log" && ! grep -rq 'evil\|mirror.invalid' "$state/cache/upstream" 2>/dev/null; }
+
+o="$( { lockfile; entry core core-v3 "$r3" "$dist3"; entry ghost ghost-v1 "$r1" "$dist1"; } | lock_case lock-bump)"
+p="$(pin_of "$o" "$r3")"; dir="$(dirname "$p")"
+[ "$(field "$p" status)" = merged-tip ] && [ "$(field "$p" verified)" = true ] && [ "$(field "$p" lock_entry)" = true ] \
+  && [ "$(field "$p" checked_branch)" = main ] && [ "$(field "$p" old_rev)" = "$r1" ] || fail "lock bump: $(cat "$p")"
+[ "$(field "$p" tag)" = core-v3 ] && [ "$(field "$p" old_tag)" = core-v1 ] && [ "$(field "$p" tag_resolves_to)" = "$r3" ] \
+  && [ "$(field "$p" tag_matches_commit)" = true ] && [ "$(field "$p" tag_annotated)" = true ] || fail "lock tag: $(cat "$p")"
+jq -e --arg d3 "$dist3" --arg d1 "$dist1" '.locked_fields | (map(.name) | sort) == ["required_check", "web_dist_sha256"]
+  and (map(select(.name == "web_dist_sha256"))[0] | .value == $d3 and .base_value == $d1 and .changed == true
+    and .provenance == "author-measured, not reproduced by the reviewer")' "$p" >/dev/null || fail "locked fields: $(jq -c .locked_fields "$p")"
+grep -q "commit $r2" "$dir/log.txt" && grep -q '^+three' "$dir/diff.patch" && grep -q 'core/src/lib.rs' "$dir/diffstat.txt" \
+  && [ "$(jq -r '.[0].number' "$dir/pulls.json")" = 9 ] || fail "lock log, diff, diff stat and pulls"
+grep -q "acme/core ${r3:0:12}: merged-tip (branch main, default); tag core-v3 peels to it (annotated)" "$o/upstream/SUMMARY.txt" \
+  || fail "lock summary row: $(cat "$o/upstream/SUMMARY.txt")"
+grep -q 'tag-mismatch' "$o/upstream/SUMMARY.txt" && [ "$(grep -c "${r1:0:12}" "$o/upstream/SUMMARY.txt")" = 0 ] \
+  || fail "the summary explains lock statuses and lists only the moved entry: $(cat "$o/upstream/SUMMARY.txt")"
+nofetch || fail "a lock URL field was used: $(cat "$t/api.log")"
+ok 'a lock bump onto the default tip, with a tag that peels to it, is verified; locked fields are author-measured'
+
+o="$( { lockfile; entry core core-v2 "$r3" "$dist3"; entry ghost ghost-v1 "$r1" "$dist1"; } | lock_case lock-mismatch)"
+p="$(pin_of "$o" "$r3")"
+[ "$(field "$p" status)" = tag-mismatch ] && [ "$(field "$p" verified)" = false ] && [ "$(field "$p" branch_status)" = merged-tip ] \
+  && [ "$(field "$p" tag_resolves_to)" = "$r2" ] && [ "$(field "$p" tag_matches_commit)" = false ] || fail "tag mismatch: $(cat "$p")"
+grep -q "acme/core ${r3:0:12}: tag-mismatch (tag core-v2 peels to ${r2:0:12}, not the locked commit; the commit itself: merged-tip, branch main, default)" "$o/upstream/SUMMARY.txt" \
+  || fail "mismatch summary: $(cat "$o/upstream/SUMMARY.txt")"
+o="$( { lockfile; entry core core-v9 "$r3" "$dist3"; entry ghost ghost-v1 "$r1" "$dist1"; } | lock_case lock-notag)"
+p="$(pin_of "$o" "$r3")"
+[ "$(field "$p" status)" = tag-mismatch ] && [ "$(field "$p" tag_resolves_to)" = null ] && grep -q 'core-v9 not found on the forge' "$o/upstream/SUMMARY.txt" \
+  || fail "missing tag: $(cat "$p")"
+ok 'a tag that peels to another commit, or is missing from the forge, is tag-mismatch and unverified'
+
+o="$( { lockfile; entry core core-v3-lw "$r3" "$dist3"; entry ghost ghost-v1 "$r1" "$dist1"; } | lock_case lock-lw)"
+p="$(pin_of "$o" "$r3")"
+[ "$(field "$p" status)" = merged-tip ] && [ "$(field "$p" tag_matches_commit)" = true ] && [ "$(field "$p" tag_annotated)" = false ] \
+  && [ "$(field "$p" tag_object_type)" = commit ] && jq -e '.notes | map(select(test("lightweight tag"))) | length == 1' "$p" >/dev/null \
+  && grep -q "tag core-v3-lw peels to it (lightweight)" "$o/upstream/SUMMARY.txt" || fail "lightweight tag: $(cat "$p")"
+ok 'a lightweight tag that peels to the commit verifies and is recorded as not annotated'
+
+o="$( { lockfile; entry core core-v1 "$r1" "$dist1"; entry ghost ghost-v1 "$r1" "$dist1"; entry secret secret-v1 "$r3" "$dist3"; } | lock_case lock-new)"
+grep -q "acme/secret ${r3:0:12}: new-pin-unverified" "$o/upstream/SUMMARY.txt" || fail "new lock entry: $(cat "$o/upstream/SUMMARY.txt")"
+[ ! -s "$t/api.log" ] && [ ! -e "$state/cache/upstream/acme@secret.git" ] && [ "$(find "$o/upstream" -mindepth 1 ! -name SUMMARY.txt | wc -l)" = 0 ] \
+  || fail "a new lock entry was fetched: $(cat "$t/api.log")"
+ok 'a lock entry new at the head is new-pin-unverified and nothing is fetched'
+
+o="$( { lockfile; entry core core-v1 "$r1" "$dist1"; entry ghost ghost-v3 "$r3" "$dist3"; } | lock_case lock-ghost)"
+grep -q "acme/ghost ${r3:0:12}: repo-not-on-forge" "$o/upstream/SUMMARY.txt" || fail "ghost repository: $(cat "$o/upstream/SUMMARY.txt")"
+[ "$(cat "$t/api.log")" = '/api/v1/repos/acme%2Fghost' ] && [ ! -e "$state/cache/upstream/acme@ghost.git" ] \
+  && [ "$(find "$o/upstream" -mindepth 1 ! -name SUMMARY.txt | wc -l)" = 0 ] || fail "a repository the forge lacks was fetched: $(cat "$t/api.log")"
+nofetch || fail "a lock URL field was used for a repository the forge lacks"
+ok 'a lock entry whose repository is not on the forge is repo-not-on-forge and nothing is fetched'
+
+o="$( { lockfile; entry core core-side "$rs" "$dist3"; entry ghost ghost-v1 "$r1" "$dist1"; } | lock_case lock-side)"
+p="$(pin_of "$o" "$rs")"
+[ "$(field "$p" status)" = NOT-ON-BRANCH ] && [ "$(field "$p" verified)" = false ] && [ "$(field "$p" tag_matches_commit)" = true ] \
+  && [ "$(field "$p" checked_branch)" = "" ] || fail "lock commit on an unprotected branch: $(cat "$p")"
+ok 'a lock commit only on an unprotected branch is unverified even when its tag peels to it'
+
+# A *.lock.toml below the root is not a release lock.
+mkdir -p "$D/sub"; { lockfile; entry core core-v1 "$r1" "$dist1"; } >"$D/sub/x.lock.toml"; b="$(snap sub-base)"
+{ lockfile; entry core core-v3 "$r3" "$dist3"; } >"$D/sub/x.lock.toml"
+o="$t/sub-lock"; mkdir -p "$o"; upstream_evidence "$D/.git" "$b" "$(snap sub)" "$o" acme 100000
+[ ! -e "$o/upstream" ] || fail "a nested *.lock.toml was read as a release lock: $(cat "$o/upstream/SUMMARY.txt")"
+ok 'only a *.lock.toml at the repository root is a release lock'
 
 # 13. No moved pin, no upstream/.
 dep plain; inline "$r1" | put Cargo.toml; b2="$(snap base)"

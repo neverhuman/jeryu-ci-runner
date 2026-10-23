@@ -223,6 +223,39 @@ bytes is not fetched. `REDTEAM_UPSTREAM_MAX_PINS`,
 commits, pull request pages, pins, protected branches) is noted in `SUMMARY.txt` and `pin.json`, as is
 a pin that moves backwards.
 
+### Release lock entries
+
+A release lock is a TOML file at the repository root named `*.lock.toml` that holds one `[[repo]]`
+table per pinned repository:
+
+```toml
+[[repo]]
+repo = "web"
+tag = "web-v1.2.0"
+commit = "<40-hex commit>"
+web_dist_sha256 = "<hash of the built bundle>"
+github = "https://github.com/example/web.git"
+required_check = "web/required"
+```
+
+A change that moves an entry's `commit` or `tag` gets the same `upstream/` evidence as a git pin, by
+the same rules: only an entry the base already has (same file, same `repo =` name) is fetched, and a
+new entry is `new-pin-unverified`. The repository fetched is `<the dependent repository's
+owner>/<repo>` on this forge, and only once the forge says it exists; otherwise the entry is
+`repo-not-on-forge` and nothing is fetched. URL fields such as `github` are never fetch targets. A
+`commit` that is not 40 hex (`PENDING`) is not fetched; at the base it simply means no old rev.
+
+For a lock entry, `upstream/` adds `diffstat.txt` (the whole repository's diff stat; `diff.patch`
+covers the whole repository within the cap), and `pin.json` adds `lock_entry`, `tag`, `old_tag`,
+`tag_resolves_to` (what the forge's `refs/tags/<tag>` peels to), `tag_matches_commit`,
+`tag_annotated` and `branch_status`. **Verified** for a lock entry means both: the commit is
+`merged-tip` or `ancestor-of-tip` on a default or protected branch, AND the forge's tag peels to that
+commit. A tag that peels elsewhere, or that the forge does not have, is `tag-mismatch`, which is
+unverified whatever `branch_status` says. A lightweight tag that peels to the commit verifies, and is
+recorded with `tag_annotated: false`. The entry's other fields (`locked_fields`, such as
+`web_dist_sha256`) are recorded with their base values as "author-measured, not reproduced by the
+reviewer": the reviewer builds nothing.
+
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,
