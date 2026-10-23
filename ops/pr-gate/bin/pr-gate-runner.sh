@@ -317,6 +317,88 @@ post_status() { # owner repo sha state description [target_url]
   die "posting $1/$2 $(gate_status_context "$1" "$2")=$4 on $3 answered $failed_code: $failed_body"
 }
 
+# ---------------------------------------------------------------------------
+# The proof base. A recipe compares the head against a base ref that defaults to origin/main, and a
+# release line does not descend from main, so every PR into one failed its gate in seconds. When the
+# site names that recipe variable for the owner (PR_GATE_PROOF_BASE_VARS, owner=VARIABLE), the recipe
+# gets origin/<base> instead -- but only for a base the forge reports as protected, or the repository's
+# default branch: anybody who can push a branch could otherwise choose what their head is proved
+# against. Any other base is proved against origin/main, as before, and the status says so.
+#
+# The base is part of the result: its name and resolved sha are in the input identity
+# (gate_input_render) and a base other than main has its own attempt and lock key
+# (gate_attempt_key), so a head proved against one base is never reused, adopted or kept green for
+# another. A base the forge cannot answer for right now is not a verdict on the head: the head is left
+# for the next tick with no status posted, at most PROOF_BASE_WAIT_CAP ticks in a row, and only then
+# is a failure posted that says why.
+# ---------------------------------------------------------------------------
+PROOF_BASE_WAIT_CAP=6
+declare -A proof_base_var_refused=()
+# The recipe variable for OWNER in pb_var, or nothing. A malformed site entry degrades that one owner
+# to the recipe's own default, said once a tick, instead of stopping every repository's gate.
+owner_proof_base_var() { # owner
+  pb_var=""
+  if ! pb_var="$(gate_proof_base_var "$1")"; then
+    pb_var=""
+    [[ -n "${proof_base_var_refused[$1]:-}" ]] \
+      || say "PR_GATE_PROOF_BASE_VARS: $1's entry is not a variable name; its repositories keep the recipe's own proof base"
+    proof_base_var_refused[$1]=1
+  fi
+  return 0
+}
+
+# A candidate's base field: "-" when the forge named none, "!" for a name the runner will not use,
+# else the checked branch name.
+candidate_base() { # branch
+  [[ -n "$1" ]] || { printf -- -; return 0; }
+  gate_base_branch "$1" || printf '!'
+}
+
+# Resolve the proof base of a head whose PR (or queue entry) names REQUESTED as its base: pb_branch and
+# pb_sha (empty for main, which the mirror resolves), and pb_note when it falls back to main. Returns 1,
+# with the reason in pb_note, when the forge cannot answer now.
+resolve_proof_base() { # owner repo requested
+  local row default
+  pb_branch=main pb_sha="" pb_note=""
+  case "$3" in
+    -|main) return 0;;
+    '!') pb_note="proof base origin/main (the base branch is not a usable name)"; return 0;;
+  esac
+  api GET "/api/v1/repos/$1%2F$2/refs"
+  if [[ "$code" == 404 ]]; then
+    pb_note="proof base origin/main (the forge does not report whether $3 is protected)"; return 0
+  fi
+  [[ "$code" == 200 ]] || { pb_note="the forge answered $code listing $1/$2 branches"; return 1; }
+  row=$(gate_ref_protection "$body" "$3")
+  if [[ "$row" == *" protected" ]]; then pb_branch=$3 pb_sha=${row%% *}; return 0; fi
+  if [[ -z "$row" ]]; then pb_note="proof base origin/main ($3 is not a branch the forge lists)"; return 0; fi
+  api GET "/api/v3/repos/$1/$2"
+  [[ "$code" == 200 ]] || { pb_note="the forge answered $code reading $1/$2 default branch"; return 1; }
+  default=$(jq -r '.default_branch // ""' <<<"$body")
+  if [[ "$default" == "$3" ]]; then pb_branch=$3 pb_sha=${row%% *}; return 0; fi
+  pb_note="proof base origin/main ($3 is not a protected branch)"
+}
+
+# A head whose proof base cannot be had this tick: leave it, say so, and count. Only the
+# PROOF_BASE_WAIT_CAP-th tick in a row posts a failure (once); a base that comes back gates the head.
+proof_base_wait() { # owner repo sha reason
+  local file="$HOME_DIR/cache/proof-base-wait/$1-$2-$3" n=0 reason=${4//;/,}
+  mkdir -p "${file%/*}"
+  [[ ! -f "$file" ]] || read -r n <"$file" || n=0
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  n=$((n + 1))
+  printf '%s\n' "$n" | gate_atomic "$file" || say "could not count the proof base wait of $1/$2@$3"
+  if ((n < PROOF_BASE_WAIT_CAP)); then
+    say "$1/$2@$3: proof base not available ($reason); leaving it for the next tick, no status posted ($n of $PROOF_BASE_WAIT_CAP)"
+  elif ((n == PROOF_BASE_WAIT_CAP)); then
+    say "$1/$2@$3: proof base still not available after $n ticks ($reason); posting failure"
+    post_status "$1" "$2" "$3" failure "no gate: proof base unavailable for $n ticks: ${reason:0:100} ($MARKER)"
+  else
+    say "$1/$2@$3: proof base still not available after $n ticks ($reason); its failure status stands"
+  fi
+}
+proof_base_settled() { rm -f -- "$HOME_DIR/cache/proof-base-wait/$1-$2-$3"; }
+
 main_health_is_current_green() { # status-snapshot
   jq -e --arg context "$(gate_main_health_context "$owner" "$repo")" --arg marker "$MARKER " '
     [.statuses[]? | select(.context == $context)] | sort_by(.updated_at // .created_at) | last
@@ -601,7 +683,7 @@ for qualified in $REPOS; do
       continue
     fi
     rm -f -- "$status_snapshot"
-    candidates+=("$owner $repo 0 $main_sha refs/heads/main 0 -")
+    candidates+=("$owner $repo 0 $main_sha refs/heads/main 0 - -")
     continue
   fi
   api GET "/api/v1/repos/$owner%2F$repo/pulls?state=open"
@@ -614,6 +696,7 @@ for qualified in $REPOS; do
     api GET "/api/v3/repos/$owner/$repo/pulls/$number"
     author="$(jq -r '.user.login // ""' <<<"$body")"
     head_ref="$(jq -r '.head.ref // ""' <<<"$body")"
+    cbase="$(candidate_base "$(jq -r '.base.ref // ""' <<<"$body")")"
     [[ "$code" == 200 && -n "$author" ]] \
       || { say "cannot read $owner/$repo#$number's author ($code); skipping rather than guessing"; continue; }
     # Never prove this runner's own work. A proof is only worth the independence of whoever
@@ -638,7 +721,7 @@ for qualified in $REPOS; do
         continue
       fi
     fi
-    candidates+=("$owner $repo $number $sha - $contributed $ready")
+    candidates+=("$owner $repo $number $sha - $contributed $cbase $ready")
   done < <(jq -r '.items[]? | [.number, .head_sha] | @tsv' <<<"$rows" | sort -n)
 done
 # Merge queue (jeryu-deploy docs/merge-queue.md). The forge replays an approved PR onto its base tip as
@@ -654,7 +737,7 @@ if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
   api GET "/api/v1/merge-queue?state=building"
   if [[ "$code" == 200 ]]; then
     queue_rows="$body"
-    while IFS=$'\t' read -r qrepo number sha qref; do
+    while IFS=$'\t' read -r qrepo number sha qref qbase; do
       queue_seen["$sha"]=1
       if ! [[ "$qrepo" =~ ^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$ && "$number" =~ ^[0-9]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
           && "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ && "$qref" != *..* ]]; then
@@ -684,8 +767,9 @@ if [[ -z "$only_pr" && "$main_health" == 0 ]]; then
           say "not running queued $qrepo#$number (contributed): $refusal"; continue
         fi
       fi
-      queued+=("$owner $repo $number $sha $qref $contributed $queued_ready")
-    done < <(jq -r '.entries[]? | [.repo, (.number|tostring), .queue_sha, .queue_ref] | @tsv' <<<"$queue_rows")
+      # The entry's own base branch, as the forge reports it, is what its replay is proved against.
+      queued+=("$owner $repo $number $sha $qref $contributed $(candidate_base "$qbase") $queued_ready")
+    done < <(jq -r '.entries[]? | [.repo, (.number|tostring), .queue_sha, .queue_ref, (.base // "")] | @tsv' <<<"$queue_rows")
   else
     say "merge queue answered $code; gating PR heads only this tick"
   fi
@@ -755,7 +839,7 @@ gate_regate_wanted() { # owner repo number sha
 # burst to end. --repo/--pr is never deferred.
 fresh=() seen_before=()
 for candidate in "${candidates[@]}"; do
-  read -r owner repo number sha qref contributed ready <<<"$candidate"
+  read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
   [[ "$owner" != . && "$owner" != .. && "$repo" != . && "$repo" != .. ]] || die "invalid repository path in dispatch"
   if [[ ! -d "$HOME_DIR/attempts/$owner-$repo-$sha" ]]; then fresh+=("$candidate"); continue; fi
   # Somebody asked for this head: it is as urgent as a new one, and coalescing a burst of merges is
@@ -775,7 +859,7 @@ done
 # is exactly what it was.
 woken=() rest=()
 for candidate in "${fresh[@]}" "${seen_before[@]}"; do
-  read -r owner repo number sha qref contributed ready <<<"$candidate"
+  read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
   if dispatch_names "$owner" "$repo" "$number" "$sha"; then woken+=("$candidate"); else rest+=("$candidate"); fi
 done
 candidates=("${queued[@]}" "${woken[@]}" "${rest[@]}")
@@ -794,9 +878,10 @@ forge_adopted=()
 GATE_FORGE_REUSE=1
 while :; do
 for candidate in "${candidates[@]}"; do
-read -r owner repo number sha qref contributed ready <<<"$candidate"
+read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
    && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ ) \
+   && ( "$cbase" == - || "$cbase" == '!' || "$cbase" == "$(gate_base_branch "$cbase")" ) \
    && "$contributed" =~ ^[01]$ && ( "$ready" == - || "$ready" =~ ^[^[:space:]]+\|[a-z-]+$ ) ]] \
   || die "invalid repository or head in dispatch"
 if [[ "$qref" == - && -z "$only_pr" ]] && gate_queue_arrived; then
@@ -811,6 +896,24 @@ if [[ -d "$HOME_DIR/claims/$owner-$repo-$sha" ]]; then
   say "recovery required: retained legacy claim for $owner/$repo@$sha; reconcile its worker before admission"
   continue
 fi
+# The proof base of this head (see resolve_proof_base), decided before the claim: a base other than main
+# is part of the attempt key. main's sha is read from the mirror refreshed in step 3, so it is bound
+# below, after that refresh.
+GATE_PROOF_BASE="" pb_var="" pb_branch="" pb_sha="" pb_note="" proof_base=0 proof_base_env=()
+if ((main_health == 0)); then
+  owner_proof_base_var "$owner"
+  if [[ -n "$pb_var" ]]; then
+    proof_base=1
+    if ! resolve_proof_base "$owner" "$repo" "$cbase"; then
+      proof_base_wait "$owner" "$repo" "$sha" "$pb_note"
+      continue
+    fi
+  fi
+  if ((proof_base)) && [[ "$pb_branch" != main ]]; then
+    GATE_PROOF_BASE=$(gate_proof_base_json "$pb_var" "$pb_branch" "$pb_sha")
+  fi
+fi
+attempt_key=$(gate_attempt_key "$owner" "$repo" "$sha") || die "cannot name the attempt of $owner/$repo@$sha"
 # The repository lock keeps two slots out of one shared build directory. A repository that builds in
 # its own slot tree (every one not in GATE_RUNNER_SHARED_TARGETS) has nothing to protect, and taking
 # the lock anyway ran two PRs of one repository strictly one after the other.
@@ -826,7 +929,7 @@ if ((shares_target)); then
   exec 7>"$HOME_DIR/targets/$owner/$repo.lock"
   flock -n 7 || { exec 7>&-; continue; }
 fi
-gate_lock "$owner-$repo-$sha" || { exec 7>&-; continue; }
+gate_lock "$attempt_key" || { exec 7>&-; continue; }
 : "${gate_key_dir:?}"
 # Recovery belongs to this head, not to the tick: a head whose evidence cannot be published (say the
 # forge refuses this identity there) must not stop every other repository from being gated.
@@ -908,6 +1011,12 @@ exec 8>&-
 # Different repositories may have different closures; they must not reset each other's settle clock.
 mkdir -p "$HOME_DIR/cache/mains/$owner"
 gate_record_mains "$HOME_DIR/cache/mains/$owner/$repo" "$mirrors" $family $repo || say "could not record $owner/$repo mains"
+# A proof base of main is the protected main just mirrored: that commit is what origin/main is in the
+# tree (sync_repo), and what the inputs bind, so a moved main is a changed input.
+if ((proof_base)) && [[ "$pb_branch" == main ]]; then
+  pb_sha=$(git -C "$mirrors/$repo.git" rev-parse --verify --quiet refs/heads/main) || die "no main in the $owner/$repo mirror"
+  GATE_PROOF_BASE=$(gate_proof_base_json "$pb_var" main "$pb_sha")
+fi
 
 # 4. reuse an identical result before preparing a tree
 # Most of what a tick examines is a head nobody has touched since it was gated, and the only way to
@@ -1061,6 +1170,18 @@ fi
 sync_repo "$repo" "$sha"
 [[ "$(git -C "$run/$repo" rev-parse HEAD)" == "$sha" ]] || die "could not check out $sha"
 [[ -z "$(git -C "$run/$repo" status --porcelain --ignored=no)" ]] || die "$repo is not clean at $sha"
+# The proof base in the tree as origin/<base>, at exactly the sha the inputs bind. A forge that will not
+# serve it now, or a base that moved since it was resolved, leaves the head for the next tick.
+if ((proof_base)); then
+  if ! base_err=$(gate_fetch_base "$run/$repo" "$BASE/git/$owner/$repo.git" "$pb_branch" "$pb_sha" 2>&1); then
+    proof_base_wait "$owner" "$repo" "$sha" "$base_err"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
+  proof_base_settled "$owner" "$repo" "$sha"
+  [[ -z "$pb_var" ]] || proof_base_env=("$pb_var=origin/$pb_branch")
+  say "$owner/$repo@$sha is proved against origin/$pb_branch at ${pb_sha:0:12}${pb_note:+ -- $pb_note}"
+fi
 # Does this head change the gate it is judged by? The recipe below is the head's own, so a diff that
 # touches the Justfile, ops/ci or the jankurai and policy files it reads rewrote the check that is
 # about to report. It is recorded on the attempt and annotated on the check run (gate_publish); it
@@ -1235,7 +1356,9 @@ if ((build_cache)); then
 fi
 # A head moving during preparation must not run under the earlier admission. A queue commit is still
 # admitted only while its entry is building at the same sha.
-checks_url="" base_branch=""
+# A head whose base was changed since it was listed is not admitted either: it was resolved, bound and
+# keyed for the base it had, and the next tick gates it for the one it has now.
+checks_url=""
 if [[ "$main_health" == 1 ]]; then
   api GET "/api/v3/repos/$owner/$repo/branches/main"
   [[ "$code" == 200 ]] || die "cannot refresh main before admission ($code)"
@@ -1249,15 +1372,17 @@ elif [[ "$qref" == - ]]; then
   # The checks page of exactly this pull request, from the forge's answer for it just now. A queue
   # commit and main-health link nothing: no PR checks page shows their sha.
   checks_url=$(gate_checks_url "$owner" "$repo" "$number" "$body")
-  base_branch="$(jq -r '.base.ref // ""' <<<"$body")"
+  if ((proof_base)) && [[ "$(candidate_base "$(jq -r '.base.ref // ""' <<<"$body")")" != "$cbase" ]]; then
+    say "$owner/$repo#$number changed its base branch since it was listed"
+    admitted=0
+  fi
 else
   api GET "/api/v1/merge-queue?state=building"
   [[ "$code" == 200 ]] || die "cannot refresh the merge queue before admission ($code)"
   admitted=0
-  jq -e --arg r "$owner/$repo" --argjson n "$number" --arg s "$sha" \
-    'any(.entries[]?; .repo == $r and (.number|tonumber) == $n and .queue_sha == $s)' <<<"$body" >/dev/null && admitted=1
-  # refs/queue/<base>/<n>: the entry's own base branch.
-  base_branch="${qref#refs/queue/}"; base_branch="${base_branch%/*}"
+  jq -e --arg r "$owner/$repo" --argjson n "$number" --arg s "$sha" --arg b "$cbase" --argjson check "$proof_base" \
+    'any(.entries[]?; .repo == $r and (.number|tonumber) == $n and .queue_sha == $s
+         and ($check == 0 or $b == "!" or (.base // "") == (if $b == "-" then "" else $b end)))' <<<"$body" >/dev/null && admitted=1
 fi
 if ((admitted == 0)); then
   say "head changed or PR closed before admission (or its queue entry moved): $owner/$repo#$number"
@@ -1265,28 +1390,11 @@ if ((admitted == 0)); then
   exec 6>&-; exec 7>&-
   continue
 fi
-# The proof base. A recipe compares against a base ref that defaults to origin/main, which a release
-# line does not descend from. When the site names that variable for this owner, the recipe gets
-# origin/<the PR's base branch>, fetched into this tree; a base that cannot be had fails the gate here
-# with that reason rather than inside the recipe. main-health and owners with no variable are unchanged.
-proof_base_env=()
-proof_base_var="$(gate_proof_base_var "$owner")" || die "PR_GATE_PROOF_BASE_VARS: $owner's entry is not a variable name"
-base_err=""
-# A forge that does not report the base leaves the recipe's own default, as it did before.
-if [[ -n "$proof_base_var" && "$main_health" == 0 && -n "$base_branch" ]]; then
-  if ! base_branch="$(gate_base_branch "$base_branch")" \
-      || ! base_err="$(gate_fetch_base "$run/$repo" "$BASE/git/$owner/$repo.git" "$base_branch" 2>&1)"; then
-    base_err="${base_err:-base branch of $owner/$repo#$number is not a usable branch name}"
-    say "$owner/$repo#$number: $base_err"
-    post_status "$owner" "$repo" "$sha" failure "no gate: proof base unavailable: ${base_err:0:120} ($MARKER)"
-    rm -f -- "$identity" "$status_snapshot"
-    exec 6>&-; exec 7>&-
-    continue
-  fi
-  proof_base_env=("$proof_base_var=origin/$base_branch")
-fi
 gate_begin "$identity"
 : "${gate_attempt_dir:?}"
+# Why this head is proved against main although its base is another branch, for its status.
+[[ -z "$pb_note" ]] || gate_update --arg note "$pb_note" '.proof_base_note=$note' \
+  || say "could not record the proof base note of $owner/$repo@$sha"
 # On the attempt, so recovery publishes the same annotation from the same evidence as this process would.
 gate_update --argjson paths "$self_gate_json" '.gate_definition_paths=$paths' \
   || say "could not record the gate-defining paths of $owner/$repo@$sha"
@@ -1329,6 +1437,16 @@ fi
 # stays until this attempt's conclusion replaces it -- a failure is still published the moment it exists.
 keep_green=0
 gate_newest_is_own_success "$status_snapshot" && keep_green=1
+# ... but only a success proved against this same base: the status is keyed by commit, so one proved
+# against a release line must not stand for main (or the other way round) while this gate re-proves it.
+if ((keep_green && proof_base)); then
+  newest_base=$(gate_status_proof_base "$(jq -r --arg c "$(gate_status_context "$owner" "$repo")" \
+    '[.statuses[]? | select(.context == $c)] | sort_by(.updated_at // .created_at) | last | .description // ""' "$status_snapshot")")
+  if [[ "$newest_base" != "$pb_branch" ]]; then
+    say "$owner/$repo@$sha: its newest success was proved against origin/$newest_base, not origin/$pb_branch; posting pending"
+    keep_green=0
+  fi
+fi
 rm -f -- "$identity" "$status_snapshot"
 log="$gate_attempt_dir/build.log"
 steps_tsv="$gate_attempt_dir/steps.tsv"
@@ -1339,13 +1457,16 @@ gate_step_vocabulary "$run/$repo" mirror/main "$step_sources" || say "could not 
 if ((keep_green)); then
   say "re-verifying $owner/$repo@$sha without pending: its newest $(gate_status_context "$owner" "$repo") is this runner's success"
 else
-  post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")" "$checks_url"
+  pending_base=$(gate_proof_base_field "$gate_receipt") || pending_base=""
+  post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")${pending_base:+; $pending_base}" "$checks_url"
 fi
 # shellcheck disable=SC2016  # a jq program: $url is jq's
 gate_update --arg url "$checks_url" '.phase="running" | .checks_url=$url'
 started_at="$(date -u +%FT%TZ)" started_s="$(date +%s)"
+gate_kind=pr
+[[ "$main_health" == 0 ]] || gate_kind=main-health
 heartbeat "$(jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" \
-  --arg recipe "$recipe_name" --arg at "$started_at" --arg kind "$([[ "$main_health" == 1 ]] && printf main-health || printf pr)" \
+  --arg recipe "$recipe_name" --arg at "$started_at" --arg kind "$gate_kind" \
   '{repo:$repo,pr:$pr,sha:$sha,recipe:$recipe,startedAt:$at,kind:$kind}')"
 # Remove inherited credential variables. This operator path is still not a
 # sealed worker: installed credential/UID isolation belongs to SplitOps promotion.
@@ -1535,7 +1656,7 @@ gate_publish || die "terminal $state saved; publication recovery required in $ga
 seconds=$(( $(date +%s) - started_s ))
 jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" --arg recipe "$recipe_name" \
   --arg conclusion "$state" --argjson exit_code "$worker_exit" --argjson seconds "$seconds" --arg at "$(date -u +%FT%TZ)" \
-  --arg kind "$([[ "$main_health" == 1 ]] && printf main-health || printf pr)" \
+  --arg kind "$gate_kind" \
   '{repo:$repo,pr:$pr,sha:$sha,recipe:$recipe,conclusion:$conclusion,exit_code:$exit_code,seconds:$seconds,finishedAt:$at,kind:$kind}' \
   | gate_atomic "$LAST_GATE"
 heartbeat

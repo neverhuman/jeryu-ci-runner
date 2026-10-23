@@ -101,6 +101,13 @@ printf '%s\n' "$((count + 1))" >"$fixture_root/executions"
 if [[ -f "$fixture_root/require-sibling" ]]; then
   cat ../sibling/file >/dev/null || exit 34
 fi
+# What the recipe was told to prove against, and what that ref is in its tree.
+if [[ -n "${ACME_PROOF_BASE_REF+set}" ]]; then
+  printf '%s %s\n' "$ACME_PROOF_BASE_REF" "$("$worker_git" rev-parse --verify --quiet "$ACME_PROOF_BASE_REF^{commit}" || printf missing)" \
+    >>"$fixture_root/proof-base.log"
+else
+  printf 'unset\n' >>"$fixture_root/proof-base.log"
+fi
 if [[ -f "$fixture_root/mutate-tool" ]]; then
   printf 'changed during recipe\n' >>"$fixture_root/tools/environment-probe"
 fi
@@ -150,6 +157,14 @@ case "$method $url" in
       '{state:"open",user:{login:"author"},head:{sha:$sha,ref:"author/feature"},base:{ref:$base},created_at:$opened,updated_at:$opened,
         html_url:"https://forge.invalid/repos/jeryu/acme/fixture/pulls/1"}'
     printf '\n200';;
+  'GET '*'/refs')
+    # The forge's ref listing with each branch's protection: refs.json, refs-fail (a transient 503),
+    # or no file at all (a forge without the route).
+    if [[ -f "$FAKE_FORGE/refs-fail" ]]; then printf '{"message":"upstream unavailable"}\n503'; exit; fi
+    [[ -f "$FAKE_FORGE/refs.json" ]] || { printf '{"message":"not found"}\n404'; exit; }
+    cat "$FAKE_FORGE/refs.json"; printf '\n200';;
+  'GET '*'/api/v3/repos/acme/fixture')
+    jq -nc '{name:"fixture",default_branch:"main"}'; printf '\n200';;
   'GET '*'/branches/main/protection')
     jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'
     printf '\n200';;
@@ -931,13 +946,13 @@ rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOT_PATTERN="$fixture/roots/{owner}" "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1) || {
   printf 'discovery through the checkout-root pattern failed:\n%s\n' "$listed" >&2; exit 1; }
-[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
+[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0 main 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'pattern discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 [[ "$(cat "$fixture/runner/cache/protected-acme")" == acme/fixture ]]
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme \
   PR_GATE_CHECKOUT_ROOTS="other=/nonexistent acme=$fixture/roots/acme" PR_GATE_CHECKOUT_ROOT_PATTERN="/nonexistent/{owner}" \
   "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
-[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
+[[ "$listed" == "acme fixture 1 $(cat "$fixture/head") - 0 main 2026-10-09T18:26:18Z|pr-opened" ]] || { printf 'explicit root discovery listed:\n%s\n' "$listed" >&2; exit 1; }
 rm -f "$fixture/runner/cache/protected-acme"
 listed=$(env -u GATE_RUNNER_REPOS -u GATE_RUNNER_FAMILY GATE_RUNNER_OWNERS=acme "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list 2>&1)
 grep -q 'no checkout root for owner acme' <<<"$listed" || { printf 'a missing checkout root was silent:\n%s\n' "$listed" >&2; exit 1; }
@@ -1454,3 +1469,163 @@ invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 expect_count "$((before_count + 1))"
 printf 'PASS an exhausted forge 5xx leaves a visible error status and the next tick gates the head\n'
+
+# ---- proof base (PR_GATE_PROOF_BASE_VARS) ----
+# The recipe is told which base to prove against: origin/main for a main-bound PR, origin/<base> for a
+# PR into a protected release line, and origin/main again -- said on the status -- for any other base.
+# The base is part of the result, so a green proof against one base is never reused or kept green for
+# another, and a forge that cannot answer for the base right now posts nothing until a cap.
+export PR_GATE_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF
+rm -f "$fixture/forge-5xx" "$fixture/regate.json" "$fixture/queue.json"
+: >"$fixture/proof-base.log"
+"$real_git" -C "$fixture/source" checkout -q --orphan release/v1
+printf 'release line\n' >"$fixture/source/release-note"
+printf 'pass\n' >"$fixture/source/mode"
+"$real_git" -C "$fixture/source" add release-note mode
+"$real_git" -C "$fixture/source" commit -qm release-line
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" release/v1
+relsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" checkout -q main
+printf 'proof base head\n' >>"$fixture/source/marker"
+printf 'pass\n' >"$fixture/source/mode"
+"$real_git" -C "$fixture/source" add marker mode
+"$real_git" -C "$fixture/source" commit -qm proof-base-head
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+head=$(cat "$fixture/head")
+mainsha=$head
+refs_json() { # protected-branch...
+  local rows=() b
+  for b in main release/v1 topic; do
+    local sha=$mainsha; [[ "$b" == main ]] || sha=$relsha
+    local p=false; [[ " $* " == *" $b "* ]] && p=true
+    rows+=("$(jq -nc --arg n "$b" --arg s "$sha" --argjson p "$p" '{name:$n,sha:$s,kind:"branch",protected:$p}')")
+  done
+  printf '%s\n' "${rows[@]}" | jq -sc . >"$fixture/refs.json"
+}
+refs_json main release/v1
+last_status() { jq -sc --arg s "$1" '[.[] | select(.sha == $s and .context == "fixture/required")] | last' "$fixture/statuses.jsonl"; }
+fail_pb() { printf '%s\n--- runner.log\n' "$1" >&2; cat "$fixture/runner.log" >&2; printf -- '--- proof-base.log\n' >&2; cat "$fixture/proof-base.log" >&2; exit 1; }
+
+# A main-bound PR: origin/main, bound with main's sha, under the historical attempt key.
+printf 'main\n' >"$fixture/pr-base-ref"
+before_count=$(count)
+invoke
+[[ "$runner_exit" == 0 ]] || fail_pb 'main-bound PR: runner failed'
+expect_count "$((before_count + 1))"
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/main $mainsha" ]] || fail_pb 'a main-bound PR was not proved against origin/main'
+jq -e --arg s "$mainsha" '.inputs.proof_base == {variable:"ACME_PROOF_BASE_REF",branch:"main",sha:$s}' \
+  "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null || fail_pb 'main proof base not in the inputs'
+last_status "$head" | jq -e '.state == "success" and (.description | contains("proof base") | not)' >/dev/null \
+  || fail_pb 'a main-bound success should name no proof base'
+printf 'PASS proof base: a main-bound PR is proved against origin/main, bound into its inputs\n'
+
+# The same head as a PR into the protected release line: origin/release/v1, its own attempt key, and
+# pending is posted over the main-based green while it re-proves.
+printf 'release/v1\n' >"$fixture/pr-base-ref"
+before_count=$(count) before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke
+[[ "$runner_exit" == 0 ]] || fail_pb 'release-line PR: runner failed'
+expect_count "$((before_count + 1))"
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/release/v1 $relsha" ]] || fail_pb 'a release-line PR was not proved against origin/release/v1'
+compgen -G "$fixture/runner/attempts/acme-fixture-$head.base-*-$relsha/last-result.json" >/dev/null \
+  || fail_pb 'a release-line base has no attempt key of its own'
+grep -q 'newest success was proved against origin/main, not origin/release/v1; posting pending' "$fixture/runner.log" \
+  || fail_pb 'a main-based green was kept for a release-line proof'
+tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" | jq -se 'length == 2 and .[0].state == "pending"
+  and (.[0].description | contains("; proof base origin/release/v1")) and .[1].state == "success"
+  and (.[1].description | contains("; proof base origin/release/v1"))' >/dev/null || fail_pb 'release-line statuses do not name their base'
+printf 'PASS proof base: a protected release line is proved against itself, under its own key, never kept green from main\n'
+
+# Retargeted back to main (the exploit in review): the release-line green is neither reused nor kept
+# green; main's proof re-runs and posts pending first.
+printf 'main\n' >"$fixture/pr-base-ref"
+before_count=$(count) before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke
+[[ "$runner_exit" == 0 ]] || fail_pb 'retarget: runner failed'
+expect_count "$((before_count + 1))"
+tail -n +"$((before_statuses + 1))" "$fixture/statuses.jsonl" | jq -se '.[0].state == "pending" and .[-1].state == "success"' >/dev/null \
+  || fail_pb 'a release-line green stood for main'
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/main $mainsha" ]] || fail_pb 'the retargeted PR was not proved against main'
+printf 'PASS proof base: a release-line green never stands for main after a retarget\n'
+
+# An unprotected base is proved against origin/main, and the status says why.
+printf 'topic\n' >"$fixture/pr-base-ref"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_pb 'unprotected base: runner failed'
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/main $mainsha" ]] || fail_pb 'an unprotected base was used as the proof base'
+last_status "$head" | jq -e '.state == "success" and (.description | contains("; proof base origin/main (topic is not a protected branch)"))' >/dev/null \
+  || fail_pb 'the fallback to main is not said on the status'
+# A forge without the ref listing degrades to main the same way, and says so.
+mv "$fixture/refs.json" "$fixture/refs.json.off"
+invoke --repo acme/fixture --pr 1
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/main $mainsha" ]] || fail_pb 'a forge without refs did not fall back to main'
+last_status "$head" | jq -e '.description | contains("the forge does not report whether topic is protected")' >/dev/null \
+  || fail_pb 'a forge without refs is not said on the status'
+mv "$fixture/refs.json.off" "$fixture/refs.json"
+printf 'PASS proof base: an unprotected base, or a forge that cannot say, is proved against origin/main and says so\n'
+
+# A transient answer leaves the head with no status, counted; only the cap posts a failure, once; and
+# a base that comes back gates the head and clears the count.
+printf 'release/v1\n' >"$fixture/pr-base-ref"
+touch "$fixture/refs-fail"
+before_count=$(count) before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+for n in 1 2 3 4 5; do
+  invoke
+  [[ "$runner_exit" == 0 ]] || fail_pb "transient $n: runner failed"
+  grep -q "proof base not available (the forge answered 503 listing acme/fixture branches); leaving it for the next tick, no status posted ($n of 6)" \
+    "$fixture/runner.log" || fail_pb "transient $n was not left and counted"
+done
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb 'a transient base failure posted a status before the cap'
+invoke
+grep -q 'proof base still not available after 6 ticks' "$fixture/runner.log" || fail_pb 'the cap was not reached'
+last_status "$head" | jq -e '.state == "failure" and (.description | startswith("no gate: proof base unavailable for 6 ticks"))' >/dev/null \
+  || fail_pb 'the cap did not post a failure that says why'
+capped=$(wc -l <"$fixture/statuses.jsonl")
+invoke
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$capped" ]] || fail_pb 'the cap failure was posted again'
+expect_count "$before_count"
+rm -f "$fixture/refs-fail"
+invoke
+[[ "$runner_exit" == 0 ]] || fail_pb 'recovered base: runner failed'
+expect_count "$((before_count + 1))"
+last_status "$head" | jq -e '.state == "success"' >/dev/null || fail_pb 'a base that came back did not gate the head'
+[[ ! -e "$fixture/runner/cache/proof-base-wait/acme-fixture-$head" ]] || fail_pb 'the wait count was not cleared'
+# A base the forge lists but will not serve is the same transient: nothing posted.
+jq -c --arg s "$relsha" '. + [{name:"release/v2",sha:$s,kind:"branch",protected:true}]' "$fixture/refs.json" >"$fixture/refs.tmp"
+mv "$fixture/refs.tmp" "$fixture/refs.json"
+printf 'release/v2\n' >"$fixture/pr-base-ref"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke
+grep -q 'proof base not available (base branch release/v2 could not be fetched' "$fixture/runner.log" || fail_pb 'an unfetchable base was not left for the next tick'
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb 'an unfetchable base posted a status'
+rm -rf "$fixture/runner/cache/proof-base-wait"
+refs_json main release/v1
+printf 'PASS proof base: a transient base failure posts nothing until the cap, once, and a returning base gates the head\n'
+
+# A merge-queue entry is proved against the base its entry reports, not one parsed out of its ref.
+"$real_git" -C "$fixture/source" checkout -q -B queue-release "$relsha"
+printf 'queued onto the release line\n' >"$fixture/source/queued"
+"$real_git" -C "$fixture/source" add queued
+"$real_git" -C "$fixture/source" commit -qm queue-release
+qrel=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" "+HEAD:refs/queue/7"
+"$real_git" -C "$fixture/source" checkout -q main
+jq -nc --arg s "$qrel" --arg h "$head" \
+  '{entries:[{repo:"acme/fixture",number:1,base:"release/v1",queue_ref:"refs/queue/7",queue_sha:$s,pr_head_sha:$h}]}' >"$fixture/queue.json"
+printf 'release/v1\n' >"$fixture/pr-base-ref"
+invoke
+[[ "$runner_exit" == 0 ]] || fail_pb 'queue: runner failed'
+grep -q "preparing acme/fixture#1 at $qrel (merge queue refs/queue/7)" "$fixture/runner.log" || fail_pb 'the queue entry was not gated'
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/release/v1 $relsha" ]] || fail_pb "a queue entry was not proved against its entry's base"
+rm -f "$fixture/queue.json"
+printf 'PASS proof base: a merge-queue entry is proved against the base its entry reports\n'
+
+# A malformed site entry degrades that owner to the recipe's own default instead of stopping the tick.
+PR_GATE_PROOF_BASE_VARS='acme=' invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_pb 'a malformed PR_GATE_PROOF_BASE_VARS stopped the tick'
+grep -q "PR_GATE_PROOF_BASE_VARS: acme's entry is not a variable name" "$fixture/runner.log" || fail_pb 'a malformed entry was not named'
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == unset ]] || fail_pb 'a malformed entry still set a proof base'
+printf 'PASS proof base: a malformed site entry degrades its owner, not the tick\n'
+
+unset PR_GATE_PROOF_BASE_VARS

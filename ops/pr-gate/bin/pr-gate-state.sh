@@ -27,7 +27,9 @@ gate_main_health_context() {
 }
 
 # The recipe variable that names the proof base for OWNER's repositories, read from the site's
-# PR_GATE_PROOF_BASE_VARS (owner=VARIABLE words), or nothing when the owner has none configured.
+# PR_GATE_PROOF_BASE_VARS (owner=VARIABLE words), or nothing when the owner has none configured. An
+# entry that is not a variable name fails (status 1) and prints nothing: the caller degrades that one
+# owner to the recipe's own default rather than stopping the tick for every repository.
 gate_proof_base_var() { # owner
   local var
   var="$(pr_gate_lookup "${PR_GATE_PROOF_BASE_VARS:-}" "$1")" || return 0
@@ -44,18 +46,68 @@ gate_base_branch() { # branch
   printf '%s' "$b"
 }
 
+# What the forge's ref listing (GET /api/v1/repos/<owner>%2F<repo>/refs: [{name,sha,kind,protected}])
+# says about BRANCH: "<sha> protected", "<sha> unprotected", or nothing when it lists no such branch.
+gate_ref_protection() { # refs-json branch
+  jq -r --arg b "$2" '
+    first((if type == "array" then . else (.refs // .items // []) end)[]?
+          | select((.kind // "branch") == "branch" and .name == $b))
+    | "\(.sha // "") \(if .protected == true then "protected" else "unprotected" end)"' <<<"$1" 2>/dev/null \
+    | grep -E '^[0-9a-f]{40} (un)?protected$' || true
+}
+
 # Fetch BRANCH of the hosted repository into the tree as origin/BRANCH, so a recipe that compares
-# against it finds it. main is already there (sync_repo). Fails with a message on stderr when the
-# branch is missing from the forge.
-gate_fetch_base() { # tree url branch
-  local out
-  [[ "$3" != main ]] || return 0
-  if ! out="$(git -C "$1" fetch --quiet "$2" "+refs/heads/$3:refs/remotes/origin/$3" 2>&1)"; then
-    printf 'base branch %s could not be fetched: %s\n' "$3" "$out" >&2
+# against it finds it, and require it to be exactly SHA, the commit the proof base was resolved to and
+# bound into the inputs. main is already there (sync_repo, from the mirror the inputs read). Fails with
+# a message on stderr: the forge would not serve it, or the branch moved since it was resolved.
+gate_fetch_base() { # tree url branch sha
+  local out got
+  if [[ "$3" != main ]] && ! out="$(git -C "$1" fetch --quiet "$2" "+refs/heads/$3:refs/remotes/origin/$3" 2>&1)"; then
+    printf 'base branch %s could not be fetched: %s\n' "$3" "${out//$'\n'/ }" >&2
     return 1
   fi
-  git -C "$1" rev-parse --verify --quiet "refs/remotes/origin/$3^{commit}" >/dev/null \
+  got=$(git -C "$1" rev-parse --verify --quiet "refs/remotes/origin/$3^{commit}") \
     || { printf 'base branch %s is missing from the gate tree\n' "$3" >&2; return 1; }
+  [[ -z "${4:-}" || "$got" == "$4" ]] \
+    || { printf 'base branch %s moved from %s to %s since it was resolved\n' "$3" "${4:0:12}" "${got:0:12}" >&2; return 1; }
+}
+
+# The proof base this gate is bound to, as GATE_PROOF_BASE: compact JSON {variable, branch, sha}, or
+# empty when the runner leaves the recipe's own default alone (an owner with no variable configured,
+# main-health). It is part of the input identity (gate_input_render), so a result proved against one
+# base is never reused for another.
+gate_proof_base_json() { # variable branch sha
+  jq -nc --arg v "$1" --arg b "$2" --arg s "$3" '{variable:$v,branch:$b,sha:$s}'
+}
+
+# The attempt and claim-lock key of OWNER/REPO@SHA under the current proof base. The default branch
+# keeps the historical key (its name and sha are still in the inputs), so the journals and recovery
+# obligations of every existing attempt stay where they are. Any other base gets its own key, naming
+# the branch (by digest: a branch name has slashes) and its resolved sha, so two proofs of one head
+# against two bases never share an attempt, a lock, a reuse decision or a recovery.
+gate_attempt_key() { # owner repo sha
+  local branch sha
+  branch=$(jq -r '.branch // ""' <<<"${GATE_PROOF_BASE:-null}" 2>/dev/null) || branch=""
+  sha=$(jq -r '.sha // ""' <<<"${GATE_PROOF_BASE:-null}" 2>/dev/null) || sha=""
+  if [[ -z "$branch" || "$branch" == main ]]; then printf '%s-%s-%s' "$1" "$2" "$3"; return; fi
+  [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+  printf '%s-%s-%s.base-%s-%s' "$1" "$2" "$3" "$(printf '%s' "$branch" | sha256sum | cut -c1-12)" "$sha"
+}
+
+# The proof base field of a status description: "proof base origin/<branch>" for a base other than
+# main, else nothing. A fallback to main says why instead (the receipt's proof_base_note).
+gate_proof_base_field() { # receipt
+  jq -r '(.proof_base_note // "") as $note
+    | if $note != "" then $note
+      else ((.inputs.proof_base.branch // "main") | if . == "main" then "" else "proof base origin/" + . end) end' "$1"
+}
+
+# The base a status description says it was proved against: the branch of its "proof base origin/<b>"
+# field, or main when it has none (a fallback note names main too). Keep-green compares it with the
+# base of the gate about to run, so a success proved against one base never stands for another.
+gate_status_proof_base() { # description
+  jq -rn --arg d "$1" '[$d | split(";")[] | ltrimstr(" ") | select(startswith("proof base origin/"))
+    | ltrimstr("proof base origin/") | split(" ")[0]] | first // "main"'
 }
 
 gate_status_context() {
@@ -280,7 +332,7 @@ gate_newest_is_own_success() { # status-snapshot
 
 gate_lock() {
   local key=$1
-  [[ "$key" =~ ^[A-Za-z0-9._-]+-[0-9a-f]{40}$ ]] || return 2
+  [[ "$key" =~ ^[A-Za-z0-9._-]+-[0-9a-f]{40}$ && "$key" != *..* ]] || return 2
   mkdir -p "$HOME_DIR/claim-locks" "$HOME_DIR/attempts/$key" || return
   chmod 0700 "$HOME_DIR/attempts" "$HOME_DIR/attempts/$key" || return
   exec 6>"$HOME_DIR/claim-locks/$key.lock" || return
@@ -607,8 +659,10 @@ gate_input_render() { # output rows inputs versions recipe
   jq -nS --slurpfile sources "$2" --rawfile tools "$3" --rawfile versions "$4" \
     --arg recipe "$5" --arg base "$BASE" --arg runner "$GATE_RUNNER_NAME" \
     --arg context "$(gate_status_context "$owner" "$repo")" --arg kind "$(gate_execution_kind)" \
+    --argjson proof_base "${GATE_PROOF_BASE:-null}" \
     '{schema:"jeryu.pr-gate-inputs/v1",sources:($sources|sort_by(.repository)),tools:$tools,
-      versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:$kind}' >"$1"
+      versions:$versions,recipe:$recipe,base:$base,runner:$runner,required_context:$context,execution_kind:$kind}
+     + (if $proof_base == null then {} else {proof_base:$proof_base} end)' >"$1"
 }
 
 # The same input identity, derived without preparing a tree: the siblings read out of the mirrors
@@ -810,7 +864,7 @@ gate_self_modification_note() { # receipt
 
 gate_publish() {
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
-  local steps_dir="" steps_end="" status_payload check_payload
+  local steps_dir="" steps_end="" status_payload check_payload proof_base
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -848,9 +902,12 @@ gate_publish() {
   if jq -e '.inputs | objects' "$gate_receipt" >/dev/null 2>&1; then
     inputs=$(gate_inputs_digest <(jq -c '.inputs' "$gate_receipt")) || return
   fi
+  # What the result was proved against, when that is not main (or why it fell back to main): the
+  # required status is keyed by commit, so a reader must be able to tell which base it speaks for.
+  proof_base=$(gate_proof_base_field "$gate_receipt") || proof_base=""
   if ! jq -e '.publication.required_status' "$gate_receipt" >/dev/null; then
     status_payload=$(jq -nc --arg state "$state" --arg context "$context" \
-      --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${inputs:+; inputs $inputs}${cause:+; cause: $cause}" \
+      --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${inputs:+; inputs $inputs}${proof_base:+; $proof_base}${cause:+; cause: $cause}" \
       '{state:$state,context:$context,description:$description}')
     api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -c --arg url "$checks_url" \
       '. + (if $url == "" then {} else {target_url:$url} end)' <<<"$status_payload")"

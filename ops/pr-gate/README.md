@@ -202,6 +202,38 @@ request's own (`pr-opened`, `pr-updated`): an unrelated change to a pull request
 measured wait shorter, never invent one. Clocks that disagree record `seconds: null` and keep both
 times rather than a negative wait.
 
+## Proving a pull request against its own base
+
+A recipe compares the head against a proof base that defaults to `origin/main`, and a release line
+does not descend from `main`, so every pull request into one failed its gate within seconds. When the
+site names that recipe variable for an owner (`PR_GATE_PROOF_BASE_VARS=owner=VARIABLE`), the runner
+sets it for every pull-request and merge-queue gate of that owner:
+
+- a base the forge reports as protected (`GET /api/v1/repos/<owner>%2F<repo>/refs`, whose rows carry
+  `{name, sha, kind, protected}`), or the repository's default branch, is proved against as
+  `origin/<base>`, fetched into the gate tree at exactly the sha the forge reported;
+- any other base -- a branch anybody with push access could create -- is proved against `origin/main`
+  as before, and the status says why (`proof base origin/main (<base> is not a protected branch)`);
+  so does a forge without the ref listing (404);
+- a merge-queue entry uses the `base` its entry reports, never one parsed out of its ref.
+
+The base is part of the result. Its variable, name and resolved sha are in the input identity
+(`proof_base` in `gate_input_render`), so a moved base is a changed input. A base other than `main`
+also has its own attempt and claim-lock key (`<owner>-<repo>-<sha>.base-<name digest>-<base sha>`,
+`gate_attempt_key`); `main` keeps the historical `<owner>-<repo>-<sha>`, so existing journals and
+recovery obligations stay where they are. A head proved against a release line is therefore never
+reused, adopted or kept green for `main`, or the other way round: the required status is keyed by
+commit, so a status proved against another base than the one now being gated gets `pending` posted
+over it, and every status names a base other than `main` (`; proof base origin/<base>`). A pull
+request whose base changes between listing and admission is left for the next tick.
+
+A base the forge cannot answer for right now (a 5xx, a 429, a fetch that fails, a base that moved since
+it was resolved) is not a verdict on the head: it is left for the next tick with no status posted, and
+counted in `cache/proof-base-wait/`. Only the sixth tick in a row posts a failure, once, saying why; a
+base that comes back gates the head and clears the count. A malformed entry in
+`PR_GATE_PROOF_BASE_VARS` leaves that owner on the recipe's own default, says so, and stops nothing
+else. Owners without an entry, and main-health, are unchanged.
+
 ## Release preflight
 
 `pr-gate-runner.sh --preflight` (ADR 0019) is a read-only look before a release. It takes no slot lock,

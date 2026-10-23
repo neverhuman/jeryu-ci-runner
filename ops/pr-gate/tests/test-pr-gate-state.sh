@@ -888,10 +888,68 @@ git -C "$pb/src" -c user.name=F -c user.email=f@example.invalid commit -q --allo
 git -C "$pb/src" checkout -q -b release/v1
 git -C "$pb/src" -c user.name=F -c user.email=f@example.invalid commit -q --allow-empty -m rel
 git clone -q --no-checkout "$pb/src" "$pb/tree"
-gate_fetch_base "$pb/tree" "$pb/src" main
-gate_fetch_base "$pb/tree" "$pb/src" release/v1
+gate_fetch_base "$pb/tree" "$pb/src" main "$(git -C "$pb/src" rev-parse main)"
+gate_fetch_base "$pb/tree" "$pb/src" release/v1 "$(git -C "$pb/src" rev-parse release/v1)"
+# A base that moved since it was resolved (and bound into the inputs) is refused, not silently used.
+if gate_fetch_base "$pb/tree" "$pb/src" release/v1 "$(git -C "$pb/src" rev-parse main)" 2>"$pb/err"; then
+  printf 'a moved base was accepted\n' >&2; exit 1
+fi
+grep -q 'release/v1 moved from' "$pb/err" || { printf 'a moved base gave no clear error\n' >&2; exit 1; }
 [[ "$(git -C "$pb/tree" rev-parse refs/remotes/origin/release/v1)" == "$(git -C "$pb/src" rev-parse release/v1)" ]] \
   || { printf 'release base not fetched as origin/<base>\n' >&2; exit 1; }
 if gate_fetch_base "$pb/tree" "$pb/src" release/missing 2>"$pb/err"; then printf 'a missing base was accepted\n' >&2; exit 1; fi
 grep -q 'release/missing could not be fetched' "$pb/err" || { printf 'missing base gave no clear error\n' >&2; exit 1; }
 printf 'PASS proof base: main keeps origin/main, a release line gets origin/<base>, a missing base fails clearly\n'
+
+# The proof base is part of the result: the forge's protection answer is read exactly, the attempt key
+# of a non-main base names it and its sha (main keeps the historical key), the input identity binds it,
+# and a status description says which base it was proved against.
+refs='[{"name":"main","sha":"'"$(printf 'a%.0s' {1..40})"'","kind":"branch","protected":true},
+  {"name":"release/v1","sha":"'"$(printf 'b%.0s' {1..40})"'","kind":"branch","protected":true},
+  {"name":"topic","sha":"'"$(printf 'c%.0s' {1..40})"'","kind":"branch","protected":false},
+  {"name":"release/v2","sha":"'"$(printf 'd%.0s' {1..40})"'","kind":"tag","protected":true}]'
+[[ "$(gate_ref_protection "$refs" release/v1)" == "$(printf 'b%.0s' {1..40}) protected" ]] || { printf 'a protected branch was not read\n' >&2; exit 1; }
+[[ "$(gate_ref_protection "$refs" topic)" == "$(printf 'c%.0s' {1..40}) unprotected" ]] || { printf 'an unprotected branch was not read\n' >&2; exit 1; }
+[[ -z "$(gate_ref_protection "$refs" release/v2)" ]] || { printf 'a protected tag was read as a branch\n' >&2; exit 1; }
+[[ -z "$(gate_ref_protection "$refs" missing)" && -z "$(gate_ref_protection 'not json' main)" ]] \
+  || { printf 'an unlisted branch or a bad answer was read as a branch\n' >&2; exit 1; }
+head40=$(printf 'e%.0s' {1..40})
+GATE_PROOF_BASE=""
+[[ "$(gate_attempt_key acme widgets "$head40")" == "acme-widgets-$head40" ]] || { printf 'no proof base changed the key\n' >&2; exit 1; }
+GATE_PROOF_BASE=$(gate_proof_base_json ACME_PROOF_BASE_REF main "$(printf 'a%.0s' {1..40})")
+[[ "$(gate_attempt_key acme widgets "$head40")" == "acme-widgets-$head40" ]] || { printf 'a main proof base changed the key\n' >&2; exit 1; }
+GATE_PROOF_BASE=$(gate_proof_base_json ACME_PROOF_BASE_REF release/v1 "$(printf 'b%.0s' {1..40})")
+key1=$(gate_attempt_key acme widgets "$head40")
+[[ "$key1" == "acme-widgets-$head40.base-"*"-$(printf 'b%.0s' {1..40})" ]] || { printf 'a release base is not in the key: %s\n' "$key1" >&2; exit 1; }
+GATE_PROOF_BASE=$(gate_proof_base_json ACME_PROOF_BASE_REF release/v9 "$(printf 'b%.0s' {1..40})")
+[[ "$(gate_attempt_key acme widgets "$head40")" != "$key1" ]] || { printf 'two bases at one sha share a key\n' >&2; exit 1; }
+[[ "$key1" =~ ^[A-Za-z0-9._-]+-[0-9a-f]{40}$ ]] || { printf 'the key is not one gate_lock takes\n' >&2; exit 1; }
+GATE_PROOF_BASE='{"variable":"V","branch":"release/v1"}'
+if gate_attempt_key acme widgets "$head40" >/dev/null; then printf 'a base without a sha was keyed\n' >&2; exit 1; fi
+# gate_input_render: the same sources under two bases are two identities; no proof base adds nothing.
+printf '{"repository":"widgets","head":"%s"}\n' "$head40" >"$scratch/pb.rows"
+: >"$scratch/pb.tools"; : >"$scratch/pb.versions"
+for b in none main release/v1; do
+  case $b in none) GATE_PROOF_BASE="";; *) GATE_PROOF_BASE=$(gate_proof_base_json V "$b" "$(printf 'b%.0s' {1..40})");; esac
+  owner=acme repo=widgets gate_input_render "$scratch/pb-${b//\//_}.json" "$scratch/pb.rows" "$scratch/pb.tools" "$scratch/pb.versions" "just required"
+done
+jq -e 'has("proof_base") | not' "$scratch/pb-none.json" >/dev/null || { printf 'no proof base still rendered one\n' >&2; exit 1; }
+jq -e --arg s "$(printf 'b%.0s' {1..40})" '.proof_base == {variable:"V",branch:"release/v1",sha:$s}' "$scratch/pb-release_v1.json" >/dev/null \
+  || { printf 'the release proof base is not rendered into the inputs\n' >&2; exit 1; }
+d_none=$(gate_inputs_digest "$scratch/pb-none.json") d_main=$(gate_inputs_digest "$scratch/pb-main.json")
+d_rel=$(gate_inputs_digest "$scratch/pb-release_v1.json")
+[[ "$d_none" != "$d_main" && "$d_main" != "$d_rel" && "$d_none" != "$d_rel" ]] \
+  || { printf 'the proof base is not in the inputs digest\n' >&2; exit 1; }
+GATE_PROOF_BASE=""
+# The status field: a release base is named, main is not, a fallback says why; and read back.
+jq -n '{inputs:{proof_base:{branch:"release/v1"}}}' >"$scratch/pb-r1.json"
+jq -n '{inputs:{proof_base:{branch:"main"}}}' >"$scratch/pb-r2.json"
+jq -n '{inputs:{proof_base:{branch:"main"}},proof_base_note:"proof base origin/main (topic is not a protected branch)"}' >"$scratch/pb-r3.json"
+[[ "$(gate_proof_base_field "$scratch/pb-r1.json")" == "proof base origin/release/v1" ]] || { printf 'a release base is not named on the status\n' >&2; exit 1; }
+[[ -z "$(gate_proof_base_field "$scratch/pb-r2.json")" ]] || { printf 'a main base was named on the status\n' >&2; exit 1; }
+[[ "$(gate_proof_base_field "$scratch/pb-r3.json")" == "proof base origin/main (topic is not a protected branch)" ]] || { printf 'a fallback did not say why\n' >&2; exit 1; }
+[[ "$(gate_status_proof_base "gate success; exit 0; inputs abc; proof base origin/release/v1; cause: x")" == release/v1 ]] \
+  && [[ "$(gate_status_proof_base "gate success; exit 0; inputs abc")" == main ]] \
+  && [[ "$(gate_status_proof_base "x; proof base origin/main (topic is not a protected branch)")" == main ]] \
+  || { printf 'a status description did not read back its proof base\n' >&2; exit 1; }
+printf 'PASS proof base: protection read exactly, keyed per base, bound into the inputs, named on the status\n'
