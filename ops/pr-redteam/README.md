@@ -194,8 +194,9 @@ commit's pull request, merge state and branch) and `note.txt`.
 
 A pin **already reviewed upstream** gets no `diff.patch`, only `diffstat.txt`. Every one of these must hold:
 the pin is verified (below) on a branch the forge reports protected; it moves forward; its commit
-list and pull requests were read whole; and every commit in the range is reachable from the head or
-merge commit of a pull request merged into that branch. That code went through those pull requests,
+list, log and pull requests were read whole; and every commit in the range lies between the base and
+head of a pull request merged into that branch (`rev-list head ^base`, not mere ancestry: a commit
+pushed straight to the branch belongs to no pull request). `pin.json` `commit_pulls` maps each one. That code went through those pull requests,
 so the reviewer does not read it again or hold the pin over its design (jain-deploy#107 held three
 times doing so). `pin.json` records `already_reviewed_upstream` and whether `diff.fetched`. Any
 other pin keeps its diff.

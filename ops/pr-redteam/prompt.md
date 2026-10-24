@@ -65,8 +65,8 @@ The review directory (its path is given below) contains:
                      build output hash) are author-measured, not reproduced: nothing was built.
                      `pin.json` `already_reviewed_upstream` is true only for a verified pin that moves
                      forward on a branch the forge reports protected, whose commit list and pull
-                     requests were read whole, with every commit of the range in a pull request merged
-                     into that branch. That code went through those pull requests: its `diff.patch` is
+                     requests and log were read whole, with every commit of the range between the base
+                     and head of a pull request merged into that branch (`commit_pulls` maps each). That code went through those pull requests: its `diff.patch` is
                      not fetched (`diffstat.txt` lists the files that moved), you do not re-review it
                      or hold the pin over its design, and you still review this PR's own diff and the
                      pin's verification and report truncation notes. Every other pin has its diff.

@@ -117,27 +117,30 @@ grep -qx '/api/v1/repos/acme%2Fcore' "$t/api.log" && grep -qx '/api/v1/repos/acm
   || fail "summary row: $(cat "$o/upstream/SUMMARY.txt")"
 ok 'forward bump onto the default branch tip is merged-tip, checked against the forge default'
 
-# 1b. Already reviewed upstream: every commit of r1..r3 is in a pull request merged into main (which
-# the forge protects), so the diff is not fetched; each missing condition keeps it.
+# 1b. Already reviewed upstream: every commit of r1..r3 lies between the base and head of a pull
+# request merged into main (which the forge protects), so the diff is not fetched; anything less --
+# including a commit that is only an ANCESTOR of a merged pull request -- keeps it.
 hb="$(git -C "$D" rev-parse HEAD)"
-merged_into() { # base_ref state head... -> pulls stub
+merged_into() { # base_ref state head:base... -> pulls stub
   local b=$1 s=$2; shift 2
-  printf '{"items":[%s]}' "$(for h in "$@"; do printf '{"number":1,"state":"%s","title":"x","head_ref":"f","base_ref":"%s","head_sha":"%s"},' "$s" "$b" "$h"; done | sed 's/,$//')"
+  printf '{"items":[%s]}' "$(n=0; for hp in "$@"; do n=$((n + 1)); printf '{"number":%s,"state":"%s","title":"x","head_ref":"f","base_ref":"%s","head_sha":"%s","base_sha":"%s"},' "$n" "$s" "$b" "${hp%%:*}" "${hp##*:}"; done | sed 's/,$//')"
 }
-stub_pulls="$(merged_into main merged "$r2" "$r3")"
+stub_pulls="$(merged_into main merged "$r2:$r1" "$r3:$r2")"
 o="$(evidence "$b" "$hb")"; p="$(pin_of "$o" "$r3")"; dir="$(dirname "$p")"
 [ "$(field "$p" already_reviewed_upstream)" = true ] && [ "$(jq -r .diff.fetched "$p")" = false ] && [ ! -e "$dir/diff.patch" ] \
-  && grep -q 'core/src/lib.rs' "$dir/diffstat.txt" && grep -q '^already reviewed upstream: all 2 commits' "$dir/note.txt" \
+  && grep -q 'core/src/lib.rs' "$dir/diffstat.txt" && grep -q '^already reviewed upstream: each of the 2 commits' "$dir/note.txt" \
+  && [ "$(jq -c --arg a "$r2" --arg b "$r3" '[.commit_pulls[$a], .commit_pulls[$b]]' "$p")" = '[1,2]' ] \
   || fail "fully reviewed upstream range: $(cat "$p"; ls "$dir")"
-stub_pulls="$(merged_into main merged "$r3")"   # one PR whose head is the tip covers r2 as well
-o="$(evidence "$b" "$hb")"; [ "$(field "$(pin_of "$o" "$r3")" already_reviewed_upstream)" = true ] || fail "a tip PR covers its ancestors"
-for case in "release/v1 merged $r3" "main open $r3" "main merged $r2"; do
+stub_pulls="$(merged_into main merged "$r3:$r1")"   # one pull request carrying both commits
+o="$(evidence "$b" "$hb")"; [ "$(field "$(pin_of "$o" "$r3")" already_reviewed_upstream)" = true ] || fail "one PR with both commits"
+for case in "main merged $r3:$r2" "release/v1 merged $r3:$r1" "main open $r3:$r1" "main merged $r2:$r1"; do
   read -r cb cs ch <<<"$case"; stub_pulls="$(merged_into "$cb" "$cs" "$ch")"
   o="$(evidence "$b" "$hb")"; p="$(pin_of "$o" "$r3")"
   [ "$(field "$p" already_reviewed_upstream)" = false ] && [ "$(jq -r .diff.fetched "$p")" = true ] && grep -q '^+three' "$(dirname "$p")/diff.patch" \
-    || fail "not every commit in a PR merged into the checked branch ($case): the diff stays: $(cat "$p")"
+    || fail "a commit outside every PR merged into the checked branch ($case) keeps the diff: $(cat "$p")"
 done
-stub_pulls="$(merged_into main merged "$r3")"; pulls_more=true
+grep -q 'commits of the range are in no pull request merged into main' "$(dirname "$p")/note.txt" || fail "the unattributed count is noted"
+stub_pulls="$(merged_into main merged "$r3:$r1")"; pulls_more=true
 o="$(evidence "$b" "$hb")"; [ "$(field "$(pin_of "$o" "$r3")" already_reviewed_upstream)" = false ] || fail "unread pull request pages keep the diff"
 pulls_more=false
 inline "$r1" | put Cargo.toml; git -C "$D" checkout -q "$b" -- Cargo.lock; hback="$(snap back)"
@@ -145,7 +148,7 @@ o="$(evidence "$hb" "$hback")"; p="$(pin_of "$o" "$r1")"
 [ "$(field "$p" already_reviewed_upstream)" = false ] && [ "$(jq -r .diff.fetched "$p")" = true ] || fail "a backwards pin keeps its diff: $(cat "$p")"
 git -C "$D" reset -q --hard "$hb"
 stub_pulls="{\"items\":[{\"number\":9,\"state\":\"merged\",\"title\":\"two\",\"head_ref\":\"feat\",\"base_ref\":\"main\",\"head_sha\":\"$r2\"}]}"
-ok 'a forward pin whose every commit is in a PR merged into a protected branch skips the diff; anything less keeps it'
+ok 'a forward pin whose every commit lies inside a PR merged into a protected branch skips the diff; anything less keeps it'
 
 # 2. An ancestor of the default branch tip.
 inline "$r2" | put Cargo.toml; git -C "$D" checkout -q "$b" -- Cargo.lock
