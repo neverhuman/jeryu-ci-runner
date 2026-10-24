@@ -108,14 +108,44 @@ o="$(evidence "$b" "$(snap bump)")"; p="$(pin_of "$o" "$r3")"; dir="$(dirname "$
   && [ "$(field "$p" checked_branch_author_supplied)" = false ] || fail "checked branch recorded: $(cat "$p")"
 [[ "$(field "$p" tips_fetched_at)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T ]] || fail "fetch time recorded"
 grep -q "commit $r2" "$dir/log.txt" || fail "log lists the commits between old and new"
-[ ! -e "$dir/diff.patch" ] && [ "$(jq -r .diff.fetched "$p")" = false ] && grep -q '^verified pin: ' "$dir/note.txt" \
-  || fail "a verified pin's upstream code is not fetched for re-review: $(ls "$dir"; cat "$dir/note.txt" 2>/dev/null)"
+grep -q '^+three' "$dir/diff.patch" || fail "diff of the imported crate"
+! grep -q "other/x" "$dir/diff.patch" || fail "diff limited to the named crate: $(cat "$dir/note.txt" 2>/dev/null; grep "^diff" "$dir/diff.patch")"
 [ "$(jq -r '.[0].number' "$dir/pulls.json")" = 9 ] && [ "$(jq -r '.[0].head_ref' "$dir/pulls.json")" = feat ] || fail "commit's pull request: $(cat "$dir/pulls.json")"
 grep -qx '/api/v1/repos/acme%2Fcore' "$t/api.log" && grep -qx '/api/v1/repos/acme%2Fcore/refs' "$t/api.log" \
   && grep -qx '/api/v1/repos/acme%2Fcore/pulls?state=all&per_page=100&page=1' "$t/api.log" || fail "forge API paths: $(cat "$t/api.log")"
 [ "$(grep -c . "$o/upstream/SUMMARY.txt" | tr -d ' ')" -gt 0 ] && grep -q "acme/core ${r3:0:12}: merged-tip (branch main, default)" "$o/upstream/SUMMARY.txt" \
   || fail "summary row: $(cat "$o/upstream/SUMMARY.txt")"
-ok 'forward bump onto the default branch tip is merged-tip, checked against the forge default; its diff is not re-reviewed'
+ok 'forward bump onto the default branch tip is merged-tip, checked against the forge default'
+
+# 1b. Already reviewed upstream: every commit of r1..r3 is in a pull request merged into main (which
+# the forge protects), so the diff is not fetched; each missing condition keeps it.
+hb="$(git -C "$D" rev-parse HEAD)"
+merged_into() { # base_ref state head... -> pulls stub
+  local b=$1 s=$2; shift 2
+  printf '{"items":[%s]}' "$(for h in "$@"; do printf '{"number":1,"state":"%s","title":"x","head_ref":"f","base_ref":"%s","head_sha":"%s"},' "$s" "$b" "$h"; done | sed 's/,$//')"
+}
+stub_pulls="$(merged_into main merged "$r2" "$r3")"
+o="$(evidence "$b" "$hb")"; p="$(pin_of "$o" "$r3")"; dir="$(dirname "$p")"
+[ "$(field "$p" already_reviewed_upstream)" = true ] && [ "$(jq -r .diff.fetched "$p")" = false ] && [ ! -e "$dir/diff.patch" ] \
+  && grep -q 'core/src/lib.rs' "$dir/diffstat.txt" && grep -q '^already reviewed upstream: all 2 commits' "$dir/note.txt" \
+  || fail "fully reviewed upstream range: $(cat "$p"; ls "$dir")"
+stub_pulls="$(merged_into main merged "$r3")"   # one PR whose head is the tip covers r2 as well
+o="$(evidence "$b" "$hb")"; [ "$(field "$(pin_of "$o" "$r3")" already_reviewed_upstream)" = true ] || fail "a tip PR covers its ancestors"
+for case in "release/v1 merged $r3" "main open $r3" "main merged $r2"; do
+  read -r cb cs ch <<<"$case"; stub_pulls="$(merged_into "$cb" "$cs" "$ch")"
+  o="$(evidence "$b" "$hb")"; p="$(pin_of "$o" "$r3")"
+  [ "$(field "$p" already_reviewed_upstream)" = false ] && [ "$(jq -r .diff.fetched "$p")" = true ] && grep -q '^+three' "$(dirname "$p")/diff.patch" \
+    || fail "not every commit in a PR merged into the checked branch ($case): the diff stays: $(cat "$p")"
+done
+stub_pulls="$(merged_into main merged "$r3")"; pulls_more=true
+o="$(evidence "$b" "$hb")"; [ "$(field "$(pin_of "$o" "$r3")" already_reviewed_upstream)" = false ] || fail "unread pull request pages keep the diff"
+pulls_more=false
+inline "$r1" | put Cargo.toml; git -C "$D" checkout -q "$b" -- Cargo.lock; hback="$(snap back)"
+o="$(evidence "$hb" "$hback")"; p="$(pin_of "$o" "$r1")"
+[ "$(field "$p" already_reviewed_upstream)" = false ] && [ "$(jq -r .diff.fetched "$p")" = true ] || fail "a backwards pin keeps its diff: $(cat "$p")"
+git -C "$D" reset -q --hard "$hb"
+stub_pulls="{\"items\":[{\"number\":9,\"state\":\"merged\",\"title\":\"two\",\"head_ref\":\"feat\",\"base_ref\":\"main\",\"head_sha\":\"$r2\"}]}"
+ok 'a forward pin whose every commit is in a PR merged into a protected branch skips the diff; anything less keeps it'
 
 # 2. An ancestor of the default branch tip.
 inline "$r2" | put Cargo.toml; git -C "$D" checkout -q "$b" -- Cargo.lock
@@ -222,8 +252,6 @@ ok 'TSV support ref, table form, package rename and rev= lock source are read'
 git init -q -b main "$t/big"; head -c 200000 /dev/urandom | base64 >"$t/big/a"; printf '[package]\nname = "big"\n' >"$t/big/Cargo.toml"
 git -C "$t/big" add -A; git -C "$t/big" -c user.name=t -c user.email=t@t commit -qm a; k1="$(git -C "$t/big" rev-parse HEAD)"
 head -c 200000 /dev/urandom | base64 >"$t/big/a"; git -C "$t/big" -c user.name=t -c user.email=t@t commit -qam b; k2="$(git -C "$t/big" rev-parse HEAD)"
-# Only a tag keeps k2: it is on no branch, so the pin is unverified and its diff is fetched (and cut).
-git -C "$t/big" tag k2 "$k2"; git -C "$t/big" reset -q --hard "$k1"
 git clone -q --bare "$t/big" "$t/forge/git/acme/big.git"
 dep size
 two() { printf '[dependencies]\nacme-core = { git = "https://forge.test/git/acme/core.git", rev = "%s" }\nbig = { git = "https://forge.test/git/acme/big.git", rev = "%s" }\n' "$1" "$2"; }
@@ -232,7 +260,7 @@ o="$(budget=6000 evidence "$b" "$(snap size)")"
 used="$(cat "$o"/upstream/*/log.txt "$o"/upstream/*/diff.patch "$o"/upstream/*/pulls.json 2>/dev/null | wc -c)"
 [ "$used" -le 6000 ] || fail "upstream evidence is $used bytes over a 6000-byte budget"
 [ "$(jq -r .diff.truncated "$o/upstream/acme@big-${k2:0:12}/pin.json")" = true ] || fail "the cut is in pin.json"
-grep -q "big ${k2:0:12}: NOT-ON-BRANCH.*truncated" "$o/upstream/SUMMARY.txt" && grep -q 'diff.patch cut' "$o/upstream/acme@big-${k2:0:12}/note.txt" \
+grep -q "big ${k2:0:12}: merged-tip.*truncated" "$o/upstream/SUMMARY.txt" && grep -q 'diff.patch cut' "$o/upstream/acme@big-${k2:0:12}/note.txt" \
   || fail "the cut is in SUMMARY.txt and note.txt: $(cat "$o/upstream/SUMMARY.txt")"
 ok 'upstream evidence is capped in total across pins and each cut is noted'
 
@@ -322,8 +350,8 @@ p="$(pin_of "$o" "$r3")"; dir="$(dirname "$p")"
 jq -e --arg d3 "$dist3" --arg d1 "$dist1" '.locked_fields | (map(.name) | sort) == ["required_check", "web_dist_sha256"]
   and (map(select(.name == "web_dist_sha256"))[0] | .value == $d3 and .base_value == $d1 and .changed == true
     and .provenance == "author-measured, not reproduced by the reviewer")' "$p" >/dev/null || fail "locked fields: $(jq -c .locked_fields "$p")"
-grep -q "commit $r2" "$dir/log.txt" && [ ! -e "$dir/diff.patch" ] && grep -q 'core/src/lib.rs' "$dir/diffstat.txt" \
-  && [ "$(jq -r '.[0].number' "$dir/pulls.json")" = 9 ] || fail "lock log, diff stat and pulls, and no diff for a verified entry"
+grep -q "commit $r2" "$dir/log.txt" && grep -q '^+three' "$dir/diff.patch" && grep -q 'core/src/lib.rs' "$dir/diffstat.txt" \
+  && [ "$(jq -r '.[0].number' "$dir/pulls.json")" = 9 ] || fail "lock log, diff, diff stat and pulls"
 grep -q "acme/core ${r3:0:12}: merged-tip (branch main, default); tag core-v3 peels to it (annotated)" "$o/upstream/SUMMARY.txt" \
   || fail "lock summary row: $(cat "$o/upstream/SUMMARY.txt")"
 grep -q 'tag-mismatch' "$o/upstream/SUMMARY.txt" && [ "$(grep -c "${r1:0:12}" "$o/upstream/SUMMARY.txt")" = 0 ] \

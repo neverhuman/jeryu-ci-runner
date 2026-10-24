@@ -192,11 +192,13 @@ repository's `hosted-pin-refs.tsv`), the review directory gets `upstream/`: `SUM
 fetched pin, `pin.json`, `log.txt`, `diff.patch` (the crates the dependent names), `pulls.json` (each
 commit's pull request, merge state and branch) and `note.txt`.
 
-A **verified** pin (below) gets no `diff.patch`: its commits reached a default or protected branch
-through that repository's own review, so they are not reviewed a second time, and the reviewer is
-told never to hold a verified pin over upstream code. Before this, a bump held when the upstream diff
-outgrew the evidence budget (a regenerated coverage file pushed a script out of it) and on design
-notes about code its own PR had already approved. `pin.json` `diff.fetched` says which case applied.
+A pin **already reviewed upstream** gets no `diff.patch`, only `diffstat.txt`. Every one of these must hold:
+the pin is verified (below) on a branch the forge reports protected; it moves forward; its commit
+list and pull requests were read whole; and every commit in the range is reachable from the head or
+merge commit of a pull request merged into that branch. That code went through those pull requests,
+so the reviewer does not read it again or hold the pin over its design (jain-deploy#107 held three
+times doing so). `pin.json` records `already_reviewed_upstream` and whether `diff.fetched`. Any
+other pin keeps its diff.
 
 The manifest is the author's text, so it never decides what is fetched or what counts as verified:
 
