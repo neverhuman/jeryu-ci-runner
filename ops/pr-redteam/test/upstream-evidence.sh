@@ -38,7 +38,8 @@ export GIT_CONFIG_GLOBAL="$t/ambient.gitconfig" HOME="$t/home" GIT_TERMINAL_PROM
 # evidence code makes, in the shapes the live forge returns (checked against it): the repository
 # read carries default_branch; /refs is an array of {name, sha, kind, protected}. Any other
 # repository path is recorded and fails the suite at the end.
-stub_default=main stub_release_protected=false pulls_more=false stub_pulls='{"items":[]}'
+stub_default=main stub_release_protected=false stub_main_protected=true pulls_more=false stub_pulls='{"items":[]}'
+stub_review=APPROVED stub_review_author="" # (empty: this reviewer) what /pulls/<n> reports for each pull request's head
 upstream_ref_rows() { # bare-repo: one {name, sha, kind:"branch", protected:false} per branch
   git -C "$1" for-each-ref --format='%(refname:strip=2) %(objectname)' refs/heads/ |
     jq -Rc 'split(" ") | {name: .[0], sha: .[1], kind: "branch", protected: false}' | jq -sc .
@@ -55,12 +56,19 @@ api() {
         id: {host: "forge", name: $n, owner: $o}, open_pull_requests: 1, visibility: "private"}')" ;;
     /api/v1/repos/acme%2Fcore/refs|/api/v1/repos/acme%2Fbig/refs)
       r="${2#/api/v1/repos/}"; r="${r%/refs}"; r="${r/\%2F//}"
-      body="$(upstream_ref_rows "$t/forge/git/$r.git" | jq -c --argjson rp "$stub_release_protected" '
-        map(if .name == "main" then .protected = true elif .name == "release/v1" then .protected = $rp else . end)
+      body="$(upstream_ref_rows "$t/forge/git/$r.git" | jq -c --argjson rp "$stub_release_protected" --argjson mp "$stub_main_protected" '
+        map(if .name == "main" then .protected = $mp elif .name == "release/v1" then .protected = $rp else . end)
         + [{name: "v1", sha: "0000000000000000000000000000000000000000", kind: "tag", protected: false}]')" ;;
     /api/v1/repos/acme%2Fcore/pulls\?state=all\&per_page=100\&page=[0-9]*|/api/v1/repos/acme%2Fbig/pulls\?state=all\&per_page=100\&page=[0-9]*)
       body="$(jq -c --argjson more "$pulls_more" --argjson p "${2##*page=}" \
         '. + {total: (.items | length), page: {limit: 100, page: $p, total: (.items | length), has_more: $more}}' <<<"$stub_pulls")" ;;
+    # One pull request's detail: its reviews, in the live shape ({author, state, head_sha, effective,
+    # stale}); the head is the one the listing gives that number.
+    /api/v1/repos/acme%2Fcore/pulls/[0-9]*|/api/v1/repos/acme%2Fbig/pulls/[0-9]*)
+      body="$(jq -c --argjson n "${2##*/}" --arg s "$stub_review" --arg a "${stub_review_author:-${me:-pragent}}" '
+        (.items[] | select(.number == $n) | .head_sha) as $h
+        | {summary: {author: "dev"}, reviews: [{author: $a, state: $s, head_sha: $h, effective: true, stale: false,
+            body_markdown: "**Red team: approved.**", id: "r1", submitted_at: "2026-10-24T00:00:00Z"}]}' <<<"$stub_pulls")" ;;
     # A repository the forge does not have: the one read a lock entry makes before fetching anything.
     /api/v1/repos/acme%2Fghost) code=404; body='{"error":{"code":"not_found"}}' ;;
     *) echo "$2" >>"$t/api.unexpected"; code=404; body='{"error":{"code":"not_found"}}' ;;
@@ -129,6 +137,8 @@ stub_pulls="$(merged_into main merged "$r2:$r1" "$r3:$r2")"
 o="$(evidence "$b" "$hb")"; p="$(pin_of "$o" "$r3")"; dir="$(dirname "$p")"
 [ "$(field "$p" already_reviewed_upstream)" = true ] && [ "$(jq -r .diff.fetched "$p")" = false ] && [ ! -e "$dir/diff.patch" ] \
   && grep -q 'core/src/lib.rs' "$dir/diffstat.txt" && grep -q '^already reviewed upstream: each of the 2 commits' "$dir/note.txt" \
+  && grep -q "${r3:0:12}: merged-tip.*already reviewed upstream: diff not fetched" "$o/upstream/SUMMARY.txt" \
+  && [ "$(jq -c '[.approved_pulls[].number]' "$p")" = '[1,2]' ] \
   && [ "$(jq -c --arg a "$r2" --arg b "$r3" '[.commit_pulls[$a], .commit_pulls[$b]]' "$p")" = '[1,2]' ] \
   || fail "fully reviewed upstream range: $(cat "$p"; ls "$dir")"
 stub_pulls="$(merged_into main merged "$r3:$r1")"   # one pull request carrying both commits
@@ -139,7 +149,14 @@ for case in "main merged $r3:$r2" "release/v1 merged $r3:$r1" "main open $r3:$r1
   [ "$(field "$p" already_reviewed_upstream)" = false ] && [ "$(jq -r .diff.fetched "$p")" = true ] && grep -q '^+three' "$(dirname "$p")/diff.patch" \
     || fail "a commit outside every PR merged into the checked branch ($case) keeps the diff: $(cat "$p")"
 done
-grep -q 'commits of the range are in no pull request merged into main' "$(dirname "$p")/note.txt" || fail "the unattributed count is noted"
+grep -q "of the range's commits are in no pull request this reviewer approved" "$(dirname "$p")/note.txt" || fail "the unattributed count is noted"
+# Every commit covered, but the approval is someone else's, a hold, or main is not protected: diff.
+stub_pulls="$(merged_into main merged "$r3:$r1")"
+for miss in "stub_review_author=someone" "stub_review=CHANGES_REQUESTED" "stub_main_protected=false"; do
+  ( eval "$miss"; o="$(evidence "$b" "$hb")"; p="$(pin_of "$o" "$r3")"
+    [ "$(field "$p" already_reviewed_upstream)" = false ] && [ "$(jq -r .diff.fetched "$p")" = true ] \
+      || fail "no approval by this reviewer at the head, or an unprotected branch ($miss), keeps the diff: $(cat "$p")" ) || exit 1
+done
 stub_pulls="$(merged_into main merged "$r3:$r1")"; pulls_more=true
 o="$(evidence "$b" "$hb")"; [ "$(field "$(pin_of "$o" "$r3")" already_reviewed_upstream)" = false ] || fail "unread pull request pages keep the diff"
 pulls_more=false
@@ -148,7 +165,7 @@ o="$(evidence "$hb" "$hback")"; p="$(pin_of "$o" "$r1")"
 [ "$(field "$p" already_reviewed_upstream)" = false ] && [ "$(jq -r .diff.fetched "$p")" = true ] || fail "a backwards pin keeps its diff: $(cat "$p")"
 git -C "$D" reset -q --hard "$hb"
 stub_pulls="{\"items\":[{\"number\":9,\"state\":\"merged\",\"title\":\"two\",\"head_ref\":\"feat\",\"base_ref\":\"main\",\"head_sha\":\"$r2\"}]}"
-ok 'a forward pin whose every commit lies inside a PR merged into a protected branch skips the diff; anything less keeps it'
+ok 'a forward pin whose every commit is in a PR this reviewer approved at its head and merged into a protected branch skips the diff; anything less keeps it'
 
 # 2. An ancestor of the default branch tip.
 inline "$r2" | put Cargo.toml; git -C "$D" checkout -q "$b" -- Cargo.lock
