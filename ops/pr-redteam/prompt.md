@@ -38,7 +38,15 @@ The review directory (its path is given below) contains:
                      backdoors and gate changes as small commits. Say in `summary` how much of the
                      diff you actually read.
 - `signals.txt`    — mechanical pre-scan hits (secret patterns, sensitive paths, binaries). They are
-                     leads to verify, not verdicts.
+                     leads to verify, not verdicts. Its last section lists each required context of
+                     this head and its state as the forge reported it when this review started
+                     (`pr.json` `required_contexts`): forge data, not author text. A change to release
+                     lock files only is reviewed once those contexts have a result, or after a bounded
+                     wait; when the section says the wait ran out with a context still pending, that
+                     context has no result yet. Report it as such; it is neither a pass nor a failure.
+                     The `checks` counts in `pr.json` include `pr-redteam/review`, this reviewer's
+                     own check run: it reflects a review, not the code, and is never evidence that a
+                     check on this head failed or passed.
 - `upstream/`      — present only when the change moves a git dependency pin (Cargo.toml `rev`, Cargo.lock
                      `source`, hosted-pin-refs.tsv, a release lock entry's `commit` or `tag`). `SUMMARY.txt` gives a status per pin; each fetched
                      pin's directory holds `pin.json`, `log.txt`, `diff.patch` (unless already reviewed
@@ -59,7 +67,9 @@ The review directory (its path is given below) contains:
                      `lock_entry`) names a commit and a tag. It is verified only when the commit is
                      `merged-tip` / `ancestor-of-tip` AND the forge's tag peels to that commit
                      (`tag_resolves_to`, `tag_matches_commit`; `tag_annotated` says whether it is an
-                     annotated tag). `tag-mismatch` — the forge's tag peels elsewhere or is missing;
+                     annotated tag). An entry that names no tag at the base or at the head
+                     (`untagged`) has no tag to check and is judged by its commit alone, like a git
+                     rev pin; an entry whose tag the change removes is `tag-mismatch`. `tag-mismatch` — the forge's tag peels elsewhere or is missing;
                      `branch_status` says where the commit stands. `repo-not-on-forge` — the forge has
                      no repository by the entry's name; nothing was fetched. `locked_fields` (such as a
                      build output hash) are author-measured, not reproduced: nothing was built.

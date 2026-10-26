@@ -268,6 +268,38 @@ recorded with `tag_annotated: false`. The entry's other fields (`locked_fields`,
 `web_dist_sha256`) are recorded with their base values as "author-measured, not reproduced by the
 reviewer": the reviewer builds nothing.
 
+A table with no `repo =` key is named by its `name =` key instead (the `jeryu-split.lock.toml`
+shape). Location fields (`github`, `jeryu`, `github_slug`, `local_path`) are never fetch targets and
+are not recorded as locked fields. An entry that names no `tag` at the base **or** at the head -- a
+repository pinned by commit alone -- has no tag to cross-check: it is judged by its commit, exactly as
+a git rev pin is, and `pin.json` records `untagged: true`. An entry whose tag the change removes is
+not untagged; its tag is missing, which is `tag-mismatch`.
+
+### Release pin bumps wait for their required contexts
+
+A head whose forge diff changes release lock or pin files only (a `*.lock.toml` at the repository
+root, a `hosted-pin-refs.tsv`) asserts one thing: that a pinned commit is on reviewed code. Where
+`upstream/` cannot show that, the PR's own required lane is the proof, and a review that runs before
+the lane reports can only hold on unresolved evidence -- final for that head (jeryu-deploy #453 and
+#457 were held this way, ten seconds after opening, and their lanes passed minutes later; #452, the
+same diff, was approved).
+
+So while any required context of such a head is `missing` or `pending` (the forge row's
+`required_contexts`), the reviewer leaves the head alone: no receipt, no review, no check run, no
+agent spend, and one log line `waiting for required contexts -- ...`. The next pass, or `poke` once
+the contexts are green, reviews it with their result in `pr.json` and at the end of `signals.txt`. A
+failing context is a result and is reviewed at once. The wait is bounded by `REDTEAM_PIN_WAIT_SECS`
+(default 3600) from the first pass that saw the head (`$REDTEAM_STATE/pin-wait/`); after that the
+head is reviewed anyway and `signals.txt` says the contexts are still without a result, so nothing
+waits silently. `0` turns the wait off.
+
+The trigger is narrow on purpose: any other head is reviewed at once, and so is a pin bump when its
+row lists no required contexts, or the forge's diff is unavailable, truncated or for another head.
+The file list comes from the forge's diff of the exact head and the states from the forge's row;
+nothing an author writes decides either, and the wait only changes when a head is reviewed, not what
+the review concludes or who can ask for one. Every review's `signals.txt` lists the required contexts
+and their states as the forge reported them when the review started.
+
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,

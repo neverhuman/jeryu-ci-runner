@@ -417,6 +417,34 @@ p="$(pin_of "$o" "$rs")"
   && [ "$(field "$p" checked_branch)" = "" ] || fail "lock commit on an unprotected branch: $(cat "$p")"
 ok 'a lock commit only on an unprotected branch is unverified even when its tag peels to it'
 
+# A lock whose [[repo]] tables name the repository with `name =` (no `repo =`), and an entry pinned
+# by commit alone: it has no tag at the base or the head, so it is judged by its commit, as a git rev
+# pin is. Location fields (`github_slug`, `local_path`) are neither fetch targets nor locked fields.
+named() { # name commit dist [tag]
+  printf '\n[[repo]]\nname = "%s"\ngithub_slug = "evil/%s"\nlocal_path = "/srv/evil/%s"\n%scommit = "%s"\nweb_dist_sha256 = "%s"\nrequired_check = "%s/required"\n' \
+    "$1" "$1" "$1" "${4:+tag = \"$4\"\n}" "$2" "$3" "$1"
+}
+namedlock() { printf 'schema_version = "acme.split.lock/v1"\n'; }
+dep named; { namedlock; named core "$r1" "$dist1"; named self PENDING_SELF "$dist1"; } | put acme-split.lock.toml; b="$(snap base)"
+{ namedlock; named core "$r3" "$dist3"; named self PENDING_SELF "$dist1"; } | put acme-split.lock.toml
+o="$(evidence "$b" "$(snap named-bump)")"; p="$(pin_of "$o" "$r3")"
+[ "$(field "$p" status)" = merged-tip ] && [ "$(field "$p" verified)" = true ] && [ "$(field "$p" lock_entry)" = true ] \
+  && [ "$(field "$p" untagged)" = true ] && [ "$(field "$p" tag_matches_commit)" = false ] && [ "$(field "$p" old_rev)" = "$r1" ] \
+  || fail "untagged named lock entry: $(cat "$p")"
+jq -e '.locked_fields | (map(.name) | sort) == ["required_check", "web_dist_sha256"]' "$p" >/dev/null \
+  || fail "location fields recorded as locked fields: $(jq -c .locked_fields "$p")"
+grep -q "acme/core ${r3:0:12}: merged-tip (branch main, default); untagged entry: judged by its commit alone" "$o/upstream/SUMMARY.txt" \
+  || fail "untagged summary row: $(cat "$o/upstream/SUMMARY.txt")"
+! grep -q 'acme/self' "$o/upstream/SUMMARY.txt" && ! grep -q evil "$t/api.log" || fail "a pending entry or a location field was fetched: $(cat "$t/api.log")"
+ok 'a [[repo]] entry named by name = and pinned by commit alone is judged by its commit; location fields are ignored'
+
+dep named-drop; { namedlock; named core "$r1" "$dist1" core-v1; } | put acme-split.lock.toml; b="$(snap base)"
+{ namedlock; named core "$r3" "$dist3"; } | put acme-split.lock.toml
+o="$(evidence "$b" "$(snap named-drop)")"; p="$(pin_of "$o" "$r3")"
+[ "$(field "$p" status)" = tag-mismatch ] && [ "$(field "$p" verified)" = false ] && [ "$(field "$p" untagged)" = false ] \
+  && [ "$(field "$p" branch_status)" = merged-tip ] || fail "a removed tag: $(cat "$p")"
+ok 'an entry whose tag the change removes is tag-mismatch, not untagged'
+
 # A *.lock.toml below the root is not a release lock.
 mkdir -p "$D/sub"; { lockfile; entry core core-v1 "$r1" "$dist1"; } >"$D/sub/x.lock.toml"; b="$(snap sub-base)"
 { lockfile; entry core core-v3 "$r3" "$dist3"; } >"$D/sub/x.lock.toml"
