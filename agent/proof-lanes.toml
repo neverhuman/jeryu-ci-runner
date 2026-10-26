@@ -69,3 +69,9 @@ name = "ci"
 command = "just fast && just check && just security && just score"
 purpose = "host CI wrapper compile, metadata, security, and score parity"
 requires_network = true
+
+[[lane]]
+name = "proof-evidence"
+command = "bash ops/ci/proof_evidence.sh"
+purpose = "exact-head proof receipts ratcheted against the forge's audit of protected main"
+requires_network = true

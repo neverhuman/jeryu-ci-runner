@@ -45,6 +45,32 @@ if [[ "$(git remote get-url origin)" != \
   exit 1
 fi
 
+# Every artifact this lane reads must come from this run. A rerun in a retained
+# target/ (the gate runner's build cache, a local repeat) would otherwise let a
+# previous run's report satisfy a check for a tool that wrote nothing this time.
+# Only paths this lane itself produces are removed: target/security/ comes from
+# the security lane that ran before it.
+rm -rf -- \
+  target/jankurai/accepted-baseline.json \
+  target/jankurai/baseline-migration-report.json \
+  target/jankurai/baseline-migration-report.md \
+  target/jankurai/copy-code \
+  target/jankurai/evidence-index.json \
+  target/jankurai/migration-report.json \
+  target/jankurai/migration-report.md \
+  target/jankurai/proof-evidence-summary.json \
+  target/jankurai/proof-plan.json \
+  target/jankurai/proof-plan.md \
+  target/jankurai/proof-verification.json \
+  target/jankurai/proof-verification.md \
+  target/jankurai/proofbind \
+  target/jankurai/proofmark \
+  target/jankurai/repair-queue.jsonl \
+  target/jankurai/repo-score.json \
+  target/jankurai/repo-score.md \
+  target/jankurai/rust \
+  target/jankurai/security
+
 mkdir -p \
   .jankurai \
   target/jankurai \
@@ -75,6 +101,9 @@ for changed_path in "${changed_paths[@]}"; do
 done
 
 receipt_dir="target/jankurai/proof-receipts/run-${current_head:0:12}-$$"
+# A rerun can reuse this name (same head, recycled pid); every receipt read
+# below has to be one this run wrote.
+rm -rf -- "${receipt_dir}"
 jankurai proof . --changed-from origin/main --out target/jankurai/proof-plan.json --md target/jankurai/proof-plan.md
 jankurai prove . --plan target/jankurai/proof-plan.json --out-dir "${receipt_dir}" --evidence-index target/jankurai/evidence-index.json
 
