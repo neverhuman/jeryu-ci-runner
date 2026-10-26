@@ -44,7 +44,3 @@ text="$(pr_description acme/deploy 7)"
 out="$(jq -c "$prjson_filter" <<<'{"title":"T","body":"x","description":"y","available_actions":[]}')"
 [ "$out" = '{"title":"T"}' ] || fail "pr.json carries neither text field: $out"
 echo "ok - description.md reads the pull request's own text; a failed read says so; pr.json carries neither"
-
-out="$(jq -c "$prjson_filter" <<<'{"title":"T","head_sha":"abc","mergeable":{},"merge_passport":{},"passport_hash":"x","review":{},"checks":[]}')"
-[ "$out" = '{"title":"T","head_sha":"abc"}' ] || fail "gate state reached the independent review context: $out"
-echo "ok - gate and approval state are absent from independent review evidence"

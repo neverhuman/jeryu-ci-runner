@@ -57,7 +57,11 @@ done
 printf '%s %s\n' "$method" "$url" >> "$PUBLISH_FIXTURE/requests"
 row() {
   jq -nc --arg sha "$(cat "$PUBLISH_FIXTURE/head")" --arg base "$(cat "$PUBLISH_FIXTURE/base")" --arg approved "$(test ! -e "$PUBLISH_FIXTURE/forge-approved" || echo approved)" \
-    '{repo:{owner:"jeryu",name:"fixture"},number:1,head_sha:$sha,base_sha:$base,head_ref:"topic",base_ref:"main",draft:false,author:"contributor",title:"fixture",body_markdown:"fixture",state:"open",labels:["origin:internal"],passport_hash:"fixture-passport",review:{user_review_state:$approved,changes_requested:0},mergeable:{can_merge:true}}'
+    --arg proof "$(if [[ ! -e "$PUBLISH_FIXTURE/with-contexts" ]]; then :; elif [[ -e "$PUBLISH_FIXTURE/gate-blocked" ]]; then echo failure; elif [[ -e "$PUBLISH_FIXTURE/gate-pending" ]]; then echo pending; else echo success; fi)" \
+    '{repo:{owner:"jeryu",name:"fixture"},number:1,head_sha:$sha,base_sha:$base,head_ref:"topic",base_ref:"main",draft:false,author:"contributor",title:"fixture",body_markdown:"fixture",state:"open",labels:["origin:internal"],passport_hash:"fixture-passport",review:{user_review_state:$approved,changes_requested:0},mergeable:{can_merge:true},
+      updated_at:(now|tostring),agents:{active_sessions:(now|floor % 7)},checks:{pending:(now|floor % 3)},
+      required_contexts:(if $proof == "" then null else [{name:"jankurai/proof",state:$proof}] end)}
+    | if .required_contexts == null then del(.required_contexts) else . end'
 }
 case "$url" in
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
@@ -71,6 +75,10 @@ case "$url" in
     elif [[ -e "$PUBLISH_FIXTURE/gate-pending" ]]; then
       printf '{"merge_passport":{"blockers":[{"code":"passport_blocked_checks","message":"Required context `jankurai/proof` is queued or running."}]}}\n200'
     else printf '{"merge_passport":{"blockers":[]}}\n200'; fi ;;
+  */pulls/1/diff)
+    # Read by the pin-wait check while a required context is pending: not a pin bump.
+    jq -nc --arg sha "$(cat "$PUBLISH_FIXTURE/head")" '{head_sha:$sha,truncated:false,files:[{path:"README.md"}]}'
+    printf '\n200' ;;
   */pulls/1/checks)
     if [[ -e "$PUBLISH_FIXTURE/gate-blocked" ]]; then
       printf '{"checks":[{"name":"jankurai/proof","required":true,"title":"score 47 < floor 85"}]}\n200'
@@ -98,6 +106,8 @@ PUBLISH_FIXTURE="$(dirname "$(dirname "$0")")"
 printf 'called\n' >> "$PUBLISH_FIXTURE/model-calls"
 touch "$PUBLISH_FIXTURE/model-started"
 while [[ -e "$PUBLISH_FIXTURE/gate" ]]; do sleep 0.05; done
+# The proof gets its (failing) result while the agent runs.
+if [[ -e "$PUBLISH_FIXTURE/model-turns-red" ]]; then rm -f "$PUBLISH_FIXTURE/gate-pending"; touch "$PUBLISH_FIXTURE/gate-blocked"; fi
 if [[ -e "$PUBLISH_FIXTURE/model-fail" ]]; then exit 42; fi
 if [[ -e "$PUBLISH_FIXTURE/model-leak" ]]; then
   jq -nc --arg secret "$(cat "$PUBLISH_FIXTURE/token")" \
@@ -328,22 +338,54 @@ jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
 echo 'ok failing required proof held without a review, cleared proof approved'
 
 # Pending proof admits the independent review, but no publication. A subsequent
-# process reuses its exact-input result after proof succeeds, without another model call.
+# process reuses its exact-input result after proof succeeds, without another model call, although
+# the row's live fields (updated_at, agents, checks) differ on every read.
 advance
-touch "$t/gate-pending"
+# The row also lists jankurai/proof among its required contexts, so signals.txt's live section moves
+# from pending to success with the proof.
+touch "$t/gate-pending" "$t/model-cost" "$t/with-contexts"
 model_calls="$(count "$t/model-calls")"; posts_before="$(count "$t/posts")"
 review
+rm "$t/model-cost"
 jq -e '.posted == false and .decision == "waiting_gate"' "$(receipt)" >/dev/null
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" && "$(count "$t/posts")" == "$posts_before" ]]
 grep -q 'waiting for jankurai/proof' "$t/controller.log"
-review
+pending="$t/state/pending/jeryu/fixture/1.json"
+jq -e '.cost_usd == 0.4321' "$pending" >/dev/null
+# While the proof still has no result, a computed head is left alone: no attempt, no agent.
+attempts="$(find "$t/state/attempts" -type f | wc -l)"
+review; review
 jq -e '.posted == false and .decision == "waiting_gate"' "$(receipt)" >/dev/null
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" && "$(count "$t/posts")" == "$posts_before" ]]
+[[ "$(find "$t/state/attempts" -type f | wc -l)" == "$attempts" ]]
 rm "$t/gate-pending"
 review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
-jq -e '.posted == true and .decision == "approve"' "$(receipt)" > /dev/null
-echo 'ok review runs during pending proof and is reused after green without early publication'
+grep -q 'reusing review computed while proof was pending' "$t/controller.log"
+# The published receipt names what the reused review cost; the saved result is used up.
+jq -e '.posted == true and .decision == "approve" and .cost_usd == 0.4321' "$(receipt)" > /dev/null
+[[ ! -e "$pending" ]]
+# Its spend was reported once, by the attempt that ran the agent; the reuse reports none.
+[[ "$(count "$t/events")" == 1 ]]
+jq -e '.kind == "pr.reviewed" and .outcome == "waiting_gate" and .cost_usd == 0.4321' "$t/events" >/dev/null
+rm "$t/events" "$t/with-contexts"
+echo 'ok review runs during pending proof and is reused after green, across live row fields, without early publication'
+
+# A proof that fails while the agent runs is the quality gate's mechanical hold, never a neutral
+# wait, and the computed result is not kept.
+advance
+touch "$t/gate-pending" "$t/model-turns-red"
+posts_before="$(count "$t/posts")"
+review
+rm -f "$t/model-turns-red"
+jq -e '.decision == "hold" and .posted == true
+  and (.verdict.findings[0].title == "jankurai/proof does not pass on this head")' "$(receipt)" >/dev/null
+[[ "$(count "$t/posts")" == "$((posts_before + 1))" ]]
+jq -e '.verdict == "request_changes"' <<<"$(tail -1 "$t/posts")" >/dev/null
+jq -se 'last | .conclusion == "action_required"' "$t/check-runs" >/dev/null
+[[ ! -e "$pending" ]]
+rm -f "$t/gate-blocked"
+echo 'ok a proof that turns red while the agent runs holds mechanically'
 
 # A push while proof is pending invalidates the saved review.
 advance
@@ -368,11 +410,8 @@ REDTEAM_MODEL=fixture-new-model review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
 review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 2))" ]]
-pending="$t/state/pending/jeryu/fixture/1.json"
 jq --rawfile secret "$t/token" '.verdict.summary=$secret' "$pending" > "$t/unsafe-pending"
 mv "$t/unsafe-pending" "$pending"
-review
-[[ "$(count "$t/model-calls")" == "$((model_calls + 3))" ]]
 rm "$t/gate-pending"
 review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 3))" ]]

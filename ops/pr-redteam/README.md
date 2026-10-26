@@ -10,11 +10,21 @@ head whose proof fails or failed to score is held with that reason before any
 agent budget is spent, and nothing here can approve it. A proof the forge has
 queued, is running, or has not started is not a verdict on the head: that head
 gets an internal review while the gate runs. Its validated model result is saved
-atomically (one pending result per PR), bound to the head, diff base, review
-identity and PR context. A later pass reuses that result and rechecks proof before
-publication. A changed head, base, context or review identity invalidates it;
-`--force` also bypasses reuse. Pending receipts have `decision: waiting_gate`
-and never count as approvals. Contributions retain their existing admission rule
+atomically (one pending result per PR), bound to the review identity, the head,
+diff base and origin, the PR row's stable fields (title, author, branches, draft,
+state, labels, supersedes), the description, the signals and any upstream pin
+evidence. The row's live fields (`updated_at`, `agents`, `checks`, `mergeable`,
+`required_contexts`, `review`, the passport) are left out of that binding: they
+move on every event, the proof finishing among them, and the gate is read live
+before publication anyway. Until the proof has a result, later passes leave a
+head with a computed result alone (no attempt, no agent). Once it has one, a pass
+reuses the result if the binding still matches, publishes it if the proof passed,
+and deletes it; a proof that failed holds the head mechanically, as if it had
+failed before the agent ran, and the result is discarded. A proof that turns red
+while the agent runs is that same mechanical hold, never a neutral wait. The
+review's cost is reported once, on the attempt that ran the agent, and the
+published receipt carries it as `cost_usd`. `--force` bypasses reuse. Pending
+receipts have `decision: waiting_gate` and never count as approvals. Contributions retain their existing admission rule
 because they have a one-attempt spend cap. Repositories
 outside the gate's rollout are unaffected — their proof is reported, not
 required. `ops/ci/jankurai-gate.sh` is the same verdict, run locally before the
