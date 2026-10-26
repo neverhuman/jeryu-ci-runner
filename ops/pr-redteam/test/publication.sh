@@ -119,7 +119,8 @@ review() { "$here/pr-redteam" _review 0 0 0 jeryu/fixture 1 >> "$t/controller.lo
 receipt() { printf '%s/state/receipts/jeryu/fixture/1-%s.json\n' "$t" "$(cat "$t/head")"; }
 count() { if [[ -f "$1" ]]; then wc -l < "$1"; else echo 0; fi; }
 advance() { printf 'next\n' >> "$t/repo/README.md"; g commit -qam next; g rev-parse HEAD > "$t/head"; }
-wait_model() { for ((i=0;i<200;i++)); do [[ ! -e "$t/model-started" ]] || return 0; sleep 0.05; done; echo 'model did not start' >&2; return 1; }
+# A loaded gate host can take well over 10 s to start the worker; 60 s still bounds a real hang.
+wait_model() { for ((i=0;i<1200;i++)); do [[ ! -e "$t/model-started" ]] || return 0; sleep 0.05; done; echo 'model did not start within 60s' >&2; return 1; }
 
 # Rejected publication is durable and retryable; a restart can publish once.
 touch "$t/reject"

@@ -1375,16 +1375,45 @@ invoke --repo acme/fixture --pr 1
 receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
 jq -e '.terminal and .outcome == "inputs_changed" and .exit_code == 0' "$receipt" >/dev/null
 jq -se 'last.state == "error"' "$fixture/statuses.jsonl" >/dev/null
+# One recipe per invocation: the re-run is the next tick's, never this unit run's.
+expect_count "$((before_count + 1))"
+jq -e '.inputs_changed_count == 1 and .inputs_changed_holds == false' "$receipt" >/dev/null
+# The next scheduled ticks re-run it first and count the chain; the third drifted result holds it.
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+grep -q "re-running acme/fixture#1 at $head first" "$fixture/runner.log" \
+  || { printf 'a drifted head was not re-run first\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+expect_count "$((before_count + 2))"
+jq -e '.inputs_changed_count == 2 and .inputs_changed_holds == true' "$receipt" >/dev/null
+invoke
 expect_count "$((before_count + 3))"
 jq -e '.inputs_changed_count == 3' "$receipt" >/dev/null
 jq -se '[.[] | select(.status == "completed")] | length == 3 and
   all(.[]; .conclusion == "neutral" and (.output.summary | contains("Passed, but inputs changed during the run"))
     and (.output.summary | contains("✗") | not)) and
-  (.[0].output.title | endswith("re-running")) and
+  (.[0].output.title | endswith("re-running on the next tick")) and
+  (.[1].output.title | endswith("re-running on the next tick")) and
   (.[2].output.title | contains("stopped after two re-runs"))' "$fixture/check-runs.jsonl" >/dev/null
 invoke
 expect_count "$((before_count + 3))"
-printf 'PASS passing input drift is neutral, retries immediately twice, and stays bounded across ticks\n'
+grep -q "hold acme/fixture@$head: inputs changed after two automatic re-runs" "$fixture/runner.log" \
+  || { printf 'a thrice-drifted head was not held\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+# A re-run is a re-gate like any other: a merge burst defers it rather than racing it.
+cp "$receipt" "$fixture/held-result.json"
+jq '.inputs_changed_count = 1' "$fixture/held-result.json" >"$receipt"
+touch "$fixture/runner/cache/mains/acme/fixture" 2>/dev/null || { mkdir -p "$fixture/runner/cache/mains/acme"; touch "$fixture/runner/cache/mains/acme/fixture"; }
+GATE_RUNNER_REGATE_SETTLE=3600 invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 3))"
+grep -q 'deferring re-gate of acme/fixture#1' "$fixture/runner.log" \
+  || { printf 'a drifted re-run skipped merge-burst coalescing\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+# A truncated receipt reads as no chain and never kills the tick.
+head -c 20 "$fixture/held-result.json" >"$receipt"
+invoke
+[[ "$runner_exit" == 0 ]] || { printf 'a truncated last-result.json killed the tick\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+expect_count "$((before_count + 4))"
+jq -e '.inputs_changed_count == 1' "$receipt" >/dev/null
+printf 'PASS passing input drift is neutral, re-runs first on the next two ticks (one recipe per tick, coalesced with a merge burst), then holds; a truncated receipt never kills a tick\n'
 
 # Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.
 rm -f "$fixture/mutate-tool"
@@ -1823,6 +1852,30 @@ last_status "$relsha" | jq -e '.state == "failure"' >/dev/null || fail_pb 'a fai
 invoke --branch release/v1
 expect_count "$((before_count + 2))"
 grep -q "hold acme/fixture@$relsha" "$fixture/runner.log" || fail_pb 'a failing tip was not held'
+# A drifting tip is never held: --branch reads no forge re-gate request, so a hold could not be lifted.
+# Each scheduled pass runs one recipe and counts the chain past three.
+"$real_git" -C "$fixture/source" checkout -q release/v1
+printf 'pass\n' >"$fixture/source/mode"
+"$real_git" -C "$fixture/source" add mode
+"$real_git" -C "$fixture/source" commit -qm release-drifts
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" release/v1
+relsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" checkout -q main
+refs_json main release/v1
+touch "$fixture/mutate-tool"
+for pass in 1 2 3 4; do
+  invoke --branch release/v1
+  [[ "$runner_exit" == 0 ]] || fail_pb "--branch drift pass $pass: runner failed"
+  expect_count "$((before_count + 2 + pass))"
+done
+! grep -q "hold acme/fixture@$relsha" "$fixture/runner.log" || fail_pb 'a drifting branch tip was held'
+jq -e '.outcome == "inputs_changed" and .inputs_changed_count == 4 and .inputs_changed_holds == false' \
+  "$(compgen -G "$fixture/runner/attempts/acme-fixture-$relsha.base-*/last-result.json")" >/dev/null \
+  || fail_pb 'a drifting branch tip did not count its chain unheld'
+! tail -n 1 "$fixture/check-runs.jsonl" | jq -e '.output.title | contains("stopped after two re-runs")' >/dev/null \
+  || fail_pb 'an unheld branch tip was labelled held'
+rm -f "$fixture/mutate-tool"
+before_count=$((before_count + 4))
 # Refusals: unprotected, an owner without a proof-base variable, and the other modes.
 invoke --branch topic --repo acme/fixture
 [[ "$runner_exit" == 1 ]] || fail_pb 'an unprotected branch was not refused'
@@ -1836,4 +1889,4 @@ invoke --branch release/v1 --main-health
 [[ "$runner_exit" == 2 ]] || fail_pb '--branch with --main-health was accepted'
 expect_count "$((before_count + 2))"
 unset PR_GATE_PROOF_BASE_VARS
-printf 'PASS --branch: a protected tip is proved against the branch before it, posted as <repo>/required, held, never re-proved over, and refused when it may not be\n'
+printf 'PASS --branch: a protected tip is proved against the branch before it, posted as <repo>/required, held, never re-proved over, never held on input drift, and refused when it may not be\n'

@@ -776,12 +776,16 @@ runs on the gate host and reads the real step text.
 Passing recipes whose execution inputs change produce a neutral check run with a
 passed-with-changed-inputs explanation; completed steps remain green. The receipt
 retains the observed after-input identity and names repository head changes. The
-required status is `error` (the result proves nothing about the head) and the slot
-re-runs that head next, ahead of the candidates the tick has not reached; the
-re-run posts its own `pending` when it starts. A merge-queue arrival still preempts
-the re-run, and the next tick resumes the chain. After two consecutive automatic
-re-runs, it holds the head until an explicit re-gate. The receipt counter survives tick restarts.
-An explicit PR invocation or forge re-gate request starts a new bounded chain.
+required status is `error` (the result proves nothing about the head). The invocation
+ends as after any result, so one unit run never holds more than one recipe. The next
+tick re-runs that head ahead of the heads that already hold a result, once the
+family's mains have settled (`GATE_RUNNER_REGATE_SETTLE`, as for any re-gate); the
+re-run posts its own `pending` when it starts. On a scheduled pull-request pass, after
+two consecutive automatic re-runs the head is held until an explicit re-gate: a forge
+re-gate request or `--repo <o>/<r> --pr <n>` starts a new bounded chain. `--branch`,
+`--main-health` and merge-queue gates have no such request, so they are never held
+and re-run on each pass. The chain counter lives in the receipt and survives tick
+restarts; an unreadable `last-result.json` counts as no chain.
 
 Sibling sources already run from the slot checkouts selected during preparation.
 A remote main moving alone does not change those checked-out inputs during a run.

@@ -930,6 +930,26 @@ fi
 gate_attempted() { # owner repo sha
   [[ -d "$HOME_DIR/attempts/$1-$2-$3" ]] || compgen -G "$HOME_DIR/attempts/$1-$2-$3.base-*" >/dev/null
 }
+# The inputs_changed chain recorded in these last-result.json files: the longest run of consecutive
+# inputs_changed results, or 0. A result superseded under another proof base counts nothing. A
+# missing, truncated or unreadable file reads as 0 and never stops the tick.
+gate_inputs_changed_count() { # last-result.json...
+  local file n best=0
+  for file in "$@"; do
+    [[ -f "$file" ]] || continue
+    n=$(jq -r 'if .outcome == "inputs_changed" and (.publication.superseded_by // null) == null
+      then (.inputs_changed_count // 1) else 0 end' "$file" 2>/dev/null) || n=0
+    [[ "$n" =~ ^[0-9]{1,6}$ ]] || n=0
+    if ((n > best)); then best=$n; fi
+  done
+  printf '%s\n' "$best"
+}
+# Only a scheduled pull-request pass holds a head whose inputs changed three times in a row: there a
+# forge re-gate request or --repo/--pr is the escape. --branch and --main-health read no re-gate
+# requests and a merge-queue entry is never asked for by number, so those re-run on each pass instead,
+# as before the chain was counted (coalesced by REGATE_SETTLE like any re-gate).
+inputs_changed_holds=0
+[[ -n "$only_pr" || -n "$only_branch" || "$main_health" != 0 ]] || inputs_changed_holds=1
 gate_queue_arrived() {
   local qrepo qsha
   api GET "/api/v1/merge-queue?state=building"
@@ -1000,6 +1020,15 @@ for candidate in "${candidates[@]}"; do
   if [[ "$main_health" == 0 && -z "$only_pr" ]] && gate_regate_settling "$HOME_DIR/cache/mains/$owner/$repo" "$REGATE_SETTLE"; then
     say "deferring re-gate of $owner/$repo#$number: $owner mains moved within ${REGATE_SETTLE}s"; continue
   fi
+  # A passing run whose inputs changed proved nothing, so its head is re-run as soon as the family's
+  # mains have settled, ahead of the heads that already hold a result. One held after two automatic
+  # re-runs waits for an explicit re-gate in its normal place, where the loop below holds it cheaply.
+  chain=$(gate_inputs_changed_count "$HOME_DIR/attempts/$owner-$repo-$sha/last-result.json" \
+    "$HOME_DIR/attempts/$owner-$repo-$sha".base-*/last-result.json)
+  if ((chain > 0)) && { ((inputs_changed_holds == 0)) || ((chain < 3)); }; then
+    say "re-running $owner/$repo#$number at $sha first: its last passing run saw its inputs change"
+    fresh+=("$candidate"); continue
+  fi
   seen_before+=("$candidate")
 done
 # The head this slot was woken for goes first of the pull-request heads: that is what makes a woken
@@ -1028,13 +1057,8 @@ if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # first one with forge reuse off, so this host's own receipt replaces the adoption one head per idle tick.
 forge_adopted=()
 GATE_FORGE_REUSE=1
-# An inputs_changed pass re-runs its head next, ahead of the candidates this tick has not reached yet.
-# retry_head names that head, so only its own chain count survives an explicit --pr invocation.
-retry_head=""
 while :; do
-candidate_index=-1
 for candidate in "${candidates[@]}"; do
-candidate_index=$((candidate_index + 1))
 read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
    && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ \
@@ -1118,18 +1142,21 @@ if ! gate_recover; then
   continue
 fi
 
-# Retain the chain length across ticks and publication recovery. An explicit request
-# starts a new chain; the immediate loop retains the previous attempt's count.
+# The inputs_changed chain survives ticks and publication recovery in the receipt. --repo/--pr starts a
+# new chain, and so does an honoured forge re-gate request of a held head. Each invocation runs one
+# recipe at most (see exit 0 below), so a chain is one re-run per tick, never three in one unit run.
 inputs_changed_count=0
-if [[ -f "$gate_key_dir/last-result.json" ]] && { [[ -z "$only_pr" ]] || [[ "$retry_head" == "$owner/$repo@$sha" ]]; }; then
-  inputs_changed_count=$(jq -r 'if .outcome == "inputs_changed" then (.inputs_changed_count // 1) else 0 end' "$gate_key_dir/last-result.json")
+[[ -n "$only_pr" ]] || inputs_changed_count=$(gate_inputs_changed_count "$gate_key_dir/last-result.json")
+head_holds=$inputs_changed_holds
+[[ "$qref" == - ]] || head_holds=0
+if ((head_holds && inputs_changed_count >= 3)); then
+  if ! gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
+    say "hold $owner/$repo@$sha: inputs changed after two automatic re-runs; explicit re-gate required"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
+  inputs_changed_count=0
 fi
-if ((inputs_changed_count >= 3)) && ! gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
-  say "hold $owner/$repo@$sha: inputs changed after two automatic re-runs; explicit re-gate required"
-  exec 6>&-; exec 7>&-
-  continue
-fi
-((inputs_changed_count < 3)) || inputs_changed_count=0
 
 # 3. the family's canonical mains
 family="$FAMILY"
@@ -1639,7 +1666,9 @@ if ((admitted == 0)); then
   continue
 fi
 gate_begin "$identity"
-gate_update --argjson count "$inputs_changed_count" '.inputs_changed_count=$count'
+gate_update --argjson count "$inputs_changed_count" --argjson holds "$head_holds" \
+  '.inputs_changed_count=$count | .inputs_changed_holds=($holds == 1)' \
+  || say "could not record the inputs_changed chain of $owner/$repo@$sha"
 : "${gate_attempt_dir:?}"
 # Why this head is proved against main although its base is another branch, for its status.
 [[ -z "$pb_note" ]] || gate_update --arg note "$pb_note" '.proof_base_note=$note' \
@@ -1882,7 +1911,8 @@ after_inputs="$gate_attempt_dir/after-inputs.json"
 if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" \
   || ! jq -e --slurpfile after "$after_inputs" '.inputs == $after[0]' "$gate_receipt" >/dev/null; then
   state=inputs_changed
-  gate_update --argjson count "$((inputs_changed_count + 1))" '.inputs_changed_count=$count'
+  gate_update --argjson count "$((inputs_changed_count + 1))" '.inputs_changed_count=$count' \
+    || say "could not record the inputs_changed chain of $owner/$repo@$sha"
   if jq -e 'type == "object"' "$after_inputs" >/dev/null 2>&1; then
     gate_update --slurpfile after "$after_inputs" '.after_inputs=$after[0]'
   fi
@@ -1914,18 +1944,9 @@ jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" --arg r
   | gate_atomic "$LAST_GATE"
 heartbeat
 say "recorded $owner/$repo $(gate_status_context "$owner" "$repo")=$state; exit $worker_exit; evidence $gate_receipt"
-if [[ "$state" == inputs_changed ]] && ((inputs_changed_count < 2)); then
-  say "inputs changed: immediately re-queuing $owner/$repo@$sha ahead of the remaining candidates"
-  # The candidates this tick has not reached stay queued behind the re-run, so a re-run that cannot
-  # start (lock contention, recovery, admission) still leaves the tick its other work. A merge-queue
-  # arrival still preempts the re-run at the top of the loop; the next tick resumes the chain from
-  # the receipt's count.
-  candidates=("$candidate" "${candidates[@]:candidate_index+1}")
-  retry_head="$owner/$repo@$sha"
-  gate_receipt=""
-  exec 6>&-; exec 7>&-
-  continue 2
-fi
+# An inputs_changed result ends the invocation like any other: the next tick re-runs that head first
+# once the family's mains have settled (see the candidate order above), so a re-run is coalesced
+# with a merge burst and no unit run holds more than one recipe against its TimeoutStartSec.
 # Attempt evidence is retained with its log, including active and unpublished results.
 # Age does not discharge a recovery obligation. Preservation-aware retention must be
 # qualified separately before any journal or legacy log is removed.

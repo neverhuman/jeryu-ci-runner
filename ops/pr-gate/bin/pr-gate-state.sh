@@ -922,8 +922,10 @@ gate_publish() {
       | select((.head | test("^[0-9a-f]{40}$")) and ($before.head | test("^[0-9a-f]{40}$")))
       | "\(.repository): \($before.head) -> \(.head)"] | join("; ")' "$gate_receipt")
     changed=${changed:-tools, fixtures, or working-tree inputs changed}
-    title="Passed, but inputs changed during the run ($changed); re-running"
-    if jq -e '(.inputs_changed_count // 1) >= 3' "$gate_receipt" >/dev/null; then
+    title="Passed, but inputs changed during the run ($changed); re-running on the next tick"
+    # Only a pull-request head of a scheduled pass is held (see inputs_changed_holds in the runner);
+    # --branch, --main-health and merge-queue gates re-run on each pass however long the chain.
+    if jq -e '(.inputs_changed_holds // false) and (.inputs_changed_count // 1) >= 3' "$gate_receipt" >/dev/null; then
       title="Passed, but inputs changed during the run ($changed); stopped after two re-runs; explicit re-gate required"
     fi
     # The required status stays `error`: this result proves nothing about the head, and a terminal
