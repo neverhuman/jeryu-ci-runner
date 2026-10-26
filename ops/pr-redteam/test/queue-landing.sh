@@ -16,7 +16,7 @@ trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_manifest_pins upstream_url_map upstream_pins upstream_tag upstream_remote upstream_git \
-    upstream_capped upstream_drop_refs upstream_pull_approved upstream_patch_id upstream_pin_evidence upstream_evidence; do
+    upstream_capped upstream_drop_refs upstream_pull_approved upstream_patch_id upstream_replay_tree upstream_pin_evidence upstream_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done
@@ -72,7 +72,8 @@ commit() { # message [author] -> sha
     u -c core.hooksPath=/dev/null commit -qm "$1"; u rev-parse HEAD
 }
 upstream() { # name
-  NAME="$1"; W="$t/w-$1"; git init -q -b main "$W"; echo start >"$W/file"; u add file; u commit -qm w0
+  NAME="$1"; W="$t/w-$1"; git init -q -b main "$W"; echo start >"$W/file"; seq 1 10 >"$W/shared.txt"
+  u add file shared.txt; u commit -qm w0
   w0="$(u rev-parse HEAD)"
 }
 replay() { # head [reverse] -> replays the commits of head (from its merge base) onto main, in order or reversed
@@ -114,19 +115,32 @@ pin_of() { echo "$1/upstream/acme@$NAME-${2:0:12}/pin.json"; }
 scenario() { # name [extra steps between landings: push|squash|edit|tail]
   local mode="${2:-$1}"
   upstream "$1"
-  u checkout -qb pr1; h1="$(commit one)"
+  # shift: #1 changes line 3 of shared.txt and #2's last commit line 5, so #2's replay is clean but its
+  # context moved (its patch-id differs). conflict: both change line 5.
+  u checkout -qb pr1
+  case "$mode" in shift*) sed -i 's/^3$/three (#1)/' "$W/shared.txt" ;; conflict) sed -i 's/^5$/five (#1)/' "$W/shared.txt" ;; esac
+  h1="$(commit one)"
   u checkout -qb pr2 "$w0"; commit two-a >/dev/null
   [ "$mode" != empty ] || u commit -q --allow-empty -m "two-empty"
+  case "$mode" in shift*|conflict) sed -i 's/^5$/five (#2)/' "$W/shared.txt" ;; esac
   echo also >"$W/two-b-also.txt"; p2="$(commit two-b)"
   u checkout -q main; u merge -q --ff-only pr1
   [ "$mode" != push ] || direct="$(commit direct-push other)"
-  if [ "$mode" = squash ]; then
+  if [ "$mode" = conflict ]; then
+    # The replay of two-b conflicts on line 5; the landing is a hand resolution keeping #2's line,
+    # under two-b's own author, date and message.
+    u cherry-pick "$(u rev-parse "$p2~1")" >/dev/null
+    a2="$(u rev-parse HEAD)"
+    git -C "$W" checkout -q "$p2" -- two-b.txt two-b-also.txt; sed -i 's/^five (#1)$/five (#2)/' "$W/shared.txt"; u add -A
+    b2="$(GIT_AUTHOR_NAME="$(u log -1 --format=%an "$p2")" GIT_AUTHOR_EMAIL="$(u log -1 --format=%ae "$p2")" \
+      GIT_AUTHOR_DATE="$(u log -1 --format=%aI "$p2")" u commit -q -m "$(u log -1 --format=%B "$p2")" && u rev-parse HEAD)"
+  elif [ "$mode" = squash ]; then
     u merge -q --squash pr2 >/dev/null 2>&1
     b2="$(GIT_AUTHOR_DATE="@$((when + 5)) +0000" u commit -qm squashed && u rev-parse HEAD)"; a2=""
   else
     b2="$(replay "$p2" "$( [ "$mode" != reorder ] || echo reverse)")"; a2="$(u rev-parse "$b2~1")"
     if [ "$mode" = edit ]; then u commit -q --amend -m "two-b, reworded"; b2="$(u rev-parse HEAD)"; fi
-    case "$mode" in alter|extra|drop) b2="$(same_meta "$mode")" ;; esac
+    case "$mode" in alter|extra|drop) b2="$(same_meta "$mode")" ;; shift-alter|shift-extra) b2="$(same_meta "${mode#shift-}")" ;; esac
   fi
   u checkout -qb pr3 "$b2"; p3="$(commit three)"
   # #3 was written on #2's landing, then main moved on with nothing else, so the queue replays it as is
@@ -155,7 +169,7 @@ jq -e --arg a2 "$a2" --arg b2 "$b2" '.landing_pulls | map(select(.kind == "repla
   and (map(select(.number == 2))[0].landing_commits == [$a2, $b2])' "$p" >/dev/null || fail "landing_pulls: $(jq -c .landing_pulls "$p")"
 [ "$(jq -c '[.approved_pulls[].number] | sort' "$p")" = '[1,2,3]' ] || fail "approved_pulls: $(jq -c .approved_pulls "$p")"
 jq -e --arg h1 "$h1" '.landing_pulls | map(select(.kind == "own-head")) == [{number: 1, kind: "own-head", head_sha: $h1,
-  merge_commit_sha: $h1, landing_commits: [$h1], attributed: true, reason: null}]' "$p" >/dev/null \
+  merge_commit_sha: $h1, landing_commits: [$h1], methods: null, attributed: true, reason: null}]' "$p" >/dev/null \
   || fail "the own-head landing is not recorded: $(jq -c .landing_pulls "$p")"
 grep -qx '/api/v3/repos/acme/ok/pulls?state=closed&per_page=100&page=1' "$t/api.log" || fail "the landing listing was not read: $(cat "$t/api.log")"
 ok 'replayed landings that line up with approved pull requests are already reviewed upstream; the diff is not fetched'
@@ -210,6 +224,34 @@ scenario reorder; publish "$(pulls)"; keeps_diff "a reordered replay" "changes o
 ok 'a replay of the right commits in the wrong order keeps the diff'
 scenario empty; publish "$(pulls)"; keeps_diff "a landing with an empty commit" "has no patch-id"
 ok 'a landing containing a commit with no patch-id (an empty commit) keeps the diff'
+
+# 4c. A replay whose context moved: the patch-id differs, but a three-way replay of the reviewed
+# commit onto the landing's parent writes exactly the landed tree, so it is attributed (replay_tree).
+scenario shift; publish "$(pulls)"
+o="$(evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"
+[ "$(arr "$p" .already_reviewed_upstream)" = true ] \
+  && [ "$(jq -c '.landing_pulls | map(select(.number == 2))[0].methods' "$p")" = '["patch_id","replay_tree"]' ] \
+  && [ "$(jq -c '.landing_pulls | map(select(.number == 3))[0].methods' "$p")" = '["patch_id"]' ] \
+  || fail "a shifted-context replay: $(jq -c .landing_pulls "$p")"
+[ "$(u diff "$p2~1" "$p2" | git patch-id --stable | cut -d' ' -f1)" != "$(u diff "$b2~1" "$b2" | git patch-id --stable | cut -d' ' -f1)" ] \
+  || fail "the shifted case does not change the patch-id, so it proves nothing"
+ok 'a replay whose context moved is attributed by its replayed tree; the method is recorded per commit'
+# Altered content under copied metadata, on a shifted replay too: neither method attributes it.
+for m in alter extra; do
+  scenario "shift-$m"; publish "$(pulls)"
+  keeps_diff "altered content ($m) under either method" "the landed tree differs from the replayed one"
+  [ "$(u log -1 --format='%an %ae %aI %B' "$b2")" = "$(u log -1 --format='%an %ae %aI %B' "$p2")" ] \
+    || fail "shift-$m: the case does not copy the metadata, so it proves nothing"
+done
+ok 'altered or extra content under copied metadata is attributed by neither patch-id nor replayed tree'
+scenario conflict; publish "$(pulls)"; keeps_diff "a conflicting replay" "the replay conflicts"
+ok 'a replay that conflicts (here, resolved by hand) keeps the diff'
+# A git without `merge-tree --write-tree --merge-base` (before 2.40) answers 129: that fails closed.
+scenario shift-oldgit shift; publish "$(pulls)"
+git() { if [ "${3:-}" = merge-tree ]; then echo "error: unknown option" >&2; return 129; fi; command git "$@"; }
+keeps_diff "a git without merge-tree --merge-base" "needs git 2.40 or later"
+unset -f git
+ok 'a git that cannot replay a tree (before 2.40) fails closed and says so'
 
 # 5. A commit after the last landing belongs to no pull request.
 scenario tail; publish "$(pulls)"; keeps_diff "a commit after the last landing"

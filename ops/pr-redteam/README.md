@@ -210,7 +210,11 @@ the landing lines up exactly. The landing is the run of first-parent, single-par
 previous landing commit (or the old pin) up to the recorded one. It must have as many commits as the
 pull request's own review diff, and each commit must carry the same content as the pull request
 commit it replays, one to one and in order: the same `git patch-id --stable`, which hashes the change
-with its context, so a replay that had to resolve anything does not match. The author, author date and
+with its context. Where only context moved under the replay (which changes a patch-id), the commit
+still matches when a clean three-way replay of the pull request commit onto the landing commit's
+parent (`git merge-tree --write-tree --merge-base=C^ L^ C`, git 2.40 or later) writes exactly the
+landed tree; a conflict, any git failure, or a root or merge commit fails closed, and `landing_pulls`
+`methods` records `patch_id` or `replay_tree` per commit. The author, author date and
 message must match as well, but metadata alone proves nothing, since anybody can copy it. A direct
 push between two landings lengthens the run, and a squash shortens it. Altered, extra or dropped
 content under copied metadata, a reordered replay, a commit with no patch-id (an empty one), a

@@ -81,7 +81,9 @@ The review directory (its path is given below) contains:
                      lands as new commits; those count as its commits only when the forge records the
                      landing (`merge_commit_sha`) and the landing is exactly the pull request's commits
                      replayed: the same number, in order, each with the same content as the commit it
-                     replays (`git patch-id --stable`) and the same author, author date and message,
+                     replays (the same `git patch-id --stable`, or, where only context moved, a clean
+                     three-way replay of that commit onto the landing's parent that writes exactly
+                     the landed tree; `methods` says which) and the same author, author date and message,
                      and nothing else between it and the previous landing (`landing_pulls`
                      says which landings were attributed and why any was not). That code went through those pull requests: its `diff.patch` is
                      not fetched (`diffstat.txt` lists the files that moved), you do not re-review it
