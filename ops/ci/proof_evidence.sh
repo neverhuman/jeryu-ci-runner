@@ -8,6 +8,7 @@ cd "${ROOT}"
 source "${ROOT}/ops/ci/lib.sh"
 require_tool jq
 require_jankurai
+source ops/ci/proof_guards.sh
 
 candidate_policy="${ROOT}/agent/audit-policy.toml"
 if [[ ! -f "${candidate_policy}" || -L "${candidate_policy}" ||
@@ -23,6 +24,7 @@ if [[ "${BASE_REF}" != origin/main ]]; then
   printf 'proof evidence base must be protected origin/main, got %s\n' "${BASE_REF}" >&2
   exit 1
 fi
+proof_require_history
 base_commit="$(git rev-parse --verify "${BASE_REF}^{commit}")" || {
   printf 'missing proof evidence base: %s\n' "${BASE_REF}" >&2
   exit 1
@@ -196,6 +198,16 @@ baseline_score="$(jq -er '.score | select(type == "number") | floor' \
   target/jankurai/accepted-baseline.json)"
 baseline_sha256="$(sha256sum target/jankurai/accepted-baseline.json | \
   awk '{print $1}')"
+# Compare actual completed migration analyses, using the same protected-main
+# tree as the audit baseline. A tool's successful exit alone is not evidence
+# that its analysis completed or that this head preserved migration liability.
+jankurai migrate "${baseline_parent}/repo" --analyze \
+  --out target/jankurai/baseline-migration-report.json \
+  --md target/jankurai/baseline-migration-report.md
+jankurai migrate . --analyze --out target/jankurai/migration-report.json \
+  --md target/jankurai/migration-report.md
+proof_require_migration target/jankurai/baseline-migration-report.json \
+  target/jankurai/migration-report.json
 trap - EXIT HUP INT TERM
 cleanup_baseline
 
@@ -315,6 +327,8 @@ jq -n \
   --argjson receipt_count "$(jq -er '.receipts | length' target/jankurai/evidence-index.json)" \
   --argjson proofmark_review "${proofmark_review}" \
   --argjson baseline_score "${baseline_score}" \
+  --argjson migration_liability "$(jq -er .liability_score target/jankurai/migration-report.json)" \
+  --argjson baseline_migration_liability "$(jq -er .liability_score target/jankurai/baseline-migration-report.json)" \
   '{schema_version:"jeryu.ci-runner.proof-evidence/v1",git_head:$head,
     base_commit:$base,dirty_worktree:false,changed_path_count:$changed_count,
     receipt_count:$receipt_count,receipt_dir:$receipt_dir,
@@ -322,6 +336,8 @@ jq -n \
     proof_verification_sha256:$verification_sha256,security_sha256:$security_sha256,
     supply_chain_sha256:$supply_chain_sha256,sbom_sha256:$sbom_sha256,
     baseline_score:$baseline_score,baseline_sha256:$baseline_sha256,
+    migration_liability_score:$migration_liability,
+    baseline_migration_liability_score:$baseline_migration_liability,
     proof_verification:"pass",proofmark_mode:"advisory",
     proofmark_review_obligations:$proofmark_review,
     synthetic_fallbacks:0,conclusion:"success"}' \

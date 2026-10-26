@@ -2,6 +2,6 @@
 # The ops/ci regression suite: offline, invented site data only.
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
-for suite in required-lane pr-ci-lanes helper-scope run-suites build-cache; do
+for suite in required-lane pr-ci-lanes helper-scope run-suites build-cache proof-guards; do
   bash "$here/test-$suite.sh"
 done

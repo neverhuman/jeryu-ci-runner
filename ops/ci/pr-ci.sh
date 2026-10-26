@@ -83,6 +83,7 @@ bash ops/ci/score.sh
 bash ops/ci/jankurai-gate.sh
 JERYU_SECURITY_NETWORK=1 bash ops/ci/security.sh
 bash ops/ci/artifact_support.sh
+bash ops/ci/proof_evidence.sh
 
 echo "[pr-ci] workspace test suite (sandbox runtime tests need real namespaces; see deploy pr-ci precedent)" >&2
 test_log="$(mktemp "${TMPDIR:-/tmp}/jeryu-ci-runner-nextest.XXXXXX")"
