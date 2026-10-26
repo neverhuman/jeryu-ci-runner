@@ -776,9 +776,11 @@ runs on the gate host and reads the real step text.
 Passing recipes whose execution inputs change produce a neutral check run with a
 passed-with-changed-inputs explanation; completed steps remain green. The receipt
 retains the observed after-input identity and names repository head changes. The
-required status stays pending while the slot immediately retries that head ahead
-of its other candidates. After two consecutive automatic re-runs, it reports an
-error requiring an explicit re-gate. The receipt counter survives tick restarts.
+required status is `error` (the result proves nothing about the head) and the slot
+re-runs that head next, ahead of the candidates the tick has not reached; the
+re-run posts its own `pending` when it starts. A merge-queue arrival still preempts
+the re-run, and the next tick resumes the chain. After two consecutive automatic
+re-runs, it holds the head until an explicit re-gate. The receipt counter survives tick restarts.
 An explicit PR invocation or forge re-gate request starts a new bounded chain.
 
 Sibling sources already run from the slot checkouts selected during preparation.

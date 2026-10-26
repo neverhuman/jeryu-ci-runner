@@ -1028,9 +1028,13 @@ if ((list)); then printf '%s\n' "${candidates[@]}"; exit 0; fi
 # first one with forge reuse off, so this host's own receipt replaces the adoption one head per idle tick.
 forge_adopted=()
 GATE_FORGE_REUSE=1
-immediate_retry=0
+# An inputs_changed pass re-runs its head next, ahead of the candidates this tick has not reached yet.
+# retry_head names that head, so only its own chain count survives an explicit --pr invocation.
+retry_head=""
 while :; do
+candidate_index=-1
 for candidate in "${candidates[@]}"; do
+candidate_index=$((candidate_index + 1))
 read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
 [[ "$owner" =~ ^[A-Za-z0-9._-]+$ && "$repo" =~ ^[A-Za-z0-9._-]+$ && "$sha" =~ ^[0-9a-f]{40}$ \
    && ( "$qref" == - || "$qref" == refs/heads/main || "$qref" =~ ^refs/queue/[A-Za-z0-9._/-]+$ \
@@ -1038,7 +1042,7 @@ read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
    && ( "$cbase" == - || "$cbase" == '!' || "$cbase" =~ ^\*[0-9]+$ || "$cbase" == "$(gate_base_branch "$cbase")" ) \
    && "$contributed" =~ ^[01]$ && ( "$ready" == - || "$ready" =~ ^[^[:space:]]+\|[a-z-]+$ ) ]] \
   || die "invalid repository or head in dispatch"
-if [[ "$qref" == - && -z "$only_pr" && "$immediate_retry" == 0 ]] && gate_queue_arrived; then
+if [[ "$qref" == - && -z "$only_pr" ]] && gate_queue_arrived; then
   heartbeat
   exit 0
 fi
@@ -1117,7 +1121,7 @@ fi
 # Retain the chain length across ticks and publication recovery. An explicit request
 # starts a new chain; the immediate loop retains the previous attempt's count.
 inputs_changed_count=0
-if [[ -f "$gate_key_dir/last-result.json" ]] && { [[ -z "$only_pr" ]] || ((immediate_retry)); }; then
+if [[ -f "$gate_key_dir/last-result.json" ]] && { [[ -z "$only_pr" ]] || [[ "$retry_head" == "$owner/$repo@$sha" ]]; }; then
   inputs_changed_count=$(jq -r 'if .outcome == "inputs_changed" then (.inputs_changed_count // 1) else 0 end' "$gate_key_dir/last-result.json")
 fi
 if ((inputs_changed_count >= 3)) && ! gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
@@ -1910,17 +1914,21 @@ jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" --arg r
   | gate_atomic "$LAST_GATE"
 heartbeat
 say "recorded $owner/$repo $(gate_status_context "$owner" "$repo")=$state; exit $worker_exit; evidence $gate_receipt"
-# Attempt evidence is retained with its log, including active and unpublished results.
-# Age does not discharge a recovery obligation. Preservation-aware retention must be
-# qualified separately before any journal or legacy log is removed.
 if [[ "$state" == inputs_changed ]] && ((inputs_changed_count < 2)); then
-  say "inputs changed: immediately re-queuing $owner/$repo@$sha ahead of other candidates"
-  candidates=("$candidate")
-  immediate_retry=1
+  say "inputs changed: immediately re-queuing $owner/$repo@$sha ahead of the remaining candidates"
+  # The candidates this tick has not reached stay queued behind the re-run, so a re-run that cannot
+  # start (lock contention, recovery, admission) still leaves the tick its other work. A merge-queue
+  # arrival still preempts the re-run at the top of the loop; the next tick resumes the chain from
+  # the receipt's count.
+  candidates=("$candidate" "${candidates[@]:candidate_index+1}")
+  retry_head="$owner/$repo@$sha"
   gate_receipt=""
   exec 6>&-; exec 7>&-
   continue 2
 fi
+# Attempt evidence is retained with its log, including active and unpublished results.
+# Age does not discharge a recovery obligation. Preservation-aware retention must be
+# qualified separately before any journal or legacy log is removed.
 # A recorded red result is the runner doing its job, not a fault: exit 0 so systemd does
 # not show a healthy slot as failed. Runner faults still die non-zero.
 exit 0

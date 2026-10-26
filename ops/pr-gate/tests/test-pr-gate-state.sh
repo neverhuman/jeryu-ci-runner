@@ -53,7 +53,7 @@ gate_publish
 jq -se --arg before "$sha" 'last | .conclusion == "neutral" and
   (.output.summary | contains("sibling: " + $before + " -> aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")) and
   (.output.summary | contains("✗") | not) and (.output.title | endswith("re-running"))' "$scratch/published.jsonl" >/dev/null
-jq -se '.[-2].state == "pending"' "$scratch/published.jsonl" >/dev/null
+jq -se '.[-2].state == "error"' "$scratch/published.jsonl" >/dev/null
 printf 'PASS changed-input receipt publishes the moved repository and passing steps\n'
 
 jq '.statuses += [{context:"fixture/required",state:"failure",id:"newer",created_at:"2026-09-18T00:00:00Z"}]' \

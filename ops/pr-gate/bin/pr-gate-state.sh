@@ -926,9 +926,11 @@ gate_publish() {
     if jq -e '(.inputs_changed_count // 1) >= 3' "$gate_receipt" >/dev/null; then
       title="Passed, but inputs changed during the run ($changed); stopped after two re-runs; explicit re-gate required"
     fi
+    # The required status stays `error`: this result proves nothing about the head, and a terminal
+    # receipt must not read as a gate in progress if no re-run follows. The re-run posts its own
+    # `pending` when it starts. Only the check run is neutral, and says the steps passed.
     if [[ "$exit_code" == 0 ]]; then
       check_state=neutral
-      if jq -e '(.inputs_changed_count // 1) < 3' "$gate_receipt" >/dev/null; then state=pending; fi
     else title="Recipe failed (exit $exit_code); ${title#Passed, but }"; fi
   fi
   log=$(jq -r '.log // ""' "$gate_receipt")
