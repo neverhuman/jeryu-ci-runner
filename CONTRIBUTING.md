@@ -18,11 +18,15 @@ Tests and fixtures must use invented data (for example `acme`, `globex` and
 
 ## Running the gate locally
 
-Run the repository's gate before opening a pull request:
+Run the repository's required gate before opening a pull request. It is the
+same script the forge's required check (`jeryu-ci-runner/required`) runs:
 
 ```sh
-JERYU_SPLIT_FULL_CHECK=1 ./ops/ci/check.sh
+bash ops/ci/pr-ci.sh
 ```
+
+It needs the governed `jankurai` auditor installed; `ops/ci/ensure-jankurai.sh` verifies it.
+`just required` runs the same script.
 
 ## Security issues
 
