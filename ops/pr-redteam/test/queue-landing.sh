@@ -16,7 +16,7 @@ trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_manifest_pins upstream_url_map upstream_pins upstream_tag upstream_remote upstream_git \
-    upstream_capped upstream_drop_refs upstream_pull_approved upstream_pin_evidence upstream_evidence; do
+    upstream_capped upstream_drop_refs upstream_pull_approved upstream_patch_id upstream_pin_evidence upstream_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done
@@ -49,9 +49,13 @@ api() {
         "$t/pulls/$name.json")" ;;
     /api/v3/repos/acme/*/pulls\?state=closed*)
       if [ -e "$t/v3-down" ]; then code=500; body='{"message":"down"}'
-      elif [ "${2##*page=}" != 1 ]; then body='[]'
-      else body="$(jq -c 'map({number, title: "t", merged_at: "2026-10-26T00:00:00Z", merge_commit_sha: .merge,
-        head: {ref: "f", sha: .head}, base: {ref: "main", sha: .base}})' "$t/pulls/$name.json")"; fi ;;
+      else
+        # A forge that clamps per_page ($t/v3-clamp): one row per page, newest first; otherwise all on page 1.
+        body="$(jq -c --argjson p "${2##*page=}" --argjson clamp "$( [ -e "$t/v3-clamp" ] && echo true || echo false)" '
+          map({number, title: "t", merged_at: "2026-10-26T00:00:00Z", merge_commit_sha: .merge,
+               head: {ref: "f", sha: .head}, base: {ref: "main", sha: .base}}) | reverse
+          | if $clamp then .[($p - 1):$p] elif $p == 1 then . else [] end' "$t/pulls/$name.json")"
+      fi ;;
     /api/v1/repos/acme%2F*)
       body="$(jq -nc --arg n "$name" '{default_branch: "main", id: {owner: "acme", name: $n}}')" ;;
     *) echo "$2" >>"$t/api.unexpected"; code=404; body='{}' ;;
@@ -71,10 +75,20 @@ upstream() { # name
   NAME="$1"; W="$t/w-$1"; git init -q -b main "$W"; echo start >"$W/file"; u add file; u commit -qm w0
   w0="$(u rev-parse HEAD)"
 }
-replay() { # head base-on-main-before -> replays the commits of head (from its merge base) onto main
-  local h="$1" mb c; mb="$(u merge-base "$h" main)"
-  for c in $(u rev-list --reverse "$h" "^$mb"); do u cherry-pick --allow-empty "$c" >/dev/null; done
+replay() { # head [reverse] -> replays the commits of head (from its merge base) onto main, in order or reversed
+  local h="$1" mb c order=--reverse; mb="$(u merge-base "$h" main)"
+  [ "${2:-}" != reverse ] || order=--topo-order
+  for c in $(u rev-list "$order" "$h" "^$mb"); do u cherry-pick --allow-empty --keep-redundant-commits "$c" >/dev/null; done
   u rev-parse HEAD
+}
+# Rewrites the landing's last commit keeping its author, author date and message: only content moves.
+same_meta() { # how: alter|extra|drop
+  case "$1" in
+    alter) echo "something else" >"$W/two-b.txt" ;;
+    extra) echo "an unreviewed hunk" >"$W/smuggled.txt" ;;
+    drop) rm "$W/two-b-also.txt" ;;
+  esac
+  u add -A; u commit -q --amend --no-edit; u rev-parse HEAD
 }
 publish() { # pulls-json: puts the forge copy and the pull request heads in place
   rm -rf "$t/forge/git/acme/$NAME.git"; mkdir -p "$t/forge/git/acme"
@@ -101,15 +115,18 @@ scenario() { # name [extra steps between landings: push|squash|edit|tail]
   local mode="${2:-$1}"
   upstream "$1"
   u checkout -qb pr1; h1="$(commit one)"
-  u checkout -qb pr2 "$w0"; commit two-a >/dev/null; p2="$(commit two-b)"
+  u checkout -qb pr2 "$w0"; commit two-a >/dev/null
+  [ "$mode" != empty ] || u commit -q --allow-empty -m "two-empty"
+  echo also >"$W/two-b-also.txt"; p2="$(commit two-b)"
   u checkout -q main; u merge -q --ff-only pr1
   [ "$mode" != push ] || direct="$(commit direct-push other)"
   if [ "$mode" = squash ]; then
     u merge -q --squash pr2 >/dev/null 2>&1
     b2="$(GIT_AUTHOR_DATE="@$((when + 5)) +0000" u commit -qm squashed && u rev-parse HEAD)"; a2=""
   else
-    b2="$(replay "$p2")"; a2="$(u rev-parse "$b2~1")"
+    b2="$(replay "$p2" "$( [ "$mode" != reorder ] || echo reverse)")"; a2="$(u rev-parse "$b2~1")"
     if [ "$mode" = edit ]; then u commit -q --amend -m "two-b, reworded"; b2="$(u rev-parse HEAD)"; fi
+    case "$mode" in alter|extra|drop) b2="$(same_meta "$mode")" ;; esac
   fi
   u checkout -qb pr3 "$b2"; p3="$(commit three)"
   # #3 was written on #2's landing, then main moved on with nothing else, so the queue replays it as is
@@ -134,9 +151,12 @@ o="$(evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"; dir="$(dirname "$p")"
   && [ ! -e "$dir/diff.patch" ] || fail "a range landed through the queue is not already reviewed: $(cat "$p")"
 [ "$(jq -c --arg h1 "$h1" --arg a2 "$a2" --arg b2 "$b2" --arg x3 "$x3" '[.commit_pulls[$h1], .commit_pulls[$a2], .commit_pulls[$b2], .commit_pulls[$x3]]' "$p")" = '[1,2,2,3]' ] \
   || fail "commit_pulls: $(jq -c .commit_pulls "$p")"
-jq -e --arg a2 "$a2" --arg b2 "$b2" '.landing_pulls | map(select(.attributed)) | map(.number) == [2, 3]
-  and (.[0].landing_commits == [$a2, $b2])' "$p" >/dev/null || fail "landing_pulls: $(jq -c .landing_pulls "$p")"
+jq -e --arg a2 "$a2" --arg b2 "$b2" '.landing_pulls | map(select(.kind == "replay" and .attributed)) | map(.number) == [2, 3]
+  and (map(select(.number == 2))[0].landing_commits == [$a2, $b2])' "$p" >/dev/null || fail "landing_pulls: $(jq -c .landing_pulls "$p")"
 [ "$(jq -c '[.approved_pulls[].number] | sort' "$p")" = '[1,2,3]' ] || fail "approved_pulls: $(jq -c .approved_pulls "$p")"
+jq -e --arg h1 "$h1" '.landing_pulls | map(select(.kind == "own-head")) == [{number: 1, kind: "own-head", head_sha: $h1,
+  merge_commit_sha: $h1, landing_commits: [$h1], attributed: true, reason: null}]' "$p" >/dev/null \
+  || fail "the own-head landing is not recorded: $(jq -c .landing_pulls "$p")"
 grep -qx '/api/v3/repos/acme/ok/pulls?state=closed&per_page=100&page=1' "$t/api.log" || fail "the landing listing was not read: $(cat "$t/api.log")"
 ok 'replayed landings that line up with approved pull requests are already reviewed upstream; the diff is not fetched'
 
@@ -148,6 +168,17 @@ keeps_diff() { # label reason-needle
     || fail "$1: reason '$2' not recorded: $(jq -c .landing_pulls "$p")"
   LAST="$p"
 }
+
+# 1b. A forge that clamps per_page returns short pages: the listing is read to its empty page, so
+# every landing is still found; a page cap reached on a page with rows is noted, and keeps the diff.
+scenario clamp; publish "$(pulls)"; touch "$t/v3-clamp"
+o="$(evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"
+[ "$(arr "$p" .already_reviewed_upstream)" = true ] && [ "$(grep -c 'pulls?state=closed' "$t/api.log")" = 4 ] \
+  || fail "short pages ended the landing listing: $(grep closed "$t/api.log"; jq -c .landing_pulls "$p")"
+upstream_max_pull_pages=1 keeps_diff "a landing listing cut by the page cap"
+grep -q 'only the newest 1 pages of closed pull requests were searched' "$(dirname "$LAST")/note.txt" || fail "the cap is not noted"
+rm "$t/v3-clamp"
+ok 'a clamped landing listing is read to its empty page; hitting the page cap is noted and keeps the diff'
 
 # 2. A direct push between two landings lengthens the next landing's run: not attributed.
 scenario push; publish "$(pulls)"; keeps_diff "a direct push before a landing" "the landing has 3 commits and the pull request 2"
@@ -161,6 +192,24 @@ ok 'a squash landing keeps the diff'
 # 4. A replay whose message differs from the approved commit does not line up.
 scenario edit; publish "$(pulls)"; keeps_diff "an edited replay" "authors, dates or messages differ"
 ok 'a replay that is not the approved commits (here, a reworded message) keeps the diff'
+
+# 4b. Content, not metadata: a landing commit with the replayed commit's author, author date and
+# message but other content is not that commit. Altered, extra and dropped hunks, and a reordered
+# replay, all keep the diff.
+for m in alter extra drop; do
+  scenario "$m"; publish "$(pulls)"
+  keeps_diff "a landing with the same metadata but $m content" "changes other content than"
+  jq -e '.landing_pulls | any(.number == 2 and .attributed == false and (.reason | test("patch-id differs")))' "$LAST" >/dev/null \
+    || fail "$m: not caught by patch-id: $(jq -c .landing_pulls "$LAST")"
+  [ "$(jq -r --arg b "$b2" '.commit_pulls[$b]' "$LAST")" = null ] || fail "$m: the altered commit was attributed"
+  [ "$(u log -1 --format='%an %ae %aI %B' "$b2")" = "$(u log -1 --format='%an %ae %aI %B' "$p2")" ] \
+    || fail "$m: the case does not copy the metadata, so it proves nothing"
+done
+ok 'a landing commit with copied metadata but altered, extra or dropped content is attributed to nothing'
+scenario reorder; publish "$(pulls)"; keeps_diff "a reordered replay" "changes other content than"
+ok 'a replay of the right commits in the wrong order keeps the diff'
+scenario empty; publish "$(pulls)"; keeps_diff "a landing with an empty commit" "has no patch-id"
+ok 'a landing containing a commit with no patch-id (an empty commit) keeps the diff'
 
 # 5. A commit after the last landing belongs to no pull request.
 scenario tail; publish "$(pulls)"; keeps_diff "a commit after the last landing"

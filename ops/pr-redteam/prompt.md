@@ -80,8 +80,9 @@ The review directory (its path is given below) contains:
                      exact head (`commit_pulls`, `approved_pulls`). A pull request the merge queue replayed onto the branch
                      lands as new commits; those count as its commits only when the forge records the
                      landing (`merge_commit_sha`) and the landing is exactly the pull request's commits
-                     replayed: the same number, in order, with the same authors, author dates and
-                     messages, and nothing else between it and the previous landing (`landing_pulls`
+                     replayed: the same number, in order, each with the same content as the commit it
+                     replays (`git patch-id --stable`) and the same author, author date and message,
+                     and nothing else between it and the previous landing (`landing_pulls`
                      says which landings were attributed and why any was not). That code went through those pull requests: its `diff.patch` is
                      not fetched (`diffstat.txt` lists the files that moved), you do not re-review it
                      or hold the pin over its design, and you still review this PR's own diff and the

@@ -204,12 +204,17 @@ squash or merge commit, is in no such range and keeps the diff. `pin.json` `comm
 A merge queue replays an approved head onto the branch tip, so what lands are new commits, not the
 head that was approved. Such a landing counts for its pull request when the forge records it as the
 pull request's `merge_commit_sha` (read from the GitHub-shaped closed listing, `GET
-/api/v3/repos/<owner>/<repo>/pulls?state=closed`, because the native listing does not carry it), and
+/api/v3/repos/<owner>/<repo>/pulls?state=closed`, because the native listing does not carry it; it is
+read until an empty page, up to `REDTEAM_UPSTREAM_MAX_PULL_PAGES`, and a cap reached is noted), and
 the landing lines up exactly. The landing is the run of first-parent, single-parent commits after the
 previous landing commit (or the old pin) up to the recorded one. It must have as many commits as the
-pull request's own review diff, carrying the same author, author date and message in the same order.
-A direct push between two landings lengthens the run, and a squash shortens it. A reworded replay, a
-merge commit, a landing that began before the old pin, a missing `merge_commit_sha`, an unreadable
+pull request's own review diff, and each commit must carry the same content as the pull request
+commit it replays, one to one and in order: the same `git patch-id --stable`, which hashes the change
+with its context, so a replay that had to resolve anything does not match. The author, author date and
+message must match as well, but metadata alone proves nothing, since anybody can copy it. A direct
+push between two landings lengthens the run, and a squash shortens it. Altered, extra or dropped
+content under copied metadata, a reordered replay, a commit with no patch-id (an empty one), a
+reworded replay, a merge commit, a landing that began before the old pin, a missing `merge_commit_sha`, an unreadable
 listing and anything after the last landing commit all keep the diff. `pin.json` `landing_pulls`
 records each landing considered and why any was not attributed (`test/queue-landing.sh`). That code went through those pull requests,
 so the reviewer does not read it again or hold the pin over its design (jain-deploy#107 held three
