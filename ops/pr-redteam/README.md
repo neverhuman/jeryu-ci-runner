@@ -202,25 +202,27 @@ squash or merge commit, is in no such range and keeps the diff. `pin.json` `comm
 `approved_pulls` record the attribution; the SUMMARY row says the diff was not fetched.
 
 A merge queue replays an approved head onto the branch tip, so what lands are new commits, not the
-head that was approved. Such a landing counts for its pull request when the forge records it as the
-pull request's `merge_commit_sha` (read from the GitHub-shaped closed listing, `GET
-/api/v3/repos/<owner>/<repo>/pulls?state=closed`, because the native listing does not carry it; it is
-read until an empty page, up to `REDTEAM_UPSTREAM_MAX_PULL_PAGES`, and a cap reached is noted), and
-the landing lines up exactly. The landing is the run of first-parent, single-parent commits after the
-previous landing commit (or the old pin) up to the recorded one. It must have as many commits as the
-pull request's own review diff, and each commit must carry the same content as the pull request
-commit it replays, one to one and in order: the same `git patch-id --stable`, which hashes the change
-with its context. Where only context moved under the replay (which changes a patch-id), the commit
-still matches when a clean three-way replay of the pull request commit onto the landing commit's
-parent (`git merge-tree --write-tree --merge-base=C^ L^ C`, git 2.40 or later) writes exactly the
-landed tree; a conflict, any git failure, or a root or merge commit fails closed, and `landing_pulls`
-`methods` records `patch_id` or `replay_tree` per commit. The author, author date and
-message must match as well, but metadata alone proves nothing, since anybody can copy it. A direct
-push between two landings lengthens the run, and a squash shortens it. Altered, extra or dropped
-content under copied metadata, a reordered replay, a commit with no patch-id (an empty one), a
-reworded replay, a merge commit, a landing that began before the old pin, a missing `merge_commit_sha`, an unreadable
-listing and anything after the last landing commit all keep the diff. `pin.json` `landing_pulls`
-records each landing considered and why any was not attributed (`test/queue-landing.sh`). That code went through those pull requests,
+head that was approved. Such a landing counts for its pull request only when it is that pull
+request's commits replayed with **exactly** the reviewed content. When some commits of a pin are
+still unattributed after the rule above, the GitHub-shaped closed listing (`GET
+/api/v3/repos/<owner>/<repo>/pulls?state=closed`) is read for that pin, because only it carries
+`merge_commit_sha`, the commit where the forge says each landing ends. It is read newest first until
+an empty page, up to `REDTEAM_UPSTREAM_MAX_PULL_PAGES`; a cap reached before every unattributed
+landing was found is noted. The landing is the run of first-parent commits after the previous
+landing end (a landing commit, a commit attributed above, or the old pin) up to the recorded one. It
+must have as many commits as the pull request's own review diff. For each pair in order, landing
+commit L and the pull request commit C it replays, a clean three-way replay of C onto L's parent
+(`git merge-tree --write-tree --merge-base=C^ L^ C`, git 2.40 or later) must write a tree **identical**
+to L's: the same tree id, so every file byte for byte, whitespace included. Context that moved under
+the replay is tolerated because the merge places it, not a textual patch; anything else on L is not.
+Neither commit may be empty, a root or a merge; a conflict or any git failure fails closed. The
+author, author date and message must match as well, but metadata alone proves nothing, since anybody
+can copy it. A direct push between two landings lengthens the run and a squash shortens it. Altered,
+re-indented, extra or dropped content under copied metadata, a reordered replay, an empty commit, a
+reworded replay, a merge commit, a conflicting replay, a landing that began before the old pin, a
+missing `merge_commit_sha`, an unreadable listing and anything after the last landing end all keep
+the diff. `pin.json` `landing_pulls` records each landing considered, the method per commit
+(`replay_tree`) and why any was not attributed (`test/queue-landing.sh`). That code went through those pull requests,
 so the reviewer does not read it again or hold the pin over its design (jain-deploy#107 held three
 times doing so). `pin.json` records `already_reviewed_upstream` and whether `diff.fetched`. Any
 other pin keeps its diff.

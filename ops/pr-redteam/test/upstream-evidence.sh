@@ -12,7 +12,7 @@ trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_manifest_pins upstream_url_map upstream_pins upstream_tag upstream_remote upstream_git \
-    upstream_capped upstream_drop_refs upstream_pull_approved upstream_patch_id upstream_replay_tree upstream_pin_evidence upstream_evidence; do
+    upstream_capped upstream_drop_refs upstream_pull_approved upstream_replay_tree upstream_pin_evidence upstream_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done

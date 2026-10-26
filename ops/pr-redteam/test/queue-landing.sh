@@ -16,7 +16,7 @@ trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_manifest_pins upstream_url_map upstream_pins upstream_tag upstream_remote upstream_git \
-    upstream_capped upstream_drop_refs upstream_pull_approved upstream_patch_id upstream_replay_tree upstream_pin_evidence upstream_evidence; do
+    upstream_capped upstream_drop_refs upstream_pull_approved upstream_replay_tree upstream_pin_evidence upstream_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done
@@ -88,6 +88,8 @@ same_meta() { # how: alter|extra|drop
     alter) echo "something else" >"$W/two-b.txt" ;;
     extra) echo "an unreviewed hunk" >"$W/smuggled.txt" ;;
     drop) rm "$W/two-b-also.txt" ;;
+    indent) sed -i 's/^/    /' "$W/two-b.txt" ;;
+    misplace) git -C "$W" show HEAD~1:rep.txt >"$W/rep.txt"; sed -i '11a X' "$W/rep.txt" ;;
   esac
   u add -A; u commit -q --amend --no-edit; u rev-parse HEAD
 }
@@ -118,11 +120,18 @@ scenario() { # name [extra steps between landings: push|squash|edit|tail]
   # shift: #1 changes line 3 of shared.txt and #2's last commit line 5, so #2's replay is clean but its
   # context moved (its patch-id differs). conflict: both change line 5.
   u checkout -qb pr1
-  case "$mode" in shift*) sed -i 's/^3$/three (#1)/' "$W/shared.txt" ;; conflict) sed -i 's/^5$/five (#1)/' "$W/shared.txt" ;; esac
+  case "$mode" in shift*) sed -i 's/^3$/three (#1)/' "$W/shared.txt" ;; conflict) sed -i 's/^5$/five (#1)/' "$W/shared.txt" ;;
+    lineshift) sed -i '1i top-1\ntop-2\ntop-3\ntop-4\ntop-5\ntop-6' "$W/shared.txt" ;; esac
   h1="$(commit one)"
-  u checkout -qb pr2 "$w0"; commit two-a >/dev/null
+  u checkout -qb pr2 "$w0"
+  # misplace: two-a adds two identical blocks and two-b inserts a line into the first, so a hunk
+  # placed in the second block has the very same text and context, only other line numbers.
+  [ "$mode" != misplace ] || { printf '%s\n' a b c d e f g a b c d e f g >"$W/rep.txt"; }
+  # lineshift: #1 adds lines at the top of shared.txt, which moves #2's hunk without touching its context.
+  commit two-a >/dev/null
+  [ "$mode" != misplace ] || sed -i '4a X' "$W/rep.txt"
   [ "$mode" != empty ] || u commit -q --allow-empty -m "two-empty"
-  case "$mode" in shift*|conflict) sed -i 's/^5$/five (#2)/' "$W/shared.txt" ;; esac
+  case "$mode" in shift*|conflict) sed -i 's/^5$/five (#2)/' "$W/shared.txt" ;; lineshift) sed -i 's/^9$/nine (#2)/' "$W/shared.txt" ;; esac
   echo also >"$W/two-b-also.txt"; p2="$(commit two-b)"
   u checkout -q main; u merge -q --ff-only pr1
   [ "$mode" != push ] || direct="$(commit direct-push other)"
@@ -140,7 +149,7 @@ scenario() { # name [extra steps between landings: push|squash|edit|tail]
   else
     b2="$(replay "$p2" "$( [ "$mode" != reorder ] || echo reverse)")"; a2="$(u rev-parse "$b2~1")"
     if [ "$mode" = edit ]; then u commit -q --amend -m "two-b, reworded"; b2="$(u rev-parse HEAD)"; fi
-    case "$mode" in alter|extra|drop) b2="$(same_meta "$mode")" ;; shift-alter|shift-extra) b2="$(same_meta "${mode#shift-}")" ;; esac
+    case "$mode" in alter|extra|drop|indent|misplace) b2="$(same_meta "$mode")" ;; shift-alter|shift-extra) b2="$(same_meta "${mode#shift-}")" ;; esac
   fi
   u checkout -qb pr3 "$b2"; p3="$(commit three)"
   # #3 was written on #2's landing, then main moved on with nothing else, so the queue replays it as is
@@ -165,6 +174,8 @@ o="$(evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"; dir="$(dirname "$p")"
   && [ ! -e "$dir/diff.patch" ] || fail "a range landed through the queue is not already reviewed: $(cat "$p")"
 [ "$(jq -c --arg h1 "$h1" --arg a2 "$a2" --arg b2 "$b2" --arg x3 "$x3" '[.commit_pulls[$h1], .commit_pulls[$a2], .commit_pulls[$b2], .commit_pulls[$x3]]' "$p")" = '[1,2,2,3]' ] \
   || fail "commit_pulls: $(jq -c .commit_pulls "$p")"
+jq -e '[.landing_pulls[] | select(.kind == "replay") | .methods[]] | . == ["replay_tree", "replay_tree", "replay_tree"]' "$p" >/dev/null \
+  || fail "every replayed commit is attributed by its exact replayed tree: $(jq -c .landing_pulls "$p")"
 jq -e --arg a2 "$a2" --arg b2 "$b2" '.landing_pulls | map(select(.kind == "replay" and .attributed)) | map(.number) == [2, 3]
   and (map(select(.number == 2))[0].landing_commits == [$a2, $b2])' "$p" >/dev/null || fail "landing_pulls: $(jq -c .landing_pulls "$p")"
 [ "$(jq -c '[.approved_pulls[].number] | sort' "$p")" = '[1,2,3]' ] || fail "approved_pulls: $(jq -c .approved_pulls "$p")"
@@ -183,6 +194,15 @@ keeps_diff() { # label reason-needle
   LAST="$p"
 }
 
+# 1a. A pin whose every commit is attributed through its own pull request's review diff reads no
+# landing listing at all.
+upstream onlyheads; u checkout -qb pr1; h1="$(commit one)"; u checkout -q main; u merge -q --ff-only pr1; tip="$h1"
+publish "$(jq -nc --arg h1 "$h1" --arg w0 "$w0" '[{number: 1, head: $h1, base: $w0, merge: $h1, approved_head: $h1}]')"
+o="$(evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"
+[ "$(arr "$p" .already_reviewed_upstream)" = true ] && ! grep -q 'pulls?state=closed' "$t/api.log" \
+  || fail "a pin attributed by review diffs alone read the landing listing: $(cat "$t/api.log")"
+ok 'a pin whose commits are all in approved review diffs does not read the landing listing'
+
 # 1b. A forge that clamps per_page returns short pages: the listing is read to its empty page, so
 # every landing is still found; a page cap reached on a page with rows is noted, and keeps the diff.
 scenario clamp; publish "$(pulls)"; touch "$t/v3-clamp"
@@ -190,7 +210,7 @@ o="$(evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"
 [ "$(arr "$p" .already_reviewed_upstream)" = true ] && [ "$(grep -c 'pulls?state=closed' "$t/api.log")" = 4 ] \
   || fail "short pages ended the landing listing: $(grep closed "$t/api.log"; jq -c .landing_pulls "$p")"
 upstream_max_pull_pages=1 keeps_diff "a landing listing cut by the page cap"
-grep -q 'only the newest 1 pages of closed pull requests were searched' "$(dirname "$LAST")/note.txt" || fail "the cap is not noted"
+grep -q 'read to the 1-page cap before every unattributed landing was found' "$(dirname "$LAST")/note.txt" || fail "the cap is not noted"
 rm "$t/v3-clamp"
 ok 'a clamped landing listing is read to its empty page; hitting the page cap is noted and keeps the diff'
 
@@ -212,30 +232,48 @@ ok 'a replay that is not the approved commits (here, a reworded message) keeps t
 # replay, all keep the diff.
 for m in alter extra drop; do
   scenario "$m"; publish "$(pulls)"
-  keeps_diff "a landing with the same metadata but $m content" "changes other content than"
-  jq -e '.landing_pulls | any(.number == 2 and .attributed == false and (.reason | test("patch-id differs")))' "$LAST" >/dev/null \
-    || fail "$m: not caught by patch-id: $(jq -c .landing_pulls "$LAST")"
+  keeps_diff "a landing with the same metadata but $m content" "the landed tree differs from the replayed one"
   [ "$(jq -r --arg b "$b2" '.commit_pulls[$b]' "$LAST")" = null ] || fail "$m: the altered commit was attributed"
   [ "$(u log -1 --format='%an %ae %aI %B' "$b2")" = "$(u log -1 --format='%an %ae %aI %B' "$p2")" ] \
     || fail "$m: the case does not copy the metadata, so it proves nothing"
 done
 ok 'a landing commit with copied metadata but altered, extra or dropped content is attributed to nothing'
-scenario reorder; publish "$(pulls)"; keeps_diff "a reordered replay" "changes other content than"
+scenario reorder; publish "$(pulls)"; keeps_diff "a reordered replay" "is not exactly"
 ok 'a replay of the right commits in the wrong order keeps the diff'
-scenario empty; publish "$(pulls)"; keeps_diff "a landing with an empty commit" "has no patch-id"
-ok 'a landing containing a commit with no patch-id (an empty commit) keeps the diff'
+scenario empty; publish "$(pulls)"; keeps_diff "a landing with an empty commit" "an empty commit (it changes nothing)"
+ok 'a landing containing an empty commit keeps the diff'
+
+# 4b'. Whitespace is content: a landing whose only difference is indentation, under copied
+# metadata, is not attributed (git patch-id, which strips whitespace, would call them equal).
+scenario indent; publish "$(pulls)"
+[ "$(u diff-tree -p "$b2" | git patch-id --stable | cut -d' ' -f1)" = "$(u diff-tree -p "$p2" | git patch-id --stable | cut -d' ' -f1)" ] \
+  || fail "the indentation case does not fool patch-id, so it proves nothing"
+keeps_diff "an indentation-only change under copied metadata" "the landed tree differs from the replayed one"
+ok 'an indentation-only change under copied metadata is not attributed'
+# The same hunk text placed at other line numbers (here, into an identical second block) is other
+# content; a hunk moved only because lines were added above it is the same content.
+scenario misplace; publish "$(pulls)"
+[ "$(u diff-tree -p "$b2" | git patch-id --stable | cut -d' ' -f1)" = "$(u diff-tree -p "$p2" | git patch-id --stable | cut -d' ' -f1)" ] \
+  || fail "the misplaced-hunk case does not fool patch-id, so it proves nothing"
+keeps_diff "identical hunk text at other line numbers" "the landed tree differs from the replayed one"
+scenario lineshift; publish "$(pulls)"
+o="$(evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"
+[ "$(arr "$p" .already_reviewed_upstream)" = true ] \
+  && [ "$(jq -c '.landing_pulls | map(select(.number == 2))[0].methods' "$p")" = '["replay_tree","replay_tree"]' ] \
+  || fail "a hunk moved by lines added above it: $(jq -c .landing_pulls "$p")"
+ok 'a hunk at other line numbers is attributed only when the replayed tree is exact'
 
 # 4c. A replay whose context moved: the patch-id differs, but a three-way replay of the reviewed
 # commit onto the landing's parent writes exactly the landed tree, so it is attributed (replay_tree).
 scenario shift; publish "$(pulls)"
 o="$(evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"
 [ "$(arr "$p" .already_reviewed_upstream)" = true ] \
-  && [ "$(jq -c '.landing_pulls | map(select(.number == 2))[0].methods' "$p")" = '["patch_id","replay_tree"]' ] \
-  && [ "$(jq -c '.landing_pulls | map(select(.number == 3))[0].methods' "$p")" = '["patch_id"]' ] \
+  && [ "$(jq -c '.landing_pulls | map(select(.number == 2))[0].methods' "$p")" = '["replay_tree","replay_tree"]' ] \
+  && [ "$(jq -c '.landing_pulls | map(select(.number == 3))[0].methods' "$p")" = '["replay_tree"]' ] \
   || fail "a shifted-context replay: $(jq -c .landing_pulls "$p")"
 [ "$(u diff "$p2~1" "$p2" | git patch-id --stable | cut -d' ' -f1)" != "$(u diff "$b2~1" "$b2" | git patch-id --stable | cut -d' ' -f1)" ] \
-  || fail "the shifted case does not change the patch-id, so it proves nothing"
-ok 'a replay whose context moved is attributed by its replayed tree; the method is recorded per commit'
+  || fail "the shifted case does not move the context, so it proves nothing"
+ok 'a replay whose context moved is attributed by its exact replayed tree; the method is recorded per commit'
 # Altered content under copied metadata, on a shifted replay too: neither method attributes it.
 for m in alter extra; do
   scenario "shift-$m"; publish "$(pulls)"
@@ -243,7 +281,7 @@ for m in alter extra; do
   [ "$(u log -1 --format='%an %ae %aI %B' "$b2")" = "$(u log -1 --format='%an %ae %aI %B' "$p2")" ] \
     || fail "shift-$m: the case does not copy the metadata, so it proves nothing"
 done
-ok 'altered or extra content under copied metadata is attributed by neither patch-id nor replayed tree'
+ok 'altered or extra content under copied metadata on a shifted replay is not attributed'
 scenario conflict; publish "$(pulls)"; keeps_diff "a conflicting replay" "the replay conflicts"
 ok 'a replay that conflicts (here, resolved by hand) keeps the diff'
 # A git without `merge-tree --write-tree --merge-base` (before 2.40) answers 129: that fails closed.
