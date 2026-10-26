@@ -2047,9 +2047,14 @@ review_one() { # owner/name number dry-run force include-drafts
   fi
   # Computed before admission replaces this head's receipt; the count leaves this head out anyway.
   # An operator's --force reviews a capped head with the agent.
-  local cap_reason=""
+  local cap_reason="" cap_posted_before=0
   if [ "$origin" != contributed ] && [ "$force" != 1 ]; then
     cap_reason="$(hold_cap_reason "$repo" "$number" "$sha")"
+    # A blocking review already posted on this exact head (under any review identity) still stands:
+    # a model or prompt change re-admits the head, but must not post a second identical review.
+    if [ -n "$cap_reason" ] && jq -e --arg sha "$sha" '.head_sha == $sha and .decision == "capped" and .posted == true'         "$(receipt_path "$repo" "$number" "$sha")" >/dev/null 2>&1; then
+      cap_posted_before=1
+    fi
   fi
 
   local started_at receipt history work check_publish=0
@@ -2324,13 +2329,26 @@ review_one() { # owner/name number dry-run force include-drafts
   # until a rearm; a post that failed is retried on the next pass.
   if [ -n "$cap_reason" ] && [ "$decision" = approve ]; then
     if [ "$dry" = 1 ]; then say "$tag: DRY RUN capped — $cap_reason (would post a blocking review)"; return 0; fi
-    local holds cap_body cap_posted=false cap_code=""
+    # The same guard as every other publication: inputs that changed while this attempt ran
+    # publish nothing.
+    if [[ "$(review_input_identity)" != "$review_identity" ]]; then
+      say "$tag: review inputs changed during execution; no review published; requalification required"
+      return 0
+    fi
+    local holds cap_body cap_posted=false cap_code="" cap_new=1
     holds="$(agent_hold_count "$repo" "$number" "$sha")"
-    cap_body="$(capped_body "$repo" "$number" "$sha" "$holds")"
-    api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/reviews" "$(jq -n --arg sha "$sha" --arg b "$cap_body" \
-      '{verdict: "request_changes", expected_head_sha: $sha, body_markdown: $b, thread_comments: []}')"
-    cap_code="$code"
-    if [[ "$code" == 2* ]]; then
+    if [ "$cap_posted_before" = 1 ]; then
+      cap_posted=true cap_code=reused cap_new=0
+      say "$tag: capped at ${sha:0:12} — $cap_reason; its blocking review is already posted"
+    else
+      cap_body="$(capped_body "$repo" "$number" "$sha" "$holds")"
+      api POST "/api/v1/repos/${repo/\//%2F}/pulls/$number/reviews" "$(jq -n --arg sha "$sha" --arg b "$cap_body" \
+        '{verdict: "request_changes", expected_head_sha: $sha, body_markdown: $b, thread_comments: []}')"
+      cap_code="$code"
+    fi
+    if [ "$cap_new" = 0 ]; then
+      :
+    elif [[ "$cap_code" == 2* ]]; then
       cap_posted=true
       say "$tag: capped at ${sha:0:12} — $cap_reason; posted a blocking review"
     else
@@ -2343,7 +2361,7 @@ review_one() { # owner/name number dry-run force include-drafts
       '{repo:$repo, number:$number, head_sha:$sha, base_sha:$base, diff_base_sha:$diff_base,
         decision:"capped", posted:$posted, post_http:$code, holds:$holds, reason:$reason, origin:$origin,
         reviewed_at:$at, reviewer_login:$reviewer, review_identity:$identity}' | store_receipt "$receipt"
-    [ "$cap_posted" = true ] && report_hold_cap_skip "$repo" "$number" "$sha" "$holds"
+    [ "$cap_posted" = true ] && [ "$cap_new" = 1 ] && report_hold_cap_skip "$repo" "$number" "$sha" "$holds"
     return 0
   fi
   # The footer says where this PR stands: which agent hold this is out of the cap. This head's own

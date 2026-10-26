@@ -113,6 +113,12 @@ fully re-reviewed, and often held again. After `REDTEAM_HOLD_CAP` agent holds on
   merged: the forge lets only the reviewer that requested changes clear them, so a person's
   approval alone cannot land a head the agent never reviewed, whatever the branch protection.
   If posting the review fails, the next pass posts it again.
+  A review-identity change (a model, prompt or limit change) does not post it twice: the review
+  already posted on that exact head stands, and only the receipt is renewed.
+- The cap trades the agent's spend, not coverage: a capped head can land only after a rearm and
+  an agent approval of that head, so two cheap holds buy the author a wait for a person, never an
+  unreviewed merge. A capped head files no held-fix todo (`REDTEAM_FIX_TODO`): it is parked for a
+  person, and an agent fix would be one more push the agent does not review.
 - The review footer says where a PR stands (`hold 1 of 2`, then `hold 2 of 2: this PR is now left
   for a person`).
 - `./pr-redteam rearm owner/name N` lets the agent review the next head and starts the count again;

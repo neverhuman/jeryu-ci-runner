@@ -177,12 +177,22 @@ grep -qF 'skip acme/widget-shop#7 — held 2 times; a person decides' "$t/log" |
   || fails 'a second pass on a capped head did more work'
 "$here/pr-redteam" poke >> "$t/log" 2>&1; "$here/pr-redteam" poke >> "$t/log" 2>&1
 [[ "$(starts)" == 1 ]] || fails 'poke loops on a capped head'
+# A review-identity change (here a review limit) re-admits the capped head, but its blocking review
+# still stands: no second review, no second event, no agent; the receipt takes the new identity.
+old_identity="$(jq -r .review_identity "$(receipt)")"
+REDTEAM_MAX_BLOB_BYTES=101 pass
+[[ "$(count "$t/model-calls")" == "$calls" && "$(count "$t/posts")" == "$((posts + 1))" \
+   && "$(jq -s 'map(select(.kind == "pr.skipped")) | length' "$t/events")" == 1 ]] \
+  || fails 'an identity change posted a second capped review'
+jq -e --arg old "$old_identity" '.decision == "capped" and .posted == true and .post_http == "reused"
+    and .review_identity != $old' "$(receipt)" >/dev/null || fails "identity-change capped receipt: $(cat "$(receipt)")"
+grep -qF 'its blocking review is already posted' "$t/log" || fails 'reuse of the capped review not logged'
 # A capped head is never landed: there is no approval to merge.
 REDTEAM_MERGE_TOKEN_FILE="$t/token" "$here/pr-redteam" _merge > "$t/merge.log" 2>&1
 cat "$t/merge.log" >> "$t/log"
 ! grep -q 'merge pass skipped' "$t/merge.log" || fails 'the merge pass did not run'
 ! grep -q '/merge\|/queue' "$t/requests" || fails 'the merge pass touched a capped head'
-echo 'ok a clean capped head gets no agent review, one blocking review, a final capped receipt, one timeline event, and no merge'
+echo 'ok a clean capped head gets no agent review, one blocking review (kept across a review-identity change), a final capped receipt, one timeline event, and no merge'
 
 # A capped head whose blocking review could not be posted is not final: the next pass posts it.
 advance
