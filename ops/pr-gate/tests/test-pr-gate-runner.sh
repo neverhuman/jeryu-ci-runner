@@ -1398,6 +1398,16 @@ invoke
 expect_count "$((before_count + 3))"
 grep -q "hold acme/fixture@$head: inputs changed after two automatic re-runs" "$fixture/runner.log" \
   || { printf 'a thrice-drifted head was not held\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+# The escape: a forge re-gate request for the held head starts a new chain on a scheduled tick.
+jq -nc --arg s "$head" '{requests:[{repo:"acme/fixture",number:1,head_sha:$s,requested_at:"2026-10-26T09:00:00Z",requested_by:"dana"}]}' \
+  >"$fixture/regate.json"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 4))"
+jq -e '.outcome == "inputs_changed" and .inputs_changed_count == 1' "$receipt" >/dev/null \
+  || { printf 'a re-gate request did not start a new chain for a held head\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/regate.json"
+before_count=$((before_count + 1))
 # A re-run is a re-gate like any other: a merge burst defers it rather than racing it.
 cp "$receipt" "$fixture/held-result.json"
 jq '.inputs_changed_count = 1' "$fixture/held-result.json" >"$receipt"
@@ -1413,7 +1423,7 @@ invoke
 [[ "$runner_exit" == 0 ]] || { printf 'a truncated last-result.json killed the tick\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 expect_count "$((before_count + 4))"
 jq -e '.inputs_changed_count == 1' "$receipt" >/dev/null
-printf 'PASS passing input drift is neutral, re-runs first on the next two ticks (one recipe per tick, coalesced with a merge burst), then holds; a truncated receipt never kills a tick\n'
+printf 'PASS passing input drift is neutral, re-runs first on the next two ticks (one recipe per tick, coalesced with a merge burst), then holds until a forge re-gate request; a truncated receipt never kills a tick\n'
 
 # Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.
 rm -f "$fixture/mutate-tool"
