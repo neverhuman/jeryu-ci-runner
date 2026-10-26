@@ -77,7 +77,12 @@ The review directory (its path is given below) contains:
                      forward on a branch the forge reports protected, whose commit list and pull
                      requests and log were read whole, with every commit of the range in the diff of a
                      pull request merged into that branch that this reviewer identity approved at its
-                     exact head (`commit_pulls`, `approved_pulls`). That code went through those pull requests: its `diff.patch` is
+                     exact head (`commit_pulls`, `approved_pulls`). A pull request the merge queue replayed onto the branch
+                     lands as new commits; those count as its commits only when the forge records the
+                     landing (`merge_commit_sha`) and the landing is exactly the pull request's commits
+                     replayed: the same number, in order, with the same authors, author dates and
+                     messages, and nothing else between it and the previous landing (`landing_pulls`
+                     says which landings were attributed and why any was not). That code went through those pull requests: its `diff.patch` is
                      not fetched (`diffstat.txt` lists the files that moved), you do not re-review it
                      or hold the pin over its design, and you still review this PR's own diff and the
                      pin's verification and report truncation notes. Every other pin has its diff.

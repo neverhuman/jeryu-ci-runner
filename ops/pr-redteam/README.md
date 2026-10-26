@@ -199,7 +199,19 @@ request merged into that branch that this same reviewer identity approved (effec
 that pull request's exact head -- its commits taken as the review diff takes them,
 `rev-list head ^merge-base(base_sha, head)`. A commit pushed straight to the branch, or landed by a
 squash or merge commit, is in no such range and keeps the diff. `pin.json` `commit_pulls` and
-`approved_pulls` record the attribution; the SUMMARY row says the diff was not fetched. That code went through those pull requests,
+`approved_pulls` record the attribution; the SUMMARY row says the diff was not fetched.
+
+A merge queue replays an approved head onto the branch tip, so what lands are new commits, not the
+head that was approved. Such a landing counts for its pull request when the forge records it as the
+pull request's `merge_commit_sha` (read from the GitHub-shaped closed listing, `GET
+/api/v3/repos/<owner>/<repo>/pulls?state=closed`, because the native listing does not carry it), and
+the landing lines up exactly. The landing is the run of first-parent, single-parent commits after the
+previous landing commit (or the old pin) up to the recorded one. It must have as many commits as the
+pull request's own review diff, carrying the same author, author date and message in the same order.
+A direct push between two landings lengthens the run, and a squash shortens it. A reworded replay, a
+merge commit, a landing that began before the old pin, a missing `merge_commit_sha`, an unreadable
+listing and anything after the last landing commit all keep the diff. `pin.json` `landing_pulls`
+records each landing considered and why any was not attributed (`test/queue-landing.sh`). That code went through those pull requests,
 so the reviewer does not read it again or hold the pin over its design (jain-deploy#107 held three
 times doing so). `pin.json` records `already_reviewed_upstream` and whether `diff.fetched`. Any
 other pin keeps its diff.

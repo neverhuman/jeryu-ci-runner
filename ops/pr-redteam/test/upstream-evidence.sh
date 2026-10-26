@@ -12,7 +12,7 @@ trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_manifest_pins upstream_url_map upstream_pins upstream_tag upstream_remote upstream_git \
-    upstream_capped upstream_drop_refs upstream_pin_evidence upstream_evidence; do
+    upstream_capped upstream_drop_refs upstream_pull_approved upstream_pin_evidence upstream_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done
@@ -69,6 +69,13 @@ api() {
         (.items[] | select(.number == $n) | .head_sha) as $h
         | {summary: {author: "dev"}, reviews: [{author: $a, state: $s, head_sha: $h, effective: true, stale: false,
             body_markdown: "**Red team: approved.**", id: "r1", submitted_at: "2026-10-24T00:00:00Z"}]}' <<<"$stub_pulls")" ;;
+    # The GitHub-shaped closed listing, which carries each landing's merge_commit_sha: these stubs
+    # land every merged pull request at its own head (test/queue-landing.sh covers replays).
+    /api/v3/repos/acme/core/pulls\?state=closed\&per_page=100\&page=[0-9]*|/api/v3/repos/acme/big/pulls\?state=closed\&per_page=100\&page=[0-9]*)
+      body="$(jq -c '[.items[] | select(.state == "merged")
+        | {number, title, merged_at: "2026-10-24T00:00:00Z", merge_commit_sha: .head_sha,
+           head: {ref: .head_ref, sha: .head_sha}, base: {ref: .base_ref, sha: (.base_sha // null)}}]' <<<"$stub_pulls")"
+      [ "${2##*page=}" = 1 ] || body='[]' ;;
     # A repository the forge does not have: the one read a lock entry makes before fetching anything.
     /api/v1/repos/acme%2Fghost) code=404; body='{"error":{"code":"not_found"}}' ;;
     *) echo "$2" >>"$t/api.unexpected"; code=404; body='{"error":{"code":"not_found"}}' ;;
