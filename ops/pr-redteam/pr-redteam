@@ -204,7 +204,7 @@ mkdir -p "$state"/{receipts,cache,locks,work}
 # sees or how its verdict becomes a decision: the diff, description, signals or other context handed
 # to the agent; the mechanical holds (unpinned blobs, diff size, author domains, the quality gate);
 # the mapping from verdict to approve/hold; or the rendering of the posted review.
-review_format=6
+review_format=7
 
 # A receipt counts as "already reviewed" only for the same review inputs: the review format above,
 # the prompt, the verdict schema and validator, the exact CLI bytes, the model, the CLI pin and the
@@ -1270,11 +1270,13 @@ upstream_pin_evidence() { # cache-root review-dir owner/name old new named-branc
     page=$((page + 1))
   done
   if [ "$has_more" = true ]; then pulls_cut=true; notes+=("pulls.json read only the newest $upstream_max_pull_pages pages of pull requests; older ones were not searched"); fi
+  # How many listed commits no row of pulls.json accounts for. Counted again, with its note, once
+  # the attribution below has added the landings it used (see "the evidence the attribution used").
   unmatched="$(jq -r --argjson p "$matched" '[.[] | select(. as $s | $p | map(.head_sha, .merge_sha) | index($s) | not)] | length' <<<"${shas:-[]}")"
-  [ "$unmatched" = 0 ] || notes+=("$unmatched of the listed commits are no pull request's head or landing commit in pulls.json (a replayed landing's earlier commits are matched through pin.json landing_pulls)")
   printf '%s\n' "$matched" >"$dir/pulls.json"
   pulls_bytes="$(wc -c <"$dir/pulls.json")"
-  if [ "$pulls_bytes" -gt $((allow / 4)) ]; then
+  local pulls_cap=$((allow / 4))
+  if [ "$pulls_bytes" -gt "$pulls_cap" ]; then
     echo "[]" >"$dir/pulls.json"; pulls_bytes=3; pulls_cut=true
     notes+=("pulls.json was dropped: its matches are larger than a quarter of the upstream evidence budget")
   fi
@@ -1427,6 +1429,65 @@ upstream_pin_evidence() { # cache-root review-dir owner/name old new named-branc
     if $listing_capped && [ "$unattributed" != 0 ]; then
       notes+=("the closed pull requests were read to the $upstream_max_pull_pages-page cap before every unattributed landing was found: $unattributed commits stay unattributed")
     fi
+  fi
+  # The evidence the attribution used. pulls.json must carry every pull request that pin.json names
+  # (commit_pulls, approved_pulls, landing_pulls): its number, head sha, base ref, merged state,
+  # landing commit (merge_sha) and the head this reviewer's approval is on (approval_head). A landing
+  # comes from the closed listing, not the native one, so its row is added here (source
+  # "closed-listing"). If that cannot be written within its budget, or any named pull request is
+  # still missing from it, the attribution is withdrawn and the diff is fetched: a skipped diff is
+  # never justified by evidence the packet does not show.
+  if [ "$unattributed" != -1 ]; then
+    local shipped="" shipped_bytes named missing
+    shipped="$(jq -c --argjson land "$landings" --argjson tips "$(printf '%s\n' "${!tip_pull[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+        --argjson appr "$approved_pulls" --arg b "$checked" '
+      ([$land[] | select(.merge_sha as $m | $tips | index($m) != null)]) as $used
+      | (reduce $used[] as $r (.;
+          if any(.[]; .number == $r.number) then map(if .number == $r.number then .merge_sha = (.merge_sha // $r.merge_sha) else . end)
+          else . + [{number: $r.number, state: "merged", title: null, merged: true, head_ref: null, base_ref: $b,
+                     head_sha: $r.head_sha, base_sha: $r.base_sha, merge_sha: $r.merge_sha, source: "closed-listing"}] end))
+      | map(. as $r | . + {merged: ((.merged // false) != false or .state == "merged"),
+                           approval_head: ([$appr[] | select(.number == $r.number) | .head_sha] | first // null)})' "$dir/pulls.json" 2>/dev/null)" || shipped=""
+    named="$(jq -nc --argjson cp "$commit_pulls" --argjson ap "$approved_pulls" --argjson lp "$landing_pulls" '
+      [($cp | to_entries[] | .value | select(. != null)), ($ap[] | .number), ($lp[] | select(.attributed) | .number)] | unique' 2>/dev/null)" || named=""
+    if [ -z "$shipped" ] || [ -z "$named" ]; then
+      missing="the evidence could not be assembled"
+    else
+      missing="$(jq -r --argjson s "$shipped" --argjson cp "$commit_pulls" '
+        . as $named | [$named[] | . as $n | ($s | map(select(.number == $n)) | first) as $r
+          | if $r == null then "#\($n) is not in pulls.json"
+            elif ($r.head_sha // "") == "" or ($r.base_ref // "") == "" or ($r.merged // false) == false then "#\($n) lacks its head, base or merged state"
+            elif ($r.approval_head // "") != ($r.head_sha // "") then "#\($n) has no approval on its head in pulls.json"
+            else empty end] | join("; ")' <<<"$named" 2>/dev/null)" || missing="the evidence could not be checked"
+    fi
+    if [ -z "$missing" ]; then
+      printf '%s\n' "$shipped" >"$dir/pulls.json"
+      shipped_bytes="$(wc -c <"$dir/pulls.json")"
+      if [ "$shipped_bytes" -gt "$pulls_cap" ]; then
+        missing="pulls.json with the attributed pull requests is $shipped_bytes bytes, over its share of the upstream evidence budget"
+        printf '%s\n' "$matched" >"$dir/pulls.json"
+      else
+        up_left=$((up_left > shipped_bytes - pulls_bytes ? up_left - (shipped_bytes - pulls_bytes) : 0))
+        allow=$((allow > shipped_bytes - pulls_bytes ? allow - (shipped_bytes - pulls_bytes) : 0))
+        pulls_bytes="$shipped_bytes"
+      fi
+    fi
+    if [ -n "$missing" ]; then
+      # Withdrawn: pin.json keeps naming only pull requests pulls.json shows, so nothing in the
+      # packet asserts an attribution the packet cannot back.
+      local kept; kept="$(jq -c '[.[].number]' "$dir/pulls.json" 2>/dev/null)" || kept="[]"
+      commit_pulls="$(jq -c --argjson k "$kept" 'map_values(. as $v | if $v != null and ($k | index($v)) != null then $v else null end)' <<<"$commit_pulls" 2>/dev/null)" || commit_pulls="{}"
+      approved_pulls="$(jq -c --argjson k "$kept" 'map(select(.number as $n | $k | index($n) != null))' <<<"$approved_pulls" 2>/dev/null)" || approved_pulls="[]"
+      landing_pulls="$(jq -c --argjson k "$kept" 'map(select(.number as $n | $k | index($n) != null))' <<<"$landing_pulls" 2>/dev/null)" || landing_pulls="[]"
+      unattributed="$(jq '[.[] | select(. == null)] | length' <<<"$commit_pulls" 2>/dev/null)" || unattributed=0
+      notes+=("the attribution is withdrawn because its evidence is not in this packet ($missing): pin.json names only pull requests pulls.json shows, and the diff is fetched")
+      reviewed_upstream=false
+    fi
+    # The counter and its note now say what the attribution found, in terms of pulls.json.
+    unmatched="$unattributed"
+    [ "$unmatched" = 0 ] || notes+=("$unmatched of the range's commits are attributed to no pull request in pulls.json")
+  else
+    [ "$unmatched" = 0 ] || notes+=("$unmatched of the listed commits are no pull request's head in pulls.json")
   fi
   if $reviewed_upstream; then
     notes+=("already reviewed upstream: each of the $total commits from ${old_full:0:12} to ${new_full:0:12} was in the approved diff of a pull request merged into $checked, which the forge reports protected, or is an exact replay of one (pin.json commit_pulls, approved_pulls, landing_pulls); diff.patch was not fetched")

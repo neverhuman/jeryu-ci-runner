@@ -237,7 +237,16 @@ re-indented, extra or dropped content under copied metadata, a reordered replay,
 reworded replay, a merge commit, a conflicting replay, a landing that began before the old pin, a
 missing `merge_commit_sha`, an unreadable listing and anything after the last landing end all keep
 the diff. `pin.json` `landing_pulls` records each landing considered, the method per commit
-(`replay_tree`) and why any was not attributed (`test/queue-landing.sh`). That code went through those pull requests,
+(`replay_tree`) and why any was not attributed (`test/queue-landing.sh`).
+
+The packet shows what the attribution used. `pulls.json` carries every pull request that
+`commit_pulls`, `approved_pulls` or `landing_pulls` names, with its number, head sha, base ref, merged
+state, landing commit (`merge_sha`) and the head this reviewer's approval is on (`approval_head`); a
+landing read from the closed listing is marked `source: "closed-listing"`. `pulls.commits_without_pull`
+and note.txt count the range's commits attributed to no pull request in `pulls.json`. If that evidence
+cannot be written within its budget, or a named pull request is missing from it, the attribution is
+withdrawn: `already_reviewed_upstream` is false, the diff is fetched, and `pin.json` names only pull
+requests `pulls.json` shows. That code went through those pull requests,
 so the reviewer does not read it again or hold the pin over its design (jain-deploy#107 held three
 times doing so). `pin.json` records `already_reviewed_upstream` and whether `diff.fetched`. Any
 other pin keeps its diff.

@@ -85,7 +85,9 @@ The review directory (its path is given below) contains:
                      to the landed one (the same tree id: every byte, whitespace included; `methods`
                      says `replay_tree`), with the same author, author date and message,
                      and nothing else between it and the previous landing (`landing_pulls`
-                     says which landings were attributed and why any was not). That code went through those pull requests: its `diff.patch` is
+                     says which landings were attributed and why any was not; `pulls.json` carries
+                     every pull request these name, with `merge_sha` and `approval_head`, and a
+                     pull request named there but missing from `pulls.json` is unsupported). That code went through those pull requests: its `diff.patch` is
                      not fetched (`diffstat.txt` lists the files that moved), you do not re-review it
                      or hold the pin over its design, and you still review this PR's own diff and the
                      pin's verification and report truncation notes. Every other pin has its diff.

@@ -107,7 +107,7 @@ evidence() { # old new -> review dir (a dependent bumping acme/<name> from old t
   snap() { git -C "$D" add -A; git -C "$D" -c user.name=t -c user.email=t@t commit -q -m s; git -C "$D" rev-parse HEAD; }
   pin "$1"; b="$(snap)"; pin "$2"
   o="$(mktemp -d "$t/out-XXXXXX")"; : >"$t/api.log"
-  upstream_evidence "$D/.git" "$b" "$(snap)" "$o" acme 100000; echo "$o"
+  upstream_evidence "$D/.git" "$b" "$(snap)" "$o" acme "${budget:-100000}"; echo "$o"
 }
 pin_of() { echo "$1/upstream/acme@$NAME-${2:0:12}/pin.json"; }
 
@@ -193,6 +193,37 @@ keeps_diff() { # label reason-needle
     || fail "$1: reason '$2' not recorded: $(jq -c .landing_pulls "$p")"
   LAST="$p"
 }
+
+# 1-evidence. The packet shows what the attribution used (jeryu-deploy#498's shape: every commit is
+# a replayed landing, so no native listing row has any of them as its head). pulls.json carries each
+# named pull request with its head, base, merged state, landing commit and approval head, and the
+# counters and notes agree with commit_pulls.
+jq -e --arg h1 "$h1" --arg p2 "$p2" --arg b2 "$b2" --arg p3 "$p3" --arg x3 "$x3" '
+  (map({key: (.number | tostring), value: .}) | from_entries) as $r
+  | $r["1"].head_sha == $h1 and $r["1"].approval_head == $h1 and $r["1"].merged == true and $r["1"].base_ref == "main"
+  and $r["2"].head_sha == $p2 and $r["2"].merge_sha == $b2 and $r["2"].approval_head == $p2 and $r["2"].merged == true
+      and $r["2"].base_ref == "main" and $r["2"].source == "closed-listing"
+  and $r["3"].head_sha == $p3 and $r["3"].merge_sha == $x3 and $r["3"].approval_head == $p3' "$dir/pulls.json" >/dev/null \
+  || fail "pulls.json does not carry the attributed pull requests: $(cat "$dir/pulls.json")"
+jq -e --slurpfile pl "$dir/pulls.json" '([.commit_pulls[]] + [.approved_pulls[].number] + [.landing_pulls[] | select(.attributed) | .number] | unique)
+  - [$pl[0][].number] == [] and .pulls.commits_without_pull == 0' "$p" >/dev/null \
+  || fail "pin.json names pull requests pulls.json does not show, or its counter disagrees: $(jq -c .pulls "$p")"
+! grep -q 'attributed to no pull request\|no pull request.s head' "$dir/note.txt" || fail "note.txt contradicts the attribution: $(cat "$dir/note.txt")"
+ok 'pulls.json carries every pull request pin.json names, and the counters and notes agree with the attribution'
+
+# 1-withdrawn. When the evidence for the attributed pull requests cannot be shipped (here, pulls.json
+# with the landing rows is over its share of a small budget), the attribution is withdrawn: the diff
+# is fetched, and pin.json names no pull request pulls.json does not show.
+o="$(budget=2400 evidence "$w0" "$tip")"; p="$(pin_of "$o" "$tip")"; dir="$(dirname "$p")"
+[ "$(arr "$p" .already_reviewed_upstream)" = false ] && [ "$(arr "$p" .diff.fetched)" = true ] \
+  && grep -q 'the attribution is withdrawn because its evidence is not in this packet' "$dir/note.txt" \
+  || fail "evidence that does not fit did not withdraw the attribution: $(cat "$p")"
+jq -e --slurpfile pl "$dir/pulls.json" '([.commit_pulls[] | select(. != null)] + [.approved_pulls[].number] + [.landing_pulls[].number] | unique)
+  - [$pl[0][].number] == [] and .pulls.commits_without_pull == ([.commit_pulls[] | select(. == null)] | length)
+  and .pulls.commits_without_pull > 0' "$p" >/dev/null \
+  || fail "a withdrawn attribution still names pull requests pulls.json lacks: $(jq -c '{commit_pulls, pulls}' "$p"; cat "$dir/pulls.json")"
+grep -q "of the range's commits are attributed to no pull request in pulls.json" "$dir/note.txt" || fail "the withdrawn count is not noted"
+ok 'evidence that cannot be shipped withdraws the attribution; the diff is fetched and pin.json stays consistent with pulls.json'
 
 # 1a. A pin whose every commit is attributed through its own pull request's review diff reads no
 # landing listing at all.
