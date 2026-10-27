@@ -107,17 +107,26 @@ fully re-reviewed, and often held again. After `REDTEAM_HOLD_CAP` agent holds on
 (default 2, across its heads; `0` turns the cap off), its later heads get no agent review:
 
 - The mechanical holds still run and still hold: the quality gate, a committed private key, an
-  unpinned blob. They do not count toward the cap.
+  unpinned blob. They do not count toward the cap. A proof that was pending when the attempt
+  started and failed during it is the quality gate's hold (`hold_kind: gate`), with or without
+  the agent.
 - A head none of them holds gets a blocking (request-changes) review that names the cap, a final
   `capped` receipt and one `pr.skipped` event on the PR's timeline. Nothing capped is approved or
-  merged: the forge lets only the reviewer that requested changes clear them, so a person's
-  approval alone cannot land a head the agent never reviewed, whatever the branch protection.
+  merged. Inside pr-redteam the cap's stand-in verdict is `block`, so a head the agent never read
+  fails closed. On the forge, the blocking review rests on how jeryu-core decides a head's
+  reviews (`branch_protection/reviews.rs`, `reduce_reviews`, and `evaluate.rs`): each reviewer's
+  newest verdict on the exact head counts, a dismissal withdraws a verdict only when its own author
+  files it (another reviewer's or an admin's dismissal withdraws nothing), and a counted
+  `changes_requested` is an intrinsic merge blocker that binds admins whatever the branch
+  protection. So a person's approval alone cannot land a head the agent never reviewed, and this
+  reviewer's own later approval of that head replaces its request for changes.
   If posting the review fails, the next pass posts it again.
   A review-identity change (a model, prompt or limit change) does not post it twice: the review
   already posted on that exact head stands, and only the receipt is renewed.
-- The cap trades the agent's spend, not coverage: a capped head can land only after a rearm and
-  an agent approval of that head, so two cheap holds buy the author a wait for a person, never an
-  unreviewed merge. A capped head files no held-fix todo (`REDTEAM_FIX_TODO`): it is parked for a
+- What the cap trades is the agent's spend for a person's attention and the author's wait: a
+  capped head is not read by the agent until a maintainer rearms the PR, and it can land only
+  after that rearm and an agent approval of that exact head. Two cheap holds buy the author a
+  wait for a person, never an unreviewed merge. A capped head files no held-fix todo (`REDTEAM_FIX_TODO`): it is parked for a
   person, and an agent fix would be one more push the agent does not review.
 - The review footer says where a PR stands (`hold 1 of 2`, then `hold 2 of 2: this PR is now left
   for a person`).
@@ -125,8 +134,9 @@ fully re-reviewed, and often held again. After `REDTEAM_HOLD_CAP` agent holds on
   an operator's `run --force` reviews a capped head once.
 
 Only holds recorded with `hold_kind: "agent"` count, so holds from before the cap existed never
-park a pull request on install. Installing it keeps every receipt valid: `review_format` is
-unchanged, because a head reviewed before the cap was decided exactly as it would be now.
+park a pull request on install. The cap changes the posted review (its footer) and adds the
+`capped` decision, so it bumps `review_format`: every open pull request is reviewed once more
+after installing it.
 
 ## Contributed pull requests
 

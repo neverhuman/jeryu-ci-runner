@@ -215,7 +215,7 @@ mkdir -p "$state"/{receipts,cache,locks,work}
 # sees or how its verdict becomes a decision: the diff, description, signals or other context handed
 # to the agent; the mechanical holds (unpinned blobs, diff size, author domains, the quality gate);
 # the mapping from verdict to approve/hold; or the rendering of the posted review.
-review_format=7
+review_format=8
 
 # A receipt counts as "already reviewed" only for the same review inputs: the review format above,
 # the prompt, the verdict schema and validator, the exact CLI bytes, the model, the CLI pin and the
@@ -2204,13 +2204,24 @@ review_one() { # owner/name number dry-run force include-drafts
     verdict="$(quality_gate_verdict "$gate_reason")"
   elif [ -n "$cap_reason" ]; then
     # At the hold cap the agent is not asked again; the mechanical checks below still hold. A head
-    # none of them holds is recorded as `capped`: no agent review and never an approval, but a
-    # blocking review that names the cap.
+    # none of them holds gets the capped blocking review below. The stand-in verdict is `block`, so
+    # a head the agent never read fails closed: whatever path it takes, it is never an approval.
     say "$tag: $cap_reason — no agent review; mechanical checks only"
     verdict="$(jq -nc --arg reason "$cap_reason" \
-      '{verdict: "approve", findings: [],
+      '{verdict: "block", findings: [],
         summary: ("The agent did not review this head: this pull request was " + $reason
-                  + ". A mechanical check holds it.")}')"
+                  + "; only the mechanical checks ran.")}')"
+    # A proof that was pending when this attempt started and has failed since is the quality gate's
+    # hold, not the cap's: it is mechanical and does not count toward the cap.
+    if [ "$proof_pending" = 1 ]; then
+      gate_reason="$(jankurai_gate_hold "$repo" "$number")"
+      if [ -n "$gate_reason" ] && ! proof_without_result "$gate_reason"; then
+        mechanical_hold=1
+        hold_kind=gate
+        say "$tag: quality gate holds ${sha:0:12} — $gate_reason"
+        verdict="$(quality_gate_verdict "$gate_reason")"
+      fi
+    fi
   else
     local agent_cap="$budget" agent_rc=0
     [ "$origin" != contributed ] || agent_cap="$contributed_budget"
@@ -2264,6 +2275,7 @@ review_one() { # owner/name number dry-run force include-drafts
       rm -f -- "$pending_file"
       if [ -n "$gate_reason" ]; then
         mechanical_hold=1
+        hold_kind=gate
         say "$tag: quality gate holds ${sha:0:12} — $gate_reason"
         verdict="$(quality_gate_verdict "$gate_reason")"
       fi
@@ -2275,7 +2287,8 @@ review_one() { # owner/name number dry-run force include-drafts
   local decision
   case "$(jq -r .verdict <<<"$verdict")" in
     approve) decision=approve ;;
-    block) decision=hold; [ -n "$hold_kind" ] || hold_kind=agent ;;
+    # The cap's stand-in block is no agent's: it never counts as an agent hold.
+    block) decision=hold; [ -n "$hold_kind" ] || [ -n "$cap_reason" ] || hold_kind=agent ;;
     *) say "$tag: unexpected verdict after validation, NOT approving"; return 0 ;;
   esac
   if grep -qE '^\+.*-----BEGIN [A-Z ]*PRIVATE KEY-----' "$d/diff.patch"; then
@@ -2327,7 +2340,7 @@ review_one() { # owner/name number dry-run force include-drafts
   # hold, and it does so only by reviewing the head after a maintainer's `pr-redteam rearm`, so a
   # head the agent never saw cannot land. Once posted, the `capped` receipt makes the head final
   # until a rearm; a post that failed is retried on the next pass.
-  if [ -n "$cap_reason" ] && [ "$decision" = approve ]; then
+  if [ -n "$cap_reason" ] && [ "$mechanical_hold" = 0 ]; then
     if [ "$dry" = 1 ]; then say "$tag: DRY RUN capped — $cap_reason (would post a blocking review)"; return 0; fi
     # The same guard as every other publication: inputs that changed while this attempt ran
     # publish nothing.

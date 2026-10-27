@@ -49,12 +49,26 @@ while (($#)); do
   shift
 done
 printf '%s %s\n' "$method" "$url" >> "$CAP_FIXTURE/requests"
+# The forge's effective verdict is the reviewer's newest review on the exact head (jeryu-core
+# reduce_reviews): a later approval by the same reviewer replaces its own request for changes, and
+# no one else's review or dismissal does. Only this reviewer posts here, so its newest post decides.
+changes_requested() {
+  [[ -s "$CAP_FIXTURE/posts" ]] || { echo 0; return; }
+  jq -s --arg sha "$(cat "$CAP_FIXTURE/head")" \
+    'map(select(.expected_head_sha == $sha)) | if length > 0 and last.verdict == "request_changes" then 1 else 0 end' \
+    "$CAP_FIXTURE/posts"
+}
 row() {
+  local cr; cr="$(changes_requested)"
   jq -nc --arg sha "$(cat "$CAP_FIXTURE/head")" --arg base "$(cat "$CAP_FIXTURE/base")" \
+    --argjson cr "$cr" --argjson red "$([[ -e "$CAP_FIXTURE/gate-failing" ]] && echo true || echo false)" \
     '{repo:{owner:"acme",name:"widget-shop"},number:7,head_sha:$sha,base_sha:$base,
       head_ref:"cart-totals",base_ref:"main",draft:false,author:"dana",title:"cart totals",
       state:"open",labels:["origin:internal"],passport_hash:"fixture-passport",
-      review:{changes_requested:0},mergeable:{can_merge:false,reason:"changes requested"}}'
+      review:{changes_requested:$cr},
+      mergeable:(if $cr > 0 then {can_merge:false,reason:"changes requested"}
+                 elif $red then {can_merge:false,reason:"required context failing"}
+                 else {can_merge:true} end)}'
 }
 case "$url" in
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
@@ -62,12 +76,21 @@ case "$url" in
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
   */pulls/7)
     # The quality gate fails while gate-failing exists; otherwise the head waits only for review.
+    # gate-pending: the proof is queued; it fails once its checks were read (gate-fails-next).
     blockers='[{"code":"passport_blocked_approvals","message":"An approval is required."}]'
+    [[ ! -e "$CAP_FIXTURE/gate-pending" ]] \
+      || blockers='[{"code":"passport_blocked_checks","message":"Required context `jankurai/proof` is queued or running."}]'
     [[ ! -e "$CAP_FIXTURE/gate-failing" ]] \
       || blockers='[{"code":"passport_blocked_checks","message":"Required context `jankurai/proof` is failing."}]'
     row | jq -c --argjson b "$blockers" '{summary: ., merge_passport:{head_sha:.head_sha, blockers:$b}, passport_hash}'
     printf '\n200' ;;
-  */pulls/7/checks) printf '{"checks":[]}\n200' ;;
+  */pulls/7/checks)
+    # The proof gets its failing result right after this read: later reads of the gate see it.
+    if [[ -e "$CAP_FIXTURE/gate-fails-next" ]]; then
+      rm -f "$CAP_FIXTURE/gate-fails-next" "$CAP_FIXTURE/gate-pending"; touch "$CAP_FIXTURE/gate-failing"
+    fi
+    printf '{"checks":[]}\n200' ;;
+  */pulls/7/merge) jq -c . <<< "$data" >> "$CAP_FIXTURE/merged"; printf '{"merged":true}\n200' ;;
   */pulls/7/reviews)
     # The forge refuses reviews while reviews-failing exists.
     [[ ! -e "$CAP_FIXTURE/reviews-failing" ]] || { printf '{"error":"unavailable"}\n503'; exit 0; }
@@ -106,6 +129,10 @@ pass() { "$here/pr-redteam" run --repo acme/widget-shop --pr 7 "$@" >> "$t/log" 
 receipt() { printf '%s/state/receipts/acme/widget-shop/7-%s.json\n' "$t" "$(cat "$t/head")"; }
 count() { if [[ -f "$1" ]]; then wc -l < "$1"; else echo 0; fi; }
 fails() { echo "$1" >&2; tail -40 "$t/log" >&2; exit 1; }
+changes_requested_now() {
+  jq -s --arg sha "$(cat "$t/head")" \
+    'map(select(.expected_head_sha == $sha)) | if length > 0 and last.verdict == "request_changes" then 1 else 0 end' "$t/posts"
+}
 footer() { jq -r .body_markdown <<<"$(tail -1 "$t/posts")" | tail -1; }
 advance() { # a new head; an optional file name adds a binary/archive the diff does not pin
   if [[ -n "${1:-}" ]]; then head -c 300 /dev/urandom > "$t/repo/$1"; g add "$1"; g commit -qm 'add payload'
@@ -284,6 +311,50 @@ echo 'ok holds from before hold_kind do not count; the cap can be turned off'
 advance; approve
 REDTEAM_HOLD_CAP=0 pass
 footer | grep -qF "exact head \`$(head -c 12 "$t/head")\` · a new push is re-reviewed</sub>" || fails "approve footer: $(footer)"
+
+# A proof that was pending when the agent started and failed while it ran is the quality gate's
+# mechanical hold (hold_kind gate), never an agent hold, so it does not move the count.
+holds_total() { REDTEAM_STATE="$t/state" bash -c 'source <(sed -n "/^agent_hold_total()/,/^}/p" "$1"); state="$2"; agent_hold_total acme/widget-shop 7' _ "$here/pr-redteam" "$t/state"; }
+advance; approve
+before_holds="$(holds_total)"; calls="$(count "$t/model-calls")"
+touch "$t/gate-pending" "$t/gate-fails-next"
+REDTEAM_HOLD_CAP=0 pass
+[[ "$(count "$t/model-calls")" == "$((calls + 1))" ]] || fails 'the agent did not run while the proof was pending'
+jq -e '.decision == "hold" and .hold_kind == "gate" and .posted == true' "$(receipt)" >/dev/null \
+  || fails "mid-review red proof: $(cat "$(receipt)")"
+[[ "$(holds_total)" == "$before_holds" ]] || fails 'a gate hold counted as an agent hold'
+rm -f "$t/gate-failing"
+echo 'ok a proof that fails while the agent runs is a gate hold, not counted'
+
+# The same at the cap: no agent, and a proof that fails during the attempt holds as the gate, not
+# as the cap.
+advance
+calls="$(count "$t/model-calls")"
+touch "$t/gate-pending" "$t/gate-fails-next"
+pass
+[[ "$(count "$t/model-calls")" == "$calls" ]] || fails 'the agent ran at the cap'
+jq -e '.decision == "hold" and .hold_kind == "gate" and .posted == true
+    and .verdict.findings[0].title == "jankurai/proof does not pass on this head"' "$(receipt)" >/dev/null \
+  || fails "capped head with a red proof: $(cat "$(receipt)")"
+[[ "$(holds_total)" == "$before_holds" ]] || fails 'a capped gate hold counted as an agent hold'
+rm -f "$t/gate-failing"
+echo 'ok a capped head whose proof fails during the attempt is a gate hold'
+
+# A capped head cannot land until the agent reviews it; once a rearm lets the agent approve that
+# same head, the approval replaces the cap's own request for changes and the head lands.
+advance; approve
+pass
+jq -e '.decision == "capped" and .posted == true' "$(receipt)" >/dev/null || fails 'expected a capped head'
+[[ "$(changes_requested_now)" == 1 ]] || fails 'the capped review did not request changes'
+REDTEAM_MERGE_TOKEN_FILE="$t/token" "$here/pr-redteam" _merge >> "$t/log" 2>&1
+[[ ! -e "$t/merged" ]] || fails 'a capped head was merged'
+"$here/pr-redteam" rearm acme/widget-shop 7 >> "$t/log" 2>&1
+pass
+jq -e '.decision == "approve" and .posted == true' "$(receipt)" >/dev/null || fails 'the rearmed head was not approved'
+[[ "$(changes_requested_now)" == 0 ]] || fails 'the approval did not replace the request for changes'
+REDTEAM_MERGE_TOKEN_FILE="$t/token" "$here/pr-redteam" _merge >> "$t/log" 2>&1
+jq -e --arg sha "$(cat "$t/head")" '.expected_head_sha == $sha' "$t/merged" >/dev/null || fails 'the rearmed, approved head did not land'
+echo 'ok a capped head lands only after a rearm and an agent approval of that head'
 [[ ! -e "$t/danger" ]] || fails "$(cat "$t/danger")"
 if grep -RFq 'fixture-bearer' "$t/state" "$t/log"; then fails 'credential leaked'; fi
 echo 'ok an approval keeps the neutral footer'
