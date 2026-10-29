@@ -181,7 +181,36 @@ the gate runner's retry is therefore landed on the next pass, with no second
 review; the same holds for a head that was behind its base and became
 mergeable.
 
-Branches are never rewritten. An approved PR behind a linear-history base is
+For installations whose rules require every merge through the queue, set
+`REDTEAM_QUEUE_ONLY=1` in `~/.config/pr-redteam/site.env`. Both the review
+service and poke's scoped merge service read this file. This setting overrides
+`REDTEAM_QUEUE=0` and `REDTEAM_REBASE=1`: every approved head is submitted to
+`POST .../pulls/<number>/queue`, and the shared API helper refuses direct merge
+writes. It defaults to `0` for existing installations; only `0` and `1` are
+accepted. Set it consistently for manual invocations too.
+
+The direct-first behavior explains why a successful automatic merge need not
+have a queue record: the direct endpoint may fast-forward or replay a head,
+without the linear-history refusal that previously triggered queue admission.
+`REDTEAM_QUEUE=1` alone does not impose queue-only operation.
+
+In queue-only mode, the forge enforces admission, approvals and required queue
+contexts. A blocked admission is retried later; an unavailable queue never
+falls through to a direct merge. Building entries stay pending. Later merge
+passes reconcile the bounded queue listing even for PRs no longer open, saving
+the exact original head, queue commit, landed commit, attempts and any covering
+stack entry in the receipt's `queue_landing` object. `merged_at` records when
+the controller observed that landing. A missing or mismatched record is not
+landing evidence. The queue API reads the current PR head itself; the
+controller checks the acknowledgement against its reviewed head, and the forge
+requires approval of the current head. Older servers without the queue route
+leave approvals waiting.
+
+This setting does not change branch protection or audit conclusions. Advisory
+or neutral findings remain reportable advice; required contexts are those
+configured by the forge, not inferred from the presence of findings.
+
+With queue-only disabled, an approved PR behind a linear-history base is
 handed to the forge's merge queue (`REDTEAM_QUEUE=1`, the default), which
 replays and gates it without touching anybody's branch. With `REDTEAM_QUEUE=0
 REDTEAM_REBASE=1` the controller will instead rebase and force-push such a

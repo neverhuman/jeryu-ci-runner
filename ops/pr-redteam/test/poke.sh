@@ -219,3 +219,12 @@ REDTEAM_MERGE_TOKEN_FILE= poke
 [[ ! -e "$t/state/merge.log" ]]
 echo 'ok managed merge retries failed start, preserves scope and reports numeric age without background workers'
 echo 'POKE PASS'
+
+# Queue-only poke delegates behind-base admission to the managed queue worker.
+jq 'del(.merged_at, .merged_by)' "$receipt" >"$t/receipt"
+mv "$t/receipt" "$receipt"
+rm "$t/state/poke-seen"
+touch "$t/behind"
+REDTEAM_QUEUE_ONLY=1 REDTEAM_MERGE_TOKEN_FILE= poke
+[[ "$(merge_starts)" == 3 && "$(count "$t/merges")" == 1 ]]
+echo 'ok queue-only poke wakes the scoped worker for a behind-base approval'

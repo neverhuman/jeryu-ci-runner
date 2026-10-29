@@ -86,7 +86,9 @@ case "$url" in
     if [[ "$bearer" == "$(cat "$MERGE_FIXTURE/merge-token")" ]]; then printf '{"login":"jain-merge-bot"}\n200'
     else printf '{"login":"independent-reviewer"}\n200'; fi ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"jeryu","name":"fixture"},"family":"jain","open_pull_requests":1}]}\n200' ;;
-  *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
+  *'/pulls?state=open')
+    if [[ -e "$MERGE_FIXTURE/closed" ]]; then printf '{"items":[]}\n200'; exit; fi
+    row | jq -c '{items:[.]}'; printf '\n200' ;;
   # The detail route nests the row under .summary, beside the passport (live forge shape).
   */pulls/107)
     if [[ -e "$MERGE_FIXTURE/detail-unavailable" ]]; then printf '{"message":"temporary detail outage"}\n503'; exit; fi
@@ -96,12 +98,16 @@ case "$url" in
   # the base in queue-failed, when that file exists.
   */pulls/107/queue)
     printf 'attempt\n' >> "$MERGE_FIXTURE/queue-attempts"
+    if [[ -e "$MERGE_FIXTURE/required-failing" ]]; then
+      printf '{"code":"merge_gate_blocked","message":"required gate pending"}\n409'; exit
+    fi
     if [[ -e "$MERGE_FIXTURE/queue-unavailable" ]]; then printf '{"message":"temporary queue outage"}\n503'; exit; fi
     printf 'queued\n' >> "$MERGE_FIXTURE/queue-posts"
     jq -nc --arg sha "$(cat "$MERGE_FIXTURE/head")" \
       '{repo:"jeryu/fixture",base:"main",number:107,pr_head_sha:$sha,queue_ref:"refs/queue/main/107",queue_sha:$sha,state:"building"}'
     printf '\n200' ;;
   */api/v1/merge-queue\?state=all*)
+    if [[ -e "$MERGE_FIXTURE/landing.json" ]]; then cat "$MERGE_FIXTURE/landing.json"; printf '\n200'; exit; fi
     if [[ -e "$MERGE_FIXTURE/list-unavailable" ]]; then printf '{"message":"temporary list outage"}\n503'; exit; fi
     if [[ -e "$MERGE_FIXTURE/queue-bulk" && "$url" == *'page=1' ]]; then
       # ~3 MB of other-head rows for the same pull request: past ARG_MAX, so any argv use fails.
@@ -325,3 +331,55 @@ grep -q 'merge queue retry limit 3 reached' "$t/controller.log"
 [[ ! -e "$t/danger" ]]
 echo 'ok three total accepted retries cap a broken head across advancing bases'
 echo 'MERGE PASS'
+
+# Queue-only overrides both queue opt-out and branch rewrite opt-in, including
+# scoped poke workers and failed-entry retries that could now fast-forward.
+export REDTEAM_QUEUE_ONLY=1 REDTEAM_QUEUE=0 REDTEAM_REBASE=1
+direct_before=$(grep -c '/pulls/107/merge ' "$t/requests")
+advance
+rm "$t/queue-failed" "$t/linear"
+merges_before=$(count "$t/merges")
+queues_before=$(count "$t/queue-posts")
+touch "$t/required-failing"
+pass
+jq -e '.queue_refused_sha == null and .merged_at == null' "$(receipt)" >/dev/null
+rm "$t/required-failing"
+touch "$t/queue-unavailable" "$t/behind"
+pass
+jq -e '.queued_sha == null and .merged_at == null' "$(receipt)" >/dev/null
+rm "$t/queue-unavailable"
+pass
+rm "$t/behind"
+[[ "$(count "$t/queue-posts")" == "$((queues_before + 1))" ]]
+jq -e '.queued_sha == .head_sha and .merged_at == null' "$(receipt)" >/dev/null
+printf '%s\n' "$base_a" >"$t/queue-failed"
+"$here/pr-redteam" _merge_scoped "jeryu:fixture:107:$(cat "$t/head")" >>"$t/controller.log" 2>&1
+[[ "$(count "$t/queue-posts")" == "$((queues_before + 2))" ]]
+[[ "$(count "$t/merges")" == "$merges_before" && ! -e "$t/danger" ]]
+# A building entry is not landing evidence, nor is a landing for a different head.
+jq -nc --arg sha "$(cat "$t/head")" --arg q "$base_b" '{entries:[
+  {repo:"jeryu/fixture",number:107,base:"main",pr_head_sha:$sha,
+   queue_sha:$q,landed_sha:$q,state:"building",attempts:[{queue_sha:$q,conclusion:null}]}],
+   page:{has_more:false}}' >"$t/landing.json"
+pass
+jq -e '.merged_at == null' "$(receipt)" >/dev/null
+jq '.entries[0].state="landed" | .entries[0].pr_head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"' "$t/landing.json" >"$t/next.json"
+mv "$t/next.json" "$t/landing.json"
+pass
+jq -e '.merged_at == null' "$(receipt)" >/dev/null
+jq --arg sha "$(cat "$t/head")" '.entries[0].pr_head_sha=$sha |
+  .entries[0].attempts[0].conclusion="success"' "$t/landing.json" >"$t/next.json"
+mv "$t/next.json" "$t/landing.json"
+touch "$t/closed"
+pass --dry-run
+jq -e '.merged_at == null' "$(receipt)" >/dev/null
+pass
+jq -e --arg sha "$(cat "$t/head")" --arg q "$base_b" '
+  .merged_by == "merge-queue" and .landed_sha == $q and
+  .queue_landing.pr_head_sha == $sha and .queue_landing.attempts[0].conclusion == "success"' "$(receipt)" >/dev/null
+cp "$(receipt)" "$t/landed-receipt"
+pass
+cmp "$(receipt)" "$t/landed-receipt"
+[[ "$(count "$t/merges")" == "$merges_before" && ! -e "$t/danger" ]]
+echo 'ok queue-only admission, gate wait, scoped retry and exact closed-PR landing evidence'
+[[ "$(grep -c '/pulls/107/merge ' "$t/requests")" == "$direct_before" ]]

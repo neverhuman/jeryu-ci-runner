@@ -102,6 +102,8 @@
 #   REDTEAM_MERGE_TOKEN_FILE  (no default)        the merger credential, a path to a mode-0600 file
 #                          owned by this user. Unset or unreadable: reviews still run and nothing is
 #                          landed. The secret never reaches argv, a model process or a log.
+#   REDTEAM_QUEUE_ONLY     0                    set to 1 to enqueue every approval; forbids direct
+#                          merge API calls and branch rebases, including retries and poke workers
 #   REDTEAM_QUEUE          1                    an approved PR behind a linear-history base is handed
 #                          to the forge's merge queue, which replays and lands it without rewriting
 #                          anybody's branch
@@ -354,6 +356,10 @@ reusable_identities="$(printf '%s\n' "$review_identity" "${accept_identities[@]}
 
 api() { # method path [json-body] -> sets $code and $body
   local method="$1" path="$2" data="${3:-}" out credential secret
+  case "${REDTEAM_QUEUE_ONLY:-0}" in 0|1) ;; *) die "REDTEAM_QUEUE_ONLY must be 0 or 1";; esac
+  if [ "${REDTEAM_QUEUE_ONLY:-0}" = 1 ] && [[ "$method" != GET && "$path" == */merge ]]; then
+    die "queue-only operation forbids the direct merge API"
+  fi
   # Check the destination before opening the reviewer credential.
   [[ "$base" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || die "credential-bearing API requires a bare hosted HTTPS origin"
   [[ "$path" == /api/v1/* || "$path" == /api/v3/* ]] || die "unexpected hosted API path"
@@ -3536,6 +3542,9 @@ merge_pass() ( # dry; child owns merge/review locks, preserving the caller's run
   fi
   merger="$(as_token="$merge_token_file"; api GET /api/v3/user; [ "$code" = 200 ] && jq -r .login <<<"$body")" \
     || { say "merge pass skipped: the merger credential was rejected"; return 0; }
+  if [ "${REDTEAM_QUEUE_ONLY:-0}" = 1 ] && [ "$dry" != 1 ]; then
+    queue_landing_receipts
+  fi
   while IFS= read -r row; do
     repo="$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$row")"; number="$(jq -r .number <<<"$row")"
     sha="$(jq -r .head_sha <<<"$row")"
@@ -3565,6 +3574,14 @@ merge_pass() ( # dry; child owns merge/review locks, preserving the caller's run
       queue_retry_due "$repo" "$number" "$sha" "$receipt" "$(jq -r .base_ref <<<"$row")" || continue
     fi
     retry_base="$queue_retry_base"
+    if [ "${REDTEAM_QUEUE_ONLY:-0}" = 1 ]; then
+      if [ "$dry" = 1 ]; then
+        say "$repo#$number: DRY RUN would enqueue ${sha:0:12} as $merger"
+      else
+        enqueue_pr "$repo" "$number" "$sha" "$receipt" "$merger" "$retry_base" "$row" "$dry"
+      fi
+      continue
+    fi
     reason="$(merge_hold_reason "$repo" "$number")"
     if [ -n "$reason" ]; then
       say "$repo#$number: approved, waiting to merge: $reason"; continue
@@ -3621,6 +3638,32 @@ queue_retry_snapshot() {
   return 1
 }
 
+# Closed PRs disappear from open_prs. Reconcile the bounded queue snapshot against
+# local approvals too, including a crash after enqueue but before its receipt write.
+queue_landing_receipts() {
+  local entry repo number sha receipt
+  queue_retry_snapshot || return 0
+  while IFS= read -r entry; do
+    repo="$(jq -r .repo <<<"$entry")"; number="$(jq -r .number <<<"$entry")"
+    sha="$(jq -r .pr_head_sha <<<"$entry")"
+    [[ "$repo" =~ ^[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*$ ]] || continue
+    [[ "$number" =~ ^[1-9][0-9]*$ && "$sha" =~ ^[0-9a-f]{40}$ ]] || continue
+    [ -z "$only_repo" ] || [ "$repo" = "$only_repo" ] || continue
+    [ -z "$only_pr" ] || [ "$number" = "$only_pr" ] || continue
+    [ -z "$only_sha" ] || [ "$sha" = "$only_sha" ] || continue
+    exec 9>"$state/locks/${repo/\//_}-$number.lock"
+    flock -n 9 || continue
+    receipt="$(merge_receipt "$repo" "$number" "$sha")" || continue
+    jq --argjson entry "$entry" --arg at "$(date -u +%FT%TZ)" '
+      .queue_landing = $entry | .merged_at = $at | .merged_by = "merge-queue"
+      | .landed_sha = $entry.landed_sha' "$receipt" | store_receipt "$receipt"
+    say "$repo#$number: queue landing recorded for $sha at $(jq -r .landed_sha <<<"$entry")"
+  done < <(jq -c '.[] | select(.state == "landed")
+    | select((.queue_sha // "" | test("^[0-9a-f]{40}$"))
+      and (.landed_sha // "" | test("^[0-9a-f]{40}$")))' <<<"$queue_cache_entries")
+  exec 9>&-
+}
+
 # Pure observation: set queue_retry_base, but never write the receipt or consume a retry here.
 # One accepted dispatch per failed base, at most three overall per reviewed head. New heads get
 # new receipts. Active/landed entries are never retried; old entries for another base are ignored.
@@ -3666,13 +3709,16 @@ enqueue_pr() { # owner/name number reviewed-sha receipt merger retry-base row dr
       say "$repo#$number: queue acknowledgement does not match the reviewed head; receipt unchanged"; return 1
     fi
     state_now="$(jq -r '.state // "?"' <<<"$body")"
-    say "$repo#$number: approved but behind; QUEUED ${sha:0:12} as $merger → $(jq -r '.queue_ref // "?"' <<<"$body") @ $(jq -r '.queue_sha // "?" | .[0:12]' <<<"$body") ($state_now)"
+    say "$repo#$number: approved; QUEUED ${sha:0:12} as $merger → $(jq -r '.queue_ref // "?"' <<<"$body") @ $(jq -r '.queue_sha // "?" | .[0:12]' <<<"$body") ($state_now)"
     jq --arg sha "$sha" --arg at "$(date -u +%FT%TZ)" --arg q "$(jq -r '.queue_sha // ""' <<<"$body")" --arg b "$retry_base" '
       .queued_sha = $sha | .queued_at = $at | .queue_commit = $q |
       if $b != "" then
         .queue_retry_bases = ((.queue_retry_bases // (if .queue_retried_base then [.queue_retried_base] else [] end)) + [$b] | unique) |
         .queue_retried_base = $b
       else . end' "$receipt" | store_receipt "$receipt"
+  elif [ "$code" = 409 ] && [ "${REDTEAM_QUEUE_ONLY:-0}" = 1 ] &&
+      jq -e '(.error // .).code == "merge_gate_blocked" or (.error // .).code == "not_open"' <<<"$body" >/dev/null 2>&1; then
+    say "$repo#$number: queue admission waits: $(jq -c '.error // .' <<<"$body" | head -c 300)"
   elif [ "$code" = 409 ]; then
     say "$repo#$number: approved but behind, and the merge queue refused it: $(jq -r '(.error // .) | "\(.code): \(.message)"' <<<"$body" 2>/dev/null | head -c 300) — the replay has to be redone on the base tip"
     jq --arg sha "$sha" '.queue_refused_sha = $sha' "$receipt" | store_receipt "$receipt"
@@ -3809,6 +3855,7 @@ queue_rework() { # owner/name number head-sha receipt row dry; caller holds the 
 # receipt, so the next pass reviews it again and lands it once its required contexts pass. Conflicts,
 # and a rebase that would leave the PR empty, are left alone.
 rebase_pr() { # owner/name number reviewed-sha head_ref base_ref receipt merger dry
+  [ "${REDTEAM_QUEUE_ONLY:-0}" != 1 ] || die "queue-only operation forbids branch rebases"
   local repo="$1" number="$2" sha="$3" head_ref="$4" base_ref="$5" receipt="$6" merger="$7" dry="$8"
   local tag="$repo#$number" cache="$state/cache/$repo.git" url="$base/git/$repo.git"
   local work; work="$(mktemp -d "$state/work/rebase.XXXXXX")"
@@ -4098,7 +4145,8 @@ poke() { # dry
         reads=$((reads + 1))
         required_contexts_green "$repo" "$number" "$sha" || continue
       fi
-    elif merge_receipt "$repo" "$number" "$sha" >/dev/null && [ -z "$(merge_hold_reason "$repo" "$number")" ]; then
+    elif merge_receipt "$repo" "$number" "$sha" >/dev/null &&
+        { [ "${REDTEAM_QUEUE_ONLY:-0}" = 1 ] || [ -z "$(merge_hold_reason "$repo" "$number")" ]; }; then
       key="merge $repo#$number $sha"
       receipt="$(merge_receipt "$repo" "$number" "$sha")"
       reviewed="$(jq -r '.reviewed_at // empty' "$receipt")"
