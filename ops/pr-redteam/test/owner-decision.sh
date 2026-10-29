@@ -27,11 +27,16 @@ satisfy() { # verdict-json decision-json
     JERYU_TOKEN_FILE="$t/token" "$here/pr-redteam" _owner_satisfy "$t/verdict.json" "$t/decision.json"
 }
 
-body() { # verdict-json decision sha origin decision-json
+body() { # verdict-json decision sha origin decision-json [hold-kind hold-number capped]
   printf '%s\n' "$1" >"$t/verdict.json"; printf '%s\n' "$5" >"$t/decision.json"
+  local v="$1" d="$2" h="$3" o="$4"; shift 5
   REDTEAM_STATE="$t/state" JERYU_BASE="${JERYU_BASE:-https://forge.invalid}" \
-    JERYU_TOKEN_FILE="$t/token" "$here/pr-redteam" _owner_body "$t/verdict.json" "$2" "$3" "$4" "$t/decision.json"
+    JERYU_TOKEN_FILE="$t/token" "$here/pr-redteam" _owner_body "$t/verdict.json" "$d" "$h" "$o" \
+      "$t/decision.json" "$@"
 }
+
+# The footer line of a rendered body, so a failure shows what was rendered rather than a claim.
+footer() { grep -F 'pr-redteam · read-only agent' <<<"$1"; }
 
 sha=1111111111111111111111111111111111111111
 other=2222222222222222222222222222222222222222
@@ -121,9 +126,18 @@ unescaped="$(sed 's/\\|//g' <<<"$row" | tr -cd '|' | wc -c)"
 [ "$unescaped" = 4 ] && ok "a finding with || renders as one table row" || bad "row has $unescaped cell pipes: $row"
 [ "$(grep -c 'Swallowed failure' <<<"$out")" = 1 ] || bad "finding spans several lines"
 
+# The five-argument test interface renders a hold the way publication does: an agent hold counted
+# against the cap, not the mechanical-hold footer. The rendered footer is printed either way.
+out="$(footer "$(body "$held" hold "$sha" internal null)")"
+[[ "$out" == *"hold 1 of 2: a new push is re-reviewed"* ]] \
+  && ok "an agent hold renders its cap count: $out" || bad "agent hold footer: $out"
+# The same interface still renders each mechanical footer when the caller names the hold.
+out="$(footer "$(body "$held" hold "$sha" internal null gate 0 0)")"
+[[ "$out" == *"mechanical hold, not counted toward the hold limit"* ]] \
+  && ok "a named mechanical hold renders its own footer: $out" || bad "mechanical hold footer: $out"
+out="$(footer "$(body "$held" hold "$sha" internal null gate 0 1)")"
+[[ "$out" == *"mechanical hold at the hold limit"* ]] \
+  && ok "a mechanical hold at the cap says so: $out" || bad "capped mechanical footer: $out"
+
 ((fail == 0))
 echo 'OWNER DECISION PASS'
-
-# The body test interface carries the same agent hold context as publication.
-out="$(body "$held" hold "$sha" internal null)"
-[[ "$out" == *"hold 1 of 2:"* ]] || bad "agent footer: $out"
