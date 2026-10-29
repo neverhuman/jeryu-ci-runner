@@ -23,7 +23,7 @@ done
 upstream_max_pins=6 upstream_max_bytes=100000 upstream_max_commits=50 upstream_fetch_timeout=20
 upstream_max_branches=8 upstream_max_pull_pages=10 upstream_min_share=1024
 state="$t/state"; me=reviewer
-base="file://$t/forge"; forge_host=forge.test
+base="file://$t/forge"; forge_host=forge.test; forge_aliases=""
 token_file="$t/token"; printf 'dummytoken' >"$token_file"; chmod 600 "$token_file"
 mkdir -p "$t/home" "$t/pulls"; export HOME="$t/home" GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0
 

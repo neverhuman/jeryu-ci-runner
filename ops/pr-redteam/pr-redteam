@@ -1754,11 +1754,12 @@ upstream_pin_evidence() { # cache-root review-dir owner/name old new named-branc
     --arg named "$named" --arg default "$default" --argjson protected "$protected_json" \
     --arg checked "$checked" --arg checked_kind "$checked_kind" --argjson author_supplied "$author_supplied" \
     --arg tip "$checked_tip" --arg fetched_at "$fetched_at" --arg direction "$direction" --arg crates "$crates" \
+    --arg source_url "${up_source:-}" \
     --argjson total "$total" --argjson listed "$listed" --argjson log_bytes "$log_bytes" --argjson log_cut "$log_cut" \
     --argjson diff_bytes "$diff_bytes" --argjson diff_cut "$diff_cut" --argjson pulls_cut "$pulls_cut" \
     --argjson pages "$pages_read" --argjson unmatched "$unmatched" --argjson notes "$notes_json" --argjson lock "$lock_json" --argjson reviewed_upstream "$reviewed_upstream" \
     --argjson diff_fetched "$([ -e "$dir/diff.patch" ] && echo true || echo false)" --argjson commit_pulls "$commit_pulls" --argjson approved_pulls "$approved_pulls" --argjson landing_pulls "$landing_pulls" '
-    {repo: $repo, old_rev: $old, new_rev: $new, status: $status,
+    {repo: $repo, source_url: $source_url, old_rev: $old, new_rev: $new, status: $status,
      verified: ($status == "merged-tip" or $status == "ancestor-of-tip"),
      checked_branch: $checked, checked_branch_kind: $checked_kind, checked_branch_author_supplied: $author_supplied,
      checked_branch_tip: $tip, tips_fetched_at: $fetched_at,
@@ -1787,7 +1788,7 @@ upstream_pin_evidence() { # cache-root review-dir owner/name old new named-branc
 # Writes <review-dir>/upstream/ for a change that moves a git pin; writes nothing otherwise.
 # The total bytes of upstream evidence across every pin are capped by `budget`.
 upstream_evidence() { # git-dir base head review-dir default-owner budget
-  local pins out="$4/upstream" st repo old new named crates source tag old_tag fields base_fields n=0 fetchable=0 skipped=0 summary="" allow
+  local pins out="$4/upstream" up_source="" st repo old new named crates source tag old_tag fields base_fields n=0 fetchable=0 skipped=0 summary="" allow
   local -a lockargs=()
   up_left="$6"; up_row=""
   pins="$(upstream_pins "$1" "$2" "$3" "$5")" || return 0
@@ -1805,8 +1806,14 @@ upstream_evidence() { # git-dir base head review-dir default-owner budget
         if [ "$allow" -lt "$upstream_min_share" ]; then
           summary+="$repo ${new:0:12}: not fetched: its share of the upstream evidence budget ($allow bytes) is too small"$'\n'; continue
         fi
+        up_source="$source"
         upstream_pin_evidence "$state/cache/upstream" "$out" "$repo" "$old" "$new" "$named" "$crates" "$allow" "${lockargs[@]}" ||
           up_row="$repo ${new:0:12}: evidence failed"
+        # A pin whose source names a configured alias host was verified and fetched on this forge, never on
+        # the alias: say so on its row, so the route a verified status took is visible.
+        if [[ "$source" =~ ^https://([^/]+)/git/ && "${BASH_REMATCH[1],,}" != "${forge_host,,}" ]]; then
+          up_row+=" [source ${source:0:120}: forge alias host ${BASH_REMATCH[1]} (REDTEAM_FORGE_ALIASES); verified and fetched on $forge_host only]"
+        fi
         summary+="$up_row"$'\n' ;;
       new-pin-unverified) summary+="$repo ${new:0:12}: new-pin-unverified (not pinned at the base; not fetched)"$'\n' ;;
       unmapped-host) summary+="${source:0:120} ${new:0:12}: unmapped-host (not on this forge, no mapping at the base; not fetched)"$'\n' ;;
