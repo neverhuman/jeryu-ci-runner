@@ -10,12 +10,18 @@ cat > "$t/bin/systemctl" <<'FIXTURE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$INSTALL_FIXTURE/calls"
 case "$*" in
-  *is-active*) [[ "$FIXTURE_UNIT_ACTIVE" == 1 || ( "$*" == *pr-redteam-merge@jeryu:* && "${FIXTURE_INSTANCE_ACTIVE:-0}" == 1 ) || ( "$*" == *pr-redteam-review@jeryu:* && "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 1 ) ]] ;;
+  # A running review instance is Type=oneshot, so systemd reports it `activating`, which
+  # `is-active` answers as not active (exit 3); only `show -p ActiveState` names it.
+  *is-active*) [[ "$FIXTURE_UNIT_ACTIVE" == 1 || ( "$*" == *pr-redteam-merge@jeryu:* && "${FIXTURE_INSTANCE_ACTIVE:-0}" == 1 ) ]] ;;
+  *'show -p ActiveState --value pr-redteam-merge@jeryu:'*)
+    if [[ "${FIXTURE_INSTANCE_ACTIVE:-0}" == 1 ]]; then echo active; else echo inactive; fi ;;
+  *'show -p ActiveState --value pr-redteam-review@jeryu:'*)
+    if [[ "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 1 ]]; then echo activating; else echo inactive; fi ;;
   # Real systemctl prints the state and exits 0 for a static unit too.
   *is-enabled*) printf '%s\n' "${FIXTURE_ENABLED_STATE:-static}"; [[ "${FIXTURE_ENABLED_STATE:-static}" != disabled ]] ;;
   '--user daemon-reload') exit 0 ;;
   *list-units*pr-redteam-merge@*) [[ "${FIXTURE_INSTANCE_ACTIVE:-0}" == 0 ]] || echo 'pr-redteam-merge@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded active running'; exit 0 ;;
-  *list-units*pr-redteam-review@*) [[ "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 0 ]] || echo 'pr-redteam-review@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded active running'; exit 0 ;;
+  *list-units*pr-redteam-review@*) [[ "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 0 ]] || echo 'pr-redteam-review@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded activating start'; exit 0 ;;
   *) echo 'unexpected activation command' >&2; exit 97 ;;
 esac
 FIXTURE
@@ -70,7 +76,8 @@ if run 1; then echo 'active installation was accepted' >&2; exit 1; fi
 # A unit that is stopped but still enabled would start on its own: refused too.
 if FIXTURE_ENABLED_STATE=enabled run 0; then echo 'enabled installation was accepted' >&2; exit 1; fi
 if FIXTURE_INSTANCE_ACTIVE=1 run 0; then echo 'active merge instance was accepted' >&2; exit 1; fi
-if FIXTURE_REVIEW_INSTANCE_ACTIVE=1 run 0; then echo 'active review instance was accepted' >&2; exit 1; fi
+if FIXTURE_REVIEW_INSTANCE_ACTIVE=1 run 0; then echo 'running (activating) review instance was accepted' >&2; exit 1; fi
+grep -q 'pr-redteam-review@jeryu:fixture:107:1111111111111111111111111111111111111111.service is activating' "$t/out"
 sha256sum -c "$t/before" > /dev/null
 if grep -Eq 'enable --now|start --no-block|disable|stop ' "$t/calls"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 

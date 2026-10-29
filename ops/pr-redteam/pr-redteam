@@ -3384,7 +3384,12 @@ poke() { # dry
 # head.
 watch_wait=45            # seconds the forge may hold one long poll open (api's own timeout is 60)
 watch_queue_cap=256      # heads waiting for a free slot; past this the oldest wait for the pass
-watch_retry_secs=5       # pause before re-polling a forge that answered something other than 200
+watch_retry_secs=5       # first pause before re-polling a forge that answered something other than 200
+watch_retry_max=300      # the pause doubles per failed poll up to this, and resets on a 200
+watch_min_poll=2         # an answer sooner than this with nothing new waits out the rest: the
+                         # forge holding the request open is what paces the loop, and a forge that
+                         # does not hold it must not turn the watcher into a hot request loop
+watch_pause=0            # what the next poll waits for, set by each watch_once
 
 # The cursor, replaced whole: a torn write would read as no cursor at all and replay what the forge
 # still keeps, which is harmless but needless.
@@ -3398,10 +3403,26 @@ watch_cursor_set() { # seq
 review_unit() { printf 'pr-redteam-review@%s:%s:%s.service\n' "${1/\//:}" "$2" "$3"; } # owner/name number sha
 
 # How many scoped reviews are running right now. A template instance counts whatever its pull
-# request is, so the bound is on reviews, not on repositories.
+# request is, so the bound is on reviews, not on repositories. The review unit is Type=oneshot, so
+# while it runs systemd reports it `activating`, never `active`: every state of an instance that has
+# not finished holds a slot.
 review_slots_busy() {
-  systemctl --user list-units --state=active --no-legend --plain 'pr-redteam-review@*.service' 2>/dev/null \
-    | grep -c . || true
+  systemctl --user list-units --state=activating,active,deactivating,reloading --no-legend --plain \
+    'pr-redteam-review@*.service' 2>/dev/null | grep -c . || true
+}
+
+# Whether owner/name is a repository this installation covers: listed for this identity and in
+# REDTEAM_FAMILIES, read exactly as open_prs reads it. A signal names a repository and nothing
+# else, so the scoped review checks coverage itself instead of trusting the forge's choice.
+repo_covered() { # owner/name
+  local fams
+  api GET /api/v1/repos
+  [ "$code" = 200 ] || return 1
+  fams="$(jq -Rc 'split(" ") | map(select(length > 0))' <<<"$families")"
+  jq -e --arg owner "${1%%/*}" --arg name "${1#*/}" --argjson f "$fams" \
+    '[.repositories[] | select(.id.owner == $owner and .id.name == $name)
+      | (.family // "") as $x | select(($f | index("all")) != null or ($f | index($x)) != null)]
+     | length > 0' <<<"$body" >/dev/null
 }
 
 # Start a scoped review per queued head while slots are free, leaving the rest queued. A head leaves
@@ -3445,21 +3466,34 @@ watch_drain() { # dry
 # durably queued: repeating a signal costs one scoped review that the per-PR lock and the receipt
 # make a no-op, while losing one would leave the head to the pass.
 watch_once() { # dry
-  local dry="$1" after seq repo number sha kind queue="$state/watch-queue" queued=0
+  local dry="$1" after seq repo number sha kind queue="$state/watch-queue" queued=0 started=$SECONDS
   after="$(cat "$state/watch-cursor" 2>/dev/null || true)"
   [[ "$after" =~ ^[0-9]+$ ]] || after=0
   api GET "/api/v1/review-wanted?after=$after&wait=$watch_wait"
   if [ "$code" != 200 ]; then
     say "watch: the forge answered $code for review-wanted; the pass remains the fallback"
-    [ "$dry" = 1 ] || sleep "$watch_retry_secs"
+    watch_backoff
+    # Heads already queued still get a start attempt: a slot may have freed since the last poll.
+    watch_drain "$dry"
     return 0
   fi
+  watch_pause=0 watch_retry_next="$watch_retry_secs"
   seq="$(jq -r '.seq // empty' <<<"$body")"
-  [[ "$seq" =~ ^[0-9]{1,18}$ ]] || { say "watch: review-wanted answered without a sequence"; return 0; }
+  if ! [[ "$seq" =~ ^[0-9]{1,18}$ ]]; then
+    say "watch: review-wanted answered without a sequence"
+    watch_backoff
+    watch_drain "$dry"
+    return 0
+  fi
   if [ "$seq" -lt "$after" ]; then
-    # The forge restarted: what it still keeps is not a backlog of new work.
+    # The forge restarted: its signal store is in memory, so its sequence started again. `seq` is
+    # the forge's newest sequence, not the oldest it keeps (jeryu-deploy docs/repo-automation.md),
+    # so a cursor moved to it asks only for signals recorded after this answer. The heads in this
+    # answer are left to the pass, as pr-gate-wake.sh treats a smaller gate-wanted sequence.
     say "watch: the forge's sequence went back to $seq; resyncing without replaying"
     [ "$dry" = 1 ] || watch_cursor_set "$seq"
+    watch_pace "$started"
+    watch_drain "$dry"
     return 0
   fi
   while IFS=$'\t' read -r repo number sha kind; do
@@ -3486,7 +3520,23 @@ watch_once() { # dry
     [ "$queued" = 0 ] || sync -f "$state"
     watch_cursor_set "$seq"
   fi
+  [ "$queued" != 0 ] || watch_pace "$started"
   watch_drain "$dry"
+}
+
+# A poll that came back sooner than watch_min_poll waits out the rest before the next one.
+watch_pace() { # SECONDS when the poll started
+  local took=$((SECONDS - $1))
+  [ "$took" -ge "$watch_min_poll" ] || watch_pause=$((watch_min_poll - took))
+}
+
+# A failed poll waits before the next one, twice as long each time up to watch_retry_max.
+watch_retry_next=""
+watch_backoff() {
+  [[ "$watch_retry_next" =~ ^[0-9]+$ ]] || watch_retry_next="$watch_retry_secs"
+  watch_pause="$watch_retry_next"
+  watch_retry_next=$((watch_retry_next * 2))
+  [ "$watch_retry_next" -le "$watch_retry_max" ] || watch_retry_next="$watch_retry_max"
 }
 
 # --- commands ------------------------------------------------------------------------------------
@@ -3554,11 +3604,18 @@ case "$cmd" in
     exec 7>"$state/watch.lock"
     flock -n 7 || { say "watch: another watcher holds the lock"; exit 0; }
     if [ "$once" = 1 ]; then watch_once "$dry"; exit 0; fi
-    while watch_once "$dry"; do :; done ;;
+    # A dry run paces itself the same way: it polls the same forge.
+    while watch_once "$dry"; do [ "$watch_pause" = 0 ] || sleep "$watch_pause"; done ;;
   _review_scoped) # managed template instance: owner:name:number:signalled-head
     [ $# = 1 ] || die "expected one review scope"
     [[ "$1" =~ ^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([1-9][0-9]*):([0-9a-f]{40})$ ]] || die "invalid review scope"
     only_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; only_pr="${BASH_REMATCH[3]}"; only_sha="${BASH_REMATCH[4]}"
+    # Coverage first, as every other entry point gets it from open_prs: a repository outside
+    # REDTEAM_FAMILIES (or one this identity is not shown) is neither reviewed nor approved here.
+    if ! repo_covered "$only_repo"; then
+      say "skip $only_repo#$only_pr: not a repository in the families this installation covers ($families)"
+      exit 0
+    fi
     # The pull request's live head is what a review binds to: a head pushed after the signal is
     # reviewed as itself, and a superseded one is skipped as already reviewed, exactly as in a pass.
     review_one "$only_repo" "$only_pr" "$dry" "$force" "$drafts" ;;

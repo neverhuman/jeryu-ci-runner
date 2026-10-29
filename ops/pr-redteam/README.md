@@ -483,7 +483,9 @@ a head appears, so a push reaches an idle reviewer slot in about as long as the
 push took, while its gate is still running. Each reported head queues and then
 starts `pr-redteam-review@owner:repo:PR:head.service`, at most `REDTEAM_JOBS` at
 a time, so one long review delays no other head; the rest wait for a free slot
-and are started by a later poll. A head only leaves the queue once its unit
+and are started by a later poll. A running review counts against that bound in
+every unfinished systemd state (a running oneshot instance is `activating`, not
+`active`). A head only leaves the queue once its unit
 started, the queue is bounded, and the cursor advances only over heads that are
 on disk, so a crash repeats a signal (which the per-PR review lock and the
 receipt make a no-op) rather than losing one.
@@ -492,12 +494,17 @@ A signal only says a head appeared. The scoped review reads the pull request
 itself and applies every rule a pass applies -- the draft and author skips, the
 hold cap, the contribution budgets, the quality gate and publication -- and it
 reviews the pull request's live head, so a head pushed after the signal is
-reviewed as itself. Neither the watcher nor a scoped review carries the merger
+reviewed as itself. It first checks coverage the way a pass does: a repository
+the forge does not list for the reviewer, or one outside `REDTEAM_FAMILIES`, is
+skipped, neither reviewed nor approved. Neither the watcher nor a scoped review carries the merger
 environment: nothing is landed from this path, and an approval still requires
 the base branch's required contexts to be green before the merge pass lands it.
 A forge that answers anything else, a forge whose sequence went backwards (a
 restart) and a watcher that was down all cost today's latency and nothing else:
-the five-minute pass and the 30-second poke remain the fallback.
+the five-minute pass and the 30-second poke remain the fallback. The watcher
+does not rely on the forge to pace it: an answer that comes back in under two
+seconds with nothing new waits out the rest, and a failed poll backs off from
+5 seconds, doubling to at most 5 minutes.
 
 The reviewer skips its own authored PRs, contributed PRs whose review spend is
 used up, drafts unless explicitly included, and
@@ -636,7 +643,8 @@ allowlist and include the latest poke result, so a failed poke appears in the
 runner's last activity on `/runners` and can be surfaced in Needs you. An
 authorization refusal is logged, not bypassed. Installation also refuses to
 replace the merge or scoped-review template while any of its instances is
-active. No scoped unit
+running (systemd's `active`, `activating`, `deactivating` or `reloading`; a
+running oneshot instance is `activating`). No scoped unit
 is enabled or started by installation; activation belongs to the service owner.
 
 ## Review isolation

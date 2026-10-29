@@ -74,10 +74,14 @@ for template in 'pr-redteam-merge@*.service' 'pr-redteam-review@*.service'; do
   instances="$(systemctl --user list-units --all --type=service --no-legend --plain "$template")"
   while read -r instance _; do
     [ -n "$instance" ] || continue
-    if systemctl --user is-active --quiet "$instance"; then
-      echo "$instance is active; its service owner must stop it before installation" >&2
-      exit 1
-    fi
+    # A running Type=oneshot instance is `activating`, which `is-active` answers as inactive: read
+    # the state itself and treat every state of an unfinished instance as running.
+    instance_state="$(systemctl --user show -p ActiveState --value "$instance" 2>/dev/null || true)"
+    case "$instance_state" in
+      active|activating|deactivating|reloading)
+        echo "$instance is $instance_state; its service owner must stop it before installation" >&2
+        exit 1 ;;
+    esac
   done <<<"$instances"
 done
 [[ "$here" =~ ^/[A-Za-z0-9._/-]+$ ]] || { echo "unit source path contains unsupported characters" >&2; exit 1; }

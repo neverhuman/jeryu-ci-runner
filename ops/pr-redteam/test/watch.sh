@@ -2,8 +2,9 @@
 # The event-driven watcher, against stand-in forge/model/unit-manager processes: one long poll
 # starts one scoped review per reported head, at most REDTEAM_JOBS at a time, advances its cursor
 # only over heads it queued, resyncs when the forge's sequence goes backwards, refuses a scope the
-# forge did not spell as a pull request head, starts nothing on a dry run, and lands nothing. The
-# scoped review entrypoint reviews the named pull request's live head and no other.
+# forge did not spell as a pull request head, starts nothing on a dry run, paces an immediate answer
+# and backs off a failing forge, and lands nothing. The scoped review entrypoint reviews the named
+# pull request's live head and no other, and skips a repository outside its coverage.
 set -euo pipefail
 umask 077
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -62,6 +63,10 @@ row() {
       mergeable:{can_merge:true,reason:"ready"}}'
 }
 case "$url" in
+  */branches/*/protection)
+    # The base branch's enforced required contexts, which a review reads. This suite's base enforces
+    # none; what a review does with enforced contexts is covered in test/pin-wait.sh.
+    printf '{"required_status_checks":{"contexts":[]}}\n200' ;;
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
   */api/v1/review-wanted*)
     # Each answer file is one long poll's answer, consumed in order.
@@ -93,9 +98,13 @@ cat > "$t/bin/systemctl" <<'FIXTURE'
 printf '%s\n' "$*" >> "$WATCH_FIXTURE/systemctl"
 case "$*" in
   *list-units*pr-redteam-review@*)
+    # A running review is a Type=oneshot instance, which systemd reports `activating` (SubState
+    # start) until it exits. `--state` filters on that literally, as the real systemctl does.
+    [[ "$*" =~ --state=([^ ]*) ]] || { echo "list-units without --state" >> "$WATCH_FIXTURE/danger"; exit 97; }
+    [[ ",${BASH_REMATCH[1]}," == *,activating,* ]] || exit 0
     busy="$(cat "$WATCH_FIXTURE/busy-slots" 2>/dev/null || echo 0)"
     for ((i = 0; i < busy; i++)); do
-      printf 'pr-redteam-review@jeryu:fixture:%s:1111111111111111111111111111111111111111.service loaded active running\n' "$((900 + i))"
+      printf 'pr-redteam-review@jeryu:fixture:%s:1111111111111111111111111111111111111111.service loaded activating start\n' "$((900 + i))"
     done
     exit 0 ;;
   '--user start --no-block pr-redteam-review@'*) [[ ! -e "$WATCH_FIXTURE/start-failed" ]] ;;
@@ -188,9 +197,30 @@ REDTEAM_STATE="$t/state" watch
 grep -q 'answered 503 for review-wanted' "$t/controller.log"
 echo 'ok a forge error changes nothing'
 
-# The scoped entrypoint reviews the pull request it was given and refuses every other scope.
+# A forge that answers at once, with or without work, does not turn the watcher into a request
+# loop: an empty answer waits out watch_min_poll and a failing one backs off. The fixture's default
+# answer is immediate and empty, as a forge that ignored `wait` would give.
+before="$(grep -c 'review-wanted' "$t/requests")"
+timeout 5 "$here/pr-redteam" watch >> "$t/controller.log" 2>&1 || [[ $? == 124 ]]
+polls=$(( $(grep -c 'review-wanted' "$t/requests") - before ))
+((polls >= 1 && polls <= 4))
+for _ in 1 2 3 4 5 6; do answer 503 '{"message":"unavailable"}'; done
+before="$(grep -c 'review-wanted' "$t/requests")"
+timeout 5 "$here/pr-redteam" watch >> "$t/controller.log" 2>&1 || [[ $? == 124 ]]
+polls=$(( $(grep -c 'review-wanted' "$t/requests") - before ))
+((polls >= 1 && polls <= 2))
+rm -f "$t/answers/"*
+echo 'ok an immediate answer is paced and a failing forge is backed off'
+
+# The scoped entrypoint reviews the pull request it was given and refuses every other scope: a
+# repository the forge does not list for this identity, a pull request that is not open, and a
+# listed repository outside REDTEAM_FAMILIES.
 "$here/pr-redteam" _review_scoped "other:fixture:107:$head_sha" >> "$t/controller.log" 2>&1
+grep -q 'skip other/fixture#107: not a repository in the families this installation covers' "$t/controller.log"
+if grep -q 'GET https://forge.invalid/api/v1/repos/other' "$t/requests"; then echo 'an uncovered repository was read' >&2; exit 1; fi
 "$here/pr-redteam" _review_scoped 'jeryu:fixture:108:1111111111111111111111111111111111111111' >> "$t/controller.log" 2>&1
+REDTEAM_FAMILIES=jeryu "$here/pr-redteam" _review_scoped "jeryu:fixture:107:$head_sha" >> "$t/controller.log" 2>&1
+grep -q 'skip jeryu/fixture#107: not a repository in the families this installation covers (jeryu)' "$t/controller.log"
 [[ ! -f "$t/model-calls" ]]
 "$here/pr-redteam" _review_scoped "jeryu:fixture:107:$head_sha" >> "$t/controller.log" 2>&1
 [[ "$(wc -l < "$t/model-calls")" == 1 ]]
