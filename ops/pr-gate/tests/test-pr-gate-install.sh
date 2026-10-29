@@ -274,3 +274,34 @@ must 'a re-rendered verifier is installed' grep -q 'verifier v2' "$bin/pr-gate-e
 must 'its predecessor is kept' compgen -G "$bin/pr-gate-ensure-jankurai.sh.*-pre-*.bak" >/dev/null
 if called 'stop pr-gate-runner@0.timer'; then printf 'FAIL: drained for the verifier\n' >&2; exit 1; fi
 printf 'PASS the auditor and its verifier install and enable without draining\n'
+
+# The main-health schedule: a drop-in of the timer template, written from the site setting, replaced
+# when it changes, refused when it is not calendar text, and removed when the setting goes.
+dropin="$fx/home/.config/systemd/user/pr-gate-main-health@.timer.d/schedule.conf"
+cp "$fx/pr-gate.env" "$fx/pr-gate.env.base"
+printf 'PR_GATE_MAIN_HEALTH_SCHEDULE="*-*-* 03:30:00; *-*-* 15:30:00"\n' >>"$fx/pr-gate.env"
+run >"$fx/out"
+must 'the drop-in resets the template schedule' grep -qx 'OnCalendar=' "$dropin"
+must 'first expression written' grep -qx 'OnCalendar=\*-\*-\* 03:30:00' "$dropin"
+must 'second expression written' grep -qx 'OnCalendar=\*-\*-\* 15:30:00' "$dropin"
+must 'units reloaded for the schedule' called 'daemon-reload'
+sum=$(cksum <"$dropin")
+run >"$fx/out"
+must 'an unchanged schedule is not rewritten' test "$(cksum <"$dropin")" == "$sum"
+if called 'daemon-reload'; then printf 'FAIL: reloaded for an unchanged schedule\n' >&2; exit 1; fi
+cp "$fx/pr-gate.env.base" "$fx/pr-gate.env"
+printf 'PR_GATE_MAIN_HEALTH_SCHEDULE=$(touch %s/pwned)\n' "$fx" >>"$fx/pr-gate.env"
+run >"$fx/out"
+must 'free text is refused by name' grep -q 'PR_GATE_MAIN_HEALTH_SCHEDULE is not a list' "$fx/out"
+must 'a refused value changes nothing' test "$(cksum <"$dropin")" == "$sum"
+must 'a refused value is never run' test ! -e "$fx/pwned"
+cp "$fx/pr-gate.env.base" "$fx/pr-gate.env"
+run >"$fx/out"
+must 'an unset schedule removes our drop-in' test ! -e "$dropin"
+mkdir -p "$(dirname "$dropin")"; printf '[Timer]\nOnCalendar=hourly\n' >"$dropin"
+printf 'PR_GATE_MAIN_HEALTH_SCHEDULE=daily\n' >>"$fx/pr-gate.env"
+run >"$fx/out"
+must "an operator's own drop-in is left alone" grep -qx 'OnCalendar=hourly' "$dropin"
+cp "$fx/pr-gate.env.base" "$fx/pr-gate.env"; run >"$fx/out"
+must "an operator's drop-in survives an unset schedule" grep -qx 'OnCalendar=hourly' "$dropin"
+printf 'PASS the main-health schedule is configurable, validated, idempotent and never overwrites the operator\n'

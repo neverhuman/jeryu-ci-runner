@@ -122,6 +122,56 @@ record_tools() {
 }
 record_tools || say "could not record the gate's tools"
 
+# 0b. when the main-health pass runs. PR_GATE_MAIN_HEALTH_SCHEDULE is one or more systemd OnCalendar
+# expressions separated by ";" (e.g. "*-*-* 03:30:00; *-*-* 15:30:00"). It is written to a drop-in of
+# the installed timer template, which this script owns (it carries SCHEDULE_MARK); unset, the
+# template's own schedule applies and a drop-in we wrote is removed. A value that is not plain
+# calendar text, or that systemd-analyze rejects, changes nothing. Never fatal.
+SCHEDULE_DROPIN="$UNITS/pr-gate-main-health@.timer.d/schedule.conf"
+SCHEDULE_MARK="# managed by pr-gate-install.sh from PR_GATE_MAIN_HEALTH_SCHEDULE"
+apply_main_health_schedule() {
+  local spec="${PR_GATE_MAIN_HEALTH_SCHEDULE:-}" expr want="" count=0 tmp i
+  local -a exprs=()
+  if [[ -n "${spec//[[:space:];]/}" ]]; then
+    IFS=';' read -r -a exprs <<<"$spec"
+    for expr in "${exprs[@]}"; do
+      expr=$(sed -E 's/^[[:space:]]+|[[:space:]]+$//g' <<<"$expr")
+      [[ -n "$expr" ]] || continue
+      if ! [[ "$expr" =~ ^[A-Za-z0-9:*,./~[:space:]-]{1,80}$ ]] || ((++count > 8)); then
+        say "PR_GATE_MAIN_HEALTH_SCHEDULE is not a list of at most 8 calendar expressions; schedule unchanged"; return 0
+      fi
+      if command -v systemd-analyze >/dev/null 2>&1 && ! systemd-analyze calendar "$expr" >/dev/null 2>&1; then
+        say "PR_GATE_MAIN_HEALTH_SCHEDULE: systemd rejects \"$expr\"; schedule unchanged"; return 0
+      fi
+      want+="OnCalendar=$expr"$'\n'
+    done
+    want="$SCHEDULE_MARK"$'\n[Timer]\nOnCalendar=\n'"$want"
+  fi
+  if [[ -z "$want" ]]; then
+    # Only a drop-in this script wrote is ours to remove.
+    if [[ -f "$SCHEDULE_DROPIN" && ! -L "$SCHEDULE_DROPIN" ]] && head -n1 "$SCHEDULE_DROPIN" | grep -qxF -- "$SCHEDULE_MARK"; then
+      rm -f -- "$SCHEDULE_DROPIN"; rmdir -- "$(dirname -- "$SCHEDULE_DROPIN")" 2>/dev/null || true
+      say "main-health schedule back to the unit's own"
+    else
+      return 0
+    fi
+  else
+    [[ ! -e "$SCHEDULE_DROPIN" ]] || head -n1 "$SCHEDULE_DROPIN" | grep -qxF -- "$SCHEDULE_MARK" \
+      || { say "$SCHEDULE_DROPIN is the operator's; schedule unchanged"; return 0; }
+    [[ "$(cat -- "$SCHEDULE_DROPIN" 2>/dev/null || true)" != "${want%$'\n'}" ]] || return 0
+    mkdir -p "$(dirname -- "$SCHEDULE_DROPIN")"
+    tmp="$SCHEDULE_DROPIN.new.$$"
+    printf '%s' "$want" >"$tmp" && mv -f -- "$tmp" "$SCHEDULE_DROPIN" || { rm -f -- "$tmp"; return 0; }
+    say "main-health schedule set: ${spec}"
+  fi
+  systemctl --user daemon-reload || true
+  for i in $(systemctl --user list-units --no-legend --plain --all 'pr-gate-main-health@*.timer' \
+      | sed -n 's/^\(pr-gate-main-health@[0-9]\+\.timer\).*/\1/p'); do
+    systemctl --user try-restart "$i" || true
+  done
+}
+apply_main_health_schedule || say "could not apply the main-health schedule"
+
 [[ -n "$SOURCE_URL" ]] || { say "PR_GATE_SOURCE_URL is not configured (set it in $PR_GATE_CONFIG_FILE); nothing installed"; exit 2; }
 
 # 1. the source branch, in the installer's own bare mirror (under its lock). A mirror whose origin is

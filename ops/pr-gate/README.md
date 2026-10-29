@@ -368,6 +368,19 @@ After configuring it, enable `pr-gate-main-health@0.timer` with
 `systemctl --user enable --now pr-gate-main-health@0.timer`.
 Installing this source does not run that activation or a live deploy.
 
+The schedule is the site's to choose: set `PR_GATE_MAIN_HEALTH_SCHEDULE` in the installer's
+`pr-gate.env` to one or more systemd `OnCalendar` expressions separated by `;`
+(`*-*-* 03:30:00; *-*-* 15:30:00`). `pr-gate-install.sh` writes them to the drop-in
+`pr-gate-main-health@.timer.d/schedule.conf`, reloads systemd and restarts the active
+main-health timers; unset, the template's nightly 03:30 applies and a drop-in the installer wrote is
+removed. A value that is not plain calendar text, or that `systemd-analyze calendar` rejects, changes
+nothing, and a drop-in the operator wrote themselves is never replaced. Today's single tier
+(`required`) is what each scheduled pass runs; a fast tier is a further expression here once it exists.
+
+A red main is reported by the forge as itself, not as a failure on a change: the runner posts the
+red `<repo>/main-health` status on the main commit, and jeryu raises the `main_red` item on
+`/needs-you` from it (jeryu-deploy: `main_red_items`), naming the first failing step.
+
 ## A head that changes its own gate
 
 The gate runs the recipe **at the head under test**, so a diff that rewrites that recipe rewrites the
