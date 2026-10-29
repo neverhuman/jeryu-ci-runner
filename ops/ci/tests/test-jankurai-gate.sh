@@ -34,7 +34,9 @@ refuse string-count '.changed_count = "0"'
 refuse other-result '.result = "scored"'
 refuse host-error '.host_error = "the auditor exited 101"'
 printf '{"result":"no-changes"}\n' >"$fixture/bare.json"
-if verdict "$fixture/bare.json" >/dev/null; then fail 'the gate passed a bare no-changes result'; fi
+if out="$(verdict "$fixture/bare.json")"; then fail 'the gate passed a bare no-changes result'; fi
+[[ "$(head -1 <<<"$out")" == "no base to diff against" ]] || fail "unexpected verdictless title: $out"
+grep -q 'returned a report with no verdict in it, so there is no score' <<<"$out" || fail "missing verdictless explanation: $out"
 printf 'not json\n' >"$fixture/garbage.json"
 if verdict "$fixture/garbage.json" >/dev/null; then fail 'the gate passed a malformed report'; fi
 printf 'ok - jankurai-gate passes the real no-changes report and refuses its mutations\n'
