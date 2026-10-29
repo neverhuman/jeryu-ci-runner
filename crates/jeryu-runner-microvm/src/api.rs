@@ -126,7 +126,12 @@ mod tests {
     fn response(result: &[u8]) -> RunnerResult<()> {
         let temporary = tempfile::tempdir()?;
         // A long TMPDIR can exceed SUN_LEN, so address the socket through an
-        // open descriptor of the directory, which keeps the path short.
+        // open descriptor of the directory, which keeps the path short. The
+        // path needs a mounted /proc (this crate drives Firecracker, which is
+        // Linux-only) and names this process's descriptor, so it is valid only
+        // here and only while `directory` is open. Declaration order already
+        // drops `directory` last; the explicit drop below only keeps that true
+        // if the fixture is reordered.
         let directory = std::fs::File::open(temporary.path())?;
         let socket = std::path::PathBuf::from(format!(
             "/proc/self/fd/{}/api.sock",
@@ -151,6 +156,7 @@ mod tests {
         let result = put(&socket, "/actions", serde_json::json!({}));
         let _ = release.send(());
         server.join().unwrap();
+        drop(directory);
         result
     }
 
