@@ -76,6 +76,7 @@ fi
 # shellcheck source=ops/pr-gate/bin/pr-gate-config.sh
 source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-config.sh"
 pr_gate_load_config
+CAPABILITIES=$(pr_gate_capabilities) || exit 2
 # shellcheck source=ops/pr-gate/bin/pr-gate-state.sh
 source "$(dirname -- "$GATE_RUNNER_SCRIPT")/pr-gate-state.sh"
 # Hash the code that is running now, and the site configuration it read; gate inputs use this, not
@@ -535,9 +536,14 @@ heartbeat() { # [current-gate-json]
   local current="${1:-null}" last="null" payload
   [[ -s "$LAST_GATE" ]] && jq -e . "$LAST_GATE" >/dev/null 2>&1 && last="$(cat "$LAST_GATE")"
   payload="$(jq -nc --arg id "$RUNNER_HOST/slot$SLOT" \
-    --arg host "$RUNNER_HOST" --argjson slot "$SLOT" --argjson current "$current" --argjson last "$last" \
-    '{runnerId: $id, host: $host, slot: $slot, labels: ["pr-gate"], current: $current, last: $last}')"
+    --argjson capabilities "$CAPABILITIES" --arg host "$RUNNER_HOST" --argjson slot "$SLOT" --argjson current "$current" --argjson last "$last" \
+    '{runnerId: $id, host: $host, slot: $slot, labels: ["pr-gate"], current: $current, last: $last} + (if $capabilities == [] then {} else {capabilities:$capabilities} end)')"
   api POST "/api/v1/runners/heartbeat" "$(gate_heartbeat_with "$payload" "$HEARTBEAT_CODE" "$HEARTBEAT_TOOLS")"
+  if [[ "$code" == 422 && "$CAPABILITIES" != '[]' && "$body" == *capabilities* ]]; then
+    say "heartbeat capabilities refused (422); retrying without them"
+    payload=$(jq -c 'del(.capabilities)' <<<"$payload")
+    api POST "/api/v1/runners/heartbeat" "$(gate_heartbeat_with "$payload" "$HEARTBEAT_CODE" "$HEARTBEAT_TOOLS")"
+  fi
   if [[ "$code" == 422 && -n "$HEARTBEAT_TOOLS" ]]; then
     say "heartbeat tools refused (422); retrying without them"
     HEARTBEAT_TOOLS=""

@@ -896,3 +896,24 @@ Sibling sources already run from the slot checkouts selected during preparation.
 A remote main moving alone does not change those checked-out inputs during a run.
 The runner still verifies every executed checkout and tool after the recipe; it
 does not accept mutations to siblings as proof of the original snapshot.
+
+## Host capability heartbeats
+
+Set `GATE_RUNNER_CAPABILITIES=host-ci` in the site configuration only on a host
+that provides the host-ci environment. An absent or empty setting advertises
+no special capability. Names are space-separated; the runner rejects unknown
+and duplicate names before making requests. Both the slot runner and heartbeat
+timer send the setting in the heartbeat's `capabilities` array. The forge
+validates it and exposes it in `/api/v1/control-plane/runners` node details.
+A heartbeat without the field clears a previous advertisement.
+
+A forge that refuses the new field receives a retry without it, preserving the
+existing task and code evidence. That forge cannot use the advertisement.
+This is capacity reporting only: repository discovery and local claims still
+use the existing settings. It does not enable active-active failover.
+
+The repository policy is to declare `capabilities = ["host-ci"]` under `[gate]`
+in `.jeryu/repo.toml` on the trusted base/default branch. Enforcing that policy
+and forge-held leases remain separate work. `veox/jain` is outside these
+repositories; its policy declaration must be added there when lease admission
+is wired up.

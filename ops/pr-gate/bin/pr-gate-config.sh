@@ -91,3 +91,23 @@ pr_gate_listed() { # list name...
   done
   return 1
 }
+
+# Advertised gate environments. Keep this vocabulary aligned with the forge's heartbeat validator.
+# Whitespace separates names; unknown and repeated names are configuration errors.
+pr_gate_capabilities() {
+  local - capability
+  local seen=0
+  set -f
+  for capability in ${GATE_RUNNER_CAPABILITIES:-}; do
+    if [[ "$capability" != host-ci ]]; then
+      printf 'GATE_RUNNER_CAPABILITIES: unknown capability %s (expected host-ci)\n' "$capability" >&2
+      return 2
+    fi
+    if ((seen)); then
+      printf 'GATE_RUNNER_CAPABILITIES: duplicate capability host-ci\n' >&2
+      return 2
+    fi
+    seen=1
+  done
+  if ((seen)); then printf '["host-ci"]'; else printf '[]'; fi
+}

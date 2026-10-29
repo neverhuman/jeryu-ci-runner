@@ -30,6 +30,9 @@ if [[ "$url" == */api/v1/events ]]; then
   if [[ "${HEARTBEAT_TEST_EVENT_HTTP:-200}" == html ]]; then printf '<!doctype html><html></html>\n200'; exit 0; fi
   printf '{"ok":true}\n%s' "${HEARTBEAT_TEST_EVENT_HTTP:-200}"; exit 0
 fi
+if [[ -n "${HEARTBEAT_TEST_REJECT_CAPABILITIES:-}" ]] && jq -e 'has("capabilities")' <<<"$data" >/dev/null; then
+  printf 'unknown field capabilities\n422'; exit 0
+fi
 if [[ -n "${HEARTBEAT_TEST_REJECT_TOOLS:-}" ]] && jq -e 'has("tools")' <<<"$data" >/dev/null; then
   printf 'Failed to deserialize the JSON body: unknown field `tools`\n422'; exit 0
 fi
@@ -325,3 +328,14 @@ GATE_RUNNER_SLOTS=0 bash "$source_file" 2> "$fixture/shape-recovered.log"
 jq -e -s '[.[] | select(.url | endswith("/runners/heartbeat"))] | first | .body | has("code")' "$HEARTBEAT_TEST_CAPTURE" >/dev/null
 rm -f "$fixture/home/cache/heartbeat-level"
 printf 'PASS a forge that refuses the newer shape gets the oldest contract; the level is remembered for 30 minutes\n'
+
+# A host advertises its environments, and a forge without that field still receives task evidence.
+rm -f "$fixture/home/cache/heartbeat-level"
+GATE_RUNNER_CAPABILITIES=host-ci bash "$source_file"
+tail -1 "$HEARTBEAT_TEST_CAPTURE" | jq -e '.body.capabilities == ["host-ci"]' >/dev/null
+GATE_RUNNER_CAPABILITIES=host-ci HEARTBEAT_TEST_REJECT_CAPABILITIES=1 bash "$source_file" 2>"$fixture/capabilities.log"
+grep -q 'capabilities refused' "$fixture/capabilities.log"
+tail -1 "$HEARTBEAT_TEST_CAPTURE" | jq -e '(.body | has("capabilities") | not) and (.body.last | has("recipe"))' >/dev/null
+refuse env GATE_RUNNER_CAPABILITIES='host-ci host-ci' bash "$source_file"
+refuse env GATE_RUNNER_CAPABILITIES=host_ci bash "$source_file"
+printf 'PASS capabilities reach the forge; older forges retain task evidence; invalid configuration sends nothing\n'

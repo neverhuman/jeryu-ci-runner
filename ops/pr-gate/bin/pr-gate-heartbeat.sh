@@ -34,6 +34,7 @@ set -euo pipefail
 # shellcheck source=ops/pr-gate/bin/pr-gate-config.sh
 source "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")/pr-gate-config.sh"
 pr_gate_load_config
+CAPABILITIES=$(pr_gate_capabilities) || exit 2
 # The credential is sent only to the configured forge: JERYU_BASE may restate it, never redirect it.
 CANONICAL="${PR_GATE_FORGE_URL:-}"
 CANONICAL="${CANONICAL%/}"
@@ -156,14 +157,19 @@ level_seen=$level
 
 for slot in $SLOTS; do
   body=$(jq -nc --arg id "$HOST/slot$slot" --arg host "$HOST" --argjson slot "$slot" \
-    --argjson current "$(current "$slot")" --argjson last "$(last "$slot")" \
-    '{runnerId:$id, host:$host, slot:$slot, labels:["pr-gate"], current:$current, last:$last}')
+    --argjson capabilities "$CAPABILITIES" --argjson current "$(current "$slot")" --argjson last "$(last "$slot")" \
+    '{runnerId:$id, host:$host, slot:$slot, labels:["pr-gate"], current:$current, last:$last} + (if $capabilities == [] then {} else {capabilities:$capabilities} end)')
   if ((minimal)); then
     post_heartbeat "$(gate_heartbeat_minimal "$body")"
   elif [[ -n "$runner_code$runner_tools" ]]; then
     post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "$runner_tools")"
   else
     post_heartbeat "$body"
+  fi
+  if [[ "$code" == 422 && "$CAPABILITIES" != '[]' && "$out" == *capabilities* ]]; then
+    printf 'heartbeat capabilities refused (422); retrying without them\n' >&2
+    body=$(jq -c 'del(.capabilities)' <<<"$body")
+    post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "$runner_tools")"
   fi
   if [[ "$code" == 422 && -n "$runner_tools" ]]; then
     printf 'heartbeat tools refused (422); retrying without them\n' >&2

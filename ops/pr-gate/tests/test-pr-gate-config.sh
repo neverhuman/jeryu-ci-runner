@@ -92,3 +92,14 @@ for invalid in 'acme/web' 'acme/web=' 'acme/*=tool' '../web=tool' 'acme/web=../t
   ! pr_gate_dependencies_valid "$invalid" || fail "invalid dependency map accepted: $invalid"
 done
 printf 'PASS dependency declarations reject ambiguous keys, duplicate names, paths and globs\n'
+
+# The operator advertises only known environments, never a misspelling or duplicate.
+[[ "$(GATE_RUNNER_CAPABILITIES= pr_gate_capabilities)" == '[]' ]]
+[[ "$(GATE_RUNNER_CAPABILITIES=' host-ci ' pr_gate_capabilities)" == '["host-ci"]' ]]
+for invalid in 'host-ci host-ci' 'host_ci' '*'; do
+  if GATE_RUNNER_CAPABILITIES="$invalid" pr_gate_capabilities; then
+    printf 'accepted invalid capabilities: %s\n' "$invalid" >&2
+    exit 1
+  fi
+done
+printf 'PASS capability vocabulary and uniqueness\n'

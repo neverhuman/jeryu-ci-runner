@@ -295,6 +295,9 @@ case "$method $url" in
     printf '{"id":"check"}\n201';;
   'POST '*'/heartbeat')
     printf '%s\n' "$payload" >>"$FAKE_FORGE/heartbeats.jsonl"
+    if [[ -f "$FAKE_FORGE/reject-heartbeat-capabilities" ]] && jq -e 'has("capabilities")' <<<"$payload" >/dev/null; then
+      printf 'unknown field capabilities\n422'; exit 0
+    fi
     if [[ -f "$FAKE_FORGE/reject-heartbeat-tools" ]] && jq -e 'has("tools")' <<<"$payload" >/dev/null; then
       printf 'Failed to deserialize the JSON body: unknown field `tools`\n422'; exit
     fi
@@ -1058,6 +1061,22 @@ jq -se 'length>=3 and (.[0]|has("tools") and has("code")) and (.[1]|(has("tools"
 ! grep -q 'heartbeat refused' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
 rm -f "$fixture/reject-heartbeat-tools" "$fixture/reject-heartbeat-code" "$fixture/runner/tools.json"
 printf 'PASS heartbeats carry the valid tools; a 422 is retried without tools, then without code, each logged once\n'
+
+: >"$beats"
+GATE_RUNNER_CAPABILITIES=host-ci invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -se 'length >= 1 and all(.[]; .capabilities == ["host-ci"])' "$beats" >/dev/null
+touch "$fixture/reject-heartbeat-capabilities"
+: >"$beats"
+GATE_RUNNER_CAPABILITIES=host-ci invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -se 'length >= 2 and .[0].capabilities == ["host-ci"] and (.[0] | del(.capabilities)) == .[1]' "$beats" >/dev/null
+rm -f "$fixture/reject-heartbeat-capabilities"
+: >"$beats"
+GATE_RUNNER_CAPABILITIES='host-ci host-ci' invoke
+[[ "$runner_exit" == 2 && ! -s "$beats" ]]
+printf 'PASS runner capabilities are validated, advertised and omitted on older forges\n'
+
 
 # Main-health gates the protected main commit under its own context. A green main SHA is skipped on
 # the next scheduled pass, but an explicit repo pass runs on demand.
