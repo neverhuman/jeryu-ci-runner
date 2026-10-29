@@ -1018,8 +1018,9 @@ gate_publish() {
     if [[ "$code" == 422 && -n "$checks_url" ]]; then api POST "/repos/$owner/$repo/check-runs" "$check_payload"; fi
     # The check run is not a required context and never gates a merge: the required status above is
     # the gate. A rejection is recorded and reported, and must not hold the attempt in recovery or
-    # stop later ticks, which is what a return 1 here did.
-    if [[ "$code" != 201 ]]; then
+    # stop later ticks, which is what a return 1 here did. An empty or malformed
+    # acknowledgement leaves this flag false so the next tick retries only the missing check.
+    if [[ "$code" != 201 ]] || ! jq -se 'length == 1 and .[0].id != null' <<<"$body" >/dev/null 2>&1; then
       gate_update --arg code "$code" '.publication.check_run=false | .publication.check_http_status=$code | .recovery_required=null' || return
       printf 'check run for %s/%s@%s answered %s (required status already posted)\n' "$owner" "$repo" "$sha" "$code" >&2
     else

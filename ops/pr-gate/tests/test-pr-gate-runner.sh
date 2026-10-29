@@ -487,6 +487,10 @@ printf 'PASS complete runner: an unpublishable head is left for the next tick, n
 # A completed green recipe whose status POST has no body must keep its recovery marker. The
 # next tick republishes the same attempt and log, without executing the recipe a second time.
 for response_code in 201 503 000; do
+  # A fresh head starts pending; re-verifying this runner's green head preserves green.
+  "$real_git" -C "$fixture/source" commit -qm "publication-$response_code" --allow-empty
+  "$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+  "$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
   printf '%s\n' "$response_code" >"$fixture/empty-terminal"
   before_count=$(count)
   invoke --repo acme/fixture --pr 1
@@ -501,13 +505,29 @@ for response_code in 201 503 000; do
   attempt=$(jq -r .id "$receipt")
   digest=$(jq -r .log_sha256 "$receipt")
   grep -q 'publication recovery required' "$fixture/runner.log"
+  # Reproduce the receipt left by the fatal body expansion, before a recovery marker was saved.
+  if [[ "$response_code" == 201 ]]; then
+    attempt_receipt="$(dirname "$receipt")/$attempt/receipt.json"
+    jq '.recovery_required=null | .phase="running" | .publication={required_status:false,check_run:false}' \
+      "$attempt_receipt" >"$fixture/crashed-receipt.json"
+    cp "$fixture/crashed-receipt.json" "$attempt_receipt"
+    cp "$fixture/crashed-receipt.json" "$receipt"
+  fi
+  jq -cS '.inputs' "$receipt" >"$fixture/recovery-inputs.json"
+  jq -se --arg sha "$head" 'last | .sha==$sha and .state=="pending"' "$fixture/statuses.jsonl" >/dev/null \
+    || { tail -3 "$fixture/statuses.jsonl" >&2; exit 1; }
   rm -f "$fixture/empty-terminal"
   invoke
   [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
   expect_count "$((before_count + 1))"
   jq -e --arg id "$attempt" --arg digest "$digest" '.id==$id and .log_sha256==$digest
     and .publication.required_status and .publication.check_run and .recovery_required==null' "$receipt" >/dev/null
-  jq -se 'last.state=="success"' "$fixture/statuses.jsonl" >/dev/null
+  jq -cS '.inputs' "$receipt" >"$fixture/recovered-inputs.json"
+  cmp "$fixture/recovery-inputs.json" "$fixture/recovered-inputs.json"
+  inputs_digest=$(sha256sum "$fixture/recovery-inputs.json" | cut -c1-64)
+  jq -se --arg sha "$head" --arg digest "$inputs_digest" 'last | .sha==$sha and .state=="success"
+    and (.description | contains("; inputs " + $digest))' "$fixture/statuses.jsonl" >/dev/null
+  jq -se --arg sha "$head" 'last | .head_sha==$sha and .conclusion=="success"' "$fixture/check-runs.jsonl" >/dev/null
 done
 printf 'PASS complete runner: empty status responses retain a green result and the next tick republishes without rerun\n'
 

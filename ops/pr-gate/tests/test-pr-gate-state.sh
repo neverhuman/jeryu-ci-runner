@@ -114,6 +114,25 @@ for publication_mode in 403 000 503 empty-201 blank-201 invalid-201; do
 done
 printf 'PASS rejected, empty and malformed publications retain terminal evidence and replay without computation\n'
 
+# A missing check acknowledgement is retried without duplicating the required status.
+for publication_mode in 403 000 503 empty-201 blank-201 invalid-201; do
+  gate_begin "$identity"
+  printf 'passed\n' >"$gate_attempt_dir/build.log"
+  gate_finish success 0 "$gate_attempt_dir/build.log"
+  (publication_mode=201; gate_publish)
+  gate_update '.publication.check_run=false'
+  before=$(wc -l <"$scratch/published.jsonl")
+  gate_publish
+  jq -e '.publication.required_status and (.publication.check_run|not)
+    and .recovery_required==null' "$gate_receipt" >/dev/null
+  publication_mode=201
+  gate_recover
+  [[ "$(wc -l <"$scratch/published.jsonl")" == "$((before + 1))" ]]
+  jq -se 'last | .head_sha != null and .conclusion=="success"' "$scratch/published.jsonl" >/dev/null
+  jq -e '.publication.required_status and .publication.check_run' "$gate_key_dir/last-result.json" >/dev/null
+done
+printf 'PASS missing check acknowledgements retry only the check without blocking required status\n'
+
 log=$(jq -r '.log' "$gate_key_dir/last-result.json")
 printf 'tampered\n' >>"$log"
 gate_decision "$identity" 0 "$statuses"
