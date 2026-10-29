@@ -506,6 +506,7 @@ printf 'PASS complete runner: an unpublishable head is left for the next tick, n
 
 # A completed green recipe whose status POST has no body must keep its recovery marker. The
 # next tick republishes the same attempt and log, without executing the recipe a second time.
+export PR_GATE_STATUS_ATTEMPTS=3 PR_GATE_STATUS_RETRY_SLEEP=0
 for response_code in 201 503 000; do
   # A fresh head starts pending; re-verifying this runner's green head preserves green.
   "$real_git" -C "$fixture/source" commit -qm "publication-$response_code" --allow-empty

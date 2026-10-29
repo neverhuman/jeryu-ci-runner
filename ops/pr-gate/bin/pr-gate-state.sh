@@ -910,10 +910,45 @@ gate_publication_answer() {
   [[ -n "$code" ]] || code=unacknowledged
 }
 
+# POST a terminal publication, retrying a forge failure (5xx, or 000: no answer) a bounded number of
+# times, as the runner's post_status does. Only the publication is repeated: the recipe is never run
+# again, and an answer that is not a 2xx acknowledgement is never accepted here -- the caller still
+# validates the response and retains the receipt for recovery when retries are exhausted. The bounds
+# are the runner's PR_GATE_STATUS_ATTEMPTS / PR_GATE_STATUS_RETRY_SLEEP (STATUS_ATTEMPTS and
+# STATUS_RETRY_SLEEP), clamped to 1..10 attempts and 0..60 seconds.
+gate_api_retry() { # method path json
+  local attempts=${STATUS_ATTEMPTS:-4} pause=${STATUS_RETRY_SLEEP:-5} attempt=1
+  [[ "$attempts" =~ ^[0-9]+$ ]] && ((attempts >= 1 && attempts <= 10)) || attempts=4
+  [[ "$pause" =~ ^[0-9]+$ ]] && ((pause <= 60)) || pause=5
+  while :; do
+    api "$@"
+    gate_publication_answer
+    [[ "$code" =~ ^(5[0-9][0-9]|000)$ ]] && ((attempt < attempts)) || return 0
+    printf 'forge answered %s publishing %s; retry %d of %d in %ss\n' "$code" "$2" "$attempt" "$((attempts - 1))" "$pause" >&2
+    attempt=$((attempt + 1))
+    sleep "$pause"
+  done
+}
+
+# Why a publication was not acknowledged, as a fixed word: never the response body, which may carry
+# forge text. Reads the globals set by gate_publication_answer.
+gate_publication_fault() {
+  if [[ "$code" == unacknowledged ]]; then printf 'no-answer'
+  elif [[ "$code" =~ ^(5[0-9][0-9]|000)$ ]]; then printf 'forge-unavailable'
+  elif [[ "$code" != 201 ]]; then printf 'rejected'
+  elif [[ -z "${body//[[:space:]]/}" ]]; then printf 'empty-acknowledgement'
+  elif ! jq -e . <<<"$body" >/dev/null 2>&1; then printf 'malformed-acknowledgement'
+  else printf 'acknowledgement-without-id'
+  fi
+}
+
+# Receipt types: publication.http_status is the number 201 once the forge acknowledged the required
+# status, and a string otherwise (the curl code, or "unacknowledged" when nothing was assigned), so
+# a failure like "000" keeps its leading zeros. publication.fault names the failure class.
 gate_publish() {
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
   local steps_dir="" steps_end="" status_payload check_payload proof_base
-  local check_state title changed="" step_state
+  local check_state title changed="" step_state fault
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -982,19 +1017,18 @@ gate_publish() {
     status_payload=$(jq -nc --arg state "$state" --arg context "$context" \
       --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${inputs:+; inputs $inputs}${proof_base:+; $proof_base}${cause:+; cause: $cause}" \
       '{state:$state,context:$context,description:$description}')
-    api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -c --arg url "$checks_url" \
-      '. + (if $url == "" then {} else {target_url:$url} end)' <<<"$status_payload")"
     # An empty response is an unacknowledged publication, not a shell invariant failure.
-    gate_publication_answer
+    gate_api_retry POST "/repos/$owner/$repo/statuses/$sha" "$(jq -c --arg url "$checks_url" \
+      '. + (if $url == "" then {} else {target_url:$url} end)' <<<"$status_payload")"
     # The link never decides a gate: a forge that refuses it (422) gets the same status without it.
     if [[ "$code" == 422 && -n "$checks_url" ]]; then
-      api POST "/repos/$owner/$repo/statuses/$sha" "$status_payload"
-      gate_publication_answer
+      gate_api_retry POST "/repos/$owner/$repo/statuses/$sha" "$status_payload"
     fi
     if [[ "$code" != 201 ]] || ! jq -se 'length == 1 and .[0].id != null' <<<"$body" >/dev/null 2>&1; then
-      gate_update --arg code "$code" '.recovery_required="required-status publication rejected or unacknowledged" | .publication.http_status=$code' || return
+      fault=$(gate_publication_fault)
+      gate_update --arg code "$code" --arg fault "$fault" '.recovery_required="required-status publication rejected or unacknowledged" | .publication.http_status=$code | .publication.fault=$fault' || return
       cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
-      printf 'required-status publication unacknowledged for %s/%s@%s (HTTP %s); retained for recovery\n' "$owner" "$repo" "$sha" "$code" >&2
+      printf 'required-status publication unacknowledged for %s/%s@%s (HTTP %s, %s); retained for recovery\n' "$owner" "$repo" "$sha" "$code" "$fault" >&2
       return 1
     fi
     gate_update --argjson response "$body" '.publication.required_status=true | .publication.status_id=$response.id | .publication.http_status=201' || return
@@ -1027,20 +1061,19 @@ gate_publish() {
       --arg note "$note" \
       '{name:"pr-gate-runner",head_sha:$sha,status:"completed",conclusion:(if $state=="error" then "failure" else $state end),
         output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}')
-    api POST "/repos/$owner/$repo/check-runs" "$(jq -c --arg url "$checks_url" \
+    gate_api_retry POST "/repos/$owner/$repo/check-runs" "$(jq -c --arg url "$checks_url" \
       '. + (if $url == "" then {} else {details_url:$url} end)' <<<"$check_payload")"
-    gate_publication_answer
     if [[ "$code" == 422 && -n "$checks_url" ]]; then
-      api POST "/repos/$owner/$repo/check-runs" "$check_payload"
-      gate_publication_answer
+      gate_api_retry POST "/repos/$owner/$repo/check-runs" "$check_payload"
     fi
     # The check run is not a required context and never gates a merge: the required status above is
     # the gate. A rejection is recorded and reported, and must not hold the attempt in recovery or
     # stop later ticks, which is what a return 1 here did. An empty or malformed
     # acknowledgement leaves this flag false so the next tick retries only the missing check.
     if [[ "$code" != 201 ]] || ! jq -se 'length == 1 and .[0].id != null' <<<"$body" >/dev/null 2>&1; then
-      gate_update --arg code "$code" '.publication.check_run=false | .publication.check_http_status=$code | .recovery_required=null' || return
-      printf 'check run for %s/%s@%s answered %s (required status already posted)\n' "$owner" "$repo" "$sha" "$code" >&2
+      fault=$(gate_publication_fault)
+      gate_update --arg code "$code" --arg fault "$fault" '.publication.check_run=false | .publication.check_http_status=$code | .publication.check_fault=$fault | .recovery_required=null' || return
+      printf 'check run for %s/%s@%s answered %s, %s (required status already posted)\n' "$owner" "$repo" "$sha" "$code" "$fault" >&2
     else
       gate_update '.publication.check_run=true | .recovery_required=null' || return
     fi

@@ -15,6 +15,7 @@ sha=0123456789012345678901234567890123456789
 HOME_DIR="$scratch/state"
 mkdir -p "$HOME_DIR"
 publication_mode=201
+STATUS_ATTEMPTS=3 STATUS_RETRY_SLEEP=0
 api() {
   case "$publication_mode" in
     # The forge answered, but this wrapper assigned no body (or neither global). gate_publish must
@@ -29,6 +30,10 @@ api() {
     blank-201) code=201 body='   '; return;;
     invalid-201) code=201 body='not JSON'; return;;
     000|503) body=""; return;;
+    flaky-*) # fail with 503 for the first N posts, then acknowledge
+      posts=$(( $(cat "$scratch/posts" 2>/dev/null || echo 0) + 1 )); echo "$posts" >"$scratch/posts"
+      if ((posts <= ${publication_mode#flaky-})); then code=503 body=""; return; fi
+      code=201;;
   esac
   if [[ "$code" != 201 ]]; then body='{"message":"rejected"}'; return; fi
   export body='{"id":"verified-publication-id"}'
@@ -120,6 +125,42 @@ for publication_mode in 403 000 503 empty-201 blank-201 invalid-201 unset-body u
   [[ "$gate_action" == reuse ]]
 done
 printf 'PASS rejected, empty, malformed and unassigned publications retain terminal evidence and replay without computation\n'
+
+# Terminal publication retries a forge failure a bounded number of times before retaining recovery.
+for flaky in 1 2; do
+  rm -f "$scratch/posts"
+  gate_begin "$identity"
+  printf 'passed\n' >"$gate_attempt_dir/build.log"
+  gate_finish success 0 "$gate_attempt_dir/build.log"
+  publication_mode=flaky-$flaky
+  gate_publish 2>"$scratch/retry.err"
+  jq -e '.publication.required_status and .publication.http_status==201 and .recovery_required==null' "$gate_receipt" >/dev/null
+    grep -q 'retry 1 of 2' "$scratch/retry.err"
+done
+rm -f "$scratch/posts"
+gate_begin "$identity"
+printf 'passed\n' >"$gate_attempt_dir/build.log"
+gate_finish success 0 "$gate_attempt_dir/build.log"
+publication_mode=flaky-3
+if gate_publish 2>"$scratch/retry.err"; then exit 1; fi
+[[ "$(cat "$scratch/posts")" == 3 ]]
+jq -e '.recovery_required!=null and (.publication.required_status|not) and .publication.fault=="forge-unavailable"' "$gate_receipt" >/dev/null
+publication_mode=201
+printf 'PASS terminal publication retries 5xx within the bound, then retains recovery without acknowledging\n'
+
+# Malformed acknowledgements are told apart by a fixed word, and the response body is never logged.
+for pair in empty-201:empty-acknowledgement blank-201:empty-acknowledgement invalid-201:malformed-acknowledgement \
+    unset-body:empty-acknowledgement unset-both:no-answer 403:rejected 503:forge-unavailable; do
+  publication_mode=${pair%%:*}
+  gate_begin "$identity"
+  printf 'passed\n' >"$gate_attempt_dir/build.log"
+  gate_finish success 0 "$gate_attempt_dir/build.log"
+  if (gate_publish 2>"$scratch/fault.err"); then exit 1; fi
+  jq -e --arg fault "${pair#*:}" '.publication.fault==$fault' "$gate_receipt" >/dev/null
+  ! grep -q 'not JSON\|rejected"' "$scratch/fault.err"
+done
+publication_mode=201
+printf 'PASS malformed acknowledgements are classified without logging response bodies\n'
 
 # A missing check acknowledgement is retried without duplicating the required status.
 for publication_mode in 403 000 503 empty-201 blank-201 invalid-201 unset-body unset-both; do
