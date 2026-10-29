@@ -42,8 +42,8 @@ The review directory (its path is given below) contains:
                      forge enforces as branch protection for this head's exact base branch, each with
                      the state the forge reported for it on this head when the review started: forge
                      data, not author text. Judge gate evidence against exactly those contexts, and
-                     treat a context with `no result` as evidence that has not arrived. A change to
-                     release lock files only is reviewed once they have a result, or after a bounded
+                     treat a context with `no result` as evidence that has not arrived. Every PR
+                     is reviewed once they have a result, or after a bounded
                      wait; when the section says the wait ran out with a context still pending, that
                      context has no result yet. Report it as such; it is neither a pass nor a failure.
                      Never guess a context from a repository name, a branch name, CI files or a
@@ -154,3 +154,12 @@ block is always honored; an approval containing a high or critical finding is re
 
 Keep `summary` to a few sentences a maintainer can read in ten seconds: what the PR does, and what
 (if anything) worried you.
+
+When a finding is solely that an enforced required context has no result yet, set its optional
+`pending_required_context` to that context's exact name from signals.txt. Always represent that
+reason as a finding, even when it is the only reason for a block. Omit this field for code defects,
+failed gates, unreadable protection, incomplete review, and other unresolved evidence. Keep such
+findings separate: never attach this field to a finding that also reports a code defect. The
+controller verifies the named context is enforced and still missing/pending in the review's forge
+snapshot; only a block consisting entirely of these findings is exempt from the agent hold cap.
+The block itself is unchanged and still prevents landing.

@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# A release pin bump (a change to release lock files only) is reviewed once its required contexts
-# have a result, never before, and never later than REDTEAM_PIN_WAIT_SECS after a pass first saw its
-# head. Which contexts those are is the base branch's enforced branch protection, read from the
-# forge: never the row's own list, a branch name or a tier guessed from either. While it waits nothing is recorded, posted or spent. Every other head is reviewed at once,
-# as is a pin bump whose contexts already have a result (a failing one included). The review is
-# told each required context's state. Offline: stand-in forge, git and model processes.
+# Every PR waits for enforced required contexts; pin bumps share the bounded path with their
+# existing timeout. Missing-result-only holds do not spend the agent hold cap. Offline fixtures.
 set -euo pipefail
 umask 077
 here="$(cd "$(dirname "$0")/.." && pwd)"
@@ -104,13 +100,17 @@ if [[ "${1:-}" == --version ]]; then echo '9.9.9 (Claude Code)'; exit 0; fi
 PIN_FIXTURE="$(dirname "$(dirname "$0")")"
 while (($#)); do [[ "$1" != --add-dir ]] || cp "$2/signals.txt" "$PIN_FIXTURE/signals.txt"; shift; done
 printf 'called\n' >>"$PIN_FIXTURE/model-calls"
-printf '{"type":"result","subtype":"success","is_error":false,"structured_output":{"verdict":"approve","summary":"fixture review","findings":[]}}\n'
+if [[ -f "$PIN_FIXTURE/verdict" ]]; then
+  jq -c '{type:"result",subtype:"success",is_error:false,structured_output:.}' "$PIN_FIXTURE/verdict"
+else
+  printf '{"type":"result","subtype":"success","is_error":false,"structured_output":{"verdict":"approve","summary":"fixture review","findings":[]}}\n'
+fi
 FIXTURE
 chmod +x "$t/bin/"*
 export PIN_FIXTURE="$t" FIXTURE_REAL_GIT="$real_git"
 export PATH="$t/bin:$PATH" JERYU_TOKEN_FILE="$t/token" REDTEAM_STATE="$t/state" REDTEAM_CLAUDE="$t/bin/model"
 export REDTEAM_CLAUDE_VERSION=9.9.9 REDTEAM_TIMEOUT=10 JERYU_BASE=https://forge.invalid
-unset REDTEAM_PIN_WAIT_SECS
+unset REDTEAM_PIN_WAIT_SECS REDTEAM_GATE_WAIT_SECS
 
 review() { "$here/pr-redteam" _review 0 0 0 acme/fixture 1 >>"$t/controller.log" 2>&1; }
 receipt() { printf '%s/state/receipts/acme/fixture/1-%s.json\n' "$t" "$(cat "$t/head")"; }
@@ -166,26 +166,37 @@ grep -qx 'acme/required: pending' "$t/signals.txt" \
   || fail "signals did not say the bound ran out: $(cat "$t/signals.txt")"
 echo 'ok past the bound a pin bump is reviewed and told its required context is still pending'
 
-# 5. Anything that is not a release-lock-only change is reviewed at once, pending or not.
+# 5. Non-pin changes share the wait, using the 5400s general default. No review is spent inside
+#    the bound; expiry reviews with the pending state, and each new head starts a fresh clock.
 for case in 'source:["acme.lock.toml","src/main.rs"]' 'nested:["sub/acme.lock.toml"]' 'cargo:["Cargo.lock"]'; do
-  bump; contexts '[{"name":"acme/required","state":"pending"}]'; files "${case#*:}"; review; calls=$((calls + 1))
-  reviewed "${case%%:*}"
+  bump; contexts '[{"name":"acme/required","state":"pending"}]'; files "${case#*:}"; review
+  [[ "$(count "$t/model-calls")" == "$calls" && ! -e "$(receipt)" ]] || fail "${case%%:*}: reviewed before bound"
   jq -e '.pin_only == false' "$(waitfile)" >/dev/null || fail "${case%%:*}: recorded as a pin bump"
+  grep -q 'of 5400s)' "$t/controller.log" || fail 'general default not 5400s'
+  jq --argjson e "$(( $(date +%s) - 5401 ))" '.first_seen_epoch = $e' "$(waitfile)" >"$t/w" && cat "$t/w" >"$(waitfile)"
+  review; calls=$((calls + 1)); reviewed "${case%%:*} expired"
+  grep -q 'bound 5400s' "$t/signals.txt" || fail 'general expiry signal missing'
 done
-echo 'ok a change that is not release locks only is reviewed at once while its context is pending'
+echo 'ok ordinary source, nested lock and Cargo.lock changes wait for the general bound'
 
-# 6. A forge diff that is stale, truncated or unavailable never makes a head wait.
+# 6. An unknown diff cannot bypass the general wait. An unavailable diff is retried while keeping
+#    the first observation, so outages cannot postpone expiry indefinitely.
 files '["acme.lock.toml"]'
 for flag in diff-stale diff-truncated diff-down; do
-  bump; touch "$t/$flag"; review; rm "$t/$flag"; calls=$((calls + 1)); reviewed "$flag"
+  bump; touch "$t/$flag"; review
+  [[ "$(count "$t/model-calls")" == "$calls" && ! -e "$(receipt)" ]] || fail "$flag bypassed wait"
+  first=$(( $(date +%s) - 601 )); first_at="$(date -u -d "@$first" +%FT%TZ)"
+  jq --argjson e "$first" --arg at "$first_at" '.first_seen_epoch = $e | .first_seen_at = $at' "$(waitfile)" >"$t/w" && cat "$t/w" >"$(waitfile)"
+  REDTEAM_GATE_WAIT_SECS=600 review
+  [[ "$(jq -r .first_seen_at "$(waitfile)")" == "$first_at" ]] || fail "$flag reset the first-observation timestamp"
+  rm "$t/$flag"; calls=$((calls + 1)); reviewed "$flag expired"
 done
-[[ ! -e "$(waitfile)" ]] || fail "an unanswered diff read was recorded"
-echo 'ok a stale, truncated or unavailable forge diff reviews at once'
+echo 'ok stale, truncated and unavailable diffs use the general bound without resetting it'
 
 # 7. Off switch, a base that enforces nothing, and protection the forge will not answer with no row
 #    list either: reviewed at once, no diff read.
 bump; contexts '[{"name":"acme/required","state":"pending"}]'; before="$(diff_reads)"
-REDTEAM_PIN_WAIT_SECS=0 review; calls=$((calls + 1)); reviewed "wait off"
+REDTEAM_PIN_WAIT_SECS=0 REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1)); reviewed "wait off"
 bump; protect '{"main": {"required_status_checks": {"contexts": []}}}'; contexts '[]'
 review; calls=$((calls + 1)); reviewed "none enforced"
 grep -qx '(the base branch enforces no required context)' "$t/signals.txt" \
@@ -236,6 +247,64 @@ grep -Fq "could not be read" "$t/signals.txt" && grep -Fq 'do not guess contexts
 grep -Fqx 'acme/required: success' "$t/signals.txt" || fail "the row's list was not shown as such"
 [[ "$(protection_reads)" -gt 0 ]] || fail "branch protection was never read"
 echo 'ok protection the forge will not answer leaves gate evidence unresolved and still waits for the row'
+
+# 10. Mixed contexts wait until every required result exists; a failed result does not hide a
+#     different missing result. Force and dry-run still respect admission and publish nothing.
+protect '{"main": {"required_status_checks": {"contexts": ["acme/required", "acme/extra"]}}}'
+files '["src/main.rs"]'; bump
+contexts '[{"name":"acme/required","state":"failure"},{"name":"acme/extra","state":"pending"}]'
+review
+"$here/pr-redteam" _review 1 1 0 acme/fixture 1 >>"$t/controller.log" 2>&1
+[[ "$(count "$t/model-calls")" == "$calls" && ! -e "$(receipt)" ]] || fail 'mixed results/force bypassed wait'
+contexts '[{"name":"acme/required","state":"failure"},{"name":"acme/extra","state":"success"}]'
+review; calls=$((calls + 1)); reviewed 'all contexts terminal'
+echo 'ok every enforced context needs a result, including under force and dry-run'
+
+# 11. Expired missing-result-only blocks stay blocking but do not consume the hold cap. A real
+#     code finding mixed in still counts, as do false labels for failed or unknown contexts.
+protect '{"main": {"required_status_checks": {"contexts": ["acme/required"]}}}'
+contexts '[{"name":"acme/required","state":"missing"}]'
+missing='{severity:"medium",title:"Required result missing",file:"signals.txt",
+  detail:"The required lane has no result yet.",evidence:"acme/required: missing",
+  pending_required_context:"acme/required"}'
+code_finding='{severity:"high",title:"Client total trusted",file:"cart.rs",
+  detail:"The server accepts the client total.",evidence:"body.total"}'
+for _attempt in 1 2 3; do
+  bump
+  jq -n "{verdict:\"block\",summary:\"Required evidence has not arrived\",findings:[$missing]}" >"$t/verdict"
+  REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1))
+  [[ "$(count "$t/model-calls")" == "$calls" ]] || fail 'missing results exhausted the hold cap'
+  jq -e '.decision == "hold" and .hold_kind == "gate" and .posted == true' "$(receipt)" >/dev/null || fail 'missing-only hold counted'
+  tail -1 "$t/posts" | jq -e '.verdict == "request_changes" and (.body_markdown | contains("not counted toward the hold limit"))' >/dev/null \
+    || fail 'missing-only hold was waived or misreported'
+done
+printf '%200s' fixture >"$t/repo/payload.bin"
+g add payload.bin; g commit -qm 'add unpinned fixture payload'; g rev-parse HEAD >"$t/head"
+REDTEAM_MAX_BLOB_BYTES=100 REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1))
+jq -e '.decision == "hold" and .hold_kind == "gate" and .posted == true
+  and any(.verdict.findings[]; .title | startswith("Unpinned binary or archive"))' "$(receipt)" >/dev/null \
+  || fail 'mechanical finding made a missing-only model hold count'
+g rm -q payload.bin; g commit -qm 'remove fixture payload'
+bump
+jq -n "{verdict:\"block\",summary:\"Missing result and code defect\",findings:[$missing,$code_finding]}" >"$t/verdict"
+REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1))
+jq -e '.decision == "hold" and .hold_kind == "agent"' "$(receipt)" >/dev/null || fail 'mixed code hold did not count'
+tail -1 "$t/posts" | jq -e '.body_markdown | contains("hold 1 of 2")' >/dev/null || fail 'missing-only holds moved the count'
+for kind in failed unknown unreadable; do
+  bump
+  contexts '[{"name":"acme/required","state":"failure"}]'
+  jq -n "{verdict:\"block\",summary:\"Unresolved evidence\",findings:[$missing]}" >"$t/verdict"
+  if [[ "$kind" == unknown ]]; then
+    contexts '[{"name":"acme/required","state":"pending"}]'
+    jq '.findings[0].pending_required_context="invented/required"' "$t/verdict" >"$t/v"; mv "$t/v" "$t/verdict"
+  elif [[ "$kind" == unreadable ]]; then
+    contexts '[{"name":"acme/required","state":"pending"}]'; protect unreadable
+  fi
+  REDTEAM_HOLD_CAP=0 REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1))
+  jq -e '.decision == "hold" and .hold_kind == "agent"' "$(receipt)" >/dev/null || fail "$kind label exempted an agent hold"
+done
+[[ "$(count "$t/model-calls")" == "$calls" ]] || fail 'accounting model call count'
+echo 'ok missing-only holds never spend the cap; mixed, failed, unknown and unverified claims count'
 
 [[ ! -e "$t/danger" ]] || fail "forbidden action: $(cat "$t/danger")"
 echo 'PIN WAIT PASS'

@@ -131,6 +131,8 @@ export REDTEAM_STATE="$t/state" REDTEAM_CLAUDE="$t/bin/model" REDTEAM_CLAUDE_VER
 export JERYU_BASE=https://forge.invalid
 # This suite publishes holds on head after head; the hold cap is hold-cap.sh's subject, not this one's.
 export REDTEAM_HOLD_CAP=0
+# Exercise publication after the admission wait expires; pin-wait.sh covers admission itself.
+export REDTEAM_GATE_WAIT_SECS=0
 review() { "$here/pr-redteam" _review 0 0 0 jeryu/fixture 1 >> "$t/controller.log" 2>&1; }
 receipt() { printf '%s/state/receipts/jeryu/fixture/1-%s.json\n' "$t" "$(cat "$t/head")"; }
 count() { if [[ -f "$1" ]]; then wc -l < "$1"; else echo 0; fi; }
@@ -376,6 +378,27 @@ jq -e '.posted == true and .decision == "approve" and .cost_usd == 0.4321' "$(re
 jq -e '.kind == "pr.reviewed" and .outcome == "waiting_gate" and .cost_usd == 0.4321' "$t/events" >/dev/null
 rm "$t/events" "$t/with-contexts"
 echo 'ok review runs during pending proof and is reused after green, across live row fields, without early publication'
+
+# A finding about the pending result becomes stale when proof reports; recompute it instead
+# of publishing the old block as a counted agent hold against the now-green context.
+advance
+touch "$t/gate-pending" "$t/with-contexts"
+jq -n '{verdict:"block",summary:"Required proof has no result",findings:[{
+  severity:"medium",title:"Required proof pending",file:"signals.txt",
+  detail:"The required proof is still running.",evidence:"jankurai/proof: pending",
+  pending_required_context:"jankurai/proof"}]}' >"$t/verdict"
+model_calls="$(count "$t/model-calls")"
+review
+jq -e '.posted == false and .decision == "waiting_gate"' "$(receipt)" >/dev/null
+[[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+rm "$t/gate-pending"
+printf '{"verdict":"approve","summary":"fixture review complete","findings":[]}\n' >"$t/verdict"
+review
+[[ "$(count "$t/model-calls")" == "$((model_calls + 2))" ]]
+jq -e '.posted == true and .decision == "approve"' "$(receipt)" >/dev/null
+[[ ! -e "$pending" ]]
+rm "$t/with-contexts"
+echo 'ok pending-context findings receive a fresh review when proof reports'
 
 # A proof that fails while the agent runs is the quality gate's mechanical hold, never a neutral
 # wait, and the computed result is not kept.

@@ -16,6 +16,10 @@ case "$FAKE_CASE" in
   valid_approve) emit "$ok" ;;
   valid_block) emit "{\"verdict\":\"block\",\"summary\":\"bad\",\"findings\":[$crit]}" ;;
   valid_high_block) emit "{\"verdict\":\"block\",\"summary\":\"bad\",\"findings\":[${crit/critical/high}]}" ;;
+  pending_context|empty_pending_context|nonstring_pending_context)
+    emit "{\"verdict\":\"block\",\"summary\":\"waiting\",\"findings\":[$crit]}" |
+      jq --arg mode "$FAKE_CASE" '.structured_output.findings[0].pending_required_context =
+        (if $mode == "pending_context" then "acme/required" elif $mode == "empty_pending_context" then "" else 1 end)' ;;
   explicit_hold) emit '{"verdict":"block","summary":"review incomplete","findings":[]}' ;;
   approve_then_exit42) emit "$ok"; exit 42 ;;
   approve_then_timeout) emit "$ok"; sleep 30 ;;
@@ -59,13 +63,13 @@ fail=0
 for c in approve_then_exit42 approve_then_timeout invalid_verdict_enum approve_with_critical \
          approve_with_high envelope_is_error missing_error_flag wrong_envelope_type multiple_envelopes \
          missing_summary empty_summary extra_property bad_severity null_line fractional_line zero_line \
-         extra_finding_property missing_evidence empty_evidence no_output; do
+         extra_finding_property missing_evidence empty_evidence empty_pending_context nonstring_pending_context no_output; do
   if out="$(run "$c")"; then echo "FAIL $c: accepted -> $out"; fail=1; else echo "ok $c: rejected"; fi
 done
 if out="$(FAKE_VERSION=0.0.1 run valid_approve)"; then
   echo "FAIL cli_version_mismatch: accepted -> $out"; fail=1
 else echo "ok cli_version_mismatch: rejected"; fi
-for c in valid_approve valid_block valid_high_block explicit_hold; do
+for c in valid_approve valid_block valid_high_block explicit_hold pending_context; do
   if out="$(run "$c")" && [[ -n "$out" ]]; then echo "ok $c: accepted"; else echo "FAIL $c: rejected"; fail=1; fi
 done
 ((fail == 0))

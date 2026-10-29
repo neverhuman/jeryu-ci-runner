@@ -9,7 +9,8 @@ Where the base branch requires `jankurai/proof`, the quality gate comes first: a
 head whose proof fails or failed to score is held with that reason before any
 agent budget is spent, and nothing here can approve it. A proof the forge has
 queued, is running, or has not started is not a verdict on the head: that head
-gets an internal review while the gate runs. Its validated model result is saved
+waits for required contexts as described below. If that bounded wait expires, an
+internal review can run while the proof is pending. Its validated model result is saved
 atomically (one pending result per PR), bound to the review identity, the head,
 diff base and origin, the PR row's stable fields (title, author, branches, draft,
 state, labels, supersedes), the description, the signals and any upstream pin
@@ -18,7 +19,9 @@ evidence. The row's live fields (`updated_at`, `agents`, `checks`, `mergeable`,
 move on every event, the proof finishing among them, and the gate is read live
 before publication anyway. Until the proof has a result, later passes leave a
 head with a computed result alone (no attempt, no agent). Once it has one, a pass
-reuses the result if the binding still matches, publishes it if the proof passed,
+reuses the result if the binding still matches and it contains no
+`pending_required_context` findings; those findings require a fresh model review
+after proof reports. It publishes the result if the proof passed,
 and deletes it; a proof that failed holds the head mechanically, as if it had
 failed before the agent ran, and the result is discarded. A proof that turns red
 while the agent runs is that same mechanical hold, never a neutral wait. The
@@ -377,29 +380,27 @@ repository pinned by commit alone -- has no tag to cross-check: it is judged by 
 a git rev pin is, and `pin.json` records `untagged: true`. An entry whose tag the change removes is
 not untagged; its tag is missing, which is `tag-mismatch`.
 
-### Release pin bumps wait for their required contexts
+### Every PR waits for its required contexts
 
-A head whose forge diff changes release lock or pin files only (a `*.lock.toml` at the repository
-root, a `hosted-pin-refs.tsv`) asserts one thing: that a pinned commit is on reviewed code. Where
-`upstream/` cannot show that, the PR's own required lane is the proof, and a review that runs before
-the lane reports can only hold on unresolved evidence -- final for that head (jeryu-deploy #453 and
-#457 were held this way, ten seconds after opening, and their lanes passed minutes later; #452, the
-same diff, was approved).
+While any context enforced by the base branch has no result (missing, pending, queued or running),
+review waits: no receipt, review, check run or agent spend. The log says `waiting for required
+contexts`. A later pass reviews the head once all required contexts have results; failures are
+results too. `REDTEAM_GATE_WAIT_SECS` bounds the wait (default 5400 seconds, or 90 minutes) from
+that head's first observation. After expiry the review proceeds with the unresolved states in
+`signals.txt`. `0` turns the general wait off.
 
-So while any context the base branch's protection enforces on such a head is without a result, the
-reviewer leaves the head alone: no receipt, no review, no check run, no
-agent spend, and one log line `waiting for required contexts -- ...`. The next pass, or `poke` once
-the contexts are green, reviews it with their result in `pr.json` and at the end of `signals.txt`. A
-failing context is a result and is reviewed at once. The wait is bounded by `REDTEAM_PIN_WAIT_SECS`
-(default 3600) from the first pass that saw the head (`$REDTEAM_STATE/pin-wait/`); after that the
-head is reviewed anyway and `signals.txt` says the contexts are still without a result, so nothing
-waits silently. `0` turns the wait off.
+Release pin bumps use this same path with their existing `REDTEAM_PIN_WAIT_SECS` override (default
+3600 seconds, `0` disables the pin wait). Only the forge's complete exact-head diff can classify a
+change as release pins only (root `*.lock.toml` or `hosted-pin-refs.tsv`). Other changes and unknown
+diffs use the general bound. An unavailable diff is retried without resetting the clock. The
+existing `$REDTEAM_STATE/pin-wait/` records are retained across reinstalls for both kinds of head.
 
-The trigger is narrow on purpose: any other head is reviewed at once, and so is a pin bump whose base
-branch enforces no context, or whose forge diff is unavailable, truncated or for another head. The
-file list comes from the forge's diff of the exact head and the context states from the forge; nothing
-an author writes decides either, and the wait only changes when a head is reviewed, not what the
-review concludes or who can ask for one.
+A missing result alone must not consume the two-hold cap. The reviewer marks each finding solely
+about such a result with `pending_required_context`, naming the exact context. A block containing
+only those findings is recorded as a gate hold only when the forge confirms every named context
+is enforced and missing/pending. Mixed code findings, failed or unknown contexts, and unreadable
+protection keep normal agent accounting. No prose matching or review dismissal is involved: the
+blocking review still stands, and the forge still requires all gates before landing.
 
 ### The enforced required contexts
 
@@ -415,7 +416,7 @@ request row reports that protection does not enforce satisfies no requirement, a
 derived from a repository name, a branch name, the PR's own files or a record -- there is no release
 exception. A branch the forge reports as unprotected enforces nothing, and a protection read the
 forge will not answer leaves gate evidence unresolved: `signals.txt` says so, the enforced set is
-treated as unknown rather than empty, and the pin bump wait still waits for what the row reported.
+treated as unknown rather than empty, and the bounded wait still waits for what the row reported.
 Pin verifiers are independent of all of this: a green required context never substitutes
 release-line ancestry for a verifier's required ancestry on `main`.
 

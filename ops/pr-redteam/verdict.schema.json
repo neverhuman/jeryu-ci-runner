@@ -59,6 +59,10 @@
           "evidence": {
             "type": "string",
             "minLength": 1
+          },
+          "pending_required_context": {
+            "type": "string",
+            "minLength": 1
           }
         }
       }

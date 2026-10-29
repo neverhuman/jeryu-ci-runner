@@ -159,11 +159,13 @@
 #                          has to be listed here, because a login is one installation's data
 #   REDTEAM_HUMAN_ACTIVITY_SECS 86400           recent-activity window for selected human authors
 #   REDTEAM_STATE          ~/.local/state/pr-redteam   receipts, git cache, locks
+#   REDTEAM_GATE_WAIT_SECS 5400                 every head waits this long for missing/pending
+#                          required contexts before review. 0 turns the general wait off.
 #   REDTEAM_PIN_WAIT_SECS  3600                 a head that changes only release lock files
 #                          (`*.lock.toml` at the root, `hosted-pin-refs.tsv`) is not reviewed while a
 #                          required context is missing or pending, for at most this long after a
 #                          pass first saw it; then it is reviewed and told the context is still
-#                          pending. 0 turns the wait off. Every other head is reviewed at once.
+#                          pending. 0 turns the pin wait off; other heads use REDTEAM_GATE_WAIT_SECS.
 #   REDTEAM_ACCEPT_IDENTITIES (none)            space-separated earlier review identities (64 hex)
 #                          whose receipts still count as "already reviewed"; for carrying receipts
 #                          across a release that changed only plumbing (see review_format below)
@@ -205,11 +207,14 @@ upstream_max_pull_pages="${REDTEAM_UPSTREAM_MAX_PULL_PAGES:-10}"
 upstream_fetch_timeout="${REDTEAM_UPSTREAM_FETCH_TIMEOUT:-300}"
 # A pin whose share of that budget is smaller than this is not fetched: it could hold nothing.
 upstream_min_share=1024
-# A release pin bump (a change to release lock files only) is reviewed once its required contexts
-# have a result, or once this many seconds have passed since a pass first saw its head; 0 reviews
-# such a head at once, as any other.
+# Every head waits for required results, bounded from first observation. Pin-only changes keep
+# their existing timeout. Zero disables the corresponding wait, never the forge gate.
+gate_wait_secs="${REDTEAM_GATE_WAIT_SECS:-5400}"
+[[ "$gate_wait_secs" =~ ^[0-9]{1,7}$ ]] || { echo "pr-redteam: REDTEAM_GATE_WAIT_SECS must be whole seconds; using 5400" >&2; gate_wait_secs=5400; }
+gate_wait_secs=$((10#$gate_wait_secs))
 pin_wait_secs="${REDTEAM_PIN_WAIT_SECS:-3600}"
 [[ "$pin_wait_secs" =~ ^[0-9]{1,7}$ ]] || { echo "pr-redteam: REDTEAM_PIN_WAIT_SECS must be whole seconds; using 3600" >&2; pin_wait_secs=3600; }
+pin_wait_secs=$((10#$pin_wait_secs))
 # The forge's host, the only host an upstream fetch goes to.
 forge_host="${base#https://}"; forge_host="${forge_host%%[/:]*}"
 # Other hostnames the operator says are this same forge's /git/<owner>/<repo>.git route (REDTEAM_FORGE_ALIASES,
@@ -252,7 +257,7 @@ mkdir -p "$state"/{receipts,cache,locks,work}
 # sees or how its verdict becomes a decision: the diff, description, signals or other context handed
 # to the agent; the mechanical holds (unpinned blobs, diff size, author domains, the quality gate);
 # the mapping from verdict to approve/hold; or the rendering of the posted review.
-review_format=9
+review_format=10
 
 # A receipt counts as "already reviewed" only for the same review inputs: the review format above,
 # the prompt, the verdict schema and validator, the exact CLI bytes, the model, the CLI pin and the
@@ -453,19 +458,12 @@ proof_without_result() { # gate reason -> 0 when the proof has no result yet
   return 1
 }
 
-# --- release pin bumps wait for their required contexts ------------------------------------------
+# --- all heads wait for their required contexts --------------------------------------------------
 #
-# A change to release lock files only (a root `*.lock.toml`, a `hosted-pin-refs.tsv`) asserts one
-# thing: that a pinned commit is on reviewed code. Where upstream/ cannot show that, the PR's own
-# required lane is what proves it, and a review that runs before the lane has reported can only
-# hold on "unresolved evidence" -- final for that head. So such a head is not reviewed while a
-# required context is missing or pending, for at most REDTEAM_PIN_WAIT_SECS after a pass first saw
-# it. Nothing is recorded or posted while it waits: the next pass, or poke once the contexts go
-# green, reviews it with their result in pr.json and signals.txt. A failing context is a result and
-# is reviewed (and held) at once. Past the bound it is reviewed anyway, and signals.txt says the
-# contexts are still pending. Nobody's text decides any of this: the file list comes from the
-# forge's diff of the exact head, and the context states from the forge's row. The wait changes
-# when a head is reviewed, never what the review concludes or who may trigger it.
+# A missing/pending result is not a failed gate. Defer review until every enforced context has a
+# result, bounded from the first observation of this head. Pin-only changes retain their existing
+# timeout through the same path. A terminal failure is a result; after expiry the reviewer still
+# sees the unresolved evidence and can hold it. No receipt, check run or model call while waiting.
 
 # Whether a path is a release lock or pin file.
 release_pin_file() { # path
@@ -547,7 +545,7 @@ required_contexts_unreported() { # head-required-contexts-json
 
 # 0 when the forge's diff of this exact head changes release lock or pin files and nothing else.
 # Anything the forge does not answer cleanly (an error, another head, a truncated file list) is
-# not a pin bump, and the head is reviewed at once as before.
+# not a confirmed pin bump, so the general gate wait applies.
 release_pin_only() { # owner/name number sha
   api GET "/api/v1/repos/${1/\//%2F}/pulls/$2/diff"
   [ "$code" = 200 ] || return 2
@@ -561,38 +559,61 @@ release_pin_only() { # owner/name number sha
 
 pin_wait_file() { echo "$state/pin-wait/$1/$2-$3.json"; } # owner/name number sha
 
-# Why this head waits, or empty when it is reviewed now. The first pass that sees a head records
-# when (and whether it is a pin bump, so the forge's diff is read once per head).
-pin_wait_reason() { # owner/name number sha row
-  local repo="$1" number="$2" sha="$3" row="$4" unreported file first pin now waited rc=0
-  [ "$pin_wait_secs" -gt 0 ] || return 0
+# Keep the existing state path so reinstalls retain a pin bump's first observation.
+gate_wait_limit() { # wait-file
+  if jq -e '.pin_only == true' "$1" >/dev/null 2>&1; then echo "$pin_wait_secs"
+  else echo "$gate_wait_secs"; fi
+}
+
+# Why this head waits, or empty when it is reviewed now. An unavailable diff uses the general
+# wait and is retried next pass without resetting the clock; it cannot bypass the wait.
+gate_wait_reason() { # owner/name number sha row
+  local repo="$1" number="$2" sha="$3" row="$4" unreported file first pin now waited limit rc=0
+  [ "$gate_wait_secs" -gt 0 ] || [ "$pin_wait_secs" -gt 0 ] || return 0
   unreported="$(required_contexts_unreported "$(head_required_contexts "$row")")"
   [ -n "$unreported" ] || return 0
   file="$(pin_wait_file "$repo" "$number" "$sha")"
   now="$(date +%s)"
-  if [ -s "$file" ] && first="$(jq -er '.first_seen_epoch | numbers' "$file" 2>/dev/null)" \
-     && pin="$(jq -er '.pin_only | if type == "boolean" then tostring else error("no pin_only") end' "$file" 2>/dev/null)"; then :
+  if first="$(jq -er '.first_seen_epoch | select(type == "number" and . == floor and . >= 0)' "$file" 2>/dev/null)"; then
+    pin="$(jq -er '.pin_only | if type == "boolean" then tostring else error("no pin_only") end' "$file" 2>/dev/null)" || pin=null
   else
+    first="$now"; pin=null
+  fi
+  if [ "$pin" = null ]; then
     release_pin_only "$repo" "$number" "$sha" || rc=$?
-    # A forge that would not answer is asked again next pass; nothing is recorded for it.
-    [ "$rc" != 2 ] || return 0
-    pin=false; [ "$rc" != 0 ] || pin=true; first="$now"
+    case "$rc" in 0) pin=true ;; 1) pin=false ;; esac
     mkdir -p "$(dirname "$file")"
     find "$state/pin-wait" -type f -mtime +30 -delete 2>/dev/null || true
-    jq -nc --argjson first "$first" --argjson pin "$pin" --arg at "$(date -u +%FT%TZ)" \
+    jq -nc --argjson first "$first" --argjson pin "$pin" --arg at "$(date -u -d "@$first" +%FT%TZ)" \
       '{first_seen_epoch: $first, first_seen_at: $at, pin_only: $pin}' | store_receipt "$file"
   fi
-  [ "$pin" = true ] || return 0
+  limit="$(gate_wait_limit "$file")"
   waited=$((now - first)); [ "$waited" -ge 0 ] || waited=0
-  [ "$waited" -lt "$pin_wait_secs" ] || return 0
-  echo "a release pin bump is reviewed once its required contexts report: $unreported (waited ${waited}s of ${pin_wait_secs}s)"
+  [ "$waited" -lt "$limit" ] || return 0
+  echo "required contexts have no result: $unreported (waited ${waited}s of ${limit}s)"
+}
+
+# Only a review explicitly about missing results, corroborated by enforced protection, is exempt
+# from the agent hold cap. Never guess from prose, accept unknown context names, or exempt a mixed
+# review with code findings. This changes accounting only: the blocking review still stands.
+pending_context_only_hold() { # verdict row
+  local required
+  required="$(head_required_contexts "$2")"
+  jq -ne --argjson v "$1" --argjson required "$required" '
+    $required.source == "protection" and $v.verdict == "block" and ($v.findings | length) > 0
+    and all($v.findings[];
+      .pending_required_context as $name
+      | ($name | type) == "string"
+        and any($required.contexts[];
+          .name == $name and ((.state // "" | ascii_downcase)
+            | IN("", "no result", "missing", "pending", "queued", "running", "in_progress", "expected", "waiting", "requested"))))' >/dev/null
 }
 
 # What signals.txt says about this head's required contexts: the contexts the base branch's
 # protection enforces, with the state the forge reported for each when the review started, and,
-# for a pin bump that waited out the bound, that it did.
+# for a head that waited out the bound, that it did.
 required_contexts_signal() { # row owner/name number sha
-  local file unreported first required
+  local file unreported first required limit
   required="$(head_required_contexts "$1")"
   jq -r --argjson row "$1" '
     "## required contexts on this head (the base branch'"'"'s enforced protection and the forge'"'"'s states when this review started; not author text)",
@@ -609,9 +630,9 @@ required_contexts_signal() { # row owner/name number sha
   echo "pr.json checks counts include pr-redteam/review, this reviewer's own check run (an earlier review of this head, or this one in progress). It is not a result about the code and not a required context: do not count it as a failing or passing check."
   file="$(pin_wait_file "$2" "$3" "$4")"
   unreported="$(required_contexts_unreported "$required")"
-  if [ -n "$unreported" ] && [ "$pin_wait_secs" -gt 0 ] && jq -e '.pin_only == true' "$file" >/dev/null 2>&1; then
-    first="$(jq -r .first_seen_epoch "$file")"
-    echo "This release pin bump waited $(( $(date +%s) - first ))s (bound ${pin_wait_secs}s) for its required contexts; still without a result: $unreported."
+  if [ -n "$unreported" ] && first="$(jq -er '.first_seen_epoch | numbers' "$file" 2>/dev/null)"; then
+    limit="$(gate_wait_limit "$file")"
+    echo "This head waited $(( $(date +%s) - first ))s (bound ${limit}s) for its required contexts; still without a result: $unreported."
   fi
 }
 
@@ -2157,12 +2178,11 @@ review_one() { # owner/name number dry-run force include-drafts
   if [ -n "$gate_reason" ] && proof_without_result "$gate_reason"; then
     proof_pending=1
   fi
-  # A release pin bump whose required contexts have no result yet waits for them, bounded, the
-  # same way: no receipt, no post, no agent (see pin_wait_reason).
-  local pin_wait
-  pin_wait="$(pin_wait_reason "$repo" "$number" "$(jq -r .head_sha <<<"$row")" "$row")"
-  if [ -n "$pin_wait" ]; then
-    say "$tag: waiting for required contexts — $pin_wait"
+  # Every head whose required contexts have no result waits, bounded: no receipt, post or agent.
+  local gate_wait
+  gate_wait="$(gate_wait_reason "$repo" "$number" "$(jq -r .head_sha <<<"$row")" "$row")"
+  if [ -n "$gate_wait" ]; then
+    say "$tag: waiting for required contexts — $gate_wait"
     return 0
   fi
 
@@ -2381,6 +2401,11 @@ review_one() { # owner/name number dry-run force include-drafts
           -f "$here/validate-verdict.jq" 2>/dev/null || true)"
       fi
     fi
+    if [ -n "$verdict" ] && jq -e 'any(.findings[]; has("pending_required_context"))' <<<"$verdict" >/dev/null; then
+      say "$tag: required-context findings need a fresh review after proof reports"
+      verdict=""
+      pending_cost=null
+    fi
     if [ -z "$verdict" ]; then
       verdict="$(run_agent "$d" "$tag" "$sha" "$work" "$origin" "$agent_cap")" || agent_rc=$?
     else
@@ -2432,6 +2457,13 @@ review_one() { # owner/name number dry-run force include-drafts
     block) decision=hold; [ -n "$hold_kind" ] || [ -n "$cap_reason" ] || hold_kind=agent ;;
     *) say "$tag: unexpected verdict after validation, NOT approving"; return 0 ;;
   esac
+  # Classify the model's findings before mechanical checks append their own: a missing-only
+  # model block does not become a counted agent hold merely because a blob also blocks this head.
+  if [ "$decision" = hold ] && [ "$hold_kind" = agent ] \
+     && pending_context_only_hold "$verdict" "$row"; then
+    hold_kind=gate
+    say "$tag: required results alone hold this head; not counted toward the hold limit"
+  fi
   if grep -qE '^\+.*-----BEGIN [A-Z ]*PRIVATE KEY-----' "$d/diff.patch"; then
     decision=hold
     mechanical_hold=1
