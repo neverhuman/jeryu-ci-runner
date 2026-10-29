@@ -44,4 +44,15 @@ else
 fi
 [[ -z $(find target/security -mindepth 1 -print -quit) ]]
 grep -q '^bash ops/ci/audit-advisories.sh$' "$root/tools/security-lane.sh"
+# A killed run leaves its checkout behind; the next run drops it and keeps a live one.
+mkdir -p target/security/advisory-db.killed target/security/advisory-db.live
+touch -d '3 days ago' target/security/advisory-db.killed
+: > "$fixture/paths"
+bash "$root/ops/ci/audit-advisories.sh" & first=$!
+bash "$root/ops/ci/audit-advisories.sh" & second=$!
+wait "$first"
+wait "$second"
+[[ ! -d target/security/advisory-db.killed ]]
+[[ -d target/security/advisory-db.live ]]
+rmdir target/security/advisory-db.live
 printf 'advisory isolation ok\n'
