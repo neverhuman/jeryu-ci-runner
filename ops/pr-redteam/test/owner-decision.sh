@@ -123,3 +123,7 @@ unescaped="$(sed 's/\\|//g' <<<"$row" | tr -cd '|' | wc -c)"
 
 ((fail == 0))
 echo 'OWNER DECISION PASS'
+
+# The body test interface carries the same agent hold context as publication.
+out="$(body "$held" hold "$sha" internal null)"
+[[ "$out" == *"hold 1 of 2:"* ]] || bad "agent footer: $out"

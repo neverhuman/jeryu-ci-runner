@@ -78,6 +78,8 @@ case "$url" in
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"acme","name":"widget-shop"},"family":"widgets","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
+  */api/v3/repos/acme/widget-shop/pulls/7)
+    row | jq -c '. + {head:{sha:.head_sha},html_url:"https://forge.invalid/repos/widgets/acme/widget-shop/pulls/7"}'; printf '\n200' ;;
   */pulls/7)
     # The quality gate fails while gate-failing exists; otherwise the head waits only for review.
     # gate-pending: the proof is queued; it fails once its checks were read (gate-fails-next).
@@ -122,6 +124,13 @@ case "$*" in
   '--user start --no-block pr-redteam.service') exit 0 ;;
   *) echo "unexpected systemctl $*" >> "$CAP_FIXTURE/danger"; exit 97 ;;
 esac
+FIXTURE
+cat > "$t/bin/todoq" <<'FIXTURE'
+#!/usr/bin/env bash
+[[ "$1" == add ]] || exit 0
+printf 'called\n' >> "$CAP_FIXTURE/todos"
+printf '%s\n' "${!#}" > "$CAP_FIXTURE/todo-text"
+printf '20261020-172419-abcdef\n'
 FIXTURE
 chmod +x "$t/bin/"*
 
@@ -225,6 +234,33 @@ cat "$t/merge.log" >> "$t/log"
 ! grep -q '/merge\|/queue' "$t/requests" || fails 'the merge pass touched a capped head'
 echo 'ok a clean capped head gets no agent review, one blocking review (kept across a review-identity change), a final capped receipt, one timeline event, and no merge'
 
+# A capped head emits its process finding without resolving unreviewed code findings,
+# and the opted-in handoff asks for a person rather than another repair push.
+jq -s -e --arg sha "$(cat "$t/head")" '[.[] | .events[]? | select(.sha == $sha)] |
+  any(.kind == "review.finding" and .detail.title == "Hold cap requires a person") and
+  all(.kind != "review.resolved")' "$t/events" >/dev/null || fails 'cap finding ledger'
+REDTEAM_FIX_TODO=1 REDTEAM_FIX_TODO_AUTHORS=dana pass
+[[ "$(count "$t/todos")" == 1 ]] || fails 'cap did not dispatch one handoff'
+jq -e '.state == "confirmed" and .todo_id == "20261020-172419-abcdef"' \
+  "$t/state/fix-todos/acme/widget-shop/7-$(cat "$t/head").json" >/dev/null || fails 'cap dispatch not confirmed'
+grep -qF 'Do not edit or push, automatically rearm' "$t/todo-text" || fails 'cap todo permits automation'
+REDTEAM_FIX_TODO=1 REDTEAM_FIX_TODO_AUTHORS=dana pass
+[[ "$(count "$t/todos")" == 1 ]] || fails 'cap handoff repeated'
+
+# Gate and blob checks still produce mechanical holds once the agent budget is exhausted.
+for kind in gate blob; do
+  if [[ "$kind" == gate ]]; then advance; touch "$t/gate-failing"
+  else advance payload.bin; fi
+  pass
+  jq -e --arg kind "$kind" '.decision == "hold" and .hold_kind == $kind and .posted == true' \
+    "$(receipt)" >/dev/null || fails "capped $kind hold"
+  [[ "$(count "$t/model-calls")" == "$calls" ]] || fails "agent ran for capped $kind"
+  footer | grep -qF 'mechanical hold at the hold limit' || fails "capped $kind footer"
+  if [[ "$kind" == gate ]]; then rm "$t/gate-failing"
+  else g rm -q payload.bin; g commit -qm 'drop payload'; fi
+done
+echo 'ok capped findings, human handoff and gate/blob mechanical holds'
+
 # A capped head whose blocking review could not be posted is not final: the next pass posts it.
 advance
 calls="$(count "$t/model-calls")"; posts="$(count "$t/posts")"
@@ -234,6 +270,8 @@ rm -f "$t/reviews-failing"
 jq -e '.decision == "capped" and .posted == false and .post_http == "503"' "$(receipt)" >/dev/null \
   || fails "failed capped post receipt: $(cat "$(receipt)")"
 [[ "$(count "$t/posts")" == "$posts" ]] || fails 'a refused capped review was recorded as posted'
+jq -s -e --arg sha "$(cat "$t/head")" '[.[] | .events[]? | select(.sha == $sha and .kind == "review.finding")] |
+  length == 0' "$t/events" >/dev/null || fails 'unpublished cap emitted a finding'
 pass
 [[ "$(count "$t/model-calls")" == "$calls" ]] || fails 'the retry asked the agent'
 [[ "$(count "$t/posts")" == "$((posts + 1))" ]] || fails 'the capped review was not retried'
