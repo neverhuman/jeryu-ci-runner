@@ -170,6 +170,11 @@ case "$method $url" in
   'GET '*'/api/v3/repos/acme/fixture')
     jq -nc '{name:"fixture",default_branch:"main"}'; printf '\n200';;
   'GET '*'/branches/'*'/protection')
+    # As the forge routes it: the branch is one percent-encoded path segment, which the forge decodes
+    # (a slashed branch read unencoded matches no route: a 404). Each decoded read is recorded.
+    segment=${url##*/branches/}; segment=${segment%/protection}
+    if [[ "$segment" == */* ]]; then printf '{"message":"no such route"}\n404'; exit; fi
+    printf '%s\n' "$(printf '%b' "${segment//%/\\x}")" >>"$FAKE_FORGE/protection-reads"
     if [[ -f "$FAKE_FORGE/protection-fail" ]]; then printf '{}\n503'; exit; fi
     if [[ -f "$FAKE_FORGE/protection.json" ]]; then cat "$FAKE_FORGE/protection.json"
     else jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'; fi

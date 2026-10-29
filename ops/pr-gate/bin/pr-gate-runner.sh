@@ -1590,6 +1590,11 @@ head_key_dir=$gate_key_dir
 has_fast=0 repo_fast=0
 if (cd "$run/$repo" && just --summary 2>/dev/null | tr ' ' '\n' | grep -qx required-fast); then repo_fast=1; fi
 ((main_health || repo_fast == 0)) || has_fast=1
+# A head without required-fast is gated on the full context alone, whatever its base enforces. On a
+# tiered repository that is worth a line: a base that enforces only <repo>/fast never sees it posted.
+if ((main_health == 0 && repo_fast == 0)) && [[ -e "$HOME_DIR/cache/tiered-repo-$owner-$repo" ]]; then
+  say "$owner/$repo@${sha:0:12} has no required-fast recipe: gating $(gate_required_context "$owner" "$repo") only; a base that enforces only $repo/fast is never satisfied by this head"
+fi
 # The repository's marker follows its protected main, not whichever head was prepared last: only a
 # main-health tree without required-fast removes it.
 if ((main_health && repo_fast == 0)); then rm -f -- "$HOME_DIR/cache/tiered-repo-$owner-$repo"; fi
@@ -1606,14 +1611,20 @@ if ((has_fast)); then
   encoded_base=$(jq -rn --arg b "$protection_base" '$b | @uri')
   api GET "/api/v3/repos/$owner/$repo/branches/$encoded_base/protection"
   if [[ "$code" != 200 ]] || ! selected_tier=$(gate_protection_tier "$body" "$owner" "$repo"); then
-    say "cannot read enforced contexts for $owner/$repo $protection_base; leaving it for the next tick"
+    say "cannot read enforced contexts for $owner/$repo $protection_base (GET .../branches/$encoded_base/protection answered $code); leaving it for the next tick"
     exec 6>&-; exec 7>&-
     continue
   fi
   tiers=(fast)
   [[ "$selected_tier" != full ]] || tiers+=(required)
-  printf '%s\n' tiered | gate_atomic "$head_key_dir/tiered"
-  printf '%s\n' tiered | gate_atomic "$HOME_DIR/cache/tiered-repo-$owner-$repo"
+  # The markers make later passes demand complete identities, so a head whose markers cannot be
+  # written is left for the next tick rather than gated without them.
+  if ! printf '%s\n' tiered | gate_atomic "$head_key_dir/tiered" \
+      || ! printf '%s\n' tiered | gate_atomic "$HOME_DIR/cache/tiered-repo-$owner-$repo"; then
+    say "could not record the tiered markers of $owner/$repo@$sha; leaving it for the next tick"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
 fi
 # A head's own `tiered` marker is attempt evidence and stays; it counts only with the repository's.
 # A forge re-gate request is read once for the head, before any tier runs. The first tier records it
@@ -1741,11 +1752,13 @@ if ((admitted == 0)); then
   break
 fi
 gate_begin "$identity"
-# The full context keeps its newest conclusion while the fast prerequisite runs. A success stays
-# mergeable, as keep_green below keeps one through any re-verification, and a failure stays red; the
-# full tier decides pending by the keep_green rule when it starts, and a fast failure replaces the
-# full context at once. Posting pending here would also erase a held full failure that the full
-# tier then holds again without re-posting it, leaving a pending nothing resolves.
+# The full context keeps its newest conclusion while the fast prerequisite runs only when the full
+# tier's own keep_green rule (below) would keep it: this runner's success, proved against this same
+# base. A failure stays red, and a fast failure replaces the full context at once. Any other newest
+# full success -- posted by another identity, or proved against another base -- gets `pending` from
+# the fast tier, as a single-tier run would post at once (see full_pending below). Posting pending
+# over a failure would erase a held full failure that the full tier then holds again without
+# re-posting it, leaving a pending nothing resolves.
 gate_update --argjson count "$inputs_changed_count" --argjson holds "$head_holds" \
   '.inputs_changed_count=$count | .inputs_changed_holds=($holds == 1)' \
   || say "could not record the inputs_changed chain of $owner/$repo@$sha"
@@ -1805,6 +1818,21 @@ if ((keep_green && proof_base)); then
     keep_green=0
   fi
 fi
+# The fast tier of a head the full tier will re-prove posts `pending` on the full context over a newest
+# full success the keep_green rule would not keep, so that success does not stand while the head is
+# re-proved. Nothing else on the full context is touched by the fast tier.
+full_pending=0
+if [[ "$tier" == fast && " ${tiers[*]} " == *" required "* ]]; then
+  full_newest=$(GATE_CONTEXT_KIND=required; jq -c --arg c "$(gate_status_context "$owner" "$repo")" \
+    '[.statuses[]? | select(.context == $c)] | sort_by(.updated_at // .created_at) | last // {}' "$status_snapshot")
+  if [[ "$(jq -r '.state // ""' <<<"$full_newest")" == success ]]; then
+    full_pending=1
+    if GATE_CONTEXT_KIND=required gate_newest_is_own_success "$status_snapshot" && { ((proof_base == 0)) \
+        || [[ "$(gate_status_proof_base "$(jq -r '.description // ""' <<<"$full_newest")")" == "$pb_branch" ]]; }; then
+      full_pending=0
+    fi
+  fi
+fi
 rm -f -- "$identity" "$status_snapshot"
 log="$gate_attempt_dir/build.log"
 steps_tsv="$gate_attempt_dir/steps.tsv"
@@ -1817,6 +1845,11 @@ if ((keep_green)); then
 else
   pending_base=$(gate_proof_base_field "$gate_receipt") || pending_base=""
   post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")${pending_base:+; $pending_base}" "$checks_url"
+fi
+if ((full_pending)); then
+  say "$owner/$repo@$sha: its newest full success is not this runner's for this base; posting full pending before the fast tier"
+  pending_base=$(gate_proof_base_field "$gate_receipt") || pending_base=""
+  GATE_CONTEXT_KIND=required post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running first on $MARKER, then $full_recipe_name; attempt $(jq -r '.id' "$gate_receipt")${pending_base:+; $pending_base}" "$checks_url"
 fi
 # shellcheck disable=SC2016  # a jq program: $url is jq's
 gate_update --arg url "$checks_url" '.phase="running" | .checks_url=$url'

@@ -34,6 +34,8 @@ export PR_GATE_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF
 run_tier
 expect_count 4
 [[ "$(tail -2 "$fixture/recipes")" == $'required-fast\nrequired' ]] || fail_tier 'unchanged release protection skipped full'
+# The base is read as one percent-encoded segment the forge decodes: the fixture refuses a raw slash.
+grep -qx 'release/v1' "$fixture/protection-reads" || fail_tier 'release/v1 protection was not read as one encoded segment'
 printf 'PASS unchanged release protection requires full validation\n'
 
 jq -nc '{required_status_checks:{contexts:["fixture/fast"]}}' >"$fixture/protection.json"
@@ -193,3 +195,23 @@ run_tier
 expect_count "$after"
 rm -f "$fixture/regate.json"
 printf 'PASS a forge re-gate of a tiered head re-runs its failed full tier\n'
+
+# A newest full success the full tier's keep_green rule would not keep (here, one another identity
+# posted by hand) does not stand while the head is re-proved: the fast tier posts full pending first.
+printf 'foreign green\n' >"$fixture/source/untiered"
+"$real_git" -C "$fixture/source" add untiered
+"$real_git" -C "$fixture/source" commit -qm foreign-green
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+head=$(cat "$fixture/head")
+jq -nc --arg sha "$head" '[{kind:"branch",name:"main",sha:$sha,protected:true}]' >"$fixture/refs.json"
+jq -nc --arg sha "$head" --argjson clock "$(wc -l <"$fixture/statuses.jsonl")" \
+  '{id:"hand-green",sha:$sha,context:"fixture/required",state:"success",description:"posted by hand",
+    updated_at:$clock,creator:{login:"someone-else"}}' >>"$fixture/statuses.jsonl"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+run_tier
+jq -se --argjson n "$before_statuses" '.[$n:] | map([.context,.state]) == [["fixture/fast","pending"],
+  ["fixture/required","pending"],["fixture/fast","success"],["fixture/required","pending"],
+  ["fixture/required","success"]]' "$fixture/statuses.jsonl" >/dev/null \
+  || fail_tier 'a foreign full green stood through the fast tier'
+printf 'PASS the fast tier posts full pending over a full green the full tier would not keep\n'
