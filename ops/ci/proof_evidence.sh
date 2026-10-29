@@ -37,8 +37,12 @@ base_commit="$(git rev-parse --verify "${BASE_REF}^{commit}")" || {
 }
 current_head="$(git rev-parse --verify 'HEAD^{commit}')"
 # The ratchet baseline is protected main's tip; the change set starts at the
-# fork point. A head behind the tip is judged against the tip, not refused, and
-# main's own head is a change set of nothing.
+# fork point. A head behind the tip is judged against the tip rather than
+# refused, the rule jeryu-jira's lane follows (#21): refusing it turns every
+# open pull request red each time main moves. The audit, migration and ratchet
+# checks below compare this head's whole tree with the tip's, so a stale head
+# that scores below the tip, adds a cap or hard finding, or raises migration
+# liability fails them; the proof plan covers this head's own change. Protected main's own head is a change set of nothing.
 fork_commit="$(proof_fork_point "${base_commit}" "${current_head}")"
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
   printf 'proof evidence requires a clean exact-head checkout\n' >&2
@@ -58,6 +62,7 @@ rm -rf -- \
   target/jankurai/baseline-migration-report.json \
   target/jankurai/baseline-migration-report.md \
   target/jankurai/changed-paths \
+  target/jankurai/changed-paths.unsorted \
   target/jankurai/copy-code \
   target/jankurai/evidence-index.json \
   target/jankurai/migration-report.json \
@@ -83,7 +88,14 @@ mkdir -p \
   target/jankurai/security
 
 proof_changed_paths "${fork_commit}" "${current_head}" target/jankurai/changed-paths
-mapfile -d '' -t changed_paths < <(LC_ALL=C sort -zu target/jankurai/changed-paths)
+# Read from the file with a plain redirect (no process substitution, whose
+# failure set -e cannot see), then check that every listed path was read: an
+# empty change set below is a pass, so a short read must not look like one.
+mapfile -d '' -t changed_paths < target/jankurai/changed-paths
+if [[ "${#changed_paths[@]}" -ne "$(tr -cd '\0' < target/jankurai/changed-paths | wc -c)" ]]; then
+  printf 'proof change set was not read in full from target/jankurai/changed-paths\n' >&2
+  exit 1
+fi
 expected_changed="$(
   printf '%s\0' "${changed_paths[@]:-}" |
     jq -Rs 'split("\u0000") | map(select(length > 0)) | sort | unique'
@@ -101,7 +113,6 @@ receipt_dir="target/jankurai/proof-receipts/run-${current_head:0:12}-$$"
 # below has to be one this run wrote.
 rm -rf -- "${receipt_dir}"
 receipt_count=0
-proofmark_review=0
 if [[ "${#changed_paths[@]}" -eq 0 ]]; then
   # Nothing changed since the fork point (protected main gating its own head):
   # there is no change surface to plan, prove or bind. The audit, security,
@@ -350,52 +361,12 @@ if [[ "$(git rev-parse --verify 'HEAD^{commit}')" != "${current_head}" ||
   exit 1
 fi
 
-# An empty change set has no plan, evidence index, verification or proofmark
-# receipt: their digests are null and the verification is not_applicable.
-plan_sha256=null
-evidence_index_sha256=null
-verification_sha256=null
-proof_verification=not_applicable
-if [[ "${#changed_paths[@]}" -gt 0 ]]; then
-  proofmark_review="$(jq -er '.summary.review_obligations' \
-    target/jankurai/proofmark/proofmark-receipt.json)"
-  plan_sha256="\"$(sha256sum target/jankurai/proof-plan.json | awk '{print $1}')\""
-  evidence_index_sha256="\"$(sha256sum target/jankurai/evidence-index.json | awk '{print $1}')\""
-  verification_sha256="\"$(sha256sum target/jankurai/proof-verification.json | awk '{print $1}')\""
-  proof_verification=pass
-fi
-jq -n \
-  --arg head "${current_head}" \
-  --arg base "${base_commit}" \
-  --arg receipt_dir "${receipt_dir}" \
-  --arg fork "${fork_commit}" \
-  --argjson plan_sha256 "${plan_sha256}" \
-  --argjson evidence_index_sha256 "${evidence_index_sha256}" \
-  --argjson verification_sha256 "${verification_sha256}" \
-  --arg proof_verification "${proof_verification}" \
-  --arg security_sha256 "$(sha256sum target/jankurai/security/evidence.json | awk '{print $1}')" \
-  --arg supply_chain_sha256 "$(sha256sum target/security/evidence.json | awk '{print $1}')" \
-  --arg sbom_sha256 "$(sha256sum target/security/sbom.cdx.json | awk '{print $1}')" \
-  --arg baseline_sha256 "${baseline_sha256}" \
-  --argjson changed_count "${#changed_paths[@]}" \
-  --argjson receipt_count "${receipt_count}" \
-  --argjson proofmark_review "${proofmark_review}" \
-  --argjson baseline_score "${baseline_score}" \
-  --argjson migration_liability "$(jq -er .liability_score target/jankurai/migration-report.json)" \
-  --argjson baseline_migration_liability "$(jq -er .liability_score target/jankurai/baseline-migration-report.json)" \
-  '{schema_version:"jeryu.ci-runner.proof-evidence/v1",git_head:$head,
-    base_commit:$base,fork_point:$fork,dirty_worktree:false,changed_path_count:$changed_count,
-    receipt_count:$receipt_count,receipt_dir:$receipt_dir,
-    proof_plan_sha256:$plan_sha256,evidence_index_sha256:$evidence_index_sha256,
-    proof_verification_sha256:$verification_sha256,security_sha256:$security_sha256,
-    supply_chain_sha256:$supply_chain_sha256,sbom_sha256:$sbom_sha256,
-    baseline_score:$baseline_score,baseline_sha256:$baseline_sha256,
-    migration_liability_score:$migration_liability,
-    baseline_migration_liability_score:$baseline_migration_liability,
-    proof_verification:$proof_verification,proofmark_mode:"advisory",
-    proofmark_review_obligations:$proofmark_review,
-    synthetic_fallbacks:0,conclusion:"success"}' \
+proof_evidence_summary "${current_head}" "${base_commit}" "${fork_commit}" \
+  "${receipt_dir}" "${#changed_paths[@]}" "${receipt_count}" \
+  "${baseline_score}" "${baseline_sha256}" \
   > target/jankurai/proof-evidence-summary.json
+proofmark_review="$(jq -r '.proofmark_review_obligations // "n/a"' \
+  target/jankurai/proof-evidence-summary.json)"
 
 printf 'proof evidence ok: head=%s base=%s paths=%s receipts=%s proofmark_review=%s\n' \
   "${current_head}" "${base_commit}" "${#changed_paths[@]}" \

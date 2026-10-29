@@ -73,6 +73,53 @@ if (cd "$fixture/pr" && proof_changed_paths "$fork" 0000000000000000000000000000
 fi
 printf 'proof change-set guard ok\n'
 
+# --- summary: v2, both shapes, from files this run wrote ----------------------
+summary_root="$fixture/summary"
+mkdir -p "$summary_root/target/jankurai/security" "$summary_root/target/security" \
+  "$summary_root/target/jankurai/proofmark"
+printf '{}' > "$summary_root/target/jankurai/security/evidence.json"
+printf '{}' > "$summary_root/target/security/evidence.json"
+printf '{}' > "$summary_root/target/security/sbom.cdx.json"
+printf '{"liability_score": 3}' > "$summary_root/target/jankurai/migration-report.json"
+printf '{"liability_score": 4}' > "$summary_root/target/jankurai/baseline-migration-report.json"
+h=1111111111111111111111111111111111111111; b=2222222222222222222222222222222222222222
+# Empty change set: no proof artifacts exist, and none are named.
+(cd "$summary_root" && proof_evidence_summary "$h" "$b" "$b" target/jankurai/proof-receipts/run-x 0 0 94 abc) \
+  > "$fixture/empty.json" || fail 'the summary refused an empty change set'
+jq -e --arg h "$h" --arg b "$b" '
+  .schema_version == "jeryu.ci-runner.proof-evidence/v2" and .git_head == $h and
+  .base_commit == $b and .fork_point == $b and .changed_path_count == 0 and
+  .receipt_count == 0 and .receipt_dir == null and .proof_plan_sha256 == null and
+  .evidence_index_sha256 == null and .proof_verification_sha256 == null and
+  .proofmark_review_obligations == null and .proof_verification == "not_applicable" and
+  .migration_liability_score == 3 and .baseline_migration_liability_score == 4 and
+  .conclusion == "success"' "$fixture/empty.json" >/dev/null ||
+  fail 'the empty-change-set summary is not the v2 shape'
+if (cd "$summary_root" && proof_evidence_summary "$h" "$b" "$b" r 0 2 94 abc) >/dev/null 2>&1; then
+  fail 'an empty change set was summarised with receipts'
+fi
+# A non-empty change set must have every proof artifact; a missing one fails.
+if (cd "$summary_root" && proof_evidence_summary "$h" "$b" "$b" r 3 2 94 abc) >/dev/null 2>&1; then
+  fail 'a non-empty change set was summarised without its proof artifacts'
+fi
+if (cd "$summary_root" && proof_evidence_summary "$h" "$b" "$b" r 3 0 94 abc) >/dev/null 2>&1; then
+  fail 'a non-empty change set was summarised with no receipts'
+fi
+printf '{"p":1}' > "$summary_root/target/jankurai/proof-plan.json"
+printf '{"i":1}' > "$summary_root/target/jankurai/evidence-index.json"
+printf '{"v":1}' > "$summary_root/target/jankurai/proof-verification.json"
+printf '{"summary":{"review_obligations":1}}' > "$summary_root/target/jankurai/proofmark/proofmark-receipt.json"
+(cd "$summary_root" && proof_evidence_summary "$h" "$b" "$b" r 3 2 94 abc) \
+  > "$fixture/full.json" || fail 'the summary refused a complete non-empty change set'
+plan_sum="$(sha256sum "$summary_root/target/jankurai/proof-plan.json" | cut -d' ' -f1)"
+jq -e --arg plan "$plan_sum" '
+  .changed_path_count == 3 and .receipt_count == 2 and .receipt_dir == "r" and
+  .proof_plan_sha256 == $plan and (.evidence_index_sha256 | test("^[0-9a-f]{64}$")) and
+  (.proof_verification_sha256 | test("^[0-9a-f]{64}$")) and
+  .proofmark_review_obligations == 1 and .proof_verification == "pass"' \
+  "$fixture/full.json" >/dev/null || fail 'the non-empty summary does not bind its artifacts'
+printf 'proof summary ok\n'
+
 # An unreachable forge fails the guard.
 git clone -q --depth 1 --branch topic "file://$fixture/forge.git" "$fixture/pr-gone"
 git -C "$fixture/pr-gone" remote set-url origin "file://$fixture/missing.git"
@@ -139,8 +186,10 @@ line_of() {
   fail 'the lane fetches from origin before checking it is the hosted repository'
 (( $(line_of '^proof_require_history$' "$lane") < $(line_of 'proof_fork_point' "$lane") )) ||
   fail 'ancestry is asked before the checkout has its history'
-grep -q 'refuses an empty' "$lane" &&
-  fail 'the lane refuses an empty change set, so protected main fails its own gate' || :
+grep -qE "mapfile .*< <\(" "$lane" &&
+  fail 'the lane reads its change set through a process substitution set -e cannot see' || :
+grep -q 'was not read in full' "$lane" ||
+  fail 'the lane does not check that its whole change set was read'
 (( $(line_of '^rm -rf -- \\$' "$lane") < $(line_of '^ *jankurai proof \.' "$lane") )) ||
   fail 'the lane runs a tool before clearing an earlier run artifacts'
 (( $(line_of '^jankurai migrate \.' "$lane") < $(line_of '^proof_require_migration' "$lane") )) ||

@@ -24,8 +24,16 @@ shares no history with protected `main`. The ratchet baseline is the current
 protected `main` tip and the change set runs from the head's fork point, so a
 head behind the tip is judged, not refused, and protected `main`'s own head (an
 empty change set) skips the proof plan and still runs the audit, security,
-migration and ratchet checks. It clones protected main from the forge to audit
-the ratchet baseline. A shallow checkout
+migration and ratchet checks. Those checks compare the head's whole tree with
+the tip's, so a stale head that scores below the tip, adds a cap or hard
+finding, or raises migration liability fails them; the proof plan covers the
+head's own change. It clones protected main from the
+forge to audit the ratchet baseline. The lane writes
+`target/jankurai/proof-evidence-summary.json`
+(`jeryu.ci-runner.proof-evidence/v2`, contract in `proof_evidence_summary`,
+`ops/ci/proof_guards.sh`); for an empty change set its proof digests, receipt
+directory and proofmark count are null and `proof_verification` is
+`not_applicable`. A shallow checkout
 is deepened from the forge first. Run the narrower `just` lanes above on a tree
 that is not yet a pushed, rebased head.
 

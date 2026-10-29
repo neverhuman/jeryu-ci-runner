@@ -103,7 +103,7 @@ required_lane_result "sandbox escape matrix" ran
 # Last, after the test suite and the sandbox matrix, so a forge or network
 # failure in this lane is reported as its own failure and hides no test result.
 # It needs a clean exact head whose origin is the hosted repository, the network
-# and the forge, and a head descending from protected main (docs/testing.md).
+# and the forge, and a head sharing history with protected main (docs/testing.md).
 echo "[pr-ci] proof evidence lane (ratchet against the forge's protected main)" >&2
 bash ops/ci/proof_evidence.sh
 echo "[pr-ci] jeryu-ci-runner OK" >&2

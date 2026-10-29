@@ -54,7 +54,82 @@ proof_fork_point() {
 proof_changed_paths() {
   local fork="$1" head="$2" out="$3"
   git diff --no-ext-diff --name-only -z --diff-filter=ACDMRT \
-    "${fork}...${head}" >"$out"
+    "${fork}...${head}" >"$out.unsorted" || return 1
+  LC_ALL=C sort -zu "$out.unsorted" >"$out" || return 1
+  rm -f -- "$out.unsorted"
+}
+
+# Print FILE's sha256 as a JSON string; fails when FILE cannot be read.
+proof_json_digest() {
+  local sum
+  sum="$(sha256sum -- "$1")" || return 1
+  printf '"%s"\n' "${sum%% *}"
+}
+
+# Print the lane's summary, jeryu.ci-runner.proof-evidence/v2, from the
+# artifacts under ./target this run wrote.
+#
+# Arguments: HEAD BASE FORK RECEIPT_DIR CHANGED_COUNT RECEIPT_COUNT
+# BASELINE_SCORE BASELINE_SHA256.
+#
+# v2 over v1: adds fork_point, and admits an empty change set (changed_path_count
+# 0). Then there is no proof plan, evidence index, verification, receipt
+# directory or proofmark receipt, so proof_plan_sha256, evidence_index_sha256,
+# proof_verification_sha256, receipt_dir and proofmark_review_obligations are
+# null, receipt_count is 0 and proof_verification is "not_applicable". With a
+# non-empty change set every one of them must come from a file this run wrote,
+# and proof_verification is "pass". Nothing in the family reads the summary
+# today; jeryu-auto-tag reads only the <repo>/required status.
+proof_evidence_summary() {
+  local head="$1" base="$2" fork="$3" receipt_dir="$4" changed="$5" receipts="$6"
+  local baseline_score="$7" baseline_sha256="$8"
+  local plan=null index=null verification=null review=null dir=null verdict=not_applicable
+  [[ "$changed" =~ ^[0-9]+$ && "$receipts" =~ ^[0-9]+$ ]] || {
+    printf 'proof summary counts are not whole numbers: %s %s\n' "$changed" "$receipts" >&2
+    return 1
+  }
+  if (( changed > 0 )); then
+    (( receipts > 0 )) || { printf 'a non-empty change set has no proof receipts\n' >&2; return 1; }
+    plan="$(proof_json_digest target/jankurai/proof-plan.json)" || return 1
+    index="$(proof_json_digest target/jankurai/evidence-index.json)" || return 1
+    verification="$(proof_json_digest target/jankurai/proof-verification.json)" || return 1
+    review="$(jq -er '.summary.review_obligations | numbers' \
+      target/jankurai/proofmark/proofmark-receipt.json)" || return 1
+    dir="$(jq -n --arg d "$receipt_dir" '$d')"
+    verdict=pass
+  elif (( receipts != 0 )); then
+    printf 'an empty change set cannot have proof receipts\n' >&2
+    return 1
+  fi
+  jq -n \
+    --arg head "$head" --arg base "$base" --arg fork "$fork" \
+    --argjson receipt_dir "$dir" \
+    --argjson plan_sha256 "$plan" \
+    --argjson evidence_index_sha256 "$index" \
+    --argjson verification_sha256 "$verification" \
+    --arg proof_verification "$verdict" \
+    --argjson proofmark_review "$review" \
+    --arg security_sha256 "$(sha256sum target/jankurai/security/evidence.json | awk '{print $1}')" \
+    --arg supply_chain_sha256 "$(sha256sum target/security/evidence.json | awk '{print $1}')" \
+    --arg sbom_sha256 "$(sha256sum target/security/sbom.cdx.json | awk '{print $1}')" \
+    --arg baseline_sha256 "$baseline_sha256" \
+    --argjson changed_count "$changed" \
+    --argjson receipt_count "$receipts" \
+    --argjson baseline_score "$baseline_score" \
+    --argjson migration_liability "$(jq -er .liability_score target/jankurai/migration-report.json)" \
+    --argjson baseline_migration_liability "$(jq -er .liability_score target/jankurai/baseline-migration-report.json)" \
+    '{schema_version:"jeryu.ci-runner.proof-evidence/v2",git_head:$head,
+      base_commit:$base,fork_point:$fork,dirty_worktree:false,changed_path_count:$changed_count,
+      receipt_count:$receipt_count,receipt_dir:$receipt_dir,
+      proof_plan_sha256:$plan_sha256,evidence_index_sha256:$evidence_index_sha256,
+      proof_verification_sha256:$verification_sha256,security_sha256:$security_sha256,
+      supply_chain_sha256:$supply_chain_sha256,sbom_sha256:$sbom_sha256,
+      baseline_score:$baseline_score,baseline_sha256:$baseline_sha256,
+      migration_liability_score:$migration_liability,
+      baseline_migration_liability_score:$baseline_migration_liability,
+      proof_verification:$proof_verification,proofmark_mode:"advisory",
+      proofmark_review_obligations:$proofmark_review,
+      synthetic_fallbacks:0,conclusion:"success"}'
 }
 
 # Ratchet this head's migration analysis against protected main's.
