@@ -300,6 +300,15 @@ The manifest is the author's text, so it never decides what is fetched or what c
   (operator environment only, never the PR or its base) lists other hostnames that are this same
   forge: their `/git/<owner>/<repo>.git` URLs count as forge repositories and are still fetched from
   `JERYU_BASE`, with the same pin, protected-branch and approval checks.
+- A source that moved from an old host (a GitHub mirror) to this forge is bound by
+  `REDTEAM_SOURCE_MAPPINGS` (operator environment only, empty by default): space-separated
+  `<https url>=<owner>/<name>` entries, each one exact source URL (no host is aliased). The base's
+  pin on that URL is then the same dependency as the forge repository, so the move is fetched with
+  the full diff, exact revision/tag, protected-branch and approval checks. Activating an entry is a
+  separate, operator-authorised act; a dependency absent from the base stays `new-pin-unverified`,
+  and nothing a PR or its base writes can add an entry. Malformed entries are ignored.
+  Owner-decision context for the independent review comes from an approval by the namespace owner
+  or a `REDTEAM_OWNER_DECISION_AUTHORS` login on the exact head (see above), never the PR author.
 - Fetches run with no system, global or XDG git configuration, no ambient credential helper and no
   netrc, and present only the reviewer's own credential.
 - The forge, not the manifest, says which branches count: the repository's default branch and the

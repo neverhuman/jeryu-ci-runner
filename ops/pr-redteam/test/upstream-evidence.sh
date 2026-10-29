@@ -21,7 +21,7 @@ upstream_max_branches=8 upstream_max_pull_pages=10 upstream_min_share=1024
 state="$t/state"; me=reviewer
 # The stand-in forge is a directory served over file://; the real upstream_remote builds
 # $base/git/<owner>/<name>.git from it. Manifests name the forge by its host, forge.test.
-base="file://$t/forge"; forge_host=forge.test; forge_aliases=""
+base="file://$t/forge"; forge_host=forge.test; forge_aliases="" source_mappings=""
 token_file="$t/token"; printf 'dummytoken' >"$token_file"; chmod 600 "$token_file"
 
 # Ambient credentials that must never be used: a global helper that records any call and fails, and
@@ -260,6 +260,30 @@ rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
 grep -q "^unmapped-host	" <<<"$rows" || fail "hostile host mapped with aliases set: $rows"
 forge_aliases=""
 ok 'a configured forge alias host maps to the forge route; unlisted hosts stay unmapped-host'
+
+# 7c. An operator's exact source mapping ties the base's old (non-forge) source to the forge repository;
+# without it, with a different URL, or for a dependency new at the base, nothing is trusted or fetched.
+dep srcmap
+gh() { printf '[dependencies]\nx = { git = "%s", rev = "%s" }\n' "$1" "$2"; }
+gh https://github.example/org/core.git "$r1" | put Cargo.toml; b="$(snap base)"
+gh https://forge.test/git/acme/core.git "$r3" | put Cargo.toml; h="$(snap moved)"
+source_mappings=""
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+grep -q "^new-pin-unverified	" <<<"$rows" || fail "unmapped old source was trusted: $rows"
+source_mappings=" https://github.example/org/other=acme/core"
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+grep -q "^new-pin-unverified	" <<<"$rows" || fail "a different URL mapping applied: $rows"
+source_mappings=" https://github.example/org/core=acme/core"
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+grep -qx "$(printf 'fetch\tacme/core\t%s\t%s\t\tx\thttps://forge.test/git/acme/core' "$r1" "$r3")" <<<"$rows" || fail "source mapping: $rows"
+o="$(evidence "$b" "$h")"
+[ "$(field "$(pin_of "$o" "$r3")" status)" = merged-tip ] || fail "mapped evidence: $(cat "$o/upstream/SUMMARY.txt")"
+# A different dependency the PR adds is still new, whatever the mapping says.
+printf '[dependencies]\nx = { git = "https://forge.test/git/acme/core.git", rev = "%s" }\ny = { git = "https://forge.test/git/acme/core.git", rev = "%s" }\n' "$r3" "$r3" | put Cargo.toml; h2="$(snap added)"
+rows="$(upstream_pins "$D/.git" "$b" "$h2" acme | tr '\037' '\t')"
+grep -q "^new-pin-unverified	" <<<"$rows" || fail "an added dependency was trusted: $rows"
+source_mappings=""
+ok 'an operator source mapping binds the old source to the forge repository without trusting new dependencies'
 
 # 8. A GitHub mirror source maps to the forge only through a mapping the base carries.
 dep mirror

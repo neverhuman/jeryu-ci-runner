@@ -110,6 +110,10 @@
 #                          default: the family's no-force rule forbids rewriting an author's branch.
 #   REDTEAM_FORGE_ALIASES  (none)                space-separated hostnames that are this forge under another
 #                          name; their /git/<owner>/<repo>.git URLs count as the forge's, fetched from JERYU_BASE
+#   REDTEAM_SOURCE_MAPPINGS (none)               space-separated `<https url>=<owner>/<name>`: the exact old source URL
+#                          of a pin at the base and the forge repository that now holds it. Activated by the
+#                          operator after a separate authorisation; no host is aliased, a new dependency is not
+#                          made trusted, and fetches still go to the forge with the reviewer's credential
 #   REDTEAM_PRIORITY_FAMILIES (none)         forge `family` values reviewed first; other families
 #                          wait until these have nothing left to review in a pass
 #   REDTEAM_FAMILIES       all                  forge `family` values to cover ("all" includes repos
@@ -217,6 +221,16 @@ for a in ${REDTEAM_FORGE_ALIASES:-}; do
     || { echo "pr-redteam: ignoring REDTEAM_FORGE_ALIASES entry that is not a bare hostname" >&2; continue; }
   forge_aliases="$forge_aliases $a"
 done
+# Exact old-source -> forge repository mappings the operator authorises (REDTEAM_SOURCE_MAPPINGS, space-separated
+# `<https url>=<owner>/<name>`). Site configuration only: never read from a PR or its base, empty unless an
+# operator activates it, and each entry names one URL, so no host is aliased. A pin whose base source is such a URL
+# is the same dependency as the forge repository it maps to; the pin is still fetched from forge_host only.
+source_mappings=""
+for a in ${REDTEAM_SOURCE_MAPPINGS:-}; do
+  [[ "$a" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._-]+)+=[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ && "$a" != *..* ]] \
+    || { echo "pr-redteam: ignoring REDTEAM_SOURCE_MAPPINGS entry that is not <https url>=<owner>/<name>" >&2; continue; }
+  source_mappings="$source_mappings $a"
+done
 read -ra author_domains <<<"${REDTEAM_AUTHOR_DOMAINS:-}"
 read -ra owner_decision_authors <<<"${REDTEAM_OWNER_DECISION_AUTHORS:-}"
 state="${REDTEAM_STATE:-$HOME/.local/state/pr-redteam}"
@@ -257,7 +271,7 @@ review_input_identity() { # [path-bound]
     if [[ -f "$claude_bin" ]]; then
       if [[ "${1:-}" == path-bound ]]; then sha256sum "$claude_bin"; else sha256sum <"$claude_bin"; fi
     else printf 'cli-unavailable\n'; fi
-    printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes" "${author_domains[*]}" "${owner_decision_authors[*]}"
+    printf '%s\n' "$model" "$claude_version_pin" "$max_diff_bytes" "$max_blob_bytes" "${author_domains[*]}" "${owner_decision_authors[*]}" "$source_mappings"
     # The upstream evidence limits decide what a pin bump's reviewer is shown (0 pins shows nothing).
     printf 'upstream %s\n' "$upstream_max_pins" "$upstream_max_bytes" "$upstream_max_commits" \
       "$upstream_max_branches" "$upstream_max_pull_pages" "$upstream_fetch_timeout"
@@ -1169,7 +1183,7 @@ upstream_pins() { # git-dir base head default-owner
       git --git-dir="$g" show "$b:$f" 2>/dev/null | upstream_manifest_pins "$kind" | upstream_tag base "$f"
       git --git-dir="$g" show "$h:$f" 2>/dev/null | upstream_manifest_pins "$kind" | upstream_tag head "$f"
     done
-  } | awk -F '\t' -v host="$forge_host" -v aliases="$forge_aliases" -v owner="$owner" '
+  } | awk -F '\t' -v host="$forge_host" -v aliases="$forge_aliases" -v owner="$owner" -v srcmaps="$source_mappings" '
     function norm(u) { sub(/[?#].*$/, "", u); sub(/\/+$/, "", u); sub(/\.git$/, "", u); return u }
     function forge_repo(u,   p, pre, h, i, n, hs) {
       p = norm(u); if (host == "") return ""
@@ -1184,7 +1198,12 @@ upstream_pins() { # git-dir base head default-owner
       if ((k = forge_repo(u)) != "") return k
       k = tolower(norm(u)); return (k in mapped) ? mapped[k] : ""
     }
-    $1 == "map" { if ((k = forge_repo($3)) != "") mapped[tolower(norm($2))] = k; next }
+    BEGIN {
+      n = split(srcmaps, ms, " ")
+      for (i = 1; i <= n; i++) { j = index(ms[i], "="); if (j > 0) { opm[tolower(norm(substr(ms[i], 1, j - 1)))] = substr(ms[i], j + 1) } }
+      for (k in opm) mapped[k] = opm[k]
+    }
+    $1 == "map" { if ((k = forge_repo($3)) != "" && !(tolower(norm($2)) in opm)) mapped[tolower(norm($2))] = k; next }
     # A lock entry exists at the base whatever its commit says there (a PENDING commit is no old rev).
     $1 == "base" && $4 ~ /^lock:/ {
       if ((r = resolve($4)) != "") { k = $2 SUBSEP $3 SUBSEP r; old[k] = ($5 ~ /^[0-9a-f]{40}$/) ? $5 : ""; otag[k] = $7; oext[k] = $9 }
