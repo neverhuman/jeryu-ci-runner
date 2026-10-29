@@ -10,6 +10,9 @@ expect_count 2
 jq -se 'map([.context,.state]) == [["fixture/fast","pending"],["fixture/fast","success"],
   ["fixture/required","pending"],["fixture/required","success"]]' "$fixture/statuses.jsonl" >/dev/null \
   || fail_tier 'the fast tier posted over the full context'
+# One head's tiers share one locked-crate prefetch: the full tier does not repeat it.
+grep -q 'acme/fixture required tier skips the locked-crate prefetch' "$fixture/runner.log" \
+  || fail_tier 'the full tier repeated the prefetch'
 
 head=$(cat "$fixture/head")
 full="$fixture/runner/attempts/acme-fixture-$head/last-result.json"

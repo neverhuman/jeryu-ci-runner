@@ -1587,10 +1587,13 @@ fi
 tiers=(required)
 full_recipe=("${recipe[@]}") full_recipe_name=$recipe_name
 head_key_dir=$gate_key_dir
-has_fast=0
-if ((main_health == 0)) && (cd "$run/$repo" && just --summary 2>/dev/null | tr ' ' '\n' | grep -qx required-fast); then has_fast=1; fi
+has_fast=0 repo_fast=0
+if (cd "$run/$repo" && just --summary 2>/dev/null | tr ' ' '\n' | grep -qx required-fast); then repo_fast=1; fi
+((main_health || repo_fast == 0)) || has_fast=1
+# The repository's marker follows its protected main, not whichever head was prepared last: only a
+# main-health tree without required-fast removes it.
+if ((main_health && repo_fast == 0)); then rm -f -- "$HOME_DIR/cache/tiered-repo-$owner-$repo"; fi
 if ((has_fast == 0)) && [[ -n "${branch_green["$owner/$repo@$sha"]:-}" ]]; then
-  rm -f -- "$HOME_DIR/cache/tiered-repo-$owner-$repo"
   say "skip $owner/$repo $only_branch: its tip ${sha:0:12} already carries a $(gate_status_context "$owner" "$repo") success"
   exec 6>&-; exec 7>&-
   continue
@@ -1611,12 +1614,8 @@ if ((has_fast)); then
   [[ "$selected_tier" != full ]] || tiers+=(required)
   printf '%s\n' tiered | gate_atomic "$head_key_dir/tiered"
   printf '%s\n' tiered | gate_atomic "$HOME_DIR/cache/tiered-repo-$owner-$repo"
-elif ((main_health == 0)); then
-  # Tier membership is the repository's: a tree without required-fast drops the repository's marker,
-  # so the cheap path and the branch-tip shortcut come back once a repository drops the recipe. The
-  # head's own `tiered` marker is attempt evidence and stays; it counts only with the repository's.
-  rm -f -- "$HOME_DIR/cache/tiered-repo-$owner-$repo"
 fi
+# A head's own `tiered` marker is attempt evidence and stays; it counts only with the repository's.
 # A forge re-gate request is read once for the head, before any tier runs. The first tier records it
 # as honoured when its attempt starts; read again for the full tier it would answer "not wanted",
 # and the full tier would hold the very failure the request asked to re-run.
@@ -1624,7 +1623,7 @@ regate_head=""
 if gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
   regate_head="${regate_at["$owner/$repo#$number $sha"]}"
 fi
-ran_tier=0
+ran_tier=0 prefetched="" seeded_cache=""
 for tier in "${tiers[@]}"; do
   gate_key_dir=$head_key_dir
   if [[ "$tier" == fast ]]; then
@@ -1632,7 +1631,7 @@ for tier in "${tiers[@]}"; do
     gate_key_dir="$head_key_dir/tiers/fast"
     # The same 0700 the attempt key directory gets from gate_lock.
     mkdir -p "$gate_key_dir" && chmod 700 "$head_key_dir/tiers" "$gate_key_dir"
-    recipe=(just required-fast) recipe_name="just required-fast" recipe_timeout=50m
+    recipe=(just required-fast) recipe_name="just required-fast" recipe_timeout=30m
   else
     GATE_CONTEXT_KIND=required
     ((main_health == 0)) || GATE_CONTEXT_KIND=main-health
@@ -1673,8 +1672,14 @@ case "${gate_action:?}" in
     break;;
 esac
 build_cache_key=""
-if ((build_cache)); then
+# The slot's build cache is seeded once per head: a full tier after a passing fast tier builds on what
+# the fast tier left in the same slot tree, and is the only tier that may publish it (see below).
+if ((build_cache)) && [[ -n "$seeded_cache" ]]; then
+  build_cache_key=$seeded_cache
+  say "$owner/$repo $tier tier reuses this head's seeded build cache"
+elif ((build_cache)); then
   build_cache_key=$(gate_build_cache_key "$identity" "$repo" "$run/$repo") || die "cannot bind $owner/$repo build cache"
+  seeded_cache=$build_cache_key
   mkdir -p "$run/$repo/target/build-cache"
   seed_started=$(date +%s)
   if seeded=$(gate_golden_seed "$build_cache_store" "$build_cache_key" "$run/$repo/target/build-cache"); then
@@ -1913,7 +1918,9 @@ for repo_dir in "$1"/*/; do
     fi
   done < <(git -C "$repo_dir" ls-files -z -- "${@:4}" ":!:*vendor/*" ":!:*fixtures/*" 2>/dev/null)
 done'
-if ((sandbox)); then
+if [[ "$prefetched" == "$sha" ]]; then
+  say "$owner/$repo $tier tier skips the locked-crate prefetch: this head's earlier tier ran it"
+elif ((sandbox)); then
   # The prefetch heals the host's shared Cargo registry, which is exactly a shared writable cache: a
   # contribution neither reads nor writes it. Its sandbox resolves dependencies on its own, within
   # whatever network the site allows it.
@@ -1924,6 +1931,7 @@ else
     ionice -c 3 timeout 30m bash -c "$prefetch" pr-gate-prefetch "$worker_root" "$repo" "$LOCK_SOURCES_ERE" \
     6>&- 7>&- 9>&- >"$gate_attempt_dir/prefetch.log" 2>&1 \
     || say "locked-crate prefetch for $owner/$repo ended $?; the recipe reports any real gap"
+  prefetched=$sha
 fi
 if [[ -s "$gate_attempt_dir/prefetch.log" ]]; then
   say "$owner/$repo prefetch: $(grep -c '^fetched ' "$gate_attempt_dir/prefetch.log") lockfile(s) healed, $(grep -c '^could not fetch ' "$gate_attempt_dir/prefetch.log") not (see prefetch.log)"
@@ -1998,7 +2006,11 @@ gate_finish "$state" "$worker_exit" "$log"
 # green main-health gate. A pull-request head is unreviewed until it is queued, so its outputs are
 # read from the store but never written to it. Every other outcome deletes the slot's copy, which
 # also keeps the disk to one cache per repository plus one per busy slot.
-if ((build_cache)); then
+# A passing fast tier that the full tier follows keeps the slot's cache for it and publishes nothing:
+# the key does not name the recipe, so only the head's last tier may become the shared version.
+if ((build_cache)) && [[ "$tier" == fast && "$state" == success && "${tiers[-1]}" != fast ]]; then
+  :
+elif ((build_cache)); then
   if [[ "$state" == success ]] && { [[ "$qref" =~ ^refs/queue/ ]] || ((main_health)); }; then
     publish_rc=0
     gate_golden_publish "$build_cache_store" "$build_cache_key" "$run/$repo/target/build-cache" \
@@ -2038,7 +2050,8 @@ fi
 # An inputs_changed result ends the invocation like any other: the next tick re-runs that head first
 # once the family's mains have settled (see the candidate order above), so a re-run is coalesced
 # with a merge burst. No unit run holds more than one head's recipes against its TimeoutStartSec:
-# required-fast is bounded at 50 minutes and the full recipe at 3 hours, inside the unit's 4 hours.
+# required-fast is bounded at 30 minutes, the full recipe at 3 hours and the once-per-head prefetch at
+# 30 minutes, inside the unit's 5 hours.
 # Attempt evidence is retained with its log, including active and unpublished results.
 # Age does not discharge a recovery obligation. Preservation-aware retention must be
 # qualified separately before any journal or legacy log is removed.

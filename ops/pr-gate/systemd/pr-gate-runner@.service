@@ -22,4 +22,6 @@ Nice=10
 # The recipe and its sccache server run under `ionice -c 3` (idle) from the runner itself. The runner's
 # own bookkeeping -- hashing inputs, the clean-tree git status, receipt fsyncs -- stays best-effort:
 # under idle it queued behind every slot's build I/O (sampled on a gate host 2026-09-18).
-TimeoutStartSec=4h
+# One head per run: up to 30m locked-crate prefetch, 30m required-fast on a tiered repository and the
+# 3h full recipe, plus preparation and publication.
+TimeoutStartSec=5h

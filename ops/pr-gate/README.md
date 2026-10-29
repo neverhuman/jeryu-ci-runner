@@ -44,8 +44,9 @@ Fast validation publishes `<repo>/fast` before full validation starts. While it 
 context keeps its newest conclusion: a success stays as `keep_green` keeps one through any
 re-verification, and a failure stays red until the full tier runs again. A fast failure stops there
 and marks the full context failed, without attaching a full evidence identity. `required-fast` is
-bounded at 50 minutes and the full recipe at 3 hours, so one head's two recipes fit the slot unit's
-4-hour `TimeoutStartSec`. A forge re-gate request is read once for the head, before either tier
+bounded at 30 minutes and the full recipe at 3 hours. The locked-crate prefetch and the build-cache
+seed run once per head, and only the head's last tier may publish the shared build cache. With the
+30-minute prefetch that is 4 hours inside the slot unit's 5-hour `TimeoutStartSec`. A forge re-gate request is read once for the head, before either tier
 runs, so it re-runs a failed full tier as well as the fast one. Fast receipts live under
 `tiers/fast/` in the head's journal, protected by the same descendant lock as the full receipts.
 Both tiers bind the source and environment inputs, with distinct recipe and context fields in their
@@ -56,8 +57,10 @@ Tiered heads prepare their tree before deciding reuse so both contexts and curre
 checked. Their `tiered` marker prevents the single-context shortcut from skipping that work, and
 `cache/tiered-repo-<owner>-<repo>` makes a green protected branch tip of a tiered repository wait
 for its prepared tree instead of being skipped at listing time. A repository without the marker
-keeps the listing-time skip. A prepared tree with no `required-fast` removes the repository's marker,
-and a head's `tiered` marker counts only while its repository's is present.
+keeps the listing-time skip. Only a main-health tree without `required-fast` removes the marker, so
+an old branch or a PR that drops the recipe does not switch it off for the repository. A head's
+`tiered` marker counts only while its repository's is present. The fast context is `<repo>/fast`
+named from the repository, also where `PR_GATE_CONTEXT_OVERRIDES` moves `<repo>/required`.
 Publication recovery retains each tier's receipts and handles them before that tier can run again.
 
 ## Deciding reuse before a tree is prepared
