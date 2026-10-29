@@ -2922,7 +2922,7 @@ queue_retry_snapshot() {
   [[ "${queue_cache_state:-0}" != 1 ]] || return 0
   [[ "${queue_cache_state:-0}" != failed ]] || return 1
   queue_cache_state=failed
-  local page entries
+  local page
   queue_cache_entries='[]'
   for page in 1 2 3 4 5; do
     api GET "/api/v1/merge-queue?state=all&per_page=100&page=$page"
@@ -2930,8 +2930,8 @@ queue_retry_snapshot() {
     if ! jq -e '(.entries|type)=="array" and (.page.has_more|type)=="boolean"' <<<"$body" >/dev/null 2>&1; then
       say 'merge queue snapshot has invalid entries/pagination; retries wait'; return 1
     fi
-    entries="$(jq -c '.entries' <<<"$body")" || return 1
-    queue_cache_entries="$(jq -cn --argjson a "$queue_cache_entries" --argjson b "$entries" '$a + $b')" || return 1
+    # Pages go through stdin (printf is a builtin): a large queue must never ride in argv.
+    queue_cache_entries="$(printf '%s\n%s\n' "$queue_cache_entries" "$body" | jq -cs '.[0] + .[1].entries')" || return 1
     if ! jq -e '.page.has_more' <<<"$body" >/dev/null; then queue_cache_state=1; return 0; fi
   done
   say 'merge queue snapshot exceeded five pages; retry state is incomplete, retries wait'

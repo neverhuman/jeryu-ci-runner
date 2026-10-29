@@ -102,6 +102,13 @@ case "$url" in
     printf '\n200' ;;
   */api/v1/merge-queue\?state=all*)
     if [[ -e "$MERGE_FIXTURE/list-unavailable" ]]; then printf '{"message":"temporary list outage"}\n503'; exit; fi
+    if [[ -e "$MERGE_FIXTURE/queue-bulk" && "$url" == *'page=1' ]]; then
+      # ~3 MB of other-head rows for the same pull request: past ARG_MAX, so any argv use fails.
+      jq -nc '{entries:[range(0;12000) | {repo:"jeryu/fixture",base:"main",number:107,
+        pr_head_sha:("b" * 40),base_sha:("c" * 40),state:"failed",enqueued_at:"2026-10-20T00:00:00Z",
+        reason:("x" * 200)}],page:{has_more:true}}'
+      printf '\n200'; exit
+    fi
     if [[ -e "$MERGE_FIXTURE/queue-paged" && "$url" == *'page=1' ]]; then
       printf '{"entries":[],"page":{"has_more":true}}\n200'; exit
     fi
@@ -276,12 +283,14 @@ grep -q 'no valid failed base' "$t/controller.log"
 printf '%s\n' "$base_a" >"$t/queue-failed"
 
 # The live page.has_more contract leads to page two, then one accepted retry is recorded.
-touch "$t/queue-paged"
+touch "$t/queue-paged" "$t/queue-bulk"
 pass
 [[ "$(count "$t/queue-posts")" == 2 ]]
 jq -e --arg b "$base_a" '.queue_retried_base == $b and .queue_retry_bases == [$b]' "$(receipt)" >/dev/null
 grep -q 'state=all&per_page=100&page=2' "$t/requests"
-rm "$t/queue-paged"
+! grep -q 'Argument list too long' "$t/controller.log"
+echo 'ok multi-megabyte queue pages are accumulated without argv overflow, exact head still selected'
+rm "$t/queue-paged" "$t/queue-bulk"
 pass
 [[ "$(count "$t/queue-posts")" == 2 ]]
 grep -q "approved, waiting to merge: merge queue entry failed on base ${base_a:0:12} after a retry" "$t/controller.log"
