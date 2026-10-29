@@ -63,22 +63,23 @@ for unit in pr-redteam.service pr-redteam.timer pr-redteam-heartbeat.service pr-
   # `is-enabled` also succeeds for a static unit (no [Install] section, as every
   # pr-redteam service is), so only states that start the unit on their own count.
   enabled_state="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
-  if systemctl --user is-active --quiet "$unit" ||
-    [[ "$enabled_state" =~ ^(enabled|enabled-runtime|linked|linked-runtime|alias)$ ]]; then
+  if [[ "$enabled_state" =~ ^(enabled|enabled-runtime|linked|linked-runtime|alias)$ ]] ||
+    { [[ "$unit" != *@.service ]] && systemctl --user is-active --quiet "$unit"; }; then
     echo "$unit is active or enabled; its service owner must stop/disable it before installation" >&2
     exit 1
   fi
 done
-# Templates can have running instances even when the template itself is inactive.
-for template in 'pr-redteam-merge@*.service' 'pr-redteam-review@*.service'; do
+# Templates have enablement but no runtime state; inspect their concrete instances.
+for template in 'pr-redteam-notify@*.service' 'pr-redteam-merge@*.service' 'pr-redteam-review@*.service'; do
   instances="$(systemctl --user list-units --all --type=service --no-legend --plain "$template")"
   while read -r instance _; do
     [ -n "$instance" ] || continue
     # A running Type=oneshot instance is `activating`, which `is-active` answers as inactive: read
     # the state itself and treat every state of an unfinished instance as running.
-    instance_state="$(systemctl --user show -p ActiveState --value "$instance" 2>/dev/null || true)"
+    instance_state="$(systemctl --user show -p ActiveState --value "$instance")"
     case "$instance_state" in
-      active|activating|deactivating|reloading)
+      inactive|failed) ;;
+      *)
         echo "$instance is $instance_state; its service owner must stop it before installation" >&2
         exit 1 ;;
     esac

@@ -10,6 +10,8 @@ cat > "$t/bin/systemctl" <<'FIXTURE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$INSTALL_FIXTURE/calls"
 case "$*" in
+  *'is-active --quiet pr-redteam-'*@.service)
+    echo 'Failed to retrieve unit state for bare template' >&2; exit 1 ;;
   # A running review instance is Type=oneshot, so systemd reports it `activating`, which
   # `is-active` answers as not active (exit 3); only `show -p ActiveState` names it.
   *is-active*) [[ "$FIXTURE_UNIT_ACTIVE" == 1 || ( "$*" == *pr-redteam-merge@jeryu:* && "${FIXTURE_INSTANCE_ACTIVE:-0}" == 1 ) ]] ;;
@@ -17,11 +19,24 @@ case "$*" in
     if [[ "${FIXTURE_INSTANCE_ACTIVE:-0}" == 1 ]]; then echo active; else echo inactive; fi ;;
   *'show -p ActiveState --value pr-redteam-review@jeryu:'*)
     if [[ "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 1 ]]; then echo activating; else echo inactive; fi ;;
+  *'show -p ActiveState --value pr-redteam-'*)
+    [[ "${FIXTURE_SHOW_FAIL:-0}" == 0 ]] || exit 1
+    printf '%s\n' "${FIXTURE_INSTANCE_STATE-inactive}" ;;
   # Real systemctl prints the state and exits 0 for a static unit too.
-  *is-enabled*) printf '%s\n' "${FIXTURE_ENABLED_STATE:-static}"; [[ "${FIXTURE_ENABLED_STATE:-static}" != disabled ]] ;;
+  *is-enabled*)
+    state=static
+    [[ "${*: -1}" != "${FIXTURE_ENABLED_UNIT:-pr-redteam.service}" ]] || state="${FIXTURE_ENABLED_STATE:-static}"
+    printf '%s\n' "$state"; [[ "$state" != disabled ]] ;;
   '--user daemon-reload') exit 0 ;;
-  *list-units*pr-redteam-merge@*) [[ "${FIXTURE_INSTANCE_ACTIVE:-0}" == 0 ]] || echo 'pr-redteam-merge@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded active running'; exit 0 ;;
-  *list-units*pr-redteam-review@*) [[ "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 0 ]] || echo 'pr-redteam-review@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded activating start'; exit 0 ;;
+  *list-units*)
+    [[ "${FIXTURE_LIST_FAIL:-0}" == 0 ]] || exit 1
+    if [[ "${*: -1}" == "${FIXTURE_TEMPLATE:-}*.service" ]]; then
+      printf '%sfixture.service loaded %s start\n' "$FIXTURE_TEMPLATE" "${FIXTURE_INSTANCE_STATE-inactive}"
+    elif [[ "$*" == *pr-redteam-merge@* && "${FIXTURE_INSTANCE_ACTIVE:-0}" == 1 ]]; then
+      echo 'pr-redteam-merge@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded active running'
+    elif [[ "$*" == *pr-redteam-review@* && "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 1 ]]; then
+      echo 'pr-redteam-review@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded activating start'
+    fi ;;
   *) echo 'unexpected activation command' >&2; exit 97 ;;
 esac
 FIXTURE
@@ -34,6 +49,8 @@ mkdir -p "$t/home/.config/pr-redteam"
 printf 'JERYU_BASE=https://forge.invalid\nJERYU_TOKEN_FILE=%s/token\nREDTEAM_CLAUDE=%s/bin/claude\nREDTEAM_CLAUDE_VERSION=9.9.9\n' "$t" "$t" > "$t/home/.config/pr-redteam/site.env"
 touch "$t/token"
 run 0
+! grep -q 'Failed to retrieve unit state' "$t/out"
+! grep -Eq 'is-active .*@\.service$' "$t/calls"
 unit="$t/home/.config/systemd/user/pr-redteam.service"
 # The merger credential path is site configuration: the unit may only point at the
 # site's environment file, never assign REDTEAM_MERGE_TOKEN_FILE itself.
@@ -78,6 +95,28 @@ if FIXTURE_ENABLED_STATE=enabled run 0; then echo 'enabled installation was acce
 if FIXTURE_INSTANCE_ACTIVE=1 run 0; then echo 'active merge instance was accepted' >&2; exit 1; fi
 if FIXTURE_REVIEW_INSTANCE_ACTIVE=1 run 0; then echo 'running (activating) review instance was accepted' >&2; exit 1; fi
 grep -q 'pr-redteam-review@jeryu:fixture:107:1111111111111111111111111111111111111111.service is activating' "$t/out"
+for template in pr-redteam-notify@ pr-redteam-merge@ pr-redteam-review@; do
+  for state in enabled enabled-runtime linked linked-runtime alias; do
+    if FIXTURE_ENABLED_UNIT="${template}.service" FIXTURE_ENABLED_STATE="$state" run 0; then
+      echo "enabled template $template ($state) was accepted" >&2; exit 1
+    fi
+    grep -q "${template}.service is active or enabled" "$t/out"
+  done
+  for state in active activating deactivating reloading unknown ''; do
+    if FIXTURE_TEMPLATE="$template" FIXTURE_INSTANCE_STATE="$state" run 0; then
+      echo "unfinished instance $template ($state) was accepted" >&2; exit 1
+    fi
+    grep -q "${template}fixture.service is $state" "$t/out"
+  done
+  if FIXTURE_TEMPLATE="$template" FIXTURE_SHOW_FAIL=1 run 0; then
+    echo 'failed instance state query was accepted' >&2; exit 1
+  fi
+  for state in inactive failed; do
+    FIXTURE_TEMPLATE="$template" FIXTURE_INSTANCE_STATE="$state" run 0
+  done
+done
+if FIXTURE_LIST_FAIL=1 run 0; then echo 'failed instance listing was accepted' >&2; exit 1; fi
+! grep -Eq 'is-active .*@\.service$' "$t/calls"
 sha256sum -c "$t/before" > /dev/null
 if grep -Eq 'enable --now|start --no-block|disable|stop ' "$t/calls"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 
