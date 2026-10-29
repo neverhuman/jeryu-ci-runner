@@ -131,6 +131,12 @@ identity. Host CI sources `ops/ci/hosted-git-env.sh` before every Cargo entrypoi
 caller-supplied Git configuration is accepted only when it is byte-identical to
 the checked-in policy, then canonicalized to that reviewed path.
 
+Each security invocation fetches RustSec into a private database under
+`target/security/` and removes it on exit. This prevents concurrent gates and
+the host refresher from rewriting advisories during parsing. A fresh fetch is
+required each time; fetch and parse failures fail the lane without retries,
+and `--deny warnings` remains required.
+
 `just contract-drift` binds the checked JSON Schema to all serialized Rust fields,
 message discriminators, wire enums, and public collection bounds. Rust serde
 and `ValidateWire` remain the runtime authority for cross-field, identity,
