@@ -1025,7 +1025,9 @@ for candidate in "${candidates[@]}"; do
   # mains have settled, ahead of the heads that already hold a result. One held after two automatic
   # re-runs waits for an explicit re-gate in its normal place, where the loop below holds it cheaply.
   chain=$(gate_inputs_changed_count "$HOME_DIR/attempts/$owner-$repo-$sha/last-result.json" \
-    "$HOME_DIR/attempts/$owner-$repo-$sha".base-*/last-result.json)
+    "$HOME_DIR/attempts/$owner-$repo-$sha".base-*/last-result.json \
+    "$HOME_DIR/attempts/$owner-$repo-$sha/tiers/fast/last-result.json" \
+    "$HOME_DIR/attempts/$owner-$repo-$sha".base-*/tiers/fast/last-result.json)
   if ((chain > 0)) && { ((inputs_changed_holds == 0)) || ((chain < 3)); }; then
     say "re-running $owner/$repo#$number at $sha first: its last passing run saw its inputs change"
     fresh+=("$candidate"); continue
@@ -1072,6 +1074,8 @@ if [[ "$qref" == - && -z "$only_pr" ]] && gate_queue_arrived; then
 fi
 # A contribution is executed in the site's sandbox, and nowhere else. GATE_SANDBOX is read by
 # gate_inputs and gate_begin, so what ran is part of the result's identity and of its receipt.
+GATE_CONTEXT_KIND=required
+((main_health == 0)) || GATE_CONTEXT_KIND=main-health
 sandbox="$contributed"
 GATE_SANDBOX="$sandbox"
 if [[ -d "$HOME_DIR/claims/$owner-$repo-$sha" ]]; then
@@ -1146,7 +1150,7 @@ fi
 # new chain, and so does an honoured forge re-gate request of a held head. Each invocation runs one
 # recipe at most (see exit 0 below), so a chain is one re-run per tick, never three in one unit run.
 inputs_changed_count=0
-[[ -n "$only_pr" ]] || inputs_changed_count=$(gate_inputs_changed_count "$gate_key_dir/last-result.json")
+[[ -n "$only_pr" ]] || inputs_changed_count=$(gate_inputs_changed_count "$gate_key_dir/last-result.json" "$gate_key_dir/tiers/fast/last-result.json")
 head_holds=$inputs_changed_holds
 [[ "$qref" == - ]] || head_holds=0
 if ((head_holds && inputs_changed_count >= 3)); then
@@ -1261,6 +1265,7 @@ for n in $family; do
   [[ -e "$run/$n" || -L "$run/$n" ]] || continue
   retry_wanted=1
 done
+if [[ -f "$gate_key_dir/tiered" ]]; then retry_wanted=1; fi
 if ((retry_wanted == 0)); then
   cheap_identity=$(mktemp "$HOME_DIR/cache/cheap-inputs-$SLOT.XXXXXXXX")
   cheap_statuses=$(mktemp "$HOME_DIR/cache/cheap-status-$SLOT.XXXXXXXX")
@@ -1568,6 +1573,44 @@ else
   exec 6>&-; exec 7>&-
   continue
 fi
+# Tier membership is repository-owned; activation is forge-owned. A protection read
+# failure leaves this head for another tick, never silently selects the pilot.
+tiers=(required)
+full_recipe=("${recipe[@]}") full_recipe_name=$recipe_name
+head_key_dir=$gate_key_dir
+if ((main_health == 0)) && (cd "$run/$repo" && just --summary 2>/dev/null | tr ' ' '\n' | grep -qx required-fast); then
+  protection_base=$cbase
+  [[ -z "$only_branch" ]] || protection_base=$only_branch
+  case "$protection_base" in -|'!'|'*'*) protection_base=main;; esac
+  protection_base=$(gate_base_branch "$protection_base") || die "invalid protection base"
+  encoded_base=$(jq -rn --arg b "$protection_base" '$b | @uri')
+  api GET "/api/v3/repos/$owner/$repo/branches/$encoded_base/protection"
+  if [[ "$code" != 200 ]] || ! selected_tier=$(gate_protection_tier "$body" "$owner" "$repo"); then
+    say "cannot read enforced contexts for $owner/$repo $protection_base; leaving it for the next tick"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
+  tiers=(fast)
+  [[ "$selected_tier" != full ]] || tiers+=(required)
+  printf '%s\n' tiered | gate_atomic "$head_key_dir/tiered"
+fi
+ran_tier=0
+for tier in "${tiers[@]}"; do
+  gate_key_dir=$head_key_dir
+  if [[ "$tier" == fast ]]; then
+    GATE_CONTEXT_KIND=fast
+    gate_key_dir="$head_key_dir/tiers/fast"
+    mkdir -p "$gate_key_dir"
+    recipe=(just required-fast) recipe_name="just required-fast"
+  else
+    GATE_CONTEXT_KIND=required
+    ((main_health == 0)) || GATE_CONTEXT_KIND=main-health
+    recipe=("${full_recipe[@]}") recipe_name=$full_recipe_name
+  fi
+  if ! gate_recover; then
+    gate_receipt=""
+    break
+  fi
 identity=$(mktemp "$HOME_DIR/cache/inputs-$SLOT.XXXXXXXX")
 status_snapshot=$(mktemp "$HOME_DIR/cache/status-$SLOT.XXXXXXXX")
 PATH="$RECIPE_PATH" gate_inputs "$identity"
@@ -1590,7 +1633,7 @@ case "${gate_action:?}" in
     say "$gate_action $owner/$repo@$sha: identical verified inputs, from the ${gate_action_source:-local} result (a failure re-runs only with --repo <o>/<r> --pr <n>, or changed inputs)"
     [[ "${gate_action_source:-local}" != forge ]] || forge_adopted+=("$candidate")
     rm -f -- "$identity" "$status_snapshot"
-    exec 6>&-; exec 7>&-
+    if [[ "$tier" == fast && "$gate_action" == hold ]]; then break; fi
     continue;;
   republish)
     id=$(jq -r '.id' "$gate_key_dir/last-result.json")
@@ -1598,8 +1641,7 @@ case "${gate_action:?}" in
     gate_publish || die "publication recovery still rejected; retained $gate_receipt"
     gate_receipt=""
     rm -f -- "$identity" "$status_snapshot"
-    exec 6>&-; exec 7>&-
-    continue;;
+    break;;
 esac
 build_cache_key=""
 if ((build_cache)); then
@@ -1662,10 +1704,14 @@ fi
 if ((admitted == 0)); then
   say "head changed or PR closed before admission (or its queue entry moved): $owner/$repo#$number"
   rm -f -- "$identity" "$status_snapshot"
-  exec 6>&-; exec 7>&-
-  continue
+  break
 fi
 gate_begin "$identity"
+# A previous full success must not remain mergeable while its fast prerequisite
+# is being re-proved. This status carries no full evidence identity.
+if [[ "$tier" == fast && "$selected_tier" == full ]]; then
+  GATE_CONTEXT_KIND=required post_status "$owner" "$repo" "$sha" pending "fast prerequisite running; full validation awaits it ($MARKER)"
+fi
 gate_update --argjson count "$inputs_changed_count" --argjson holds "$head_holds" \
   '.inputs_changed_count=$count | .inputs_changed_holds=($holds == 1)' \
   || say "could not record the inputs_changed chain of $owner/$repo@$sha"
@@ -1892,6 +1938,7 @@ else
 ) >"$log" 2>&1 &
 fi
 gate_worker=$!
+ran_tier=1
 gate_update --argjson worker "$gate_worker" '.worker_pid=$worker'
 # What the gate is checking, step by step, while it runs (pr-gate-progress.sh). Best effort.
 gate_progress_watch "$log" "$steps_tsv" "$gate_worker" "$owner" "$repo" "$sha" \
@@ -1944,6 +1991,21 @@ jq -nc --arg repo "$owner/$repo" --argjson pr "$number" --arg sha "$sha" --arg r
   | gate_atomic "$LAST_GATE"
 heartbeat
 say "recorded $owner/$repo $(gate_status_context "$owner" "$repo")=$state; exit $worker_exit; evidence $gate_receipt"
+gate_receipt=""
+if [[ "$tier" == fast && "$state" != success ]]; then
+  if [[ "$selected_tier" == full ]]; then
+    GATE_CONTEXT_KIND=required post_status "$owner" "$repo" "$sha" failure "fast prerequisite did not pass; full validation not started ($MARKER)"
+  fi
+  break
+fi
+done
+GATE_CONTEXT_KIND=required
+((main_health == 0)) || GATE_CONTEXT_KIND=main-health
+if ((ran_tier == 0)); then
+  gate_key_dir=$head_key_dir
+  exec 6>&-; exec 7>&-
+  continue
+fi
 # An inputs_changed result ends the invocation like any other: the next tick re-runs that head first
 # once the family's mains have settled (see the candidate order above), so a re-run is coalesced
 # with a merge burst and no unit run holds more than one recipe against its TimeoutStartSec.

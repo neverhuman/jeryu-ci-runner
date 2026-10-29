@@ -31,6 +31,26 @@ On a gate host the scripts live in `~/gate-runner/bin`, the units in `~/.config/
 the state under `~/gate-runner` (`installed-main.json`, `tools.json`, `attempts/`, `cache/`,
 `regate/`, mirrors and trees). The units run `%h/gate-runner/bin/<script>`.
 
+## Fast and full validation
+
+For a head with a `required-fast` recipe, the runner reads the target branch's enforced contexts
+from the forge's branch-protection API. A requirement for `<repo>/required` selects fast validation
+followed by the complete `required` recipe. Only protection requiring `<repo>/fast` without the full
+context selects fast validation alone. Branch names do not select a tier. An unavailable or malformed
+protection response defers the head; it never activates fast-only validation. Repositories without
+`required-fast` keep their existing recipe and context. Main-health continues to run the full recipe.
+
+Fast validation publishes `<repo>/fast` before full validation starts. A fast failure stops there and
+marks the full context blocked, without attaching a full evidence identity. Fast receipts live under
+`tiers/fast/` in the head's journal, protected by the same descendant lock as the full receipts.
+Both tiers bind the source and environment inputs, with distinct recipe and context fields in their
+identities. Reuse checks each identity separately, including the forge status creator for results
+from another host. A fast digest cannot satisfy a full claim, even if posted under the full context.
+
+Tiered heads prepare their tree before deciding reuse so both contexts and current protection are
+checked. Their durable `tiered` marker prevents the single-context shortcut from skipping that work.
+Publication recovery retains each tier's receipts and handles them before that tier can run again.
+
 ## Deciding reuse before a tree is prepared
 
 Most of what a tick looks at is a head nobody has touched since it was gated. Finding that out used

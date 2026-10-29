@@ -65,8 +65,8 @@ SH
 cat >"$fixture/tools/just" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-if [[ "${1:-}" == --summary ]]; then [[ -f "$FAKE_FORGE/no-recipe" ]] || printf 'required\n'; exit; fi
-[[ "${1:-}" == required ]]
+if [[ "${1:-}" == --summary ]]; then [[ -f "$FAKE_FORGE/no-recipe" ]] || { printf 'required\n'; [[ ! -f "$FAKE_FORGE/two-tiers" ]] || printf 'required-fast\n'; }; exit; fi
+[[ "${1:-}" == required || "${1:-}" == required-fast ]]
 fixture_root="$(cd "$(dirname "$0")/.." && pwd)"
 worker_git="$(cat "$fixture_root/real-git")"
 expected_repository=acme/fixture
@@ -98,6 +98,8 @@ fi
 count=0
 [[ ! -f "$fixture_root/executions" ]] || read -r count <"$fixture_root/executions"
 printf '%s\n' "$((count + 1))" >"$fixture_root/executions"
+printf '%s\n' "$1" >>"$fixture_root/recipes"
+if [[ "$1" == required-fast && "$(cat mode)" == fast-fail ]]; then exit 8; fi
 if [[ -f "$fixture_root/require-sibling" ]]; then
   cat ../sibling/file >/dev/null || exit 34
 fi
@@ -166,8 +168,10 @@ case "$method $url" in
     cat "$FAKE_FORGE/refs.json"; printf '\n200';;
   'GET '*'/api/v3/repos/acme/fixture')
     jq -nc '{name:"fixture",default_branch:"main"}'; printf '\n200';;
-  'GET '*'/branches/main/protection')
-    jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'
+  'GET '*'/branches/'*'/protection')
+    if [[ -f "$FAKE_FORGE/protection-fail" ]]; then printf '{}\n503'; exit; fi
+    if [[ -f "$FAKE_FORGE/protection.json" ]]; then cat "$FAKE_FORGE/protection.json"
+    else jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'; fi
     printf '\n200';;
   'GET '*'/branches/main')
     jq -nc --arg sha "$head" '{name:"main",commit:{sha:$sha}}'
@@ -293,6 +297,12 @@ expect_count() {
   ls -la "$fixture/runner/tree/fixture" 2>/dev/null >&2 || true
   exit 1
 }
+# The tier matrix uses this same real runner/forge harness in an isolated invocation.
+if [[ "${1:-}" == --tiers ]]; then
+  source "$script_dir/../tests/tiers-matrix.sh"
+  exit 0
+fi
+
 invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 expect_count 1

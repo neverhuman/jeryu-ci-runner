@@ -26,6 +26,17 @@ gate_main_health_context() {
   printf '%s/main-health' "$2"
 }
 
+# Only an explicit fast requirement without the full requirement activates the pilot.
+# Missing or unreadable protection can never lower the validation tier.
+gate_protection_tier() { # protection-json owner repo
+  jq -er --arg full "$(gate_required_context "$2" "$3")" --arg fast "$3/fast" '
+    .required_status_checks.contexts as $contexts
+    | if ($contexts | type) != "array" then error("missing enforced contexts")
+      elif ($contexts | index($full)) != null then "full"
+      elif ($contexts | index($fast)) != null then "fast"
+      else "full" end' <<<"$1"
+}
+
 # The recipe variable that names the proof base for OWNER's repositories, read from the site's
 # PR_GATE_PROOF_BASE_VARS (owner=VARIABLE words), or nothing when the owner has none configured. An
 # entry that is not a variable name fails (status 1) and prints nothing: the caller degrades that one
@@ -113,6 +124,8 @@ gate_status_proof_base() { # description
 gate_status_context() {
   if [[ "${GATE_CONTEXT_KIND:-required}" == main-health ]]; then
     gate_main_health_context "$1" "$2"
+  elif [[ "${GATE_CONTEXT_KIND:-required}" == fast ]]; then
+    printf '%s/fast' "$2"
   else
     gate_required_context "$1" "$2"
   fi
@@ -346,29 +359,35 @@ gate_lock() {
 # attempt of this head is running there: fail, so the caller leaves the head for the next tick.
 gate_discharge_other_keys() { # owner repo sha current-key
   local dir key receipt rc=0 next
+  local receipts=()
   for dir in "$HOME_DIR/attempts/$1-$2-$3" "$HOME_DIR/attempts/$1-$2-$3".base-*; do
     [[ -d "$dir" ]] || continue
     key=${dir##*/}
     [[ "$key" != "$4" ]] || continue
-    compgen -G "$dir/*/receipt.json" >/dev/null || continue
-    # Nothing owed there: every receipt is published, or already superseded.
+    receipts=()
+    for receipt in "$dir"/*/receipt.json "$dir"/tiers/fast/*/receipt.json; do
+      [[ ! -f "$receipt" ]] || receipts+=("$receipt")
+    done
+    ((${#receipts[@]})) || continue
+    # Published tiers owe no recovery and need no lock on their previous base.
     jq -se 'all(.[]; (.publication.required_status and .publication.check_run) or (.publication.superseded_by != null))' \
-      "$dir"/*/receipt.json >/dev/null 2>&1 && continue
+      "${receipts[@]}" >/dev/null 2>&1 && continue
     exec 4>"$HOME_DIR/claim-locks/$key.lock" || { rc=1; continue; }
     if ! flock -n 4; then exec 4>&-; rc=1; continue; fi
-    for receipt in "$dir"/*/receipt.json; do
-      [[ -f "$receipt" ]] || continue
+    for receipt in "${receipts[@]}"; do
       next=$(jq --arg by "$4" '
         if (.publication.required_status and .publication.check_run) or .publication.superseded_by != null then .
         else (if .terminal then . else .terminal=true | .outcome="interrupted" end)
           | .publication.superseded_by=("proof base: " + $by) | .recovery_required=null end' "$receipt") \
         && printf '%s\n' "$next" | gate_atomic "$receipt" || rc=1
     done
-    [[ ! -f "$dir/last-result.json" ]] || {
-      next=$(jq --arg by "$4" 'if .publication.superseded_by == null and ((.publication.required_status and .publication.check_run) | not)
-        then .publication.superseded_by=("proof base: " + $by) | .recovery_required=null else . end' "$dir/last-result.json") \
-        && printf '%s\n' "$next" | gate_atomic "$dir/last-result.json" || rc=1
-    }
+    for receipt in "$dir/last-result.json" "$dir/tiers/fast/last-result.json"; do
+      [[ ! -f "$receipt" ]] || {
+        next=$(jq --arg by "$4" 'if .publication.superseded_by == null and ((.publication.required_status and .publication.check_run) | not)
+        then .publication.superseded_by=("proof base: " + $by) | .recovery_required=null else . end' "$receipt") \
+          && printf '%s\n' "$next" | gate_atomic "$receipt" || rc=1
+      }
+    done
     printf 'discharged unpublished evidence of %s/%s@%s under %s: superseded by %s\n' "$1" "$2" "${3:0:12}" "$key" "$4" >&2
     exec 4>&-
   done
@@ -726,6 +745,7 @@ gate_input_cheap() { # output previous-result
     'first(.inputs.sources[]? | select(.repository == $repo and .head == $sha and .origin == $origin))' \
     "$previous") || return 1
   recipe=$(jq -re '.inputs.recipe' "$previous") || return 1
+  [[ "$recipe" != 'just required-fast' ]] || return 1
   : >"$rows" || return
   : >"$inputs" || return
   : >"$versions" || return
