@@ -203,6 +203,26 @@ case "$method $url" in
     if [[ -f "$FAKE_FORGE/empty-terminal" && "$(jq -r '.state' <<<"$payload")" != pending ]]; then
       printf '\n%s' "$(cat "$FAKE_FORGE/empty-terminal")"; exit
     fi
+    # kill-terminal: the slot dies in the middle of publishing a terminal result, where the fatal
+    # `${body?}` expansion killed it on a gate host -- after the recipe and after gate_finish
+    # persisted the green receipt, before any publication marker. SIGKILL, so no EXIT trap runs and
+    # nothing records an obligation. One shot: the recovering tick must publish normally. The runner
+    # is found by walking up from this process, which may be api's command substitution or the
+    # runner itself depending on how bash ran it.
+    if [[ -f "$FAKE_FORGE/kill-terminal" && "$(jq -r '.state' <<<"$payload")" != pending ]]; then
+      rm -f "$FAKE_FORGE/kill-terminal"
+      runner=$PPID
+      while [[ -n "$runner" && "$runner" != 1 ]] \
+          && ! grep -qa pr-gate-runner.sh "/proc/$runner/cmdline" 2>/dev/null; do
+        runner=$(awk -F') ' '{split($2,f," "); print f[2]}' "/proc/$runner/stat" 2>/dev/null) || runner=""
+      done
+      [[ -n "$runner" && "$runner" != 1 ]] || { printf 'fixture could not find the runner\n' >&2; exit 64; }
+      # This fixture inherited the slot lock on fd 9 from the runner, as everything it starts does;
+      # hold it open and the recovering tick would find "a gate is already running".
+      exec 9>&- 2>/dev/null || true
+      kill -KILL "$runner"
+      exit 64
+    fi
     # forge-5xx holds how many more status posts answer 503 before the forge recovers (-1: never).
     if [[ -f "$FAKE_FORGE/forge-5xx" ]]; then
       read -r left <"$FAKE_FORGE/forge-5xx"
@@ -530,6 +550,46 @@ for response_code in 201 503 000; do
   jq -se --arg sha "$head" 'last | .head_sha==$sha and .conclusion=="success"' "$fixture/check-runs.jsonl" >/dev/null
 done
 printf 'PASS complete runner: empty status responses retain a green result and the next tick republishes without rerun\n'
+
+# A slot killed while publishing a green result leaves exactly the receipt found on a gate host after
+# the fatal `${body?}` expansion: terminal success, exit 0, neither publication, no recovery marker,
+# phase still "running" -- and the head pending on the forge. The next tick must publish that same
+# attempt and log for the same inputs, and must not execute the recipe again.
+"$real_git" -C "$fixture/source" commit -qm publication-killed --allow-empty
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+head=$(cat "$fixture/head")
+before_count=$(count)
+touch "$fixture/kill-terminal"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 137 ]] \
+  || { printf 'the slot was not killed mid-publication (exit %s)\n' "$runner_exit" >&2; cat "$fixture/runner.log" >&2; exit 1; }
+[[ ! -e "$fixture/kill-terminal" ]] || { printf 'no terminal publication was attempted\n' >&2; exit 1; }
+expect_count "$((before_count + 1))"
+receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
+jq -e '.terminal and .outcome=="success" and .exit_code==0 and .phase=="running"
+  and .inputs_changed_count==0 and .recovery_required==null
+  and (.publication.required_status|not) and (.publication.check_run|not)' "$receipt" >/dev/null \
+  || { printf 'the killed slot did not leave the reported receipt\n' >&2; cat "$receipt" >&2; exit 1; }
+jq -se --arg sha "$head" 'last | .sha==$sha and .state=="pending"' "$fixture/statuses.jsonl" >/dev/null \
+  || { printf 'the head is not pending on the forge\n' >&2; tail -3 "$fixture/statuses.jsonl" >&2; exit 1; }
+attempt=$(jq -r .id "$receipt")
+digest=$(jq -r .log_sha256 "$receipt")
+jq -cS '.inputs' "$receipt" >"$fixture/killed-inputs.json"
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+jq -e --arg id "$attempt" --arg digest "$digest" '.id==$id and .log_sha256==$digest
+  and .publication.required_status and .publication.check_run and .recovery_required==null' "$receipt" >/dev/null \
+  || { printf 'recovery did not publish the attempt the killed slot left\n' >&2; cat "$receipt" "$fixture/runner.log" >&2; exit 1; }
+jq -cS '.inputs' "$receipt" >"$fixture/recovered-killed-inputs.json"
+cmp "$fixture/killed-inputs.json" "$fixture/recovered-killed-inputs.json"
+inputs_digest=$(sha256sum "$fixture/killed-inputs.json" | cut -c1-64)
+jq -se --arg sha "$head" --arg digest "$inputs_digest" 'last | .sha==$sha and .state=="success"
+  and (.description | contains("; inputs " + $digest))' "$fixture/statuses.jsonl" >/dev/null \
+  || { printf 'the recovered status does not bind this head and these inputs\n' >&2; tail -3 "$fixture/statuses.jsonl" >&2; exit 1; }
+jq -se --arg sha "$head" 'last | .head_sha==$sha and .conclusion=="success"' "$fixture/check-runs.jsonl" >/dev/null
+printf 'PASS complete runner: a slot killed mid-publication leaves a green attempt that the next tick publishes without rerunning it\n'
 
 # A family sibling with no canonical main is skipped, not fatal: a repository with only a scaffold
 # branch once made a fatal mirror step stop every gate of its family before any commit was tested.

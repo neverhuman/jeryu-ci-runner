@@ -899,6 +899,17 @@ gate_self_modification_note() { # receipt
     "$shown" "'s"
 }
 
+# What the forge answered the last publication, as the two globals `api` sets. Both are normalised
+# here before they are read: a wrapper that answered without assigning `body` (or a call that died
+# before it got there) is an unacknowledged publication, which the caller records and retries.
+# Reading them with `: "${code?}" "${body?}"` instead was a fatal expansion under `set -u`: a slot
+# that met it died with a terminal green attempt unpublished and no recovery marker, and every later
+# tick died again in the same place in gate_recover, so the head stayed pending on the forge.
+gate_publication_answer() {
+  code=${code-} body=${body-}
+  [[ -n "$code" ]] || code=unacknowledged
+}
+
 gate_publish() {
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
   local steps_dir="" steps_end="" status_payload check_payload proof_base
@@ -974,9 +985,12 @@ gate_publish() {
     api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -c --arg url "$checks_url" \
       '. + (if $url == "" then {} else {target_url:$url} end)' <<<"$status_payload")"
     # An empty response is an unacknowledged publication, not a shell invariant failure.
-    : "${code?}" "${body?}"
+    gate_publication_answer
     # The link never decides a gate: a forge that refuses it (422) gets the same status without it.
-    if [[ "$code" == 422 && -n "$checks_url" ]]; then api POST "/repos/$owner/$repo/statuses/$sha" "$status_payload"; fi
+    if [[ "$code" == 422 && -n "$checks_url" ]]; then
+      api POST "/repos/$owner/$repo/statuses/$sha" "$status_payload"
+      gate_publication_answer
+    fi
     if [[ "$code" != 201 ]] || ! jq -se 'length == 1 and .[0].id != null' <<<"$body" >/dev/null 2>&1; then
       gate_update --arg code "$code" '.recovery_required="required-status publication rejected or unacknowledged" | .publication.http_status=$code' || return
       cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
@@ -1015,7 +1029,11 @@ gate_publish() {
         output:({title:$title,summary:$summary} + (if $note == "" then {} else {text:$note} end))}')
     api POST "/repos/$owner/$repo/check-runs" "$(jq -c --arg url "$checks_url" \
       '. + (if $url == "" then {} else {details_url:$url} end)' <<<"$check_payload")"
-    if [[ "$code" == 422 && -n "$checks_url" ]]; then api POST "/repos/$owner/$repo/check-runs" "$check_payload"; fi
+    gate_publication_answer
+    if [[ "$code" == 422 && -n "$checks_url" ]]; then
+      api POST "/repos/$owner/$repo/check-runs" "$check_payload"
+      gate_publication_answer
+    fi
     # The check run is not a required context and never gates a merge: the required status above is
     # the gate. A rejection is recorded and reported, and must not hold the attempt in recovery or
     # stop later ticks, which is what a return 1 here did. An empty or malformed

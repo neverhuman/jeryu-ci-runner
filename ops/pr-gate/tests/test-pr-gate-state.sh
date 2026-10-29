@@ -16,6 +16,13 @@ HOME_DIR="$scratch/state"
 mkdir -p "$HOME_DIR"
 publication_mode=201
 api() {
+  case "$publication_mode" in
+    # The forge answered, but this wrapper assigned no body (or neither global). gate_publish must
+    # read that as an unacknowledged publication and retain the result, never abort the slot on a
+    # fatal parameter expansion in the middle of a terminal green attempt.
+    unset-body) code=201; unset body; return;;
+    unset-both) unset code body; return;;
+  esac
   code=$publication_mode
   case "$publication_mode" in
     empty-201) code=201 body=""; return;;
@@ -96,7 +103,7 @@ for input in source dependencies toolchain fixtures; do
 done
 printf 'PASS deterministic failure needs explicit retry or changed bound inputs\n'
 
-for publication_mode in 403 000 503 empty-201 blank-201 invalid-201; do
+for publication_mode in 403 000 503 empty-201 blank-201 invalid-201 unset-body unset-both; do
   gate_begin "$identity"
   printf 'passed\n' >"$gate_attempt_dir/build.log"
   gate_finish success 0 "$gate_attempt_dir/build.log"
@@ -112,10 +119,10 @@ for publication_mode in 403 000 503 empty-201 blank-201 invalid-201; do
   gate_decision "$identity" 0 "$statuses"
   [[ "$gate_action" == reuse ]]
 done
-printf 'PASS rejected, empty and malformed publications retain terminal evidence and replay without computation\n'
+printf 'PASS rejected, empty, malformed and unassigned publications retain terminal evidence and replay without computation\n'
 
 # A missing check acknowledgement is retried without duplicating the required status.
-for publication_mode in 403 000 503 empty-201 blank-201 invalid-201; do
+for publication_mode in 403 000 503 empty-201 blank-201 invalid-201 unset-body unset-both; do
   gate_begin "$identity"
   printf 'passed\n' >"$gate_attempt_dir/build.log"
   gate_finish success 0 "$gate_attempt_dir/build.log"
