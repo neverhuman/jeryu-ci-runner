@@ -296,7 +296,10 @@ The manifest is the author's text, so it never decides what is fetched or what c
   -- is fetched. A brand-new pin is reported as `new-pin-unverified` and nothing is fetched.
 - Only the forge named by `JERYU_BASE` is fetched from. A source on another host (a GitHub mirror)
   counts only through an `insteadOf` mapping to this forge that the base's `.cargo/hosted-gitconfig`
-  already carries; otherwise it is `unmapped-host` and nothing is fetched.
+  already carries; otherwise it is `unmapped-host` and nothing is fetched. `REDTEAM_FORGE_ALIASES`
+  (operator environment only, never the PR or its base) lists other hostnames that are this same
+  forge: their `/git/<owner>/<repo>.git` URLs count as forge repositories and are still fetched from
+  `JERYU_BASE`, with the same pin, protected-branch and approval checks.
 - Fetches run with no system, global or XDG git configuration, no ambient credential helper and no
   netrc, and present only the reviewer's own credential.
 - The forge, not the manifest, says which branches count: the repository's default branch and the

@@ -108,6 +108,8 @@
 #   REDTEAM_REBASE         0                    with REDTEAM_QUEUE=0, set to 1 to rebase such a
 #                          branch and force-push it (leased to the reviewed head) instead. Off by
 #                          default: the family's no-force rule forbids rewriting an author's branch.
+#   REDTEAM_FORGE_ALIASES  (none)                space-separated hostnames that are this forge under another
+#                          name; their /git/<owner>/<repo>.git URLs count as the forge's, fetched from JERYU_BASE
 #   REDTEAM_PRIORITY_FAMILIES (none)         forge `family` values reviewed first; other families
 #                          wait until these have nothing left to review in a pass
 #   REDTEAM_FAMILIES       all                  forge `family` values to cover ("all" includes repos
@@ -206,6 +208,15 @@ pin_wait_secs="${REDTEAM_PIN_WAIT_SECS:-3600}"
 [[ "$pin_wait_secs" =~ ^[0-9]{1,7}$ ]] || { echo "pr-redteam: REDTEAM_PIN_WAIT_SECS must be whole seconds; using 3600" >&2; pin_wait_secs=3600; }
 # The forge's host, the only host an upstream fetch goes to.
 forge_host="${base#https://}"; forge_host="${forge_host%%[/:]*}"
+# Other hostnames the operator says are this same forge's /git/<owner>/<repo>.git route (REDTEAM_FORGE_ALIASES,
+# space-separated bare hostnames). Site configuration only: never read from a PR or its base. A source URL on
+# one is recognised as a forge repository, but every fetch still goes to forge_host.
+forge_aliases=""
+for a in ${REDTEAM_FORGE_ALIASES:-}; do
+  [[ "$a" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]] \
+    || { echo "pr-redteam: ignoring REDTEAM_FORGE_ALIASES entry that is not a bare hostname" >&2; continue; }
+  forge_aliases="$forge_aliases $a"
+done
 read -ra author_domains <<<"${REDTEAM_AUTHOR_DOMAINS:-}"
 read -ra owner_decision_authors <<<"${REDTEAM_OWNER_DECISION_AUTHORS:-}"
 state="${REDTEAM_STATE:-$HOME/.local/state/pr-redteam}"
@@ -1158,11 +1169,13 @@ upstream_pins() { # git-dir base head default-owner
       git --git-dir="$g" show "$b:$f" 2>/dev/null | upstream_manifest_pins "$kind" | upstream_tag base "$f"
       git --git-dir="$g" show "$h:$f" 2>/dev/null | upstream_manifest_pins "$kind" | upstream_tag head "$f"
     done
-  } | awk -F '\t' -v host="$forge_host" -v owner="$owner" '
+  } | awk -F '\t' -v host="$forge_host" -v aliases="$forge_aliases" -v owner="$owner" '
     function norm(u) { sub(/[?#].*$/, "", u); sub(/\/+$/, "", u); sub(/\.git$/, "", u); return u }
-    function forge_repo(u,   p, pre) {
-      p = norm(u); pre = "https://" tolower(host) "/git/"
-      if (host == "" || tolower(substr(p, 1, length(pre))) != pre) return ""
+    function forge_repo(u,   p, pre, h, i, n, hs) {
+      p = norm(u); if (host == "") return ""
+      n = split(tolower(host " " aliases), hs, " "); pre = ""
+      for (i = 1; i <= n; i++) { h = "https://" hs[i] "/git/"; if (tolower(substr(p, 1, length(h))) == h) { pre = h; break } }
+      if (pre == "") return ""
       p = substr(p, length(pre) + 1)
       return (p ~ /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/ && p !~ /\.\./) ? p : ""
     }

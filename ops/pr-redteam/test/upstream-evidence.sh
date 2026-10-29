@@ -21,7 +21,7 @@ upstream_max_branches=8 upstream_max_pull_pages=10 upstream_min_share=1024
 state="$t/state"; me=reviewer
 # The stand-in forge is a directory served over file://; the real upstream_remote builds
 # $base/git/<owner>/<name>.git from it. Manifests name the forge by its host, forge.test.
-base="file://$t/forge"; forge_host=forge.test
+base="file://$t/forge"; forge_host=forge.test; forge_aliases=""
 token_file="$t/token"; printf 'dummytoken' >"$token_file"; chmod 600 "$token_file"
 
 # Ambient credentials that must never be used: a global helper that records any call and fails, and
@@ -237,6 +237,26 @@ o="$(evidence "$b" "$(snap evil)")"
 grep -q "https://evil.example/git/acme/core ${r3:0:12}: unmapped-host" "$o/upstream/SUMMARY.txt" || fail "foreign host: $(cat "$o/upstream/SUMMARY.txt")"
 [ ! -s "$t/api.log" ] && [ "$(find "$o/upstream" -mindepth 1 ! -name SUMMARY.txt | wc -l)" = 0 ] || fail "a foreign host was fetched"
 ok 'a foreign host is unmapped-host and nothing is fetched'
+
+# 7b. A configured forge alias host is the forge's own /git route; an unlisted host stays unmapped.
+dep alias
+al() { printf '[dependencies]\nx = { git = "https://%s/git/acme/core.git", rev = "%s" }\n' "$1" "$2"; }
+al git.alias.test "$r1" | put Cargo.toml; b="$(snap base)"
+al git.alias.test "$r3" | put Cargo.toml; h="$(snap alias)"
+forge_aliases=" git.alias.test"
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+grep -qx "$(printf 'fetch\tacme/core\t%s\t%s\t\tx\thttps://git.alias.test/git/acme/core' "$r1" "$r3")" <<<"$rows" || fail "alias host: $rows"
+o="$(evidence "$b" "$h")"
+[ "$(field "$(pin_of "$o" "$r3")" status)" = merged-tip ] || fail "alias evidence: $(cat "$o/upstream/SUMMARY.txt")"
+forge_aliases=""
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+grep -q "^unmapped-host	" <<<"$rows" || fail "unconfigured alias was mapped: $rows"
+forge_aliases=" git.alias.test"
+al evil.example "$r1" | put Cargo.toml; b="$(snap base2)"; al evil.example "$r3" | put Cargo.toml; h="$(snap evil2)"
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+grep -q "^unmapped-host	" <<<"$rows" || fail "hostile host mapped with aliases set: $rows"
+forge_aliases=""
+ok 'a configured forge alias host maps to the forge route; unlisted hosts stay unmapped-host'
 
 # 8. A GitHub mirror source maps to the forge only through a mapping the base carries.
 dep mirror
