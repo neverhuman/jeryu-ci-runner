@@ -104,3 +104,17 @@ expect_count 9
 jq -e '.publication.required_status and .publication.check_run' "$fast" >/dev/null
 last_tier | jq -e '.context == "fixture/required" and .state == "success"' >/dev/null
 printf 'PASS retained fast publication recovers before full validation without rerunning fast\n'
+
+# A branch tip's existing full green is subject to the same complete identity
+# checks. The earlier PR proof had a different base, and changed tools invalidate
+# the branch proof too; neither status-only shortcut may adopt it.
+"$real_git" -C "$fixture/source" branch release/tiers
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" release/tiers
+jq -nc --arg sha "$head" '[{kind:"branch",name:"main",sha:$sha,protected:true},
+  {kind:"branch",name:"release/tiers",sha:$sha,protected:true}]' >"$fixture/refs.json"
+run_tier --branch release/tiers
+expect_count 11
+printf 'changed tool bytes\n' >"$fixture/tools/environment-probe"
+run_tier --branch release/tiers
+expect_count 13
+printf 'PASS branch-tip greens require complete full identities on tiered repositories\n'

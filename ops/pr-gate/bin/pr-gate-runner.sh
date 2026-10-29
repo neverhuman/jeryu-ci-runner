@@ -388,7 +388,7 @@ queue_entry_base() { # base-field queue-ref
 # Resolve the proof base of a head whose PR (or queue entry) names REQUESTED as its base: pb_branch and
 # pb_sha (empty for main, which the mirror resolves), and pb_note when it falls back to main. Returns 1,
 # with the reason in pb_note, when the forge cannot answer now.
-declare -A refs_seen=()
+declare -A refs_seen=() branch_green=()
 resolve_proof_base() { # owner repo requested [cached]
   local row default
   pb_branch=main pb_sha="" pb_note=""
@@ -792,8 +792,9 @@ for qualified in $REPOS; do
     printf '%s\n' "$body" >"$tip_statuses"
     if gate_newest_is_own_success "$tip_statuses"; then
       rm -f -- "$tip_statuses"
-      say "skip $owner/$repo $only_branch: its tip ${row:0:12} already carries a $(gate_status_context "$owner" "$repo") success"
-      continue
+      # Defer this shortcut until the head's recipe is known. Tiered repositories
+      # must verify the complete identity even when a tip already looks green.
+      branch_green["$owner/$repo@${row%% *}"]=1
     fi
     rm -f -- "$tip_statuses"
     candidates+=("$owner $repo 0 ${row%% *} refs/heads/$only_branch 0 $only_branch -")
@@ -1265,7 +1266,7 @@ for n in $family; do
   [[ -e "$run/$n" || -L "$run/$n" ]] || continue
   retry_wanted=1
 done
-if [[ -f "$gate_key_dir/tiered" ]]; then retry_wanted=1; fi
+if [[ -f "$gate_key_dir/tiered" || -n "${branch_green["$owner/$repo@$sha"]:-}" ]]; then retry_wanted=1; fi
 if ((retry_wanted == 0)); then
   cheap_identity=$(mktemp "$HOME_DIR/cache/cheap-inputs-$SLOT.XXXXXXXX")
   cheap_statuses=$(mktemp "$HOME_DIR/cache/cheap-status-$SLOT.XXXXXXXX")
@@ -1578,7 +1579,14 @@ fi
 tiers=(required)
 full_recipe=("${recipe[@]}") full_recipe_name=$recipe_name
 head_key_dir=$gate_key_dir
-if ((main_health == 0)) && (cd "$run/$repo" && just --summary 2>/dev/null | tr ' ' '\n' | grep -qx required-fast); then
+has_fast=0
+if ((main_health == 0)) && (cd "$run/$repo" && just --summary 2>/dev/null | tr ' ' '\n' | grep -qx required-fast); then has_fast=1; fi
+if ((has_fast == 0)) && [[ -n "${branch_green["$owner/$repo@$sha"]:-}" ]]; then
+  say "skip $owner/$repo $only_branch: its tip ${sha:0:12} already carries a $(gate_status_context "$owner" "$repo") success"
+  exec 6>&-; exec 7>&-
+  continue
+fi
+if ((has_fast)); then
   protection_base=$cbase
   [[ -z "$only_branch" ]] || protection_base=$only_branch
   case "$protection_base" in -|'!'|'*'*) protection_base=main;; esac
