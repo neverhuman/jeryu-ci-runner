@@ -30,6 +30,9 @@ g add .; g commit -qm base; g rev-parse HEAD >"$t/base"
 g switch -qc topic
 bump() { printf '# bump %s\n' "$RANDOM$RANDOM" >>"$t/repo/acme.lock.toml"; g commit -qam bump; g rev-parse HEAD >"$t/head"; }
 bump
+printf 'main\n' >"$t/base-ref"
+g branch release/pilot "$(cat "$t/base")"
+g branch release/unchanged "$(cat "$t/base")"
 
 cat >"$t/bin/git" <<'FIXTURE'
 #!/usr/bin/env bash
@@ -62,9 +65,9 @@ head="$(cat "$PIN_FIXTURE/head")"
 case "$url" in
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
   *'/pulls?state=open')
-    jq -nc --arg sha "$head" --arg base "$(cat "$PIN_FIXTURE/base")" --slurpfile ctx "$PIN_FIXTURE/contexts" \
+    jq -nc --arg sha "$head" --arg base "$(cat "$PIN_FIXTURE/base")" --arg base_ref "$(cat "$PIN_FIXTURE/base-ref")" --slurpfile ctx "$PIN_FIXTURE/contexts" \
       '{items: [{repo: {owner: "acme", name: "fixture"}, number: 1, head_sha: $sha, base_sha: $base,
-        head_ref: "topic", base_ref: "main", draft: false, author: "pinbot", title: "release: pin web",
+        head_ref: "topic", base_ref: $base_ref, draft: false, author: "pinbot", title: "release: pin web",
         state: "open", labels: ["origin:internal"], passport_hash: "p", review: {changes_requested: 0},
         mergeable: {can_merge: false}}
         + (if $ctx[0] == "absent" then {} else {required_contexts: $ctx[0]} end)]}'
@@ -171,8 +174,29 @@ REDTEAM_PIN_WAIT_SECS=0 review; calls=$((calls + 1)); reviewed "wait off"
 bump; contexts '[]'; review; calls=$((calls + 1)); reviewed "none required"
 grep -qx '(none required)' "$t/signals.txt" || fail "no-context signal: $(cat "$t/signals.txt")"
 bump; contexts '"absent"'; review; calls=$((calls + 1)); reviewed "field absent"
+grep -Fq 'gate evidence is unresolved: do not guess contexts' "$t/signals.txt" \
+  || fail "missing enforcement data was not identified as unresolved"
 [[ "$(diff_reads)" == "$before" ]] || fail "the diff was read with nothing to wait for"
 echo 'ok with the wait off or nothing to wait for, the diff is not read and the head is reviewed'
+
+# The forge's enforced context set, not the base's spelling, determines gate evidence.
+# These responses model protection on main, a pilot switched to fast, and an unchanged release.
+for base_ref in main release/pilot release/unchanged; do
+  printf '%s\n' "$base_ref" >"$t/base-ref"
+  context=acme/required
+  [[ "$base_ref" != release/pilot ]] || context=acme/fast
+  bump; contexts "[{\"name\":\"$context\",\"state\":\"pending\"}]"; review
+  [[ "$(count "$t/model-calls")" == "$calls" ]] || fail "$base_ref: did not wait for $context"
+  contexts "[{\"name\":\"$context\",\"state\":\"success\"}]"; review
+  calls=$((calls + 1)); reviewed "$base_ref"
+  grep -Fqx "$context: success" "$t/signals.txt" || fail "$base_ref: missing enforced context"
+  other=acme/fast; [[ "$context" != acme/fast ]] || other=acme/required
+  ! grep -q "^$other:" "$t/signals.txt" || fail "$base_ref: guessed $other"
+  grep -Fq "Base branch: \"$base_ref\"." "$t/signals.txt" || fail "$base_ref: missing base"
+  grep -Fq 'an upstream commit merged only on a release line is not on main' "$t/signals.txt" \
+    || fail "$base_ref: ancestry requirement omitted"
+done
+echo 'ok main, fast pilot and unchanged release use exactly their enforced contexts and preserve ancestry requirements'
 
 [[ ! -e "$t/danger" ]] || fail "forbidden action: $(cat "$t/danger")"
 echo 'PIN WAIT PASS'

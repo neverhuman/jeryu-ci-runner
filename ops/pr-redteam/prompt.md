@@ -44,6 +44,15 @@ The review directory (its path is given below) contains:
                      lock files only is reviewed once those contexts have a result, or after a bounded
                      wait; when the section says the wait ran out with a context still pending, that
                      context has no result yet. Report it as such; it is neither a pass nor a failure.
+                     Judge gate evidence against exactly this base branch's enforced contexts,
+                     which the forge reads from branch protection. Never guess `<repo>/required`
+                     or `<repo>/fast` from branch names, CI files or an ADR. A pilot release base
+                     can require fast only after its protection changes; a release base with
+                     unchanged protection still requires its listed contexts. Missing context
+                     data is unresolved evidence, not an empty requirement set.
+                     This does not change pin-verifier requirements. Independently check their
+                     ancestry requirements: a commit merged only on a release line does not
+                     satisfy a verifier that requires it on main, even with passing gate evidence.
                      The `checks` counts in `pr.json` include `pr-redteam/review`, this reviewer's
                      own check run: it reflects a review, not the code, and is never evidence that a
                      check on this head failed or passed.

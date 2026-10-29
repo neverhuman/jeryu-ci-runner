@@ -492,10 +492,13 @@ pin_wait_reason() { # owner/name number sha row
 required_contexts_signal() { # row owner/name number sha
   local file unreported first
   jq -r '"## required contexts on this head (the forge'"'"'s states when this review started; not author text)",
-    (if .required_contexts == null then "(the forge did not list required contexts for this pull request)"
+    "Base branch: \(.base_ref | tojson). Required contexts below come from forge enforcement of protection for that branch.",
+    (if .required_contexts == null then "(the forge did not list required contexts for this pull request; gate evidence is unresolved: do not guess contexts or treat this as no requirements)"
      elif (.required_contexts | length) == 0 then "(none required)"
      else .required_contexts[] | "\(.name // "?"): \(.state // "no state")" end)' <<<"$1" 2>/dev/null \
     || echo "## required contexts on this head: (the forge's row could not be read)"
+  echo "Judge gate evidence against exactly these enforced contexts on this head. Do not infer a context from the repository name, CI files, another branch, or an ADR. A release base has no exception: fast-tier evidence suffices only when its protection requires that tier; unchanged protection still requires its listed contexts."
+  echo "Pin-verifier requirements remain separate and unchanged. A passing required context does not waive a verifier's required branch ancestry: an upstream commit merged only on a release line is not on main."
   echo "pr.json checks counts include pr-redteam/review, this reviewer's own check run (an earlier review of this head, or this one in progress). It is not a result about the code and not a required context: do not count it as a failing or passing check."
   file="$(pin_wait_file "$2" "$3" "$4")"
   unreported="$(required_contexts_unreported "$1")"

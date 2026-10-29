@@ -384,7 +384,14 @@ row lists no required contexts, or the forge's diff is unavailable, truncated or
 The file list comes from the forge's diff of the exact head and the states from the forge's row;
 nothing an author writes decides either, and the wait only changes when a head is reviewed, not what
 the review concludes or who can ask for one. Every review's `signals.txt` lists the required contexts
-and their states as the forge reported them when the review started.
+and their states as the forge reported them when the review started. The forge computes this
+`required_contexts` field from the exact base branch's protection and enforced site requirements;
+the controller uses it directly rather than guessing names or reading expectations from the PR's
+files. Review gate evidence against exactly that set. A pilot release requiring `<repo>/fast`
+does not need `<repo>/required` evidence; a release whose protection still requires
+`<repo>/required` does. There is no exception based on a release branch name or an ADR.
+Missing context data leaves evidence unresolved. Pin verifiers remain independent: a green gate
+never substitutes release-line ancestry for a verifier's required ancestry on main.
 
 ## Qualification
 
