@@ -15,7 +15,8 @@ cleanup() {
 }
 trap cleanup EXIT
 # Use the actual launch line, so descriptor regressions in production fail here.
-launch=$(sed -n '/^[[:space:]]*timeout --kill-after=30s 3h /p' "$script_dir/pr-gate-runner.sh")
+# The per-tier bound is "${recipe_timeout:-3h}"; unset here, so the launch runs under the 3h default.
+launch=$(sed -n '/^[[:space:]]*timeout --kill-after=30s "${recipe_timeout:-3h}" /p' "$script_dir/pr-gate-runner.sh")
 [[ -n "$launch" && "$(printf '%s\n' "$launch" | wc -l)" == 1 ]]
 cat >"$fixture/worker.sh" <<'SH'
 #!/usr/bin/env bash

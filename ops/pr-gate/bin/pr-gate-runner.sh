@@ -792,8 +792,13 @@ for qualified in $REPOS; do
     printf '%s\n' "$body" >"$tip_statuses"
     if gate_newest_is_own_success "$tip_statuses"; then
       rm -f -- "$tip_statuses"
-      # Defer this shortcut until the head's recipe is known. Tiered repositories
-      # must verify the complete identity even when a tip already looks green.
+      if [[ ! -f "$HOME_DIR/cache/tiered-repo-$owner-$repo" ]]; then
+        say "skip $owner/$repo $only_branch: its tip ${row:0:12} already carries a $(gate_status_context "$owner" "$repo") success"
+        continue
+      fi
+      # A repository whose last prepared tree had a required-fast recipe defers this shortcut until
+      # the head's recipe is known: a tiered tip must verify its complete identity even when it
+      # already looks green. Every other repository keeps the listing-time skip and its cost.
       branch_green["$owner/$repo@${row%% *}"]=1
     fi
     rm -f -- "$tip_statuses"
@@ -1148,8 +1153,9 @@ if ! gate_recover; then
 fi
 
 # The inputs_changed chain survives ticks and publication recovery in the receipt. --repo/--pr starts a
-# new chain, and so does an honoured forge re-gate request of a held head. Each invocation runs one
-# recipe at most (see exit 0 below), so a chain is one re-run per tick, never three in one unit run.
+# new chain, and so does an honoured forge re-gate request of a held head. Each invocation gates one
+# head at most (see exit 0 below): its full recipe, preceded on a tiered repository by its bounded
+# required-fast recipe. So a chain is one re-run per tick, never three in one unit run.
 inputs_changed_count=0
 [[ -n "$only_pr" ]] || inputs_changed_count=$(gate_inputs_changed_count "$gate_key_dir/last-result.json" "$gate_key_dir/tiers/fast/last-result.json")
 head_holds=$inputs_changed_holds
@@ -1266,7 +1272,9 @@ for n in $family; do
   [[ -e "$run/$n" || -L "$run/$n" ]] || continue
   retry_wanted=1
 done
-if [[ -f "$gate_key_dir/tiered" || -n "${branch_green["$owner/$repo@$sha"]:-}" ]]; then retry_wanted=1; fi
+if [[ ( -f "$gate_key_dir/tiered" && -f "$HOME_DIR/cache/tiered-repo-$owner-$repo" ) || -n "${branch_green["$owner/$repo@$sha"]:-}" ]]; then
+  retry_wanted=1
+fi
 if ((retry_wanted == 0)); then
   cheap_identity=$(mktemp "$HOME_DIR/cache/cheap-inputs-$SLOT.XXXXXXXX")
   cheap_statuses=$(mktemp "$HOME_DIR/cache/cheap-status-$SLOT.XXXXXXXX")
@@ -1582,6 +1590,7 @@ head_key_dir=$gate_key_dir
 has_fast=0
 if ((main_health == 0)) && (cd "$run/$repo" && just --summary 2>/dev/null | tr ' ' '\n' | grep -qx required-fast); then has_fast=1; fi
 if ((has_fast == 0)) && [[ -n "${branch_green["$owner/$repo@$sha"]:-}" ]]; then
+  rm -f -- "$HOME_DIR/cache/tiered-repo-$owner-$repo"
   say "skip $owner/$repo $only_branch: its tip ${sha:0:12} already carries a $(gate_status_context "$owner" "$repo") success"
   exec 6>&-; exec 7>&-
   continue
@@ -1601,6 +1610,19 @@ if ((has_fast)); then
   tiers=(fast)
   [[ "$selected_tier" != full ]] || tiers+=(required)
   printf '%s\n' tiered | gate_atomic "$head_key_dir/tiered"
+  printf '%s\n' tiered | gate_atomic "$HOME_DIR/cache/tiered-repo-$owner-$repo"
+elif ((main_health == 0)); then
+  # Tier membership is the repository's: a tree without required-fast drops the repository's marker,
+  # so the cheap path and the branch-tip shortcut come back once a repository drops the recipe. The
+  # head's own `tiered` marker is attempt evidence and stays; it counts only with the repository's.
+  rm -f -- "$HOME_DIR/cache/tiered-repo-$owner-$repo"
+fi
+# A forge re-gate request is read once for the head, before any tier runs. The first tier records it
+# as honoured when its attempt starts; read again for the full tier it would answer "not wanted",
+# and the full tier would hold the very failure the request asked to re-run.
+regate_head=""
+if gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
+  regate_head="${regate_at["$owner/$repo#$number $sha"]}"
 fi
 ran_tier=0
 for tier in "${tiers[@]}"; do
@@ -1608,14 +1630,16 @@ for tier in "${tiers[@]}"; do
   if [[ "$tier" == fast ]]; then
     GATE_CONTEXT_KIND=fast
     gate_key_dir="$head_key_dir/tiers/fast"
-    mkdir -p "$gate_key_dir"
-    recipe=(just required-fast) recipe_name="just required-fast"
+    # The same 0700 the attempt key directory gets from gate_lock.
+    mkdir -p "$gate_key_dir" && chmod 700 "$head_key_dir/tiers" "$gate_key_dir"
+    recipe=(just required-fast) recipe_name="just required-fast" recipe_timeout=50m
   else
     GATE_CONTEXT_KIND=required
     ((main_health == 0)) || GATE_CONTEXT_KIND=main-health
-    recipe=("${full_recipe[@]}") recipe_name=$full_recipe_name
+    recipe=("${full_recipe[@]}") recipe_name=$full_recipe_name recipe_timeout=3h
   fi
   if ! gate_recover; then
+    say "recovery required for $owner/$repo@$sha ($tier tier): unpublished terminal evidence; leaving it for the next tick"
     gate_receipt=""
     break
   fi
@@ -1630,11 +1654,8 @@ retry=0; [[ -z "$only_pr" && "$main_health" == 0 ]] || retry=1
 [[ -z "$only_branch" || -z "$only_repo" ]] || retry=1
 # A requested re-gate is a retry of this head: gate_decision must neither reuse its success nor hold
 # its failure.
-regate_now=""
-if gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
-  regate_now="${regate_at["$owner/$repo#$number $sha"]}"
-  retry=1
-fi
+regate_now=$regate_head
+[[ -z "$regate_now" ]] || retry=1
 gate_decision "$identity" "$retry" "$status_snapshot"
 case "${gate_action:?}" in
   reuse|hold)
@@ -1715,11 +1736,11 @@ if ((admitted == 0)); then
   break
 fi
 gate_begin "$identity"
-# A previous full success must not remain mergeable while its fast prerequisite
-# is being re-proved. This status carries no full evidence identity.
-if [[ "$tier" == fast && "$selected_tier" == full ]]; then
-  GATE_CONTEXT_KIND=required post_status "$owner" "$repo" "$sha" pending "fast prerequisite running; full validation awaits it ($MARKER)"
-fi
+# The full context keeps its newest conclusion while the fast prerequisite runs. A success stays
+# mergeable, as keep_green below keeps one through any re-verification, and a failure stays red; the
+# full tier decides pending by the keep_green rule when it starts, and a fast failure replaces the
+# full context at once. Posting pending here would also erase a held full failure that the full
+# tier then holds again without re-posting it, leaving a pending nothing resolves.
 gate_update --argjson count "$inputs_changed_count" --argjson holds "$head_holds" \
   '.inputs_changed_count=$count | .inputs_changed_holds=($holds == 1)' \
   || say "could not record the inputs_changed chain of $owner/$repo@$sha"
@@ -1930,7 +1951,7 @@ if ((sandbox)); then
     exec setsid env -i PATH="$SANDBOX_PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 \
       GIT_LFS_SKIP_SMUDGE=1 PR_GATE_SANDBOX=1 "${root_env[@]}" \
       JERYU_PLAYWRIGHT_WEB_PORT="$PLAYWRIGHT_WEB_PORT" \
-      ionice -c 3 timeout --kill-after=30s 3h \
+      ionice -c 3 timeout --kill-after=30s "${recipe_timeout:-3h}" \
       bash -c 'exec 6>&- 7>&- 9>&-; exec "$@"' pr-gate-sandbox \
       "${sandbox_cmd[@]}" "$run" "$repo" "${recipe[@]}"
   ) >"$log" 2>&1 &
@@ -1942,7 +1963,7 @@ else
     GIT_LFS_SKIP_SMUDGE=1 "${git_env[@]}" "${root_env[@]}" \
     JERYU_PLAYWRIGHT_WEB_PORT="$PLAYWRIGHT_WEB_PORT" \
     "${cache_env[@]}" ionice -c 3 \
-    timeout --kill-after=30s 3h bash -c 'exec 6>&- 7>&- 9>&-; exec "$@"' pr-gate-worker "${recipe[@]}"
+    timeout --kill-after=30s "${recipe_timeout:-3h}" bash -c 'exec 6>&- 7>&- 9>&-; exec "$@"' pr-gate-worker "${recipe[@]}"
 ) >"$log" 2>&1 &
 fi
 gate_worker=$!
@@ -2016,7 +2037,8 @@ if ((ran_tier == 0)); then
 fi
 # An inputs_changed result ends the invocation like any other: the next tick re-runs that head first
 # once the family's mains have settled (see the candidate order above), so a re-run is coalesced
-# with a merge burst and no unit run holds more than one recipe against its TimeoutStartSec.
+# with a merge burst. No unit run holds more than one head's recipes against its TimeoutStartSec:
+# required-fast is bounded at 50 minutes and the full recipe at 3 hours, inside the unit's 4 hours.
 # Attempt evidence is retained with its log, including active and unpublished results.
 # Age does not discharge a recovery obligation. Preservation-aware retention must be
 # qualified separately before any journal or legacy log is removed.

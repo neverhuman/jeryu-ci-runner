@@ -6,8 +6,11 @@ touch "$fixture/two-tiers"
 run_tier
 expect_count 2
 [[ "$(cat "$fixture/recipes")" == $'required-fast\nrequired' ]] || fail_tier 'main did not run fast then full'
-jq -se 'map([.context,.state]) == [["fixture/required","pending"],["fixture/fast","pending"],["fixture/fast","success"],
-  ["fixture/required","pending"],["fixture/required","success"]]' "$fixture/statuses.jsonl" >/dev/null
+# The fast tier posts only its own context: the full context is left to the full tier.
+jq -se 'map([.context,.state]) == [["fixture/fast","pending"],["fixture/fast","success"],
+  ["fixture/required","pending"],["fixture/required","success"]]' "$fixture/statuses.jsonl" >/dev/null \
+  || fail_tier 'the fast tier posted over the full context'
+
 head=$(cat "$fixture/head")
 full="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
 fast="$fixture/runner/attempts/acme-fixture-$head/tiers/fast/last-result.json"
@@ -143,3 +146,47 @@ last_tier | jq -e '.state == "success"' >/dev/null
 [[ ! -e "$fixture/runner/attempts/acme-fixture-$head/tiered" ]] || fail_tier 'an untiered head recorded a tier'
 [[ ! -d "$fixture/runner/attempts/acme-fixture-$head/tiers" ]] || fail_tier 'an untiered head kept a tier journal'
 printf 'PASS a repository without required-fast gates full validation as today\n'
+
+# A tiered head whose full tier failed holds that failure, and the full context stays the failure
+# even when the fast tier has to run again (its journal gone): nothing posts pending over it.
+touch "$fixture/two-tiers"
+rm -f "$fixture/protection.json"
+printf 'full tier fails\n' >"$fixture/source/untiered"
+"$real_git" -C "$fixture/source" add untiered
+"$real_git" -C "$fixture/source" commit -qm full-tier-failure
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+head=$(cat "$fixture/head")
+jq -nc --arg sha "$head" '[{kind:"branch",name:"main",sha:$sha,protected:true}]' >"$fixture/refs.json"
+required_state() { jq -sr 'map(select(.context == "fixture/required")) | last | .state' "$fixture/statuses.jsonl"; }
+touch "$fixture/full-fail"
+before=$(count)
+run_tier
+expect_count "$((before + 2))"
+[[ "$(required_state)" == failure ]] || fail_tier 'the full failure was not published'
+run_tier
+expect_count "$((before + 2))"
+mv "$fixture/runner/attempts/acme-fixture-$head/tiers/fast" "$fixture/retained-fast-$head"
+run_tier
+expect_count "$((before + 3))"
+[[ "$(tail -1 "$fixture/recipes")" == required-fast ]] || fail_tier 'the held full failure was re-run'
+[[ "$(required_state)" == failure ]] || fail_tier 'a fast re-run replaced the held full failure'
+printf 'PASS a held full failure stays published while the fast tier runs again\n'
+
+# A forge re-gate of that head re-runs the full tier too: the fast tier honouring the request
+# must not leave the full tier holding the failure the request asked to re-run.
+rm "$fixture/full-fail"
+jq -nc --arg s "$head" \
+  '{requests:[{repo:"acme/fixture",number:1,head_sha:$s,requested_at:"2026-10-29T10:00:00Z",requested_by:"dana"}]}' \
+  >"$fixture/regate.json"
+before=$(count)
+run_tier
+[[ "$(tail -1 "$fixture/recipes")" == required ]] || fail_tier 'a re-gate did not re-run the full tier'
+(( $(count) > before )) || fail_tier 'a re-gate ran nothing'
+[[ "$(required_state)" == success ]] || fail_tier 'a re-gate left the full context unresolved'
+[[ "$(cat "$fixture/runner/regate/acme-fixture-$head")" == 2026-10-29T10:00:00Z ]] || fail_tier 'the re-gate was not recorded'
+after=$(count)
+run_tier
+expect_count "$after"
+rm -f "$fixture/regate.json"
+printf 'PASS a forge re-gate of a tiered head re-runs its failed full tier\n'

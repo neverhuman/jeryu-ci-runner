@@ -40,15 +40,24 @@ context selects fast validation alone. Branch names do not select a tier. An una
 protection response defers the head; it never activates fast-only validation. Repositories without
 `required-fast` keep their existing recipe and context. Main-health continues to run the full recipe.
 
-Fast validation publishes `<repo>/fast` before full validation starts. A fast failure stops there and
-marks the full context blocked, without attaching a full evidence identity. Fast receipts live under
+Fast validation publishes `<repo>/fast` before full validation starts. While it runs, the full
+context keeps its newest conclusion: a success stays as `keep_green` keeps one through any
+re-verification, and a failure stays red until the full tier runs again. A fast failure stops there
+and marks the full context failed, without attaching a full evidence identity. `required-fast` is
+bounded at 50 minutes and the full recipe at 3 hours, so one head's two recipes fit the slot unit's
+4-hour `TimeoutStartSec`. A forge re-gate request is read once for the head, before either tier
+runs, so it re-runs a failed full tier as well as the fast one. Fast receipts live under
 `tiers/fast/` in the head's journal, protected by the same descendant lock as the full receipts.
 Both tiers bind the source and environment inputs, with distinct recipe and context fields in their
 identities. Reuse checks each identity separately, including the forge status creator for results
 from another host. A fast digest cannot satisfy a full claim, even if posted under the full context.
 
 Tiered heads prepare their tree before deciding reuse so both contexts and current protection are
-checked. Their durable `tiered` marker prevents the single-context shortcut from skipping that work.
+checked. Their `tiered` marker prevents the single-context shortcut from skipping that work, and
+`cache/tiered-repo-<owner>-<repo>` makes a green protected branch tip of a tiered repository wait
+for its prepared tree instead of being skipped at listing time. A repository without the marker
+keeps the listing-time skip. A prepared tree with no `required-fast` removes the repository's marker,
+and a head's `tiered` marker counts only while its repository's is present.
 Publication recovery retains each tier's receipts and handles them before that tier can run again.
 
 ## Deciding reuse before a tree is prepared

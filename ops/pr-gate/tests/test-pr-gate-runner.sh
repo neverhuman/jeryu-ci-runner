@@ -100,6 +100,7 @@ count=0
 printf '%s\n' "$((count + 1))" >"$fixture_root/executions"
 printf '%s\n' "$1" >>"$fixture_root/recipes"
 if [[ "$1" == required-fast && "$(cat mode)" == fast-fail ]]; then exit 8; fi
+if [[ "$1" == required && -f "$fixture_root/full-fail" ]]; then exit 9; fi
 if [[ -f "$fixture_root/require-sibling" ]]; then
   cat ../sibling/file >/dev/null || exit 34
 fi
