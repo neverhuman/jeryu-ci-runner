@@ -125,7 +125,13 @@ mod tests {
 
     fn response(result: &[u8]) -> RunnerResult<()> {
         let temporary = tempfile::tempdir()?;
-        let socket = temporary.path().join("api.sock");
+        // A long TMPDIR can exceed SUN_LEN, so address the socket through an
+        // open descriptor of the directory, which keeps the path short.
+        let directory = std::fs::File::open(temporary.path())?;
+        let socket = std::path::PathBuf::from(format!(
+            "/proc/self/fd/{}/api.sock",
+            std::os::fd::AsRawFd::as_raw_fd(&directory)
+        ));
         let listener = UnixListener::bind(&socket)?;
         let response = result.to_vec();
         let (release, wait) = mpsc::channel();
