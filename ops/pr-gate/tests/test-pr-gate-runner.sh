@@ -293,6 +293,57 @@ case "$method $url" in
     if [[ -f "$FAKE_FORGE/reject-check-run" ]]; then printf '{"message":"check runs unavailable"}\n500'; exit; fi
     printf '%s\n' "$payload" >>"$FAKE_FORGE/check-runs.jsonl"
     printf '{"id":"check"}\n201';;
+  'POST '*'/api/v1/gate-claims')
+    # The forge-held lease on one head: exactly one holder until it expires. Held leases live in
+    # claims/<repo>-<number>-<sha>; claim-ttl holds the lease length in seconds (default 180), and
+    # no-gate-claims stands in for a forge that predates the route.
+    [[ ! -f "$FAKE_FORGE/no-gate-claims" ]] || { printf '<html>not found</html>\n404'; exit; }
+    repo=$(jq -r '.repo' <<<"$payload"); number=$(jq -r '.number' <<<"$payload")
+    sha=$(jq -r '.head_sha // .queue_sha' <<<"$payload")
+    runner=$(jq -r '.runner_id' <<<"$payload"); host=$(jq -r '.host' <<<"$payload")
+    ttl=180; [[ ! -f "$FAKE_FORGE/claim-ttl" ]] || read -r ttl <"$FAKE_FORGE/claim-ttl"
+    mkdir -p "$FAKE_FORGE/claims"
+    file="$FAKE_FORGE/claims/${repo//\//-}-$number-$sha"
+    now=$(date +%s)
+    # What the repository requires of a host, as the forge reads it from the base branch's
+    # .jeryu/repo.toml; here, the repositories listed in require-host-ci.
+    if [[ -f "$FAKE_FORGE/require-host-ci" ]] && grep -qx "$repo" "$FAKE_FORGE/require-host-ci"; then
+      # What this host advertises, from the heartbeats it has sent, as the forge matches it.
+      advertised=$(jq -sc --arg h "$host" '[.[] | select(.host == $h) | .capabilities // []] | last // []' \
+        "$FAKE_FORGE/heartbeats.jsonl" 2>/dev/null || printf '[]')
+      if ! jq -e 'index("host-ci")' <<<"${advertised:-[]}" >/dev/null 2>&1; then
+        printf '%s\n' "$repo $sha $host" >>"$FAKE_FORGE/claims-refused.log"
+        jq -nc --arg r "$repo" --arg h "$host" \
+          '{code:"capability_missing",message:($r + " requires host-ci in .jeryu/repo.toml; " + $h + " advertises none")}'
+        printf '\n409'; exit
+      fi
+    fi
+    if [[ -f "$file" ]]; then
+      read -r held_runner held_host held_until <"$file"
+      if [[ "$held_runner" != "$runner" ]] && ((held_until > now)); then
+        printf '%s\n' "$repo $sha $runner" >>"$FAKE_FORGE/claims-refused.log"
+        jq -nc --arg r "$held_runner" --arg h "$held_host" --arg s "$sha" \
+          '{code:"claim_held",message:($r + " on " + $h + " holds the gate claim on " + $s)}'
+        printf '\n409'; exit
+      fi
+    fi
+    printf '%s %s %s\n' "$runner" "$host" "$((now + ttl))" >"$file"
+    printf '%s\n' "$repo $sha $runner" >>"$FAKE_FORGE/claims-granted.log"
+    jq -nc --arg s "$sha" --argjson ttl "$ttl" '{state:"granted",head:$s,ttl_seconds:$ttl}'
+    printf '\n201';;
+  'POST '*'/api/v1/gate-claims/release')
+    [[ ! -f "$FAKE_FORGE/no-gate-claims" ]] || { printf '<html>not found</html>\n404'; exit; }
+    repo=$(jq -r '.repo' <<<"$payload"); number=$(jq -r '.number' <<<"$payload")
+    sha=$(jq -r '.head_sha // .queue_sha' <<<"$payload"); runner=$(jq -r '.runner_id' <<<"$payload")
+    file="$FAKE_FORGE/claims/${repo//\//-}-$number-$sha"
+    if [[ -f "$file" ]]; then
+      read -r held_runner _ _ <"$file"
+      if [[ "$held_runner" != "$runner" ]]; then
+        printf '{"code":"claim_held","message":"another runner holds it"}\n409'; exit
+      fi
+      rm -f -- "$file"
+    fi
+    printf '{"state":"released"}\n200';;
   'POST '*'/heartbeat')
     printf '%s\n' "$payload" >>"$FAKE_FORGE/heartbeats.jsonl"
     if [[ -f "$FAKE_FORGE/reject-heartbeat-capabilities" ]] && jq -e 'has("capabilities")' <<<"$payload" >/dev/null; then
@@ -2315,3 +2366,72 @@ unset PR_GATE_MAIN_PROOF_BASE_VARS
 printf 'PASS --branch main: retried after a latest error with the strict baseline and nothing a caller controls, never over a success, a merged or closed PR, a moved tip or a non-main branch\n'
 
 printf 'PASS --branch: a protected tip is proved against the branch before it, posted as <repo>/required, held, never re-proved over, never held on input drift, and refused when it may not be\n'
+
+# --- active-active gate hosts: the forge holds the claim on each gated head ---------------------
+# Two hosts gate at once. The lease, not a hand-edited owner list, is what keeps them off each
+# other's heads, and an unrenewed lease is what hands a dead host's head to a live one.
+printf 'pass\n' >"$fixture/source/mode"
+date +%s%N >"$fixture/source/claims-marker"   # a head of its own, whatever the suite left behind
+"$real_git" -C "$fixture/source" add -A
+"$real_git" -C "$fixture/source" commit -qm claims-fixture
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+head=$(cat "$fixture/head")
+claim="$fixture/claims/acme-fixture-1-$head"
+claims_count=$(count)
+fail_claims() { printf '%s\n--- runner.log\n' "$1" >&2; cat "$fixture/runner.log" >&2; exit 1; }
+
+# A live lease held by the other host: this host posts nothing at all for that head.
+mkdir -p "$fixture/claims"
+printf 'gate-b/slot0 gate-b %s\n' "$(( $(date +%s) + 3600 ))" >"$claim"
+statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_claims 'a refused claim should not fail the runner'
+expect_count "$claims_count"
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$statuses" ]] \
+  || fail_claims 'a host without the claim posted a status on the head'
+grep -q 'holds the gate claim' "$fixture/runner.log" || fail_claims 'the refusal does not say who holds the head'
+[[ "$(cut -d' ' -f1 <"$claim")" == gate-b/slot0 ]] || fail_claims 'the refused host took over the lease'
+printf 'PASS gate claims: two runners never both post on one head\n'
+
+# The holder is killed: its lease is not renewed, and within one TTL the head is gated here. The
+# expired lease is exactly what a killed slot leaves behind.
+printf 'gate-b/slot0 gate-b %s\n' "$(( $(date +%s) - 1 ))" >"$claim"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_claims 'the surviving host did not gate the head'
+expect_count "$((claims_count + 1))"
+jq -se 'last.state == "success"' "$fixture/statuses.jsonl" >/dev/null \
+  || fail_claims 'the head was not re-gated after the lease expired'
+grep -q "gate claim held for" "$fixture/runner.log" || fail_claims 'the surviving host did not take the lease'
+[[ ! -e "$claim" ]] || fail_claims 'the lease was not released on publication'
+printf 'PASS gate claims: a killed runner s head is re-gated by the other host within one TTL\n'
+
+# A head whose repository needs host-ci is refused to a host that does not advertise it, and gated
+# by the same host once it does. The policy is the repository s, and the advertisement is the
+# heartbeat s: nothing here names an owner.
+printf 'acme/fixture\n' >"$fixture/require-host-ci"
+statuses=$(wc -l <"$fixture/statuses.jsonl")
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_claims 'a capability refusal should not fail the runner'
+expect_count "$((claims_count + 1))"
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$statuses" ]] \
+  || fail_claims 'a host without host-ci posted a status on a head that needs it'
+grep -q 'requires host-ci' "$fixture/runner.log" || fail_claims 'the refusal does not name the capability'
+GATE_RUNNER_CAPABILITIES=host-ci invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_claims 'the capable host did not gate the head'
+expect_count "$((claims_count + 2))"
+jq -se 'last.state == "success"' "$fixture/statuses.jsonl" >/dev/null \
+  || fail_claims 'the capable host did not publish the head'
+rm -f "$fixture/require-host-ci"
+printf 'PASS gate claims: a head needing host-ci is refused to a host without it\n'
+
+# A forge that predates the route is gated as it was before the lease existed.
+touch "$fixture/no-gate-claims"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_claims 'an older forge stopped the gate'
+expect_count "$((claims_count + 3))"
+grep -q 'no gate-claims route' "$fixture/runner.log" || fail_claims 'the older forge was not reported'
+jq -se 'last.state == "success"' "$fixture/statuses.jsonl" >/dev/null \
+  || fail_claims 'an older forge lost the verdict'
+rm -f "$fixture/no-gate-claims"
+printf 'PASS gate claims: a forge without the route gates on the local claim alone\n'

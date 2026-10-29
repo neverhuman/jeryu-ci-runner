@@ -711,8 +711,10 @@ Parsing requires exactly one inputs field. Cross-host adoption requires the auth
 creator login. Keep-green retains the old own-host marker fallback for account renames; that fallback
 suppresses pending only and never authenticates adoption.
 
-Claims are still local, so two hosts must not gate the same owners at once; failover is moving an
-owner from one host's `GATE_RUNNER_OWNERS` to the other's.
+Local claims are the fast path; the forge holds the claim that keeps two hosts off one head. See
+"Active-active gate hosts" below: every host may gate every repository it can reach, and a host
+that dies loses its heads to a live one within one lease, with nobody editing a configuration
+file.
 
 ## Version
 
@@ -897,23 +899,79 @@ A remote main moving alone does not change those checked-out inputs during a run
 The runner still verifies every executed checkout and tool after the recipe; it
 does not accept mutations to siblings as proof of the original snapshot.
 
-## Host capability heartbeats
+## Active-active gate hosts
+
+Every gate host gates every repository it can reach, at the same time as the
+others. What keeps two hosts off one head is a lease the forge holds, not an
+owner list an operator edits:
+
+1. a slot decides to execute a head, takes its own slot lock and local head
+   claim as before, and then asks the forge for the head:
+   `POST /api/v1/gate-claims {repo, number, head_sha|queue_sha, runner_id,
+   host}`. It asks after admission and **before** it posts `pending`, so a
+   host that is not gating a head posts nothing for it;
+2. the forge answers `201` with `ttl_seconds` (the lease length) or refuses
+   with `409`: `claim_held` names the host that is gating the head,
+   `capability_missing` names what the repository needs. A refused head is
+   left where it was -- no status, no attempt, no local state -- and the host
+   goes on to the next candidate;
+3. while the recipe runs, the slot repeats the same ask every third of the TTL;
+   it is the renewal (the lease keeps its `granted_at` and moves its
+   `expires_at`). A slot that is killed, or a host that hangs or loses power,
+   stops renewing;
+4. on publication the slot gives the head back
+   (`POST /api/v1/gate-claims/release`), so the next host does not wait out
+   the TTL. Releasing a head nobody holds is not an error, which is what a
+   publication retry or a recovering tick does;
+5. a lease nobody renews expires. The head is then claimable by any live host,
+   so a dead host's work is picked up automatically, within one TTL.
+
+Repeating an ask with an `Idempotency-Key` replays the forge's first answer, so
+a runner that lost the answer to a timeout can ask again safely.
+
+A forge without the route (a 404 that is not a typed refusal) is gated the way
+it was before the lease existed: the local claim is the only exclusion, as on a
+single-host site. A forge that cannot answer at all leaves the head for the
+next tick -- posting `pending` for a head this host may not be gating is
+exactly what the lease prevents.
+
+### Capabilities instead of owners
 
 Set `GATE_RUNNER_CAPABILITIES=host-ci` in the site configuration only on a host
 that provides the host-ci environment. An absent or empty setting advertises
 no special capability. Names are space-separated; the runner rejects unknown
 and duplicate names before making requests. Both the slot runner and heartbeat
-timer send the setting in the heartbeat's `capabilities` array. The forge
-validates it and exposes it in `/api/v1/control-plane/runners` node details.
-A heartbeat without the field clears a previous advertisement.
+timer send the setting in the heartbeat's `capabilities` array, and
+`/api/v1/control-plane/runners` shows it per node. A heartbeat without the
+field clears a previous advertisement; a forge that refuses the field gets a
+retry without it, and cannot match on capabilities at all.
 
-A forge that refuses the new field receives a retry without it, preserving the
-existing task and code evidence. That forge cannot use the advertisement.
-This is capacity reporting only: repository discovery and local claims still
-use the existing settings. It does not enable active-active failover.
+A repository declares what a gate of it needs in its own `.jeryu/repo.toml`:
 
-The repository policy is to declare `capabilities = ["host-ci"]` under `[gate]`
-in `.jeryu/repo.toml` on the trusted base/default branch. Enforcing that policy
-and forge-held leases remain separate work. `veox/jain` is outside these
-repositories; its policy declaration must be added there when lease admission
-is wired up.
+```toml
+[gate]
+capabilities = ["host-ci"]
+```
+
+The forge reads that file at the gated head's base branch (the default branch
+for a head with no pull request), never at the pull request's own head, so a
+pull request cannot change what its own gate requires. A claim is granted only
+to a host whose advertised set covers the repository's required set; an unknown
+or repeated name, or a file that cannot be read as a policy, refuses every
+claim rather than quietly requiring nothing.
+
+`GATE_RUNNER_OWNERS`/`GATE_RUNNER_REPOS` still say which repositories a host
+discovers and gates, and remain how a host is given a smaller share of the
+work. They are no longer a failover mechanism: there is nothing to move when a
+host dies, and no need to keep two hosts off each other's owners.
+
+### When it needs a person
+
+needs-you raises `gate_claim_stale` for a head whose lease expired while no
+live gate host advertises every capability the repository requires -- then
+nothing will pick that head up, and `gate_runner_down` stays quiet because
+other hosts are beating. An expired lease that any live host could take is not
+a row: that is the design working.
+
+`veox/jain`, whose gate needs the host-ci sandbox, is outside these
+repositories; its `.jeryu/repo.toml` has to be committed there.

@@ -1195,6 +1195,10 @@ gate_exit() {
     gate_finish interrupted null "" "runner exited $result without a verified worker result" || true
     gate_publish || true
   fi
+  # The forge-held lease on the head this run was gating (pr-gate-runner.sh). A run that is killed
+  # outright never reaches this, which is the point: that lease expires and another host takes the
+  # head. An orderly exit gives it back at once.
+  ! declare -F gate_claim_release >/dev/null || gate_claim_release || true
   [[ -z "${AUTH_CONFIG:-}" ]] || rm -f -- "$AUTH_CONFIG"
   exit "$result"
 }
