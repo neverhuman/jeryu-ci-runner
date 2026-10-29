@@ -632,7 +632,11 @@ required_contexts_signal() { # row owner/name number sha
   unreported="$(required_contexts_unreported "$required")"
   if [ -n "$unreported" ] && first="$(jq -er '.first_seen_epoch | numbers' "$file" 2>/dev/null)"; then
     limit="$(gate_wait_limit "$file")"
-    echo "This head waited $(( $(date +%s) - first ))s (bound ${limit}s) for its required contexts; still without a result: $unreported."
+    if [ "$limit" -eq 0 ]; then
+      echo "Required-context admission wait is disabled (bound 0s); still without a result: $unreported."
+    else
+      echo "This head waited $(( $(date +%s) - first ))s (bound ${limit}s) for its required contexts; still without a result: $unreported."
+    fi
   fi
 }
 
@@ -1961,6 +1965,8 @@ render_body() { # verdict-json decision sha origin [owner-decision-json hold-kin
        "hold \(if $k > $cap then "\($k) (limit \($cap))" else "\($k) of \($cap)" end): this PR is now left for a person; later pushes are not reviewed automatically until a maintainer runs `pr-redteam rearm`"
      elif $kind == "agent" and $cap > 0 then
        "hold \($k) of \($cap): a new push is re-reviewed; after \($cap) holds this PR is left for a person"
+     elif $kind == "gate" and any(.findings[]; has("pending_required_context")) then
+       "required-context hold, not counted toward the hold limit: a new push is re-reviewed"
      elif $capped == 1 then
        "mechanical hold at the hold limit: a push that clears it gets the mechanical checks only; a person decides (`pr-redteam rearm`)"
      elif $kind == "agent" then "a new push is re-reviewed"
@@ -2402,7 +2408,7 @@ review_one() { # owner/name number dry-run force include-drafts
       fi
     fi
     if [ -n "$verdict" ] && jq -e 'any(.findings[]; has("pending_required_context"))' <<<"$verdict" >/dev/null; then
-      say "$tag: required-context findings need a fresh review after proof reports"
+      say "$tag: cached result contains required-context findings; recomputing before reuse"
       verdict=""
       pending_cost=null
     fi

@@ -387,7 +387,11 @@ review waits: no receipt, review, check run or agent spend. The log says `waitin
 contexts`. A later pass reviews the head once all required contexts have results; failures are
 results too. `REDTEAM_GATE_WAIT_SECS` bounds the wait (default 5400 seconds, or 90 minutes) from
 that head's first observation. After expiry the review proceeds with the unresolved states in
-`signals.txt`. `0` turns the general wait off.
+`signals.txt`. Force and dry-run obey this admission check too; neither starts an agent
+inside the bound. The operator escape is `REDTEAM_GATE_WAIT_SECS=0` for ordinary heads
+(and `REDTEAM_PIN_WAIT_SECS=0` for release-pin heads). This disables admission delay,
+not the proof publication gate or branch protection. A zero-bound signal says the wait
+is disabled, rather than claiming the head waited out a timeout.
 
 Release pin bumps use this same path with their existing `REDTEAM_PIN_WAIT_SECS` override (default
 3600 seconds, `0` disables the pin wait). Only the forge's complete exact-head diff can classify a
@@ -401,6 +405,22 @@ only those findings is recorded as a gate hold only when the forge confirms ever
 is enforced and missing/pending. Mixed code findings, failed or unknown contexts, and unreadable
 protection keep normal agent accounting. No prose matching or review dismissal is involved: the
 blocking review still stands, and the forge still requires all gates before landing.
+
+The classifier examines only model findings, before controller findings are appended.
+We deliberately retain all-or-nothing accounting: even a low-severity unlabelled model
+finding keeps a mixed block counted. Splitting findings into separate decisions could
+hide why the model blocked; no finding or blocking review is removed. The footer calls
+a missing-only model block a required-context hold, rather than a mechanical hold.
+A lane that never reports eventually reaches admission expiry and can receive such a
+blocking review without exhausting the cap; expiry does not manufacture a passing result.
+
+Proof publication remains separate: after admission expires, a pending `jankurai/proof`
+allows computation but saves the result without publishing. A subsequent pass with proof
+still pending leaves it alone. Before reuse, any cached result containing a
+`pending_required_context` finding is recomputed, even if the named context is still
+pending; the log describes recomputation, not a claim that proof has reported. A failing
+proof discards the result and holds mechanically. A passing proof permits reuse only
+when the existing input key matches and no such findings need recomputation.
 
 ### The enforced required contexts
 
@@ -417,6 +437,9 @@ derived from a repository name, a branch name, the PR's own files or a record --
 exception. A branch the forge reports as unprotected enforces nothing, and a protection read the
 forge will not answer leaves gate evidence unresolved: `signals.txt` says so, the enforced set is
 treated as unknown rather than empty, and the bounded wait still waits for what the row reported.
+If that row also reports no contexts, there is nothing identifiable to wait for: review
+starts immediately with the unresolved-protection warning. This does not prove there are
+no requirements and cannot exempt a model block from the hold cap.
 Pin verifiers are independent of all of this: a green required context never substitutes
 release-line ancestry for a verifier's required ancestry on `main`.
 

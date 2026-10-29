@@ -248,6 +248,9 @@ grep -Fqx 'acme/required: success' "$t/signals.txt" || fail "the row's list was 
 [[ "$(protection_reads)" -gt 0 ]] || fail "branch protection was never read"
 echo 'ok protection the forge will not answer leaves gate evidence unresolved and still waits for the row'
 
+bump; contexts '"absent"'; review; calls=$((calls + 1)); reviewed "unreadable protection without row contexts"
+grep -Fq '(the row reported none either)' "$t/signals.txt" || fail 'unknown protection without row contexts was hidden'
+
 # 10. Mixed contexts wait until every required result exists; a failed result does not hide a
 #     different missing result. Force and dry-run still respect admission and publish nothing.
 protect '{"main": {"required_status_checks": {"contexts": ["acme/required", "acme/extra"]}}}'
@@ -267,6 +270,7 @@ contexts '[{"name":"acme/required","state":"missing"}]'
 missing='{severity:"medium",title:"Required result missing",file:"signals.txt",
   detail:"The required lane has no result yet.",evidence:"acme/required: missing",
   pending_required_context:"acme/required"}'
+advice='{severity:"low",title:"Name the unit",file:"cart.rs",detail:"Name the unit in the local variable.",evidence:"total"}'
 code_finding='{severity:"high",title:"Client total trusted",file:"cart.rs",
   detail:"The server accepts the client total.",evidence:"body.total"}'
 for _attempt in 1 2 3; do
@@ -275,12 +279,13 @@ for _attempt in 1 2 3; do
   REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1))
   [[ "$(count "$t/model-calls")" == "$calls" ]] || fail 'missing results exhausted the hold cap'
   jq -e '.decision == "hold" and .hold_kind == "gate" and .posted == true' "$(receipt)" >/dev/null || fail 'missing-only hold counted'
-  tail -1 "$t/posts" | jq -e '.verdict == "request_changes" and (.body_markdown | contains("not counted toward the hold limit"))' >/dev/null \
+  tail -1 "$t/posts" | jq -e '.verdict == "request_changes" and (.body_markdown | contains("required-context hold, not counted toward the hold limit"))' >/dev/null \
     || fail 'missing-only hold was waived or misreported'
 done
 printf '%200s' fixture >"$t/repo/payload.bin"
 g add payload.bin; g commit -qm 'add unpinned fixture payload'; g rev-parse HEAD >"$t/head"
 REDTEAM_MAX_BLOB_BYTES=100 REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1))
+grep -Fq 'admission wait is disabled (bound 0s)' "$t/signals.txt" || fail 'zero-bound signal claimed an expired wait'
 jq -e '.decision == "hold" and .hold_kind == "gate" and .posted == true
   and any(.verdict.findings[]; .title | startswith("Unpinned binary or archive"))' "$(receipt)" >/dev/null \
   || fail 'mechanical finding made a missing-only model hold count'
@@ -290,6 +295,11 @@ jq -n "{verdict:\"block\",summary:\"Missing result and code defect\",findings:[$
 REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1))
 jq -e '.decision == "hold" and .hold_kind == "agent"' "$(receipt)" >/dev/null || fail 'mixed code hold did not count'
 tail -1 "$t/posts" | jq -e '.body_markdown | contains("hold 1 of 2")' >/dev/null || fail 'missing-only holds moved the count'
+bump
+jq -n "{verdict:\"block\",summary:\"Missing result with advice\",findings:[$missing,$advice]}" >"$t/verdict"
+REDTEAM_HOLD_CAP=0 REDTEAM_GATE_WAIT_SECS=0 review; calls=$((calls + 1))
+jq -e '.decision == "hold" and .hold_kind == "agent" and (.verdict.findings | length) == 2' "$(receipt)" >/dev/null \
+  || fail 'low model advice was segregated out of a blocking review'
 for kind in failed unknown unreadable; do
   bump
   contexts '[{"name":"acme/required","state":"failure"}]'

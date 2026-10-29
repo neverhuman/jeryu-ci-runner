@@ -353,7 +353,14 @@ advance
 # from pending to success with the proof.
 touch "$t/gate-pending" "$t/model-cost" "$t/with-contexts"
 model_calls="$(count "$t/model-calls")"; posts_before="$(count "$t/posts")"
-review
+# Exercise production admission with its enabled default before proof's independent wait.
+(unset REDTEAM_GATE_WAIT_SECS; review)
+[[ "$(count "$t/model-calls")" == "$model_calls" && ! -e "$(receipt)" ]]
+[[ "$(count "$t/posts")" == "$posts_before" ]]
+wait_file="$t/state/pin-wait/jeryu/fixture/1-$(cat "$t/head").json"
+jq --argjson first "$(( $(date +%s) - 5401 ))" '.first_seen_epoch=$first' "$wait_file" >"$t/wait-expired"
+cat "$t/wait-expired" >"$wait_file"
+(unset REDTEAM_GATE_WAIT_SECS; review)
 rm "$t/model-cost"
 jq -e '.posted == false and .decision == "waiting_gate"' "$(receipt)" >/dev/null
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" && "$(count "$t/posts")" == "$posts_before" ]]
@@ -397,6 +404,7 @@ review
 [[ "$(count "$t/model-calls")" == "$((model_calls + 2))" ]]
 jq -e '.posted == true and .decision == "approve"' "$(receipt)" >/dev/null
 [[ ! -e "$pending" ]]
+grep -Fq 'cached result contains required-context findings; recomputing before reuse' "$t/controller.log"
 rm "$t/with-contexts"
 echo 'ok pending-context findings receive a fresh review when proof reports'
 
