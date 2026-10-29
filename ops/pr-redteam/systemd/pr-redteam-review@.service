@@ -1,0 +1,22 @@
+# One review of one exact pull request head, as the watcher reports it. The instance names the
+# scope: owner:name:number:signalled-head. This unit reviews and publishes only; it has no merger
+# environment and lands nothing, which stays with the merge pass and pr-redteam-merge@.service.
+# Installation stages it inactive. Its service owner qualifies and authorizes activation.
+[Unit]
+Description=pr-redteam: review scoped head %i
+After=network-online.target
+Wants=network-online.target
+OnFailure=pr-redteam-notify@%n.service
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=REDTEAM_MODEL=claude-opus-5
+# The forge origin and the approver credential path are site configuration, not
+# source: set JERYU_BASE and JERYU_TOKEN_FILE in this file. Without it the unit
+# refuses to run rather than guessing one installation's forge.
+EnvironmentFile=%h/.config/pr-redteam/site.env
+ExecStart=@REDTEAM_DIR@/pr-redteam _review_scoped %i
+Nice=10
+# One agent review, bounded by REDTEAM_TIMEOUT, plus the forge reads around it.
+TimeoutStartSec=60min

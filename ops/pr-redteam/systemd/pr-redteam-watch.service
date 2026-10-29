@@ -1,0 +1,24 @@
+# React to the forge's own events instead of a timer: long-poll the pull request heads that became
+# reviewable (`GET /api/v1/review-wanted`) and start one scoped review unit per head, at most
+# REDTEAM_JOBS at a time. It never reviews or merges in this process, and it has no merger
+# environment. Installation stages it inactive; its service owner qualifies and activates it.
+[Unit]
+Description=pr-redteam: start a review as each reviewable head is reported
+After=network-online.target
+Wants=network-online.target
+OnFailure=pr-redteam-notify@%n.service
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:%h/.cargo/bin:/usr/local/bin:/usr/bin:/bin
+Environment=REDTEAM_JOBS=4
+# The forge origin and the approver credential path are site configuration, not
+# source: set JERYU_BASE and JERYU_TOKEN_FILE in this file. Without it the unit
+# refuses to run rather than guessing one installation's forge.
+EnvironmentFile=%h/.config/pr-redteam/site.env
+ExecStart=@REDTEAM_DIR@/pr-redteam watch
+# A long poll that ends, a forge that went away and a watcher that was killed all leave the heads to
+# the five-minute pass; coming back is what keeps the latency down, so it restarts.
+Restart=always
+RestartSec=5s
+Nice=15

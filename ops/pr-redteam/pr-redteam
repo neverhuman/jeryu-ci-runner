@@ -10,6 +10,9 @@
 #   pr-redteam poke [--dry-run]            start a pass now if a new head needs review, an unreviewed
 #                                          head's required gate went green, or an approval became
 #                                          landable (30-second timer; never reviews or merges)
+#   pr-redteam watch [--dry-run] [--once]  long-poll the forge for pull requests opened and pushed
+#                                          to, and start one scoped review unit per head, at most
+#                                          REDTEAM_JOBS at a time (never merges)
 #   pr-redteam rearm owner/name N          review the next head of a PR that reached the hold cap
 #
 # Each open PR is reviewed at its exact head by a read-only agent. Confirmed high or critical
@@ -29,6 +32,15 @@
 # can approve such a head, and the forge refuses an approval on one anyway. A proof that is queued,
 # running or has not started yet admits an internal review alongside the gate. Its validated result
 # is saved for a later pass; publication still requires the proof to pass.
+#
+# A review does not depend on the gate's result, so it does not wait for one. The forge records a
+# signal the moment a pull request is opened or a push moves an open pull request's head, and
+# `pr-redteam watch` long-polls for those signals (`GET /api/v1/review-wanted`) and starts one
+# scoped review unit per head while the gate runs. At most REDTEAM_JOBS reviews run at once, so one
+# long review delays no other head; the rest wait for a free slot. The signal is a hint, not an
+# instruction: each scoped review applies the same skip, budget, quality-gate and publication rules
+# as a pass, and an approval still requires the base branch's required contexts to be green. The
+# five-minute pass and the poke stay as the fallback for a signal nobody read.
 #
 # pr-redteam also lands what it approved. After the review pass, every open PR this tool approved
 # at its current head is merged as the merger identity, once the forge itself says it can merge
@@ -3353,19 +3365,144 @@ poke() { # dry
   fi
 }
 
+# --- watch ---------------------------------------------------------------------------------------
+
+# Event-driven review. `GET /api/v1/review-wanted?after=<seq>&wait=<secs>` is the forge's record of
+# the pull request heads that became reviewable: one signal per pull request opened and per open
+# pull request whose head a push moved (jeryu-deploy, docs/repo-automation.md). The forge holds the
+# request open until a head appears, so a push reaches an idle reviewer slot in about as long as the
+# push took, instead of waiting for the five-minute pass.
+#
+# A signal only says a head appeared. The scoped review it starts reads the pull request itself and
+# applies every rule a pass applies -- the draft and author skips, the hold cap, the contribution
+# budgets, the quality gate, publication -- so nothing here can review, approve or land a head a
+# pass would not. Nothing is merged from this path at all: the merge pass and the scoped merge units
+# own that, with the merger credential this unit does not have.
+#
+# Signals are kept in the forge's memory and bounded, so a forge restart or a watcher that was down
+# can lose one. That costs today's latency and nothing else: the pass and the poke still find the
+# head.
+watch_wait=45            # seconds the forge may hold one long poll open (api's own timeout is 60)
+watch_queue_cap=256      # heads waiting for a free slot; past this the oldest wait for the pass
+watch_retry_secs=5       # pause before re-polling a forge that answered something other than 200
+
+# The cursor, replaced whole: a torn write would read as no cursor at all and replay what the forge
+# still keeps, which is harmless but needless.
+watch_cursor_set() { # seq
+  local tmp
+  tmp="$(mktemp "$state/watch-cursor.XXXXXX")"
+  printf '%s\n' "$1" >"$tmp"
+  mv "$tmp" "$state/watch-cursor"
+}
+
+review_unit() { printf 'pr-redteam-review@%s:%s:%s.service\n' "${1/\//:}" "$2" "$3"; } # owner/name number sha
+
+# How many scoped reviews are running right now. A template instance counts whatever its pull
+# request is, so the bound is on reviews, not on repositories.
+review_slots_busy() {
+  systemctl --user list-units --state=active --no-legend --plain 'pr-redteam-review@*.service' 2>/dev/null \
+    | grep -c . || true
+}
+
+# Start a scoped review per queued head while slots are free, leaving the rest queued. A head leaves
+# the queue only once its unit started: a start that failed is kept for the next poll, and a unit
+# that dies without reviewing leaves the head to the pass.
+watch_drain() { # dry
+  local dry="$1" queue="$state/watch-queue" kept repo number sha busy unit pool="$jobs"
+  [ -s "$queue" ] || return 0
+  # A pool size that is not a count would make every comparison below an error; the default is
+  # the same one REDTEAM_JOBS documents.
+  [[ "$pool" =~ ^[1-9][0-9]{0,3}$ ]] || pool=4
+  busy="$(review_slots_busy)"
+  [[ "$busy" =~ ^[0-9]+$ ]] || busy=0
+  if [ "$dry" = 1 ]; then
+    while IFS=' ' read -r repo number sha; do
+      [ -n "$repo" ] || continue
+      say "watch: would start $(review_unit "$repo" "$number" "$sha") ($busy of $pool slots busy)"
+    done <"$queue"
+    return 0
+  fi
+  kept="$(mktemp "$state/watch-queue.XXXXXX")"
+  while IFS=' ' read -r repo number sha; do
+    [ -n "$repo" ] || continue
+    if [ "$busy" -ge "$pool" ]; then
+      printf '%s %s %s\n' "$repo" "$number" "$sha" >>"$kept"
+      continue
+    fi
+    unit="$(review_unit "$repo" "$number" "$sha")"
+    if systemctl --user start --no-block "$unit"; then
+      busy=$((busy + 1))
+      say "watch: started $unit ($busy of $pool slots busy)"
+    else
+      printf '%s %s %s\n' "$repo" "$number" "$sha" >>"$kept"
+      say "watch: could not start $unit; it waits for a later poll or the pass"
+    fi
+  done <"$queue"
+  mv "$kept" "$queue"
+}
+
+# One long poll and what it reported. The cursor is advanced only after the heads it reported are
+# durably queued: repeating a signal costs one scoped review that the per-PR lock and the receipt
+# make a no-op, while losing one would leave the head to the pass.
+watch_once() { # dry
+  local dry="$1" after seq repo number sha kind queue="$state/watch-queue" queued=0
+  after="$(cat "$state/watch-cursor" 2>/dev/null || true)"
+  [[ "$after" =~ ^[0-9]+$ ]] || after=0
+  api GET "/api/v1/review-wanted?after=$after&wait=$watch_wait"
+  if [ "$code" != 200 ]; then
+    say "watch: the forge answered $code for review-wanted; the pass remains the fallback"
+    [ "$dry" = 1 ] || sleep "$watch_retry_secs"
+    return 0
+  fi
+  seq="$(jq -r '.seq // empty' <<<"$body")"
+  [[ "$seq" =~ ^[0-9]{1,18}$ ]] || { say "watch: review-wanted answered without a sequence"; return 0; }
+  if [ "$seq" -lt "$after" ]; then
+    # The forge restarted: what it still keeps is not a backlog of new work.
+    say "watch: the forge's sequence went back to $seq; resyncing without replaying"
+    [ "$dry" = 1 ] || watch_cursor_set "$seq"
+    return 0
+  fi
+  while IFS=$'\t' read -r repo number sha kind; do
+    # The forge is trusted to answer, not to name a unit: a scope that is not exactly owner/name,
+    # a positive number and a 40-hex head never reaches a unit name, argv or a path.
+    if ! [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ && "$number" =~ ^[1-9][0-9]{0,8}$ && "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+      say "watch: ignoring a signal that is not a reviewable scope"
+      continue
+    fi
+    say "watch: $kind $repo#$number ${sha:0:12}"
+    [ "$dry" = 0 ] || continue
+    ! grep -qxF "$repo $number $sha" "$queue" 2>/dev/null || continue
+    printf '%s %s %s\n' "$repo" "$number" "$sha" >>"$queue"
+    queued=$((queued + 1))
+  done < <(jq -r '.signals // [] | .[] | [.repo, (.number | tostring), .head_sha, .kind] | @tsv' <<<"$body")
+  if [ "$dry" = 0 ]; then
+    # Oldest first in the file, so the heads dropped at the cap are the ones the pass is most
+    # likely to have covered already.
+    if [ -s "$queue" ] && [ "$(wc -l <"$queue")" -gt "$watch_queue_cap" ]; then
+      say "watch: more than $watch_queue_cap heads are waiting; the oldest wait for the pass"
+      tail -n "$watch_queue_cap" "$queue" >"$queue.capped" && mv "$queue.capped" "$queue"
+    fi
+    # The queued heads are on disk before the cursor stops asking for them again.
+    [ "$queued" = 0 ] || sync -f "$state"
+    watch_cursor_set "$seq"
+  fi
+  watch_drain "$dry"
+}
+
 # --- commands ------------------------------------------------------------------------------------
 
 cmd="${1:-}"; shift || true
-dry=0 force=0 drafts=0 only_repo="" only_pr="" only_sha=""
+dry=0 force=0 drafts=0 once=0 only_repo="" only_pr="" only_sha=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run) dry=1 ;;
     --force) force=1 ;;
     --include-drafts) drafts=1 ;;
+    --once) once=1 ;;
     --jobs) jobs="$2"; shift ;;
     --repo) only_repo="$2"; shift ;;
     --pr) only_pr="$2"; shift ;;
-    *) [ "$cmd" = _review ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _owner_decision ] || [ "$cmd" = _owner_satisfy ] || [ "$cmd" = _owner_body ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = _holds ] || [ "$cmd" = show ] || [ "$cmd" = rearm ] || die "unknown option $1"; break ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _review_scoped ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _owner_decision ] || [ "$cmd" = _owner_satisfy ] || [ "$cmd" = _owner_body ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = _holds ] || [ "$cmd" = show ] || [ "$cmd" = rearm ] || die "unknown option $1"; break ;;
   esac
   shift
 done
@@ -3413,6 +3550,18 @@ case "$cmd" in
     heartbeat ;;
   poke) # start a pass now if there is a new head to review or a newly landable approval
     poke "$dry" ;;
+  watch) # start a scoped review as each reviewable head is reported; never merges
+    exec 7>"$state/watch.lock"
+    flock -n 7 || { say "watch: another watcher holds the lock"; exit 0; }
+    if [ "$once" = 1 ]; then watch_once "$dry"; exit 0; fi
+    while watch_once "$dry"; do :; done ;;
+  _review_scoped) # managed template instance: owner:name:number:signalled-head
+    [ $# = 1 ] || die "expected one review scope"
+    [[ "$1" =~ ^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([1-9][0-9]*):([0-9a-f]{40})$ ]] || die "invalid review scope"
+    only_repo="${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"; only_pr="${BASH_REMATCH[3]}"; only_sha="${BASH_REMATCH[4]}"
+    # The pull request's live head is what a review binds to: a head pushed after the signal is
+    # reviewed as itself, and a superseded one is skipped as already reviewed, exactly as in a pass.
+    review_one "$only_repo" "$only_pr" "$dry" "$force" "$drafts" ;;
   _merge) # internal/testing: the merge pass alone, with no review pass before it
     merge_pass "$dry" ;;
   _merge_scoped) # managed template instance: owner:name:number:reviewed-head

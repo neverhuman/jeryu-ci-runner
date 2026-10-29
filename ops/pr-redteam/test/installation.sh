@@ -10,11 +10,12 @@ cat > "$t/bin/systemctl" <<'FIXTURE'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$INSTALL_FIXTURE/calls"
 case "$*" in
-  *is-active*) [[ "$FIXTURE_UNIT_ACTIVE" == 1 || ( "$*" == *pr-redteam-merge@jeryu:* && "${FIXTURE_INSTANCE_ACTIVE:-0}" == 1 ) ]] ;;
+  *is-active*) [[ "$FIXTURE_UNIT_ACTIVE" == 1 || ( "$*" == *pr-redteam-merge@jeryu:* && "${FIXTURE_INSTANCE_ACTIVE:-0}" == 1 ) || ( "$*" == *pr-redteam-review@jeryu:* && "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 1 ) ]] ;;
   # Real systemctl prints the state and exits 0 for a static unit too.
   *is-enabled*) printf '%s\n' "${FIXTURE_ENABLED_STATE:-static}"; [[ "${FIXTURE_ENABLED_STATE:-static}" != disabled ]] ;;
   '--user daemon-reload') exit 0 ;;
-  *list-units*) [[ "${FIXTURE_INSTANCE_ACTIVE:-0}" == 0 ]] || echo 'pr-redteam-merge@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded active running'; exit 0 ;;
+  *list-units*pr-redteam-merge@*) [[ "${FIXTURE_INSTANCE_ACTIVE:-0}" == 0 ]] || echo 'pr-redteam-merge@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded active running'; exit 0 ;;
+  *list-units*pr-redteam-review@*) [[ "${FIXTURE_REVIEW_INSTANCE_ACTIVE:-0}" == 0 ]] || echo 'pr-redteam-review@jeryu:fixture:107:1111111111111111111111111111111111111111.service loaded active running'; exit 0 ;;
   *) echo 'unexpected activation command' >&2; exit 97 ;;
 esac
 FIXTURE
@@ -36,16 +37,26 @@ grep -q '^EnvironmentFile=-%h/.config/pr-redteam/merge.env$' "$unit"
 for staged in "$t/home/.config/systemd/user/pr-redteam.service" \
   "$t/home/.config/systemd/user/pr-redteam-heartbeat.service" \
   "$t/home/.config/systemd/user/pr-redteam-poke.service" \
-  "$t/home/.config/systemd/user/pr-redteam-merge@.service"; do
+  "$t/home/.config/systemd/user/pr-redteam-merge@.service" \
+  "$t/home/.config/systemd/user/pr-redteam-watch.service" \
+  "$t/home/.config/systemd/user/pr-redteam-review@.service"; do
   grep -q '^EnvironmentFile=%h/.config/pr-redteam/site.env$' "$staged"
   if grep -Eq '^Environment=.*(JERYU_BASE|JERYU_TOKEN_FILE|REDTEAM_MERGE_TOKEN_FILE|REDTEAM_PRIORITY_FAMILIES)' "$staged"; then
     echo 'forbidden credential or site setting in a unit' >&2; exit 1
   fi
   if grep -Eq 'credentials/|\.pat' "$staged"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 done
-[[ "$(find "$t/home/.config/systemd/user" -type f | wc -l)" == 8 ]]
+[[ "$(find "$t/home/.config/systemd/user" -type f | wc -l)" == 10 ]]
 grep -q "^ExecStart=$here/pr-redteam _merge_scoped %i\$" "$t/home/.config/systemd/user/pr-redteam-merge@.service"
 ! grep -q 'merge.env' "$t/home/.config/systemd/user/pr-redteam-poke.service"
+# The event-driven reviewer reviews and publishes; it lands nothing, so neither the watcher nor a
+# scoped review may carry the merger environment.
+! grep -q 'merge.env' "$t/home/.config/systemd/user/pr-redteam-watch.service"
+! grep -q 'merge.env' "$t/home/.config/systemd/user/pr-redteam-review@.service"
+grep -q "^ExecStart=$here/pr-redteam watch\$" "$t/home/.config/systemd/user/pr-redteam-watch.service"
+grep -q "^ExecStart=$here/pr-redteam _review_scoped %i\$" "$t/home/.config/systemd/user/pr-redteam-review@.service"
+grep -q '^OnFailure=pr-redteam-notify@%n.service$' "$t/home/.config/systemd/user/pr-redteam-watch.service"
+grep -q '^OnFailure=pr-redteam-notify@%n.service$' "$t/home/.config/systemd/user/pr-redteam-review@.service"
 # The poke unit runs this directory's script, like the review and heartbeat units.
 grep -q "^ExecStart=$here/pr-redteam poke\$" "$t/home/.config/systemd/user/pr-redteam-poke.service"
 grep -q '^OnFailure=pr-redteam-notify@%n.service$' "$t/home/.config/systemd/user/pr-redteam.service"
@@ -59,6 +70,7 @@ if run 1; then echo 'active installation was accepted' >&2; exit 1; fi
 # A unit that is stopped but still enabled would start on its own: refused too.
 if FIXTURE_ENABLED_STATE=enabled run 0; then echo 'enabled installation was accepted' >&2; exit 1; fi
 if FIXTURE_INSTANCE_ACTIVE=1 run 0; then echo 'active merge instance was accepted' >&2; exit 1; fi
+if FIXTURE_REVIEW_INSTANCE_ACTIVE=1 run 0; then echo 'active review instance was accepted' >&2; exit 1; fi
 sha256sum -c "$t/before" > /dev/null
 if grep -Eq 'enable --now|start --no-block|disable|stop ' "$t/calls"; then echo 'forbidden credential or activation evidence' >&2; exit 1; fi
 

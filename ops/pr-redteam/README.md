@@ -406,7 +406,7 @@ release-line ancestry for a verifier's required ancestry on `main`.
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,
-upstream-evidence, credential-transport, heartbeat contract, poke, publication/recovery, merge-pass, queue-rework, contributed-origin, owner-decision and installation checks. The actual repository required lane
+upstream-evidence, credential-transport, heartbeat contract, poke, watch, publication/recovery, merge-pass, queue-rework, contributed-origin, owner-decision and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
 publication refusal, restart, duplicate dispatch, worker loss and changed heads,
@@ -436,6 +436,7 @@ activation approval.
 ./pr-redteam identity
 ./pr-redteam heartbeat
 ./pr-redteam poke --dry-run
+./pr-redteam watch --dry-run --once
 ./pr-redteam rearm acme/widget-web 16
 ```
 
@@ -472,6 +473,31 @@ An active rereview defers landing. A failed unit-start request is retried by the
 next poke; an accepted start is recorded once per head. Execution failures still
 retry through the five-minute review/merge timer. Dry runs consume no poke key.
 The merge log reports seconds since the receipt's ISO `reviewed_at` timestamp.
+
+`watch` is the event-driven trigger, and `pr-redteam-watch.service` is the unit
+that runs it. It long-polls `GET /api/v1/review-wanted?after=<seq>&wait=<secs>`,
+the forge's record of the pull request heads that became reviewable: one signal
+per pull request opened and per open pull request whose head a push moved
+(jeryu-deploy `docs/repo-automation.md`). The forge holds the request open until
+a head appears, so a push reaches an idle reviewer slot in about as long as the
+push took, while its gate is still running. Each reported head queues and then
+starts `pr-redteam-review@owner:repo:PR:head.service`, at most `REDTEAM_JOBS` at
+a time, so one long review delays no other head; the rest wait for a free slot
+and are started by a later poll. A head only leaves the queue once its unit
+started, the queue is bounded, and the cursor advances only over heads that are
+on disk, so a crash repeats a signal (which the per-PR review lock and the
+receipt make a no-op) rather than losing one.
+
+A signal only says a head appeared. The scoped review reads the pull request
+itself and applies every rule a pass applies -- the draft and author skips, the
+hold cap, the contribution budgets, the quality gate and publication -- and it
+reviews the pull request's live head, so a head pushed after the signal is
+reviewed as itself. Neither the watcher nor a scoped review carries the merger
+environment: nothing is landed from this path, and an approval still requires
+the base branch's required contexts to be green before the merge pass lands it.
+A forge that answers anything else, a forge whose sequence went backwards (a
+restart) and a watcher that was down all cost today's latency and nothing else:
+the five-minute pass and the 30-second poke remain the fallback.
 
 The reviewer skips its own authored PRs, contributed PRs whose review spend is
 used up, drafts unless explicitly included, and
@@ -591,8 +617,9 @@ maintainer list before any contribution is imported.
 
 ## Installation and service ownership
 
-`./install.sh` stages seven user units and reloads their definitions: review,
-heartbeat and poke services with timers, plus the failure-notification template.
+`./install.sh` stages nine user units and reloads their definitions: review,
+heartbeat and poke services with timers, the event-driven watcher and the scoped
+review template, plus the failure-notification template.
 It refuses to replace active or enabled units, and refuses to stage the
 operational units until their required site environment file exists. The existing
 service owner must explicitly stop/disable an earlier installation, qualify the
@@ -608,7 +635,8 @@ credential. Heartbeats report liveness through Jeryu's existing runner-reporting
 allowlist and include the latest poke result, so a failed poke appears in the
 runner's last activity on `/runners` and can be surfaced in Needs you. An
 authorization refusal is logged, not bypassed. Installation also refuses to
-replace the merge template while any of its instances is active. No scoped unit
+replace the merge or scoped-review template while any of its instances is
+active. No scoped unit
 is enabled or started by installation; activation belongs to the service owner.
 
 ## Review isolation
