@@ -214,6 +214,15 @@ trap 'baseline_signal 143' TERM
 git clone --quiet --no-local --no-hardlinks --single-branch --branch main \
   'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' \
   "${baseline_parent}/repo"
+# Protected main may move forward while this gate runs: the merge queue builds several entries at
+# once, and another one landing moves the tip. The baseline stays the tip this gate started from, which
+# must still be on protected main's history; a main that no longer contains it (rewritten, or a base
+# this gate was never given) still refuses.
+if ! git -C "${baseline_parent}/repo" merge-base --is-ancestor "${base_commit}" 'HEAD^{commit}' 2>/dev/null; then
+  printf 'protected-main baseline %s is not on the cloned protected main\n' "${base_commit}" >&2
+  exit 1
+fi
+git -C "${baseline_parent}/repo" -c advice.detachedHead=false checkout --quiet --detach "${base_commit}"
 if [[ "$(git -C "${baseline_parent}/repo" rev-parse 'HEAD^{commit}')" != \
       "${base_commit}" ||
       -n "$(git -C "${baseline_parent}/repo" status --porcelain=v1 \
