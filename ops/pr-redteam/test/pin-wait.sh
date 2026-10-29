@@ -316,5 +316,30 @@ done
 [[ "$(count "$t/model-calls")" == "$calls" ]] || fail 'accounting model call count'
 echo 'ok missing-only holds never spend the cap; mixed, failed, unknown and unverified claims count'
 
+# 12. A lane that never reports serves out the enabled default bound: inside it nothing is spent,
+#     at expiry the head is reviewed with the unresolved state, and the missing-only block still
+#     blocks without spending the cap, head after head. The signal names the wait it served out
+#     rather than the disabled-bound wording.
+protect '{"main": {"required_status_checks": {"contexts": ["acme/required"]}}}'
+contexts '[{"name":"acme/required","state":"missing"}]'
+for _attempt in 1 2 3; do
+  bump
+  jq -n "{verdict:\"block\",summary:\"Required evidence has not arrived\",findings:[$missing]}" >"$t/verdict"
+  REDTEAM_HOLD_CAP=99 review
+  [[ "$(count "$t/model-calls")" == "$calls" && ! -e "$(receipt)" ]] || fail 'a never-reporting lane was reviewed inside the bound'
+  jq --argjson e "$(( $(date +%s) - 5401 ))" '.first_seen_epoch = $e' "$(waitfile)" >"$t/w" && cat "$t/w" >"$(waitfile)"
+  REDTEAM_HOLD_CAP=99 review; calls=$((calls + 1))
+  [[ "$(count "$t/model-calls")" == "$calls" ]] || fail 'expired missing-only holds exhausted the hold cap'
+  grep -q 'waited [0-9]*s (bound 5400s) for its required contexts; still without a result: acme/required' "$t/signals.txt" \
+    || fail "the expiry signal did not name the wait it served out: $(cat "$t/signals.txt")"
+  ! grep -Fq 'admission wait is disabled' "$t/signals.txt" || fail 'an expired wait was reported as disabled'
+  jq -e '.decision == "hold" and .hold_kind == "gate" and .posted == true' "$(receipt)" >/dev/null \
+    || fail 'an expired missing-only hold was counted or left unpublished'
+  tail -1 "$t/posts" | jq -e '.verdict == "request_changes" and (.body_markdown | contains("required-context hold, not counted toward the hold limit"))' >/dev/null \
+    || fail 'the expired missing-only hold was waived or misreported'
+done
+rm -f "$t/verdict"
+echo 'ok a lane that never reports is reviewed at expiry and its blocking holds never spend the cap'
+
 [[ ! -e "$t/danger" ]] || fail "forbidden action: $(cat "$t/danger")"
 echo 'PIN WAIT PASS'
