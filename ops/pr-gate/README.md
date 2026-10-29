@@ -419,6 +419,12 @@ slot trees; tools in `PR_GATE_PINNED_TOOLS_FILE` (`name package version[,version
 missing, carry another digest, or whose installed dpkg version is not a reviewed one; and each family
 main's latest `<repo>/required` status. Exit 0: clean; 1: findings; 2: misconfigured.
 
+The runner does not gate release tags. The agreed rules for doing so -- what a pushed tag admits, how
+provenance decides the sandbox boundary, what the forge is allowed to be asked per tick, which branch a
+tag is proved against, and when a verdict becomes final -- are
+[ADR 0004](../../docs/adr/0004-release-tag-gating.md). This section describes the behaviour as each
+implementation PR lands it.
+
 ## Main health
 
 `pr-gate-runner.sh --main-health` gates each protected repository's current `main` with the same
