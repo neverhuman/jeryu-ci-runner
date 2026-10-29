@@ -584,6 +584,15 @@ o="$(evidence "$b" "$(snap family-fourteen)")"; upstream_max_pins="$saved_max"
 grep -q '13 more moved pins were not fetched (REDTEAM_UPSTREAM_MAX_PINS=1)' "$o/upstream/SUMMARY.txt" || fail 'family pin truncation hidden'
 ok 'family locks collect changed/new pins, ignore unchanged pins, reject malformed input and disclose limits'
 
+# More changed manifests than upstream_pins reads leaves pin movement unknown for all of them,
+# rather than silently analysing the first fifty and reporting the rest as unmoved.
+dep manyfiles; echo init | put readme; b="$(snap many-base)"
+for i in $(seq 1 51); do inline "$r3" | put "c$i/Cargo.toml"; done
+o="$(evidence "$b" "$(snap many-head)")"
+grep -q 'NOT ANALYSED.*pin movement is unknown' "$o/upstream/SUMMARY.txt" || fail "51 changed manifests were analysed in part: $(cat "$o/upstream/SUMMARY.txt")"
+[ ! -s "$t/api.log" ] || fail 'a partially read manifest set was fetched'
+ok 'more changed manifests than are read reports pin movement unknown, not a partial pin list'
+
 # 13. No moved pin, no upstream/.
 dep plain; inline "$r1" | put Cargo.toml; b2="$(snap base)"
 echo x | put readme; o="$t/plain"; mkdir -p "$o"

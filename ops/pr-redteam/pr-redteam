@@ -1210,6 +1210,11 @@ upstream_url_map() { # < gitconfig
 # status is `fetch` (pinned at the base, on or mapped to this forge), `new-pin-unverified` or
 # `unmapped-host`; only `fetch` rows are fetched. A lock entry is pinned at the base when the same
 # file has a `[[repo]]` with the same `repo =` name there, and moves when its commit or tag changes.
+# A family.lock `[[repo]]` the change introduces is `fetch`: a release composition's new member is
+# source the dependent ships, so it gets its own forge evidence rather than being reported unpinned.
+# The whole analysis collapses to the single row `not-analysed` when any manifest could not be read:
+# an unparsable or oversized release lock, or more changed manifests than this function reads. Pin
+# movement is then unknown, and no partial pin list is reported in its place.
 upstream_pins() { # git-dir base head default-owner
   local g="$1" b="$2" h="$3" owner="$4" f kind map n=0
   local -a files=()
@@ -1816,10 +1821,9 @@ upstream_pin_evidence() { # cache-root review-dir owner/name old new named-branc
     # A newly introduced repository has no reviewed base: expose its entire tree,
     # bounded by the same evidence budget, without claiming prior review coverage.
     notes+=("new lock pin: diff.patch compares the empty tree with the pinned repository")
-    local empty_tree
+    local empty_tree limit
     empty_tree="$(git -C "$g" hash-object -t tree --stdin </dev/null)"
     limit=$((allow - log_bytes - stat_bytes)); [ "$limit" -gt 0 ] || limit=0
-    diff_fetched=true
     diff_bytes="$(git -C "$g" diff --no-renames "$empty_tree" "$new_full" 2>/dev/null |
       upstream_capped "$dir/diff.patch" "$limit")" || { diff_cut=true; notes+=("diff.patch cut at $diff_bytes bytes (the upstream evidence budget)"); }
     up_left=$((up_left > diff_bytes ? up_left - diff_bytes : 0))

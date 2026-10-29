@@ -751,6 +751,11 @@ unsupported input produces `NOT ANALYSED` in the upstream summary, never a claim
 that no pins moved. Repository names resolve under the dependent owner on the
 configured forge; lock URLs and local paths cannot select a fetch target.
 New family members get forge ancestry/tag evidence and a bounded full-tree diff,
-without claiming independent review coverage. Unchanged commit/tag pairs are
-omitted. The existing pin and byte budgets still apply: a fourteen-pin release
-can exceed the pin limit, and the summary reports how many were not fetched.
+without claiming independent review coverage: a release composition's new member
+is source the dependent ships, so `family.lock` fetches a `[[repo]]` the change
+introduces instead of reporting it `new-pin-unverified`, as a `*.lock.toml`
+entry new at the head still is. Unchanged commit/tag pairs are omitted. The
+existing pin and byte budgets still apply: a fourteen-pin release can exceed the
+pin limit, and the summary reports how many were not fetched. More changed
+manifests than `upstream_pins` reads is also `NOT ANALYSED`, for the whole
+change rather than for the manifests past the limit.
