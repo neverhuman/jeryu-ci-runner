@@ -129,9 +129,9 @@ mod tests {
         // open descriptor of the directory, which keeps the path short. The
         // path needs a mounted /proc (this crate drives Firecracker, which is
         // Linux-only) and names this process's descriptor, so it is valid only
-        // here and only while `directory` is open. Declaration order already
-        // drops `directory` last; the explicit drop below only keeps that true
-        // if the fixture is reordered.
+        // here and only while `directory` is open. `directory` is declared
+        // before the listener and the server thread, so it is dropped after
+        // `put` returns and the server joins; keep it declared first.
         let directory = std::fs::File::open(temporary.path())?;
         let socket = std::path::PathBuf::from(format!(
             "/proc/self/fd/{}/api.sock",
@@ -156,7 +156,6 @@ mod tests {
         let result = put(&socket, "/actions", serde_json::json!({}));
         let _ = release.send(());
         server.join().unwrap();
-        drop(directory);
         result
     }
 
