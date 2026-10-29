@@ -118,3 +118,28 @@ printf 'changed tool bytes\n' >"$fixture/tools/environment-probe"
 run_tier --branch release/tiers
 expect_count 13
 printf 'PASS branch-tip greens require complete full identities on tiered repositories\n'
+
+# Compatibility: tier membership is the repository's. A repository whose recipes do not
+# include required-fast gates exactly as today -- one full run on the full context, no
+# protection-driven tier, no tier journal -- even when the base's enforced contexts name
+# the fast context.
+rm "$fixture/two-tiers"
+printf 'main\n' >"$fixture/pr-base-ref"
+jq -nc --arg sha "$head" '[{kind:"branch",name:"main",sha:$sha,protected:true}]' >"$fixture/refs.json"
+jq -nc '{required_status_checks:{contexts:["fixture/fast"]}}' >"$fixture/protection.json"
+printf 'pass\n' >"$fixture/source/mode"
+printf 'untiered head\n' >"$fixture/source/untiered"
+"$real_git" -C "$fixture/source" add mode untiered
+"$real_git" -C "$fixture/source" commit -qm untiered-repository
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+"$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
+head=$(cat "$fixture/head")
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+run_tier
+expect_count 14
+[[ "$(tail -1 "$fixture/recipes")" == required ]] || fail_tier 'an untiered repository did not run full validation'
+jq -se --argjson n "$before_statuses" '.[$n:] | all(.context == "fixture/required")' "$fixture/statuses.jsonl" >/dev/null
+last_tier | jq -e '.state == "success"' >/dev/null
+[[ ! -e "$fixture/runner/attempts/acme-fixture-$head/tiered" ]] || fail_tier 'an untiered head recorded a tier'
+[[ ! -d "$fixture/runner/attempts/acme-fixture-$head/tiers" ]] || fail_tier 'an untiered head kept a tier journal'
+printf 'PASS a repository without required-fast gates full validation as today\n'
