@@ -617,6 +617,7 @@ gate_inputs() {
   # Bind all actual family sources, locks, executable tools and external fixtures.
   # The full identity is retained, so cache invalidation can be independently read.
   local output=$1 directory lock_digest head tree origin clean
+  GATE_INPUTS_ERROR=""
   local rows="$output.rows" inputs="$output.inputs" versions="$output.versions"
   : >"$rows" || return
   : >"$inputs" || return
@@ -624,7 +625,14 @@ gate_inputs() {
   for directory in "$run"/*; do
     [[ -d "$directory/.git" ]] || continue
     clean=$(git -C "$directory" status --porcelain --untracked-files=normal) || return
-    [[ -z "$clean" ]] || return 1
+    if [[ -n "$clean" ]]; then
+      # Keep diagnostics outside the portable identity. Porcelain quotes unusual paths;
+      # retain at most 20 lines, without reading or publishing any file contents.
+      GATE_INPUTS_ERROR="dirty repository $owner/$(basename -- "$directory") (first 20 porcelain lines):
+$(printf '%s\n' "$clean" | sed -n '1,20p')"
+      printf '%s\n' "$GATE_INPUTS_ERROR" >&2
+      return 1
+    fi
     # A directory with a .git but no commits is not an input: a repository with only a scaffold
     # branch and no mirror, so its slot checkouts were empty, and 'rev-parse HEAD' is a fatal there.
     # That fatal used to leave through the unguarded caller and end the whole tick with exit 128; the
@@ -968,7 +976,8 @@ gate_publication_fault() {
 gate_publish() {
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
   local steps_dir="" steps_end="" status_payload check_payload proof_base
-  local check_state title changed="" step_state fault
+  local check_state title changed="" step_state fault capture_error
+  capture_error=$(jq -r '.input_capture_error // ""' "$gate_receipt")
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -987,7 +996,7 @@ gate_publish() {
       | select(.repository | test("^[A-Za-z0-9._-]+$"))
       | select((.head | test("^[0-9a-f]{40}$")) and ($before.head | test("^[0-9a-f]{40}$")))
       | "\(.repository): \($before.head) -> \(.head)"] | join("; ")' "$gate_receipt")
-    changed=${changed:-tools, fixtures, or working-tree inputs changed}
+    changed=${capture_error:-${changed:-tools, fixtures, or working-tree inputs changed}}
     title="Passed, but inputs changed during the run ($changed); re-running on the next tick"
     # Only a pull-request head of a scheduled pass is held (see inputs_changed_holds in the runner);
     # --branch, --main-health and merge-queue gates re-run on each pass however long the chain.
@@ -1035,7 +1044,7 @@ gate_publish() {
   proof_base=$(gate_proof_base_field "$gate_receipt") || proof_base=""
   if ! jq -e '.publication.required_status' "$gate_receipt" >/dev/null; then
     status_payload=$(jq -nc --arg state "$state" --arg context "$context" \
-      --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${inputs:+; inputs $inputs}${proof_base:+; $proof_base}${cause:+; cause: $cause}" \
+      --arg description "$MARKER $kind $outcome; exit $exit_code; attempt $id; log $digest${inputs:+; inputs $inputs}${proof_base:+; $proof_base}${cause:+; cause: $cause}${capture_error:+; input capture: $capture_error}" \
       '{state:$state,context:$context,description:$description}')
     # An empty response is an unacknowledged publication, not a shell invariant failure.
     gate_api_retry POST "/repos/$owner/$repo/statuses/$sha" "$(jq -c --arg url "$checks_url" \

@@ -114,6 +114,12 @@ fi
 if [[ -f "$fixture_root/mutate-tool" ]]; then
   printf 'changed during recipe\n' >>"$fixture_root/tools/environment-probe"
 fi
+if [[ -f "$fixture_root/dirty-inputs" ]]; then
+  printf 'pass\n' >>mode
+  for n in $(seq -w 1 24); do printf 'private content\n' >"dirty path $n"; done
+  # Both zero and nonzero recipes keep their original verdict semantics.
+  exit "$(cat "$fixture_root/dirty-inputs")"
+fi
 printf 'error: expected rejection in a passing negative test\n'
 # Step lines, one of them the gate's own credential: what a head's recipe may print, never publish.
 printf '[pr-ci] fixture recipe step\n==> %s\n' "$(cat "$fixture_root/token")"
@@ -1583,6 +1589,29 @@ invoke
 expect_count "$((before_count + 4))"
 jq -e '.inputs_changed_count == 1' "$receipt" >/dev/null
 printf 'PASS passing input drift is neutral, re-runs first on the next two ticks (one recipe per tick, coalesced with a merge burst), then holds until a forge re-gate request; a truncated receipt never kills a tick\n'
+
+# Failed after-run capture carries the same bounded diagnostic into the attempt
+# log, durable receipt and published status, for passing and failing recipes.
+rm -f "$fixture/mutate-tool"
+for recipe_exit in 0 7; do
+  printf '%s\n' "$recipe_exit" >"$fixture/dirty-inputs"
+  invoke --repo acme/fixture --pr 1
+  [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+  receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
+  diagnostic="dirty repository acme/fixture (first 20 porcelain lines):
+$("$real_git" -C "$fixture/runner/tree/fixture" status --porcelain --untracked-files=normal | sed -n '1,20p')"
+  jq -e --arg error "$diagnostic" --argjson rc "$recipe_exit" '
+    .terminal and .outcome == "inputs_changed" and .exit_code == $rc and
+    .input_capture_error == $error and .publication.required_status and .publication.check_run' "$receipt" >/dev/null
+  [[ "$(tail -n 21 "$(jq -r .log "$receipt")")" == "$diagnostic" ]]
+  jq -se --arg error "$diagnostic" 'last | .state == "error" and
+    (.description | contains($error)) and (.description | contains("private content") | not)' "$fixture/statuses.jsonl" >/dev/null
+  jq -se --arg error "$diagnostic" --argjson rc "$recipe_exit" 'last |
+    .conclusion == (if $rc == 0 then "neutral" else "failure" end) and
+    (.output.title | contains($error))' "$fixture/check-runs.jsonl" >/dev/null
+done
+rm -f "$fixture/dirty-inputs"
+printf 'PASS dirty after-run capture publishes repository and bounded paths without changing verdicts\n'
 
 # Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.
 rm -f "$fixture/mutate-tool"

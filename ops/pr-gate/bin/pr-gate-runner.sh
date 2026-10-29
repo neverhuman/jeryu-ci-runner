@@ -2025,9 +2025,12 @@ state=success
 ((worker_exit == 0)) || state=failure
 ((worker_exit != 124 && worker_exit != 137)) || state=timed_out
 after_inputs="$gate_attempt_dir/after-inputs.json"
-if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" \
+if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" 2>>"$log" \
   || ! jq -e --slurpfile after "$after_inputs" '.inputs == $after[0]' "$gate_receipt" >/dev/null; then
   state=inputs_changed
+  if [[ -n "$GATE_INPUTS_ERROR" ]]; then
+    gate_update --arg error "$GATE_INPUTS_ERROR" '.input_capture_error=$error'
+  fi
   gate_update --argjson count "$((inputs_changed_count + 1))" '.inputs_changed_count=$count' \
     || say "could not record the inputs_changed chain of $owner/$repo@$sha"
   if jq -e 'type == "object"' "$after_inputs" >/dev/null 2>&1; then

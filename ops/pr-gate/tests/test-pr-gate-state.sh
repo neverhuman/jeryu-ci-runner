@@ -307,6 +307,41 @@ jq -e '[.sources[].repository] == ["real"]' "$inputs_probe/inputs.json" >/dev/nu
   || { printf 'gate_inputs did not skip the commitless directory\n' >&2; cat "$inputs_probe/inputs.json" >&2; exit 1; }
 printf 'PASS gate inputs: a directory with no commits is skipped, not fatal\n'
 
+# Dirty siblings name the actual checkout, not the requested repository. Bound the
+# diagnostic and clear it at each capture so an older failure cannot leak forward.
+(
+  printf 'changed\n' >>"$inputs_probe/tree/real/file"
+  for n in $(seq -w 1 24); do printf 'private content\n' >"$inputs_probe/tree/real/path $n"; done
+  expected="dirty repository acme/real (first 20 porcelain lines):
+$(git -C "$inputs_probe/tree/real" status --porcelain --untracked-files=normal | sed -n '1,20p')"
+  run="$inputs_probe/tree" owner=acme repo=unrelated recipe_name="just required"
+  capture_rc=0
+  gate_inputs "$inputs_probe/dirty.json" 2>"$inputs_probe/dirty.err" || capture_rc=$?
+  [[ "$capture_rc" == 1 && "$GATE_INPUTS_ERROR" == "$expected" ]]
+  [[ "$(cat "$inputs_probe/dirty.err")" == "$expected" ]]
+  [[ "$(wc -l <"$inputs_probe/dirty.err")" == 21 ]]
+  ! grep -q 'private content' "$inputs_probe/dirty.err"
+  # Persisted diagnostics remain publishable after the process-local variable is gone.
+  gate_begin "$identity"
+  gate_update --arg error "$GATE_INPUTS_ERROR" '.input_capture_error=$error'
+  printf '%s\n' "$GATE_INPUTS_ERROR" >"$gate_attempt_dir/build.log"
+  gate_finish inputs_changed 0 "$gate_attempt_dir/build.log"
+  unset GATE_INPUTS_ERROR
+  gate_publish
+  jq -se --arg error "$expected" '.[-2] | .state == "error" and
+    (.description | contains($error))' "$scratch/published.jsonl" >/dev/null
+  jq -se --arg error "$expected" 'last | .conclusion == "neutral" and
+    (.output.title | contains($error))' "$scratch/published.jsonl" >/dev/null
+  git -C "$inputs_probe/tree/real" restore file
+  for n in $(seq -w 1 24); do rm -- "$inputs_probe/tree/real/path $n"; done
+  run="$scratch/absent-tree"
+  gate_input_tools() { return 1; }
+  GATE_INPUTS_ERROR=previous
+  if gate_inputs "$inputs_probe/tool-error.json"; then exit 1; fi
+  [[ -z "$GATE_INPUTS_ERROR" ]]
+)
+printf 'PASS dirty input capture names the sibling and first 20 paths; receipt survives publication recovery\n'
+
 
 # A fixture or vendor tree being written by a live build must not end the gate: scratch is excluded and
 # a file that vanishes between find and hash is recorded, not fatal.
