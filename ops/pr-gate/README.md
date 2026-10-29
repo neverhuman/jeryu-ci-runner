@@ -213,9 +213,11 @@ starts an idle slot the moment it learns a head can be gated, from two sources:
 Before starting any slot, the waker saves every new head hint as one line of
 `~/gate-runner/cache/wake-dispatch` (`<owner/repo> <number|-> <sha|-> <source> <when|->`). The runner
 takes one line per tick -- a main-health pass from `cache/wake-main-dispatch` instead, so the two
-never take each other's lines -- and gates that head first of the pull-request heads its own pass found --
-merge-queue entries still come first, each being one gate from landing -- and dates the queue wait
-from `<when>`. The line decides nothing else: the tick still lists, chooses, claims and gates heads
+never take each other's lines -- and dates the queue wait from `<when>`. Its pass picks candidates in this order: merge-queue entries
+first, each being one gate from landing; then explicitly requested re-gates; then the woken head;
+then the other pull-request heads. A woken head therefore never jumps ahead of a re-gate someone
+asked for. A candidate that cannot start (for example its repository or head is already claimed or
+busy) is skipped cheaply and does not stop the pass: later candidates are still tried in order. The line decides nothing else: the tick still lists, chooses, claims and gates heads
 by the ordinary rules, which is what keeps the slot timers a sufficient fallback. Hints survive busy
 slots and failed service starts for the next scheduled tick (normally 20–25 seconds after a slot
 finishes). Saving hints happens before acknowledging the signal or updating the observed PR view;
