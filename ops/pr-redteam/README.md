@@ -241,6 +241,19 @@ maintainer approves has to be readable from the log, and an unconfigured git
 writes a name that says nothing. This decides only whether a head is reviewed,
 so it does not move `review_format`: a head already reviewed keeps its receipt.
 
+## Lock-source report
+
+`signals.txt` carries a lock-source section from `lock-source-report`, a shell wrapper that runs `python3 -I`. The
+changed-file list is read NUL-delimited (`files.nul`), so no path is parsed from git's quoted form.
+Each changed `Cargo.lock` is read at the base and at the head and parsed with the standard library's
+TOML parser (no awk, grep or sed reads TOML). The `[[package]]` entries (name, version, source,
+checksum, replace) and the `[patch]`, `[replace]` and `[metadata]` tables are compared as sets and
+reported as ADDED, REMOVED or CHANGED. An added or deleted lock file is moved and is reported per file.
+A lock that is missing at both revisions, fails to parse (a repeated key included), or is over a limit
+(8 MiB, 20000 entries, 50 files) is NOT ANALYSED, and the summary never says nothing moved while any
+lock is. Every value is printed as a JSON string. Stated limit: dependency edges are not compared.
+Suite: `test/lock-source.sh`.
+
 ## Upstream evidence for a git-pin bump
 
 When a change moves a git dependency's revision (a `rev =` in Cargo.toml, inline or in a

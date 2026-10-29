@@ -257,7 +257,7 @@ mkdir -p "$state"/{receipts,cache,locks,work}
 # sees or how its verdict becomes a decision: the diff, description, signals or other context handed
 # to the agent; the mechanical holds (unpinned blobs, diff size, author domains, the quality gate);
 # the mapping from verdict to approve/hold; or the rendering of the posted review.
-review_format=10
+review_format=11
 
 # A receipt counts as "already reviewed" only for the same review inputs: the review format above,
 # the prompt, the verdict schema and validator, the exact CLI bytes, the model, the CLI pin and the
@@ -1918,6 +1918,22 @@ upstream_evidence() { # git-dir base head review-dir default-owner budget
 
 # --- one review ----------------------------------------------------------------------------------
 
+# The changed paths, one per line, read NUL-delimited so no path is quoted or escaped (git quotes
+# non-ASCII, quote and backslash paths on the default listing and then no path matches a file on
+# either side). A newline inside a path cannot be one line, so it is shown as '?'. The exact list is
+# kept in $4 (NUL-delimited) for consumers that must open each path.
+changed_files() { # git-dir base head nul-out-file
+  git -C "$1" -c core.quotePath=false diff -z --name-only "$2...$3" >"$4" || return 1
+  tr '\0\n' '\n?' <"$4"
+}
+
+# Which Cargo.lock sources the change moves: the locks parsed as TOML data at both revisions
+# (lock-source-report). A report that cannot run says so; it never reads as "nothing moved".
+lock_source_report() { # git-dir base head files.nul
+  timeout 300 "$here/lock-source-report" "$1" "$2" "$3" "$4" 2>/dev/null ||
+    echo "NOT ANALYSED: the lock-source report did not run; lock sources are unknown, do not read this as no movement"
+}
+
 # Mechanical leads for the agent: secret patterns on added lines, sensitive paths, binaries.
 signals() { # review-dir
   local d="$1"
@@ -2296,13 +2312,14 @@ review_one() { # owner/name number dry-run force include-drafts
   git -C "$cache" log --stat --format='commit %H%nAuthor: %an <%ae>%nDate: %aI%n%n%B' "$base_sha..$sha" >"$d/log.txt"
   git -C "$cache" diff --stat=200 "$base_sha...$sha" >"$d/stat.txt"
   git -C "$cache" diff --numstat "$base_sha...$sha" >"$d/numstat.txt"
-  git -C "$cache" diff --name-only "$base_sha...$sha" >"$d/files.txt"
+  changed_files "$cache" "$base_sha" "$sha" "$d/files.nul" >"$d/files.txt"
   # Lock files stay in files.txt/stat.txt and are listed in signals.txt, but not in the diff the agent
   # reads: they are the bulk of large PRs and are verified by the required lanes, not by reading.
   git -C "$cache" diff "$base_sha...$sha" -- . ':(exclude,glob)**/*.lock' ':(exclude,glob)**/package-lock.json' \
     ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/yarn.lock' ':(exclude,glob)**/go.sum' >"$d/diff.patch"
   git -C "$cache" archive "$sha" | tar -x -C "$d/checkout"
   signals "$d"
+  { echo; lock_source_report "$cache" "$base_sha" "$sha" "$d/files.nul"; } >>"$d/signals.txt"
   { echo; required_contexts_signal "$row" "$repo" "$number" "$sha"; } >>"$d/signals.txt"
   local diff_bytes files_count; diff_bytes="$(wc -c <"$d/diff.patch")"; files_count="$(wc -l <"$d/files.txt")"
   # Upstream evidence is reading the agent is told to do, so it shares the diff's size limit: at most
@@ -3645,7 +3662,7 @@ while [ $# -gt 0 ]; do
     --jobs) jobs="$2"; shift ;;
     --repo) only_repo="$2"; shift ;;
     --pr) only_pr="$2"; shift ;;
-    *) [ "$cmd" = _review ] || [ "$cmd" = _review_scoped ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _owner_decision ] || [ "$cmd" = _owner_satisfy ] || [ "$cmd" = _owner_body ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = _holds ] || [ "$cmd" = show ] || [ "$cmd" = rearm ] || die "unknown option $1"; break ;;
+    *) [ "$cmd" = _review ] || [ "$cmd" = _review_scoped ] || [ "$cmd" = _agent ] || [ "$cmd" = _blobs ] || [ "$cmd" = _files ] || [ "$cmd" = _locks ] || [ "$cmd" = _owner_decision ] || [ "$cmd" = _owner_satisfy ] || [ "$cmd" = _owner_body ] || [ "$cmd" = _gate ] || [ "$cmd" = _merge ] || [ "$cmd" = _merge_scoped ] || [ "$cmd" = _holds ] || [ "$cmd" = show ] || [ "$cmd" = rearm ] || die "unknown option $1"; break ;;
   esac
   shift
 done
@@ -3734,6 +3751,10 @@ case "$cmd" in
     satisfy_owner_decision "$(cat "$1")" "$(cat "$2")" ;;
   _owner_body) # internal/testing: verdict.json decision sha origin decision.json [hold-kind hold-number capped] -> review body
     render_body "$(cat "$1")" "$2" "$3" "$4" "$(cat "$5")" "${6:-agent}" "${7:-1}" "${8:-0}" ;;
+  _files) # internal/testing: git-dir base head nul-out-file -> changed paths, one per line
+    changed_files "$1" "$2" "$3" "$4" ;;
+  _locks) # internal/testing: git-dir base head files.nul -> the lock-source report
+    lock_source_report "$1" "$2" "$3" "$4" ;;
   _blobs) # internal/testing: git-dir base head diff.patch -> unpinned binaries (no forge calls)
     unpinned_blobs "$1" "$2" "$3" "$4" ;;
   _agent) # internal/testing: review-dir tag sha -> verdict JSON (no forge calls)

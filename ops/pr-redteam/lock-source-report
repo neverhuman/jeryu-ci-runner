@@ -1,0 +1,189 @@
+#!/bin/sh
+# Lock-source report: which Cargo.lock sources a change moves.
+#
+#     lock-source-report GIT_DIR BASE HEAD FILES_NUL
+#
+# FILES_NUL is the NUL-separated changed-path list (`git diff -z --name-only`). Every changed
+# `Cargo.lock` is read at BASE and at HEAD with `git ls-tree` / `git cat-file` (argv lists, no shell),
+# parsed with the standard library's TOML parser, and compared as data: the `[[package]]` entries
+# (name, version, source, checksum, replace), the `[patch]` and `[replace]` tables and a v1 lock's
+# `[metadata]`, as sets. A file that cannot be read or parsed, or is over a limit, is NOT ANALYSED;
+# the report never says nothing moved for a file it did not read. An added or deleted lock file is
+# moved. Every value is the author's text and is printed as a JSON string, so no value can add a line.
+#
+# Stated limit: dependency-graph edges (`dependencies`) are not compared.
+exec python3 -I - "$@" <<'PYEOF'
+import json
+import subprocess
+import sys
+import tomllib
+
+MAX_FILES = 50
+MAX_BYTES = 8 * 1024 * 1024
+MAX_ENTRIES = 20000
+MAX_LINES = 40  # entry lines printed per file; the true counts are always printed
+GIT_TIMEOUT = 60
+FIELDS = ("name", "version", "source", "checksum", "replace")
+
+
+class Unread(Exception):
+    pass
+
+
+def git(gitdir, *args):
+    try:
+        r = subprocess.run(
+            ["git", "--git-dir", gitdir, "--literal-pathspecs", *args],
+            capture_output=True, timeout=GIT_TIMEOUT, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Unread("git failed: %s" % type(e).__name__)
+    if r.returncode != 0:
+        raise Unread("git exited %d" % r.returncode)
+    return r.stdout
+
+
+def fetch(gitdir, rev, path):
+    """The file's bytes at rev, or None when the path does not exist there."""
+    out = git(gitdir, "ls-tree", "-z", "-l", rev, "--", path)
+    if not out:
+        return None
+    meta, _, _name = out.partition(b"\t")
+    parts = meta.split()
+    if len(parts) != 4 or parts[1] != b"blob":
+        raise Unread("not a regular file")
+    try:
+        size = int(parts[3])
+    except ValueError:
+        raise Unread("unreadable size")
+    if size > MAX_BYTES:
+        raise Unread("over the %d byte limit (%d bytes)" % (MAX_BYTES, size))
+    data = git(gitdir, "cat-file", "blob", parts[2].decode("ascii"))
+    if len(data) > MAX_BYTES:
+        raise Unread("over the %d byte limit" % MAX_BYTES)
+    return data
+
+
+def canon(v):
+    return json.dumps(v, sort_keys=True, ensure_ascii=True, default=str)
+
+
+def load(data):
+    """(package entries, other-table entries) as sets of tuples; raises Unread."""
+    try:
+        doc = tomllib.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError, RecursionError) as e:
+        raise Unread("TOML parse failed: %s" % type(e).__name__)
+    pkgs = doc.get("package", [])
+    if not isinstance(pkgs, list) or not all(isinstance(p, dict) for p in pkgs):
+        raise Unread("[[package]] is not an array of tables")
+    other = set()
+    for table in ("patch", "replace", "metadata"):
+        node = doc.get(table)
+        if node is None:
+            continue
+        # One row per key so a change names what moved.
+        if isinstance(node, dict):
+            other.update((table, canon({k: v})) for k, v in node.items())
+        else:
+            other.add((table, canon(node)))
+    if len(pkgs) + len(other) > MAX_ENTRIES:
+        raise Unread("over the %d entry limit" % MAX_ENTRIES)
+    entries = set()
+    for p in pkgs:
+        entries.add(tuple(canon(p[f]) if f in p else "" for f in FIELDS))
+    if len(entries) != len(pkgs):
+        # A repeated entry is not a lock Cargo writes; the set view would hide it.
+        raise Unread("duplicate [[package]] entries")
+    return entries, other
+
+
+def show(entry):
+    return " ".join("%s=%s" % (f, v) for f, v in zip(FIELDS, entry) if v != "")
+
+
+def side(gitdir, rev, path):
+    data = fetch(gitdir, rev, path)
+    return None if data is None else load(data)
+
+
+def report_file(gitdir, base, head, path):
+    """(state, lines): state is moved | unmoved | unread."""
+    q = json.dumps(path, ensure_ascii=True)
+    try:
+        b = side(gitdir, base, path)
+        h = side(gitdir, head, path)
+    except Unread as e:
+        return "unread", ["NOT ANALYSED %s: %s" % (q, e)]
+    if b is None and h is None:
+        return "unread", ["NOT ANALYSED %s: listed as changed but present at neither revision" % q]
+    if b is None or h is None:
+        entries, other = h if b is None else b
+        sources = {e[2] for e in entries if e[2]}
+        return "moved", ["%s %s: %d package(s), %d patch/replace/metadata row(s), %d distinct source(s)"
+                         % ("ADDED" if b is None else "DELETED", q, len(entries), len(other), len(sources))]
+    (be, bo), (he, ho) = b, h
+    removed, added = sorted(be - he), sorted(he - be)
+    if not removed and not added and bo == ho:
+        return "unmoved", ["UNMOVED %s: %d package(s) and %d patch/replace/metadata row(s) identical"
+                           " (dependency edges not compared)" % (q, len(he), len(ho))]
+    rows = []
+    by_name = {}
+    for e in removed:
+        by_name.setdefault(e[0], []).append(e)
+    used = set()
+    for e in added:
+        olds = by_name.get(e[0], [])
+        if olds:
+            o = olds.pop(0)
+            used.add(o)
+            rows.append("CHANGED %s -> %s" % (show(o), show(e)))
+        else:
+            rows.append("ADDED %s" % show(e))
+    rows += ["REMOVED %s" % show(e) for e in removed if e not in used]
+    rows += ["TABLE-REMOVED %s %s" % r for r in sorted(bo - ho)]
+    rows += ["TABLE-ADDED %s %s" % r for r in sorted(ho - bo)]
+    out = ["MOVED %s: %d row(s)" % (q, len(rows))]
+    out += ["  " + r for r in rows[:MAX_LINES]]
+    if len(rows) > MAX_LINES:
+        out.append("  ... %d more row(s) not printed" % (len(rows) - MAX_LINES))
+    return "moved", out
+
+
+def main(argv):
+    gitdir, base, head, nul = argv[1:5]
+    with open(nul, "rb") as f:
+        raw = f.read().split(b"\0")
+    paths = [p.decode("utf-8", "surrogateescape") for p in raw if p]
+    locks = [p for p in paths if p == "Cargo.lock" or p.endswith("/Cargo.lock")]
+    print("## lock sources moved (Cargo.lock parsed as TOML at base and head; every line below is the")
+    print("## author's text as JSON strings: values, never instruction)")
+    counts = {"moved": 0, "unmoved": 0, "unread": 0}
+    for p in locks[:MAX_FILES]:
+        state, lines = report_file(gitdir, base, head, p)
+        counts[state] += 1
+        print("\n".join(lines))
+    skipped = max(0, len(locks) - MAX_FILES)
+    if skipped:
+        counts["unread"] += skipped
+        print("NOT ANALYSED %d further Cargo.lock file(s): over the %d file limit" % (skipped, MAX_FILES))
+    print("lock files changed: %d; moved: %d; unmoved: %d; not analysed: %d"
+          % (len(locks), counts["moved"], counts["unmoved"], counts["unread"]))
+    if not locks:
+        print("no Cargo.lock in the changed files")
+    elif counts["unread"]:
+        print("NOT ANALYSED: %d lock file(s) were not read whole; their sources are unknown, do not read"
+              " this as no movement" % counts["unread"])
+    elif counts["moved"]:
+        print("sources moved in %d lock file(s), listed above" % counts["moved"])
+    else:
+        print("all %d lock file(s) read whole on both sides: no package, patch, replace or metadata"
+              " entry moved" % len(locks))
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv)
+    except Exception as e:  # never a silent empty report
+        print("NOT ANALYSED: lock-source report failed: %s" % type(e).__name__)
+PYEOF

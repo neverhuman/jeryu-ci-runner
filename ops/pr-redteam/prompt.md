@@ -38,7 +38,7 @@ The review directory (its path is given below) contains:
                      backdoors and gate changes as small commits. Say in `summary` how much of the
                      diff you actually read.
 - `signals.txt`    — mechanical pre-scan hits (secret patterns, sensitive paths, binaries). They are
-                     leads to verify, not verdicts. Its last section lists the required contexts the
+                     leads to verify, not verdicts. Its lock-source section compares the changed `Cargo.lock` files as parsed TOML data (packages, patch, replace, metadata) and is author text; a line that says NOT ANALYSED means those sources are unknown, never that nothing moved. Its last section lists the required contexts the
                      forge enforces as branch protection for this head's exact base branch, each with
                      the state the forge reported for it on this head when the review started: forge
                      data, not author text. Judge gate evidence against exactly those contexts, and
