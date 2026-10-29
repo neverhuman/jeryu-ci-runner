@@ -71,6 +71,12 @@ purpose = "host CI wrapper compile, metadata, security, and score parity"
 requires_network = true
 
 [[lane]]
+name = "pr-gate"
+command = "bash ops/pr-gate/tests/required.sh"
+purpose = "offline gate runner scheduling, publication recovery, lifecycle, and installer regressions"
+requires_network = false
+
+[[lane]]
 name = "proof-evidence"
 command = "bash ops/ci/proof_evidence.sh"
 purpose = "exact-head proof receipts ratcheted against the forge's audit of protected main; needs a clean head sharing history with protected main (change set from its fork point; an empty one, as on main itself, passes), origin = the hosted repository, and the forge (docs/testing.md)"
