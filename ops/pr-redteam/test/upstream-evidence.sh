@@ -273,17 +273,41 @@ grep -q "^new-pin-unverified	" <<<"$rows" || fail "unmapped old source was trust
 source_mappings=" https://github.example/org/other=acme/core"
 rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
 grep -q "^new-pin-unverified	" <<<"$rows" || fail "a different URL mapping applied: $rows"
-source_mappings=" https://github.example/org/core=acme/core"
+source_mappings=" https://github.example/org/core=acme/core https://github.example/org/other=acme/big"
 rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
-grep -qx "$(printf 'fetch\tacme/core\t%s\t%s\t\tx\thttps://forge.test/git/acme/core' "$r1" "$r3")" <<<"$rows" || fail "source mapping: $rows"
+[ "$rows" = "$(printf 'fetch\tacme/core\t%s\t%s\t\tx\thttps://forge.test/git/acme/core\t\t\t\t\thttps://github.example/org/core' "$r1" "$r3")" ] || fail "source mapping must emit exactly one annotated row: $rows"
 o="$(evidence "$b" "$h")"
 [ "$(field "$(pin_of "$o" "$r3")" status)" = merged-tip ] || fail "mapped evidence: $(cat "$o/upstream/SUMMARY.txt")"
+grep -qF 'base source https://github.example/org/core mapped to acme/core by REDTEAM_SOURCE_MAPPINGS; head source https://forge.test/git/acme/core' "$o/upstream/SUMMARY.txt" || fail 'mapping provenance absent from summary'
 # A different dependency the PR adds is still new, whatever the mapping says.
 printf '[dependencies]\nx = { git = "https://forge.test/git/acme/core.git", rev = "%s" }\ny = { git = "https://forge.test/git/acme/core.git", rev = "%s" }\n' "$r3" "$r3" | put Cargo.toml; h2="$(snap added)"
 rows="$(upstream_pins "$D/.git" "$b" "$h2" acme | tr '\037' '\t')"
-grep -q "^new-pin-unverified	" <<<"$rows" || fail "an added dependency was trusted: $rows"
+grep -q $'^new-pin-unverified\t' <<<"$rows" || fail "an added dependency was trusted: $rows"
+# The operator entry applies only to the old source. Moving off the forge remains unmapped.
+gh https://forge.test/git/acme/core.git "$r1" | put Cargo.toml; b="$(snap forge-base)"
+gh https://github.example/org/core.git "$r3" | put Cargo.toml; h="$(snap reverse)"
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+[ "$rows" = "$(printf 'unmapped-host\t\t\t%s\t\tx\thttps://github.example/org/core' "$r3")" ] || fail "reverse source move was trusted: $rows"
+o="$(evidence "$b" "$h")"
+! find "$o/upstream" -name pin.json -print | grep -q . || fail 'reverse move fetched upstream evidence'
+# Configured mappings must not create phantom rows for a changed manifest with unchanged pins.
+gh https://forge.test/git/acme/core.git "$r1" | put Cargo.toml; b="$(snap unchanged-base)"
+printf '\n# package documentation\n' >>"$D/Cargo.toml"; h="$(snap unchanged-pin)"
+[ -z "$(upstream_pins "$D/.git" "$b" "$h" acme)" ] || fail 'configured mappings emitted phantom pin rows'
+o="$(evidence "$b" "$h")"; [ ! -e "$o/upstream" ] || fail 'unchanged pins created an upstream packet'
+# Even a same-revision source migration needs provenance for the newly selected forge source.
+gh https://github.example/org/core.git "$r1" | put Cargo.toml; b="$(snap same-rev-base)"
+gh https://forge.test/git/acme/core.git "$r1" | put Cargo.toml; h="$(snap same-rev-forge)"
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+grep -q "$(printf '^fetch\tacme/core\t%s\t%s\t' "$r1" "$r1")" <<<"$rows" || fail 'same-revision source migration was omitted'
+# A conflicting base-carried Git rewrite cannot override the operator mapping.
+printf '[url "https://forge.test/git/acme/big.git"]\n\tinsteadOf = https://github.example/org/core.git\n' | put .cargo/hosted-gitconfig
+gh https://github.example/org/core.git "$r1" | put Cargo.toml; b="$(snap conflicting-map-base)"
+gh https://forge.test/git/acme/core.git "$r3" | put Cargo.toml; h="$(snap operator-map-head)"
+rows="$(upstream_pins "$D/.git" "$b" "$h" acme | tr '\037' '\t')"
+grep -q "$(printf '^fetch\tacme/core\t%s\t%s\t' "$r1" "$r3")" <<<"$rows" || fail 'base Git rewrite overrode the operator mapping'
 source_mappings=""
-ok 'an operator source mapping binds the old source to the forge repository without trusting new dependencies'
+ok 'operator mappings bind only the base source, annotate evidence, preserve row counts and reject reverse/new pins'
 
 # 8. A GitHub mirror source maps to the forge only through a mapping the base carries.
 dep mirror

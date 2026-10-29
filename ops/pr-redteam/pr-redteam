@@ -1193,35 +1193,44 @@ upstream_pins() { # git-dir base head default-owner
       p = substr(p, length(pre) + 1)
       return (p ~ /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/ && p !~ /\.\./) ? p : ""
     }
-    function resolve(u,   k) {
+    function resolve(u, side,   k) {
       if (u ~ /^(tsv|lock):/) { k = u; sub(/^[a-z]+:/, "", k); return (k ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/ && k !~ /\.\./ && owner != "") ? owner "/" k : "" }
       if ((k = forge_repo(u)) != "") return k
-      k = tolower(norm(u)); return (k in mapped) ? mapped[k] : ""
+      k = tolower(norm(u))
+      if (k in opm) return side == "base" ? opm[k] : ""
+      return (k in mapped) ? mapped[k] : ""
     }
     BEGIN {
-      n = split(srcmaps, ms, " ")
-      for (i = 1; i <= n; i++) { j = index(ms[i], "="); if (j > 0) { opm[tolower(norm(substr(ms[i], 1, j - 1)))] = substr(ms[i], j + 1) } }
-      for (k in opm) mapped[k] = opm[k]
+      nm = split(srcmaps, ms, " ")
+      for (i = 1; i <= nm; i++) { j = index(ms[i], "="); if (j > 0) { opm[tolower(norm(substr(ms[i], 1, j - 1)))] = substr(ms[i], j + 1) } }
     }
     $1 == "map" { if ((k = forge_repo($3)) != "" && !(tolower(norm($2)) in opm)) mapped[tolower(norm($2))] = k; next }
     # A lock entry exists at the base whatever its commit says there (a PENDING commit is no old rev).
     $1 == "base" && $4 ~ /^lock:/ {
-      if ((r = resolve($4)) != "") { k = $2 SUBSEP $3 SUBSEP r; old[k] = ($5 ~ /^[0-9a-f]{40}$/) ? $5 : ""; otag[k] = $7; oext[k] = $9 }
+      if ((r = resolve($4, "base")) != "") { k = $2 SUBSEP $3 SUBSEP r; old[k] = ($5 ~ /^[0-9a-f]{40}$/) ? $5 : ""; otag[k] = $7; oext[k] = $9 }
       next
     }
-    $1 == "base" { if ($5 ~ /^[0-9a-f]{7,40}$/ && (r = resolve($4)) != "") old[$2 SUBSEP $3 SUBSEP r] = $5; next }
+    $1 == "base" {
+      if ($5 ~ /^[0-9a-f]{7,40}$/ && (r = resolve($4, "base")) != "") {
+        k = $2 SUBSEP $3 SUBSEP r; old[k] = $5
+        if (forge_repo($4) == "" && tolower(norm($4)) in opm) ombase[k] = norm($4)
+      }
+      next
+    }
     $1 == "head" {
       rev = $5; lk = ($4 ~ /^lock:/)
       if (rev !~ (lk ? "^[0-9a-f]{40}$" : "^[0-9a-f]{7,40}$")) next
-      r = resolve($4); k = $2 SUBSEP $3 SUBSEP r
+      r = resolve($4, "head"); k = $2 SUBSEP $3 SUBSEP r
       if (r == "") st = "unmapped-host"
       else if (!(k in old)) st = "new-pin-unverified"
-      else if (old[k] == rev && (!lk || otag[k] == $7)) next
+      else if (k in ombase && forge_repo($4) == "") st = "new-pin-unverified"
+      else if (!(k in ombase) && old[k] == rev && (!lk || otag[k] == $7)) next
       else st = "fetch"
       id = st SUBSEP r SUBSEP rev SUBSEP (r == "" ? norm($4) : "") SUBSEP (lk ? "lock" SUBSEP $2 SUBSEP $7 : "")
       if (!(id in seen)) {
         seen[id] = 1; order[++n] = id; rs[id] = r; rv[id] = rev; sts[id] = st; src[id] = norm($4)
         olds[id] = (st == "fetch") ? old[k] : ""; brs[id] = $6; crs[id] = $8
+        oms[id] = (st == "fetch" && k in ombase) ? ombase[k] : ""
         if (lk) { lock[id] = 1; tg[id] = $7; otg[id] = (k in otag) ? otag[k] : ""; ext[id] = $9; oex[id] = (k in oext) ? oext[k] : "" }
       } else {
         if (brs[id] == "") brs[id] = $6
@@ -1232,6 +1241,10 @@ upstream_pins() { # git-dir base head default-owner
       for (i = 1; i <= n; i++) { id = order[i]
         printf "%s\037%s\037%s\037%s\037%s\037%s\037%s", sts[id], rs[id], olds[id], rv[id], brs[id], crs[id], src[id]
         if (id in lock) printf "\037%s\037%s\037%s\037%s", tg[id], otg[id], ext[id], oex[id]
+        if (oms[id] != "") {
+          if (!(id in lock)) printf "\037\037\037\037"
+          printf "\037%s", oms[id]
+        }
         printf "\n" }
     }'
 }
@@ -1807,7 +1820,7 @@ upstream_pin_evidence() { # cache-root review-dir owner/name old new named-branc
 # Writes <review-dir>/upstream/ for a change that moves a git pin; writes nothing otherwise.
 # The total bytes of upstream evidence across every pin are capped by `budget`.
 upstream_evidence() { # git-dir base head review-dir default-owner budget
-  local pins out="$4/upstream" up_source="" st repo old new named crates source tag old_tag fields base_fields n=0 fetchable=0 skipped=0 summary="" allow
+  local pins out="$4/upstream" up_source="" st repo old new named crates source tag old_tag fields base_fields mapped_base n=0 fetchable=0 skipped=0 summary="" allow
   local -a lockargs=()
   up_left="$6"; up_row=""
   pins="$(upstream_pins "$1" "$2" "$3" "$5")" || return 0
@@ -1815,7 +1828,7 @@ upstream_evidence() { # git-dir base head review-dir default-owner budget
   mkdir -p "$out"
   fetchable="$(grep -c $'^fetch\037' <<<"$pins" || true)"
   [ "$fetchable" -le "$upstream_max_pins" ] || fetchable="$upstream_max_pins"
-  while IFS=$'\037' read -r st repo old new named crates source tag old_tag fields base_fields; do
+  while IFS=$'\037' read -r st repo old new named crates source tag old_tag fields base_fields mapped_base; do
     lockargs=(); [[ "$source" != lock:* ]] || lockargs=(lock "$tag" "$old_tag" "$fields" "$base_fields")
     case "$st" in
       fetch)
@@ -1832,6 +1845,9 @@ upstream_evidence() { # git-dir base head review-dir default-owner budget
         # the alias: say so on its row, so the route a verified status took is visible.
         if [[ "$source" =~ ^https://([^/]+)/git/ && "${BASH_REMATCH[1],,}" != "${forge_host,,}" ]]; then
           up_row+=" [source ${source:0:120}: forge alias host ${BASH_REMATCH[1]} (REDTEAM_FORGE_ALIASES); verified and fetched on $forge_host only]"
+        fi
+        if [ -n "$mapped_base" ]; then
+          up_row+=" [base source ${mapped_base:0:120} mapped to $repo by REDTEAM_SOURCE_MAPPINGS; head source ${source:0:120}; verified and fetched on $forge_host only]"
         fi
         summary+="$up_row"$'\n' ;;
       new-pin-unverified) summary+="$repo ${new:0:12}: new-pin-unverified (not pinned at the base; not fetched)"$'\n' ;;

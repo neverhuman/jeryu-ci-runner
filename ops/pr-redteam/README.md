@@ -303,10 +303,14 @@ The manifest is the author's text, so it never decides what is fetched or what c
 - A source that moved from an old host (a GitHub mirror) to this forge is bound by
   `REDTEAM_SOURCE_MAPPINGS` (operator environment only, empty by default): space-separated
   `<https url>=<owner>/<name>` entries, each one exact source URL (no host is aliased). The base's
-  pin on that URL is then the same dependency as the forge repository, so the move is fetched with
-  the full diff, exact revision/tag, protected-branch and approval checks. Activating an entry is a
+  pin on that URL is then the same dependency as the forge repository, provided the head names
+  the forge directly (or a configured forge alias). This applies only from the old source to the
+  forge; moving a pin onto the mapped external URL remains unverified. The evidence summary names
+  the old source, operator mapping and head source, including a move that keeps the same revision.
+  The move gets the full diff, exact revision/tag, protected-branch and approval checks. Activating an entry is a
   separate, operator-authorised act; a dependency absent from the base stays `new-pin-unverified`,
-  and nothing a PR or its base writes can add an entry. Malformed entries are ignored.
+  and nothing a PR or its base writes can add an entry. A conflicting Git rewrite from the base
+  cannot override an operator entry. Malformed entries are ignored.
   Owner-decision context for the independent review comes from an approval by the namespace owner
   or a `REDTEAM_OWNER_DECISION_AUTHORS` login on the exact head (see above), never the PR author.
 - Fetches run with no system, global or XDG git configuration, no ambient credential helper and no

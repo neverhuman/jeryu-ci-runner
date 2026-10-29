@@ -55,6 +55,12 @@ copy "$t/a"
 original="$(run "$t/a" identity)"
 [[ "$original" =~ ^[0-9a-f]{64}$ ]] || fail "identity is not 64 hex: $original"
 
+mapped="$(REDTEAM_SOURCE_MAPPINGS=https://mirror.example/org/core=acme/core run "$t/a" identity)"
+remapped="$(REDTEAM_SOURCE_MAPPINGS=https://mirror.example/org/core=acme/other run "$t/a" identity)"
+[[ "$mapped" =~ ^[0-9a-f]{64}$ && "$mapped" != "$original" && "$remapped" != "$mapped" ]] \
+  || fail 'operator source mapping did not change the review identity'
+echo 'ok operator source mappings change the review identity'
+
 # Plumbing: a change the agent never sees keeps the identity.
 printf '\n# a heartbeat-only change\nheartbeat_note=1\n' >> "$t/a/pr-redteam"
 [[ "$(run "$t/a" identity)" == "$original" ]] || fail 'a plumbing-only script change moved the review identity'
