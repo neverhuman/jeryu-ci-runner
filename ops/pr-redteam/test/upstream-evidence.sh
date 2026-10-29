@@ -499,7 +499,7 @@ ok 'a lock commit only on an unprotected branch is unverified even when its tag 
 # by commit alone: it has no tag at the base or the head, so it is judged by its commit, as a git rev
 # pin is. Location fields (`github_slug`, `local_path`) are neither fetch targets nor locked fields.
 named() { # name commit dist [tag]
-  printf '\n[[repo]]\nname = "%s"\ngithub_slug = "evil/%s"\nlocal_path = "/srv/evil/%s"\n%scommit = "%s"\nweb_dist_sha256 = "%s"\nrequired_check = "%s/required"\n' \
+  printf '\n[[repo]]\nname = "%s"\ngithub_slug = "evil/%s"\nlocal_path = "/srv/evil/%s"\n%bcommit = "%s"\nweb_dist_sha256 = "%s"\nrequired_check = "%s/required"\n' \
     "$1" "$1" "$1" "${4:+tag = \"$4\"\n}" "$2" "$3" "$1"
 }
 namedlock() { printf 'schema_version = "acme.split.lock/v1"\n'; }
@@ -529,6 +529,60 @@ mkdir -p "$D/sub"; { lockfile; entry core core-v1 "$r1" "$dist1"; } >"$D/sub/x.l
 o="$t/sub-lock"; mkdir -p "$o"; upstream_evidence "$D/.git" "$b" "$(snap sub)" "$o" acme 100000
 [ ! -e "$o/upstream" ] || fail "a nested *.lock.toml was read as a release lock: $(cat "$o/upstream/SUMMARY.txt")"
 ok 'only a *.lock.toml at the repository root is a release lock'
+
+# family.lock uses the same evidence checks and parses TOML quoting as data.
+dep family
+{ lockfile; entry core core-v1 "$r1" "$dist1"; } | put family.lock
+b="$(snap family-base)"
+{ lockfile; entry core core-v3 "$r3" "$dist3"; } | put family.lock
+o="$(evidence "$b" "$(snap family-head)")"; p="$(pin_of "$o" "$r3")"
+jq -e --arg rev "$r3" '.verified and .lock_entry and .tag_resolves_to == $rev and .checked_branch == "main"' "$p" >/dev/null || fail 'family pin not verified'
+grep -q '^+three' "$(dirname "$p")/diff.patch" || fail 'family diff missing'
+nofetch || fail 'family URL redirected fetch'
+b="$(snap family-same)"; echo '# unchanged' >>"$D/family.lock"
+o="$(evidence "$b" "$(snap family-comment)")"
+[ ! -e "$o/upstream" ] || fail 'unchanged family pin produced evidence'
+
+# A newly introduced family lock pin has no base revision, but still gets forge evidence.
+dep family-new; echo init | put readme; b="$(snap family-empty)"
+printf "[[repo]]\nname = 'core'\ncommit = '%s'\ntag = 'core-v3'\nlocal_path = '/evil/core'\n" "$r3" | put family.lock
+o="$(evidence "$b" "$(snap family-new)")"; p="$(pin_of "$o" "$r3")"
+jq -e '.verified and .old_rev == "" and .lock_entry and (.already_reviewed_upstream == false)' "$p" >/dev/null || fail 'new family pin lacks independent evidence'
+nofetch || fail 'family local path redirected fetch'
+grep -q '^+three' "$(dirname "$p")/diff.patch" || fail 'new family pin lacks full-tree diff'
+# Adding a member to an existing lock also gets evidence; its large tree is capped.
+b="$(snap family-member-base)"
+printf "\n[[repo]]\nname = 'big'\ncommit = '%s'\n" "$k2" >>"$D/family.lock"
+o="$(evidence "$b" "$(snap family-member-added)")"
+p="$o/upstream/acme@big-${k2:0:12}/pin.json"
+jq -e '.verified and .old_rev == "" and .diff.fetched and .diff.truncated and (.already_reviewed_upstream == false)' "$p" >/dev/null || fail 'new member evidence missing'
+[ ! -e "$(pin_of "$o" "$r3")" ] || fail 'unchanged core was collected with new member'
+# A changed member uses its actual previous revision.
+printf "[[repo]]\nname = 'big'\ncommit = '%s'\n" "$k1" | put family.lock
+b="$(snap family-member-old)"
+printf "[[repo]]\nname = 'big'\ncommit = '%s'\n" "$k2" | put family.lock
+o="$(evidence "$b" "$(snap family-member-changed)")"
+jq -e --arg rev "$k1" '.verified and .old_rev == $rev and .diff.fetched' "$o/upstream/acme@big-${k2:0:12}/pin.json" >/dev/null || fail 'changed member evidence missing'
+
+
+# Invalid input must suppress partial results and visibly report unknown pin movement.
+for bad in "[[repo" "repo = 'core'" "[[repo]]
+name = 'core'
+commit = 'bad'" "[[repo]]
+name = '../core'
+commit = '$r3'"; do
+  printf '%b\n' "$bad" | put family.lock
+  o="$(evidence "$b" "$(snap family-malformed)")"
+  grep -q 'NOT ANALYSED.*pin movement is unknown' "$o/upstream/SUMMARY.txt" || fail 'malformed family input silently omitted'
+  [ ! -s "$t/api.log" ] || fail 'malformed family input was fetched'
+done
+
+# Fourteen changed release pins retain the configured limit and expose omitted evidence.
+{ lockfile; entry core core-v3 "$r3" "$dist3"; for i in {1..13}; do entry "member$i" member-v3 "$r3" "$dist3"; done; } | put family.lock
+saved_max="$upstream_max_pins"; upstream_max_pins=1
+o="$(evidence "$b" "$(snap family-fourteen)")"; upstream_max_pins="$saved_max"
+grep -q '13 more moved pins were not fetched (REDTEAM_UPSTREAM_MAX_PINS=1)' "$o/upstream/SUMMARY.txt" || fail 'family pin truncation hidden'
+ok 'family locks collect changed/new pins, ignore unchanged pins, reject malformed input and disclose limits'
 
 # 13. No moved pin, no upstream/.
 dep plain; inline "$r1" | put Cargo.toml; b2="$(snap base)"

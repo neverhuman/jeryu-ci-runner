@@ -744,3 +744,13 @@ It is a semantic controller change: predecessor review identities must not be
 accepted for this upgrade. `REDTEAM_ACCEPT_IDENTITIES` is only appropriate for
 a separately documented plumbing-equivalent reinstall. It stays unset for
 this integration; new receipts use the current input identity.
+
+`family.lock` at the repository root is also a release lock. Release locks are
+parsed with isolated Python `tomllib`, with byte and entry limits. Invalid or
+unsupported input produces `NOT ANALYSED` in the upstream summary, never a claim
+that no pins moved. Repository names resolve under the dependent owner on the
+configured forge; lock URLs and local paths cannot select a fetch target.
+New family members get forge ancestry/tag evidence and a bounded full-tree diff,
+without claiming independent review coverage. Unchanged commit/tag pairs are
+omitted. The existing pin and byte budgets still apply: a fourteen-pin release
+can exceed the pin limit, and the summary reports how many were not fetched.
