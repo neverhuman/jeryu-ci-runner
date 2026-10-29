@@ -1,0 +1,9 @@
+{
+  "base_ref": "HEAD",
+  "caps_applied": 0,
+  "changed_count": 0,
+  "hard_findings": 0,
+  "kind": "diff-audit",
+  "result": "no-changes",
+  "score": 100
+}
