@@ -24,6 +24,12 @@ if [[ "${BASE_REF}" != origin/main ]]; then
   printf 'proof evidence base must be protected origin/main, got %s\n' "${BASE_REF}" >&2
   exit 1
 fi
+# origin must be the hosted source repository before anything is fetched from it.
+if [[ "$(git remote get-url origin)" != \
+      'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' ]]; then
+  printf 'proof origin is not the hosted source repository\n' >&2
+  exit 1
+fi
 proof_require_history
 base_commit="$(git rev-parse --verify "${BASE_REF}^{commit}")" || {
   printf 'missing proof evidence base: %s\n' "${BASE_REF}" >&2
@@ -39,17 +45,15 @@ if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
   printf 'proof evidence requires a clean exact-head checkout\n' >&2
   exit 1
 fi
-if [[ "$(git remote get-url origin)" != \
-      'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' ]]; then
-  printf 'proof origin is not the hosted source repository\n' >&2
-  exit 1
-fi
 
 # Every artifact this lane reads must come from this run. A rerun in a retained
 # target/ (the gate runner's build cache, a local repeat) would otherwise let a
 # previous run's report satisfy a check for a tool that wrote nothing this time.
 # Only paths this lane itself produces are removed: target/security/ comes from
-# the security lane that ran before it.
+# the security lane that ran before it, and target/jankurai/repo-score.* is the
+# score lane's uploaded report until this lane's ratchet audit replaces it (the
+# ratchet report is then bound to this head before it is read), so a failure
+# earlier in this lane leaves the score lane's evidence in place.
 rm -rf -- \
   target/jankurai/accepted-baseline.json \
   target/jankurai/baseline-migration-report.json \
@@ -66,8 +70,6 @@ rm -rf -- \
   target/jankurai/proofbind \
   target/jankurai/proofmark \
   target/jankurai/repair-queue.jsonl \
-  target/jankurai/repo-score.json \
-  target/jankurai/repo-score.md \
   target/jankurai/rust \
   target/jankurai/security
 
@@ -235,8 +237,9 @@ jankurai migrate "${baseline_parent}/repo" --analyze \
   --md target/jankurai/baseline-migration-report.md
 jankurai migrate . --analyze --out target/jankurai/migration-report.json \
   --md target/jankurai/migration-report.md
-proof_require_migration target/jankurai/baseline-migration-report.json \
-  target/jankurai/migration-report.json
+proof_require_migration \
+  target/jankurai/baseline-migration-report.json "${baseline_parent}/repo" \
+  target/jankurai/migration-report.json .
 trap - EXIT HUP INT TERM
 cleanup_baseline
 

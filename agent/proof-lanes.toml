@@ -73,5 +73,5 @@ requires_network = true
 [[lane]]
 name = "proof-evidence"
 command = "bash ops/ci/proof_evidence.sh"
-purpose = "exact-head proof receipts ratcheted against the forge's audit of protected main"
+purpose = "exact-head proof receipts ratcheted against the forge's audit of protected main; needs a clean head descending from protected main, origin = the hosted repository, and the forge (docs/testing.md)"
 requires_network = true

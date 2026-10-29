@@ -1,0 +1,155 @@
+{
+  "schema_version": "1.0.0",
+  "command": "jankurai migrate",
+  "status": "complete",
+  "generated_at": "1793239924",
+  "source_root": ".",
+  "source_stack": "rust",
+  "target_stack": "rust-ts-postgres",
+  "liability_score": 25,
+  "liability_breakdown": {
+    "total": 25,
+    "dimensions": [
+      {
+        "name": "agent-operability",
+        "score": 20,
+        "weight": 0.1,
+        "evidence": [
+          "agent configuration detected"
+        ]
+      },
+      {
+        "name": "contract-drift",
+        "score": 25,
+        "weight": 0.12,
+        "evidence": [
+          "2 contract artifacts detected"
+        ]
+      },
+      {
+        "name": "product-truth-sprawl",
+        "score": 25,
+        "weight": 0.12,
+        "evidence": [
+          "1 languages detected"
+        ]
+      },
+      {
+        "name": "security-risk",
+        "score": 30,
+        "weight": 0.15,
+        "evidence": [
+          "lockfile present"
+        ]
+      },
+      {
+        "name": "db-data-risk",
+        "score": 15,
+        "weight": 0.13,
+        "evidence": [
+          "0 DB client(s) detected"
+        ]
+      },
+      {
+        "name": "test-proof-gaps",
+        "score": 15,
+        "weight": 0.15,
+        "evidence": [
+          "tests=true, ci=true"
+        ]
+      },
+      {
+        "name": "runtime-cost-risk",
+        "score": 15,
+        "weight": 0.1,
+        "evidence": [
+          "primary language: rust"
+        ]
+      },
+      {
+        "name": "migration-complexity",
+        "score": 55,
+        "weight": 0.13,
+        "evidence": [
+          "0 framework(s) detected"
+        ]
+      }
+    ]
+  },
+  "inventory": {
+    "languages": [
+      {
+        "name": "rust",
+        "evidence": "Cargo.toml",
+        "confidence": "high"
+      }
+    ],
+    "frameworks": [],
+    "db_clients": [],
+    "test_frameworks": [
+      {
+        "name": "cargo-test",
+        "evidence": "Cargo.toml",
+        "confidence": "high"
+      }
+    ],
+    "package_managers": [
+      {
+        "name": "cargo",
+        "evidence": "Cargo.toml",
+        "confidence": "high"
+      }
+    ],
+    "ci_systems": [
+      {
+        "name": "github-actions",
+        "evidence": ".github/workflows/",
+        "confidence": "high"
+      }
+    ],
+    "api_surfaces": [],
+    "contract_evidence": [
+      {
+        "kind": "directory",
+        "path": "contracts/",
+        "status": "detected"
+      },
+      {
+        "kind": "directory",
+        "path": "schemas/",
+        "status": "detected"
+      }
+    ]
+  },
+  "module_inventory": [
+    "language:rust",
+    "package-manager:cargo"
+  ],
+  "contract_evidence": [
+    {
+      "kind": "directory",
+      "path": "contracts/",
+      "status": "detected"
+    },
+    {
+      "kind": "directory",
+      "path": "schemas/",
+      "status": "detected"
+    }
+  ],
+  "recommended_slice_order": [
+    "inventory-and-classify",
+    "extract-contracts",
+    "port-business-logic",
+    "prove-equivalence",
+    "cutover-and-retire"
+  ],
+  "required_proof_lanes": [
+    "fast",
+    "contract"
+  ],
+  "rollback_cutover_notes": [
+    "migration planning is derived from repo inventory and audit evidence",
+    "each slice should have explicit rollback before cutover"
+  ]
+}

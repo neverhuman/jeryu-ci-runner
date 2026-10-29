@@ -15,6 +15,16 @@ host-reproducible lanes; `scripts/ci-doctor.sh` checks the required local tools.
 The compatibility workflow must never be treated as a substitute for a genuine
 hosted runner result.
 
+`ops/ci/pr-ci.sh` ends with the proof evidence lane (`ops/ci/proof_evidence.sh`),
+so the canonical gate as a whole is a network-, forge- and exact-head-bound
+lane. It refuses a work-in-progress tree (the checkout must be clean, untracked
+files included), an `origin` other than
+`https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git`, and a head that does
+not descend from the current protected `main` (rebase and rerun). It clones
+protected main from the forge to audit the ratchet baseline. A shallow checkout
+is deepened from the forge first. Run the narrower `just` lanes above on a tree
+that is not yet a pushed, rebased head.
+
 The security lane runs networked dependency checks by default through
 `just security`. It preserves Cargo's immutable source identity while
 `ops/ci/dependency-sources.sh` proves the active Git transport policy, hosted
