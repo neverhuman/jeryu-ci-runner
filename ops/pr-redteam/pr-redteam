@@ -435,12 +435,76 @@ release_pin_file() { # path
   [[ "$1" =~ ^[^/]+\.lock\.toml$ || "$1" =~ (^|/)hosted-pin-refs\.tsv$ ]]
 }
 
-# The required contexts of a PR row that have no result yet, "name (state)" joined by ", ", or empty.
-# A row that does not list required contexts at all (a forge without the field) waits for nothing.
-required_contexts_unreported() { # row
-  jq -r '(.required_contexts // [])
+# --- the base branch's enforced required contexts ------------------------------------------------
+#
+# Which contexts a head must satisfy is branch protection's answer for its exact base branch, and
+# only a repository administrator changes it: `main` enforces `<repo>/required`, and a release line
+# enforces whatever its own protection lists -- `<repo>/fast` only once an administrator has made
+# it so, and its unchanged contexts until then. So this source reads that enforcement from the
+# forge and judges gate evidence against exactly those contexts. It never derives one from a
+# repository or branch name, the PR's own files, a record or a release line's being a release line:
+# protection it cannot read is unresolved evidence, not an empty requirement set.
+
+# The enforcement the forge reports for a branch: {"enforced": ["<context>", ...]}, or
+# {"unreadable": "<why>"} when the forge would not say. 404 is the forge's answer that the branch
+# has no protection, so it enforces no context; a review still holds on evidence it cannot resolve.
+enforced_contexts() { # owner/name branch
+  [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] \
+    || { jq -nc '{unreadable: "the repository is not a plain owner/name"}'; return 0; }
+  # The branch becomes path segments of the request, so only a plain ref goes into it.
+  [[ "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ && "$2" != *..* && "$2" != */ ]] \
+    || { jq -nc --arg r "$2" '{unreadable: "the base branch \($r) is not a plain ref"}'; return 0; }
+  api GET "/api/v3/repos/$1/branches/$2/protection"
+  case "$code" in
+    200) jq -ce '{enforced: ((.required_status_checks.contexts // [])
+                             | map(select(type == "string")) | unique)}' <<<"$body" 2>/dev/null \
+           || jq -nc '{unreadable: "the protection the forge returned could not be read"}' ;;
+    404) jq -nc '{enforced: []}' ;;
+    *) jq -nc --arg c "$code" '{unreadable: "the forge answered \($c) for this branch'"'"'s protection"}' ;;
+  esac
+}
+
+# Protection is per branch and changes rarely, so it is read once per branch per pass. The map is
+# dropped whole once it holds more branches than a pass plausibly touches, so it cannot grow on.
+declare -A enforced_contexts_cache=()
+enforced_contexts_cached() { # owner/name branch
+  local key="$1 $2"
+  if [ -z "${enforced_contexts_cache[$key]+set}" ]; then
+    [ "${#enforced_contexts_cache[@]}" -lt 64 ] || enforced_contexts_cache=()
+    enforced_contexts_cache[$key]="$(enforced_contexts "$1" "$2")"
+  fi
+  printf '%s\n' "${enforced_contexts_cache[$key]}"
+}
+
+# What this head must satisfy, and how far each one has got:
+#   {source: "protection", contexts: [{name, state}]}   the base branch's enforced contexts, each
+#       with the state the forge reported for it on this head, or "no result" when it has none;
+#   {source: "unresolved", why, contexts: [...]}        protection could not be read, so the set is
+#       unknown and the contexts are only what the forge's pull request row happened to report.
+head_required_contexts() { # row
+  local base_ref enf
+  base_ref="$(jq -r '.base_ref // ""' <<<"$1")"
+  enf="$(enforced_contexts_cached "$(jq -r '"\(.repo.owner)/\(.repo.name)"' <<<"$1")" "$base_ref")"
+  jq -nc --argjson row "$1" --argjson enf "$enf" '
+    (($row.required_contexts // []) | map(select(type == "object"))) as $r
+    | if ($enf.enforced // null) != null then
+        {source: "protection",
+         contexts: ($enf.enforced | map(. as $n
+           | {name: $n,
+              state: (($r | map(select(.name == $n)) | first | .state) // "no result")}))}
+      else
+        {source: "unresolved", why: ($enf.unreadable // "protection could not be read"),
+         contexts: ($r | map({name: (.name // "?"), state: (.state // "no state")}))}
+      end'
+}
+
+# The required contexts that have no result yet, "name (state)" joined by ", ", or empty. A head
+# with no required context, and one whose requirements could not be resolved and whose row listed
+# none either, waits for nothing.
+required_contexts_unreported() { # head-required-contexts-json
+  jq -r '.contexts
     | map(select(((.state // "") | ascii_downcase)
-                 | IN("", "missing", "pending", "queued", "running", "in_progress", "expected", "waiting", "requested")))
+                 | IN("", "no result", "missing", "pending", "queued", "running", "in_progress", "expected", "waiting", "requested")))
     | map("\(.name // "?") (\(.state // "no state"))") | join(", ")' <<<"$1" 2>/dev/null || true
 }
 
@@ -465,7 +529,7 @@ pin_wait_file() { echo "$state/pin-wait/$1/$2-$3.json"; } # owner/name number sh
 pin_wait_reason() { # owner/name number sha row
   local repo="$1" number="$2" sha="$3" row="$4" unreported file first pin now waited rc=0
   [ "$pin_wait_secs" -gt 0 ] || return 0
-  unreported="$(required_contexts_unreported "$row")"
+  unreported="$(required_contexts_unreported "$(head_required_contexts "$row")")"
   [ -n "$unreported" ] || return 0
   file="$(pin_wait_file "$repo" "$number" "$sha")"
   now="$(date +%s)"
@@ -487,21 +551,27 @@ pin_wait_reason() { # owner/name number sha row
   echo "a release pin bump is reviewed once its required contexts report: $unreported (waited ${waited}s of ${pin_wait_secs}s)"
 }
 
-# What signals.txt says about this head's required contexts: their states as the forge reported
-# them when the review started, and, for a pin bump that waited out the bound, that it did.
+# What signals.txt says about this head's required contexts: the contexts the base branch's
+# protection enforces, with the state the forge reported for each when the review started, and,
+# for a pin bump that waited out the bound, that it did.
 required_contexts_signal() { # row owner/name number sha
-  local file unreported first
-  jq -r '"## required contexts on this head (the forge'"'"'s states when this review started; not author text)",
-    "Base branch: \(.base_ref | tojson). Required contexts below come from forge enforcement of protection for that branch.",
-    (if .required_contexts == null then "(the forge did not list required contexts for this pull request; gate evidence is unresolved: do not guess contexts or treat this as no requirements)"
-     elif (.required_contexts | length) == 0 then "(none required)"
-     else .required_contexts[] | "\(.name // "?"): \(.state // "no state")" end)' <<<"$1" 2>/dev/null \
+  local file unreported first required
+  required="$(head_required_contexts "$1")"
+  jq -r --argjson row "$1" '
+    "## required contexts on this head (the base branch'"'"'s enforced protection and the forge'"'"'s states when this review started; not author text)",
+    "Base branch: \($row.base_ref | tojson). The contexts below are exactly what the forge enforces as branch protection for that branch; only a repository administrator changes them.",
+    (if .source != "protection" then
+       "(the base branch'"'"'s enforced required contexts could not be read: \(.why). Gate evidence is unresolved: do not guess contexts or treat this as no requirements. What follows is only what the forge'"'"'s pull request row reported, which is not the enforced set.)"
+     else empty end),
+    (if (.contexts | length) == 0 then
+       (if .source == "protection" then "(the base branch enforces no required context)" else "(the row reported none either)" end)
+     else .contexts[] | "\(.name): \(.state)" end)' <<<"$required" 2>/dev/null \
     || echo "## required contexts on this head: (the forge's row could not be read)"
-  echo "Judge gate evidence against exactly these enforced contexts on this head. Do not infer a context from the repository name, CI files, another branch, or an ADR. A release base has no exception: fast-tier evidence suffices only when its protection requires that tier; unchanged protection still requires its listed contexts."
+  echo "Judge gate evidence against exactly these enforced contexts on this head. Do not infer a context from the repository name, the branch name, CI files, another branch, or an ADR. A release base has no exception: fast-tier evidence suffices only when its protection requires that tier; unchanged protection still requires its listed contexts."
   echo "Pin-verifier requirements remain separate and unchanged. A passing required context does not waive a verifier's required branch ancestry: an upstream commit merged only on a release line is not on main."
   echo "pr.json checks counts include pr-redteam/review, this reviewer's own check run (an earlier review of this head, or this one in progress). It is not a result about the code and not a required context: do not count it as a failing or passing check."
   file="$(pin_wait_file "$2" "$3" "$4")"
-  unreported="$(required_contexts_unreported "$1")"
+  unreported="$(required_contexts_unreported "$required")"
   if [ -n "$unreported" ] && [ "$pin_wait_secs" -gt 0 ] && jq -e '.pin_only == true' "$file" >/dev/null 2>&1; then
     first="$(jq -r .first_seen_epoch "$file")"
     echo "This release pin bump waited $(( $(date +%s) - first ))s (bound ${pin_wait_secs}s) for its required contexts; still without a result: $unreported."

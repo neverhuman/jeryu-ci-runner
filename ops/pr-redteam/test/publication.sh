@@ -64,6 +64,10 @@ row() {
     | if .required_contexts == null then del(.required_contexts) else . end'
 }
 case "$url" in
+  */branches/*/protection)
+    # The base branch's enforced required contexts: this fixture's main enforces the quality proof,
+    # exactly as the row reports it on the head.
+    printf '{"required_status_checks":{"contexts":["jankurai/proof"]}}\n200' ;;
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"jeryu","name":"fixture"},"family":"jain","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;

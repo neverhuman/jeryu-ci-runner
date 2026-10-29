@@ -76,6 +76,10 @@ row() {
       mergeable:{can_merge:$can,reason:$why}}'
 }
 case "$url" in
+  */branches/*/protection)
+    # The base branch's enforced required contexts. This suite's base enforces none; what a review
+    # is told about enforced contexts, and what it waits for, is covered in test/pin-wait.sh.
+    printf '{"required_status_checks":{"contexts":[]}}\n200' ;;
   */api/v3/user)
     if [[ "$bearer" == "$(cat "$MERGE_FIXTURE/merge-token")" ]]; then printf '{"login":"jain-merge-bot"}\n200'
     else printf '{"login":"independent-reviewer"}\n200'; fi ;;

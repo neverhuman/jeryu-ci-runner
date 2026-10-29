@@ -370,8 +370,8 @@ the lane reports can only hold on unresolved evidence -- final for that head (je
 #457 were held this way, ten seconds after opening, and their lanes passed minutes later; #452, the
 same diff, was approved).
 
-So while any required context of such a head is `missing` or `pending` (the forge row's
-`required_contexts`), the reviewer leaves the head alone: no receipt, no review, no check run, no
+So while any context the base branch's protection enforces on such a head is without a result, the
+reviewer leaves the head alone: no receipt, no review, no check run, no
 agent spend, and one log line `waiting for required contexts -- ...`. The next pass, or `poke` once
 the contexts are green, reviews it with their result in `pr.json` and at the end of `signals.txt`. A
 failing context is a result and is reviewed at once. The wait is bounded by `REDTEAM_PIN_WAIT_SECS`
@@ -379,19 +379,29 @@ failing context is a result and is reviewed at once. The wait is bounded by `RED
 head is reviewed anyway and `signals.txt` says the contexts are still without a result, so nothing
 waits silently. `0` turns the wait off.
 
-The trigger is narrow on purpose: any other head is reviewed at once, and so is a pin bump when its
-row lists no required contexts, or the forge's diff is unavailable, truncated or for another head.
-The file list comes from the forge's diff of the exact head and the states from the forge's row;
-nothing an author writes decides either, and the wait only changes when a head is reviewed, not what
-the review concludes or who can ask for one. Every review's `signals.txt` lists the required contexts
-and their states as the forge reported them when the review started. The forge computes this
-`required_contexts` field from the exact base branch's protection and enforced site requirements;
-the controller uses it directly rather than guessing names or reading expectations from the PR's
-files. Review gate evidence against exactly that set. A pilot release requiring `<repo>/fast`
-does not need `<repo>/required` evidence; a release whose protection still requires
-`<repo>/required` does. There is no exception based on a release branch name or an ADR.
-Missing context data leaves evidence unresolved. Pin verifiers remain independent: a green gate
-never substitutes release-line ancestry for a verifier's required ancestry on main.
+The trigger is narrow on purpose: any other head is reviewed at once, and so is a pin bump whose base
+branch enforces no context, or whose forge diff is unavailable, truncated or for another head. The
+file list comes from the forge's diff of the exact head and the context states from the forge; nothing
+an author writes decides either, and the wait only changes when a head is reviewed, not what the
+review concludes or who can ask for one.
+
+### The enforced required contexts
+
+Which contexts a head must satisfy is the forge's branch protection for its exact base branch, read
+from `GET /api/v3/repos/<owner>/<name>/branches/<base branch>/protection`
+(`required_status_checks.contexts`), once per branch per pass. Only a repository administrator
+changes that list: `main` enforces `<repo>/required`, and a release line enforces whatever its own
+protection lists -- `<repo>/fast` only once an administrator has made it so, and its previous
+contexts until then (jeryu-deploy ADR 0019). Every review's `signals.txt` lists exactly those
+contexts, each with the state the forge reported for it on this head, or `no result` when the head
+has none; the review judges gate evidence against that set and nothing else. A context the pull
+request row reports that protection does not enforce satisfies no requirement, and no context is
+derived from a repository name, a branch name, the PR's own files or a record -- there is no release
+exception. A branch the forge reports as unprotected enforces nothing, and a protection read the
+forge will not answer leaves gate evidence unresolved: `signals.txt` says so, the enforced set is
+treated as unknown rather than empty, and the pin bump wait still waits for what the row reported.
+Pin verifiers are independent of all of this: a green required context never substitutes
+release-line ancestry for a verifier's required ancestry on `main`.
 
 ## Qualification
 

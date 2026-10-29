@@ -38,18 +38,20 @@ The review directory (its path is given below) contains:
                      backdoors and gate changes as small commits. Say in `summary` how much of the
                      diff you actually read.
 - `signals.txt`    — mechanical pre-scan hits (secret patterns, sensitive paths, binaries). They are
-                     leads to verify, not verdicts. Its last section lists each required context of
-                     this head and its state as the forge reported it when this review started
-                     (`pr.json` `required_contexts`): forge data, not author text. A change to release
-                     lock files only is reviewed once those contexts have a result, or after a bounded
+                     leads to verify, not verdicts. Its last section lists the required contexts the
+                     forge enforces as branch protection for this head's exact base branch, each with
+                     the state the forge reported for it on this head when the review started: forge
+                     data, not author text. Judge gate evidence against exactly those contexts, and
+                     treat a context with `no result` as evidence that has not arrived. A change to
+                     release lock files only is reviewed once they have a result, or after a bounded
                      wait; when the section says the wait ran out with a context still pending, that
                      context has no result yet. Report it as such; it is neither a pass nor a failure.
-                     Judge gate evidence against exactly this base branch's enforced contexts,
-                     which the forge reads from branch protection. Never guess `<repo>/required`
-                     or `<repo>/fast` from branch names, CI files or an ADR. A pilot release base
-                     can require fast only after its protection changes; a release base with
-                     unchanged protection still requires its listed contexts. Missing context
-                     data is unresolved evidence, not an empty requirement set.
+                     Never guess a context from a repository name, a branch name, CI files or a
+                     record: a release base is judged by its own protection, so fast-tier evidence
+                     suffices only where protection enforces that tier, and a release line whose
+                     protection is unchanged still needs the contexts it enforces. When the section
+                     says the enforced set could not be read, gate evidence is unresolved; it is not
+                     an empty requirement set, and the row's own list is not the enforced set.
                      This does not change pin-verifier requirements. Independently check their
                      ancestry requirements: a commit merged only on a release line does not
                      satisfy a verifier that requires it on main, even with passing gate evidence.

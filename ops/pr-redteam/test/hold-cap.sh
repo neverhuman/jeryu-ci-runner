@@ -71,6 +71,10 @@ row() {
                  else {can_merge:true} end)}'
 }
 case "$url" in
+  */branches/*/protection)
+    # The base branch's enforced required contexts. This suite's base enforces none; what a review
+    # is told about enforced contexts, and what it waits for, is covered in test/pin-wait.sh.
+    printf '{"required_status_checks":{"contexts":[]}}\n200' ;;
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"acme","name":"widget-shop"},"family":"widgets","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;

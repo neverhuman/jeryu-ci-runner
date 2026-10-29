@@ -60,6 +60,10 @@ row() {
       review:{changes_requested:0},mergeable:{can_merge:false,reason:"changes requested"}}'
 }
 case "$url" in
+  */branches/*/protection)
+    # The base branch's enforced required contexts. This suite's base enforces none; what a review
+    # is told about enforced contexts, and what it waits for, is covered in test/pin-wait.sh.
+    printf '{"required_status_checks":{"contexts":[]}}\n200' ;;
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"acme","name":"widget-shop"},"family":"widgets","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c --argjson second "$(test -e "$HOLD_FIXTURE/second-pr" && echo true || echo false)" '{items:([.] + (if $second then [. + {number:8}] else [] end))}'; printf '\n200' ;;

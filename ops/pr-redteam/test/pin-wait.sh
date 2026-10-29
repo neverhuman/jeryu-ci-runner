@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # A release pin bump (a change to release lock files only) is reviewed once its required contexts
 # have a result, never before, and never later than REDTEAM_PIN_WAIT_SECS after a pass first saw its
-# head. While it waits nothing is recorded, posted or spent. Every other head is reviewed at once,
+# head. Which contexts those are is the base branch's enforced branch protection, read from the
+# forge: never the row's own list, a branch name or a tier guessed from either. While it waits nothing is recorded, posted or spent. Every other head is reviewed at once,
 # as is a pin bump whose contexts already have a result (a failing one included). The review is
 # told each required context's state. Offline: stand-in forge, git and model processes.
 set -euo pipefail
@@ -80,6 +81,14 @@ case "$url" in
       '{head_sha: $sha, base_sha: "b", truncated: $truncated,
         files: ($files[0] | map({path: ., old_path: null, status: "modified", hunks: []}))}'
     printf '\n200' ;;
+  */branches/*/protection)
+    ref="${url#*/branches/}"; ref="${ref%/protection}"
+    if [[ "$(cat "$PIN_FIXTURE/protection")" == unreadable ]]; then printf '{"message":"server error"}\n500'; exit 0; fi
+    if out="$(jq -ce --arg ref "$ref" '.[$ref]' "$PIN_FIXTURE/protection")"; then
+      printf '%s\n200' "$out"
+    else
+      printf '{"message":"Branch not protected"}\n404'
+    fi ;;
   */pulls/1) printf '{"merge_passport":{"blockers":[]}}\n200' ;;
   */pulls/1/checks) printf '{"checks":[]}\n200' ;;
   */check-runs) jq -c . <<<"$data" >>"$PIN_FIXTURE/check-runs"; printf '{"id":"c"}\n201' ;;
@@ -109,6 +118,11 @@ waitfile() { printf '%s/state/pin-wait/acme/fixture/1-%s.json\n' "$t" "$(cat "$t
 count() { if [[ -f "$1" ]]; then wc -l <"$1"; else echo 0; fi; }
 diff_reads() { grep -c '/pulls/1/diff' "$t/requests" || true; }
 contexts() { printf '%s\n' "$1" >"$t/contexts"; }
+# What the forge enforces per branch: a branch absent from this map has no protection (404), and
+# "unreadable" makes the forge answer 500 for every branch.
+protect() { printf '%s\n' "$1" >"$t/protection"; }
+protect '{"main": {"required_status_checks": {"contexts": ["acme/required"]}}}'
+protection_reads() { grep -c '/protection' "$t/requests" || true; }
 files() { printf '%s\n' "$1" >"$t/diff-files"; }
 reviewed() { # label: the head was reviewed and approved, the model ran once more
   [[ "$(count "$t/model-calls")" == "$calls" ]] && jq -e '.decision == "approve" and .posted == true' "$(receipt)" >/dev/null \
@@ -168,35 +182,60 @@ done
 [[ ! -e "$(waitfile)" ]] || fail "an unanswered diff read was recorded"
 echo 'ok a stale, truncated or unavailable forge diff reviews at once'
 
-# 7. Off switch, no required contexts, and a forge without the field: reviewed at once, no diff read.
+# 7. Off switch, a base that enforces nothing, and protection the forge will not answer with no row
+#    list either: reviewed at once, no diff read.
 bump; contexts '[{"name":"acme/required","state":"pending"}]'; before="$(diff_reads)"
 REDTEAM_PIN_WAIT_SECS=0 review; calls=$((calls + 1)); reviewed "wait off"
-bump; contexts '[]'; review; calls=$((calls + 1)); reviewed "none required"
-grep -qx '(none required)' "$t/signals.txt" || fail "no-context signal: $(cat "$t/signals.txt")"
-bump; contexts '"absent"'; review; calls=$((calls + 1)); reviewed "field absent"
-grep -Fq 'gate evidence is unresolved: do not guess contexts' "$t/signals.txt" \
-  || fail "missing enforcement data was not identified as unresolved"
+bump; protect '{"main": {"required_status_checks": {"contexts": []}}}'; contexts '[]'
+review; calls=$((calls + 1)); reviewed "none enforced"
+grep -qx '(the base branch enforces no required context)' "$t/signals.txt" \
+  || fail "no-context signal: $(cat "$t/signals.txt")"
+bump; protect '{}'; contexts '"absent"'; review; calls=$((calls + 1)); reviewed "unprotected base"
+grep -qx '(the base branch enforces no required context)' "$t/signals.txt" \
+  || fail "unprotected base signal: $(cat "$t/signals.txt")"
 [[ "$(diff_reads)" == "$before" ]] || fail "the diff was read with nothing to wait for"
-echo 'ok with the wait off or nothing to wait for, the diff is not read and the head is reviewed'
+echo 'ok with the wait off or nothing enforced, the diff is not read and the head is reviewed'
 
-# The forge's enforced context set, not the base's spelling, determines gate evidence.
-# These responses model protection on main, a pilot switched to fast, and an unchanged release.
+# 8. The base branch's enforced protection decides, for a main base, a pilot release switched to the
+#    fast tier, and a release line whose protection is unchanged. The row's own list never does: a
+#    context it reports that protection does not enforce satisfies nothing, and an enforced context
+#    the row does not report has no result and is waited for.
+protect '{"main": {"required_status_checks": {"contexts": ["acme/required"]}},
+          "release/pilot": {"required_status_checks": {"contexts": ["acme/fast"]}},
+          "release/unchanged": {"required_status_checks": {"contexts": ["acme/required"]}}}'
 for base_ref in main release/pilot release/unchanged; do
   printf '%s\n' "$base_ref" >"$t/base-ref"
-  context=acme/required
-  [[ "$base_ref" != release/pilot ]] || context=acme/fast
-  bump; contexts "[{\"name\":\"$context\",\"state\":\"pending\"}]"; review
-  [[ "$(count "$t/model-calls")" == "$calls" ]] || fail "$base_ref: did not wait for $context"
-  contexts "[{\"name\":\"$context\",\"state\":\"success\"}]"; review
-  calls=$((calls + 1)); reviewed "$base_ref"
-  grep -Fqx "$context: success" "$t/signals.txt" || fail "$base_ref: missing enforced context"
-  other=acme/fast; [[ "$context" != acme/fast ]] || other=acme/required
-  ! grep -q "^$other:" "$t/signals.txt" || fail "$base_ref: guessed $other"
+  enforced=acme/required other=acme/fast
+  [[ "$base_ref" != release/pilot ]] || { enforced=acme/fast; other=acme/required; }
+  # Only the context protection does not enforce has a result: the head waits for the enforced one.
+  bump; contexts "[{\"name\":\"$other\",\"state\":\"success\"}]"; review
+  [[ "$(count "$t/model-calls")" == "$calls" ]] || fail "$base_ref: $other stood in for $enforced"
+  grep -q "waiting for required contexts — .*$enforced (no result)" "$t/controller.log" \
+    || fail "$base_ref: did not wait for $enforced with no result"
+  # Pending is still no result; the enforced context's own success is what releases the head.
+  contexts "[{\"name\":\"$enforced\",\"state\":\"pending\"},{\"name\":\"$other\",\"state\":\"success\"}]"
+  review; [[ "$(count "$t/model-calls")" == "$calls" ]] || fail "$base_ref: reviewed while $enforced pending"
+  contexts "[{\"name\":\"$enforced\",\"state\":\"success\"},{\"name\":\"$other\",\"state\":\"failing\"}]"
+  review; calls=$((calls + 1)); reviewed "$base_ref"
+  grep -Fqx "$enforced: success" "$t/signals.txt" || fail "$base_ref: enforced context missing from signals"
+  ! grep -Fq "$other:" "$t/signals.txt" || fail "$base_ref: judged against $other, which is not enforced"
   grep -Fq "Base branch: \"$base_ref\"." "$t/signals.txt" || fail "$base_ref: missing base"
   grep -Fq 'an upstream commit merged only on a release line is not on main' "$t/signals.txt" \
-    || fail "$base_ref: ancestry requirement omitted"
+    || fail "$base_ref: the pin verifier's ancestry requirement was omitted"
 done
-echo 'ok main, fast pilot and unchanged release use exactly their enforced contexts and preserve ancestry requirements'
+echo 'ok a main base, a fast-tier pilot release and an unchanged release line are each judged against exactly their enforced contexts'
+
+# 9. Protection the forge will not answer is unresolved evidence, not an empty requirement set: the
+#    row's list is still waited for and the review is told the enforced set is unknown.
+printf 'main\n' >"$t/base-ref"
+bump; protect unreadable; contexts '[{"name":"acme/required","state":"pending"}]'; review
+[[ "$(count "$t/model-calls")" == "$calls" ]] || fail "reviewed without waiting while protection was unreadable"
+contexts '[{"name":"acme/required","state":"success"}]'; review; calls=$((calls + 1)); reviewed "protection unreadable"
+grep -Fq "could not be read" "$t/signals.txt" && grep -Fq 'do not guess contexts' "$t/signals.txt" \
+  || fail "unreadable protection was not identified as unresolved: $(cat "$t/signals.txt")"
+grep -Fqx 'acme/required: success' "$t/signals.txt" || fail "the row's list was not shown as such"
+[[ "$(protection_reads)" -gt 0 ]] || fail "branch protection was never read"
+echo 'ok protection the forge will not answer leaves gate evidence unresolved and still waits for the row'
 
 [[ ! -e "$t/danger" ]] || fail "forbidden action: $(cat "$t/danger")"
 echo 'PIN WAIT PASS'
