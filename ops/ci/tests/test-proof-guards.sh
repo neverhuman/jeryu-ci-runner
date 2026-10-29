@@ -44,6 +44,35 @@ git clone -q --depth 1 --branch topic "file://$fixture/forge.git" "$fixture/pr"
 [[ "$(git -C "$fixture/pr" diff --name-only "origin/main...HEAD" | tr '\n' ' ')" == 't1 t2 t3 ' ]] ||
   fail 'the head diff against protected main is not answerable'
 
+# --- change set: from the fork point, never refused for being empty ----------
+# A head behind the tip is judged from its fork point: its own commits, not
+# main's newer one.
+[[ "$(cd "$fixture/pr" && proof_fork_point "$main_tip" "$topic")" == "$fork" ]] ||
+  fail 'the fork point of a head behind the tip is not its merge-base'
+(cd "$fixture/pr" && proof_changed_paths "$fork" "$topic" "$fixture/changed")
+[[ "$(tr '\0' ' ' < "$fixture/changed")" == 't1 t2 t3 ' ]] ||
+  fail 'the change set of a head behind the tip is not its own commits'
+# Protected main gating its own head: the fork point is the tip and the change
+# set is empty, which the lane passes rather than refuses.
+[[ "$(cd "$fixture/pr" && proof_fork_point "$main_tip" "$main_tip")" == "$main_tip" ]] ||
+  fail 'the fork point of main'"'"'s own head is not the tip'
+(cd "$fixture/pr" && proof_changed_paths "$main_tip" "$main_tip" "$fixture/changed") ||
+  fail 'main'"'"'s own head was refused'
+[[ ! -s "$fixture/changed" ]] || fail 'main'"'"'s own head has a non-empty change set'
+# An unrelated history has no fork point.
+git init -q -b main "$fixture/other"
+commit "$fixture/other" o1
+git -C "$fixture/pr" fetch -q "$fixture/other" main
+other="$(git -C "$fixture/other" rev-parse HEAD)"
+if (cd "$fixture/pr" && proof_fork_point "$main_tip" "$other") 2>/dev/null; then
+  fail 'accepted a head that shares no history with protected main'
+fi
+# A failing diff fails the guard instead of reading as an empty change set.
+if (cd "$fixture/pr" && proof_changed_paths "$fork" 0000000000000000000000000000000000000000 "$fixture/changed") 2>/dev/null; then
+  fail 'a failed diff read as an empty change set'
+fi
+printf 'proof change-set guard ok\n'
+
 # An unreachable forge fails the guard.
 git clone -q --depth 1 --branch topic "file://$fixture/forge.git" "$fixture/pr-gone"
 git -C "$fixture/pr-gone" remote set-url origin "file://$fixture/missing.git"
@@ -108,9 +137,11 @@ line_of() {
 }
 (( $(line_of 'git remote get-url origin' "$lane") < $(line_of '^proof_require_history$' "$lane") )) ||
   fail 'the lane fetches from origin before checking it is the hosted repository'
-(( $(line_of '^proof_require_history$' "$lane") < $(line_of 'merge-base --is-ancestor' "$lane") )) ||
+(( $(line_of '^proof_require_history$' "$lane") < $(line_of 'proof_fork_point' "$lane") )) ||
   fail 'ancestry is asked before the checkout has its history'
-(( $(line_of '^rm -rf -- \\$' "$lane") < $(line_of '^jankurai proof \.' "$lane") )) ||
+grep -q 'refuses an empty' "$lane" &&
+  fail 'the lane refuses an empty change set, so protected main fails its own gate' || :
+(( $(line_of '^rm -rf -- \\$' "$lane") < $(line_of '^ *jankurai proof \.' "$lane") )) ||
   fail 'the lane runs a tool before clearing an earlier run artifacts'
 (( $(line_of '^jankurai migrate \.' "$lane") < $(line_of '^proof_require_migration' "$lane") )) ||
   fail 'the migration gate reads a report the lane did not just produce'

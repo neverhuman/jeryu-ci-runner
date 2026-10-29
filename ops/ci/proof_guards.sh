@@ -33,6 +33,30 @@ proof_require_history() {
   git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
 }
 
+# Print the fork point of HEAD_COMMIT from protected main's tip BASE_COMMIT.
+# The change set is judged from here, so a head behind the tip is not refused,
+# and main's own head (or any ancestor of the tip) has the tip's ancestor as its
+# fork point and changes nothing. Only a head with no shared history fails.
+proof_fork_point() {
+  local base="$1" head="$2" fork
+  fork="$(git merge-base "$base" "$head")" && [[ "$fork" =~ ^[0-9a-f]{40}$ ]] || {
+    printf 'proof head shares no history with protected base: base=%s head=%s\n' \
+      "$base" "$head" >&2
+    return 1
+  }
+  printf '%s\n' "$fork"
+}
+
+# Write the NUL-separated paths HEAD_COMMIT changes since FORK_COMMIT to OUT.
+# The diff goes to a file first, so a failing git diff fails the caller under
+# set -e instead of leaving an empty change set behind a process substitution.
+# An empty OUT is a change set of nothing, not an error.
+proof_changed_paths() {
+  local fork="$1" head="$2" out="$3"
+  git diff --no-ext-diff --name-only -z --diff-filter=ACDMRT \
+    "${fork}...${head}" >"$out"
+}
+
 # Ratchet this head's migration analysis against protected main's.
 #
 # Both reports are held to the same shape, the one the pinned Jankurai 1.7.5

@@ -19,9 +19,13 @@ hosted runner result.
 so the canonical gate as a whole is a network-, forge- and exact-head-bound
 lane. It refuses a work-in-progress tree (the checkout must be clean, untracked
 files included), an `origin` other than
-`https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git`, and a head that does
-not descend from the current protected `main` (rebase and rerun). It clones
-protected main from the forge to audit the ratchet baseline. A shallow checkout
+`https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git`, and a head that
+shares no history with protected `main`. The ratchet baseline is the current
+protected `main` tip and the change set runs from the head's fork point, so a
+head behind the tip is judged, not refused, and protected `main`'s own head (an
+empty change set) skips the proof plan and still runs the audit, security,
+migration and ratchet checks. It clones protected main from the forge to audit
+the ratchet baseline. A shallow checkout
 is deepened from the forge first. Run the narrower `just` lanes above on a tree
 that is not yet a pushed, rebased head.
 

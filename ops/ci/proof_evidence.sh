@@ -36,11 +36,10 @@ base_commit="$(git rev-parse --verify "${BASE_REF}^{commit}")" || {
   exit 1
 }
 current_head="$(git rev-parse --verify 'HEAD^{commit}')"
-if ! git merge-base --is-ancestor "${base_commit}" "${current_head}"; then
-  printf 'proof head is not a descendant of protected base: base=%s head=%s\n' \
-    "${base_commit}" "${current_head}" >&2
-  exit 1
-fi
+# The ratchet baseline is protected main's tip; the change set starts at the
+# fork point. A head behind the tip is judged against the tip, not refused, and
+# main's own head is a change set of nothing.
+fork_commit="$(proof_fork_point "${base_commit}" "${current_head}")"
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
   printf 'proof evidence requires a clean exact-head checkout\n' >&2
   exit 1
@@ -58,6 +57,7 @@ rm -rf -- \
   target/jankurai/accepted-baseline.json \
   target/jankurai/baseline-migration-report.json \
   target/jankurai/baseline-migration-report.md \
+  target/jankurai/changed-paths \
   target/jankurai/copy-code \
   target/jankurai/evidence-index.json \
   target/jankurai/migration-report.json \
@@ -82,16 +82,10 @@ mkdir -p \
   target/jankurai/rust \
   target/jankurai/security
 
-mapfile -d '' -t changed_paths < <(
-  git diff --no-ext-diff --name-only -z --diff-filter=ACDMRT \
-    "${BASE_REF}...${current_head}" | LC_ALL=C sort -zu
-)
-if [[ "${#changed_paths[@]}" -eq 0 ]]; then
-  printf 'proof evidence refuses an empty protected-main change set\n' >&2
-  exit 1
-fi
+proof_changed_paths "${fork_commit}" "${current_head}" target/jankurai/changed-paths
+mapfile -d '' -t changed_paths < <(LC_ALL=C sort -zu target/jankurai/changed-paths)
 expected_changed="$(
-  printf '%s\0' "${changed_paths[@]}" |
+  printf '%s\0' "${changed_paths[@]:-}" |
     jq -Rs 'split("\u0000") | map(select(length > 0)) | sort | unique'
 )"
 for changed_path in "${changed_paths[@]}"; do
@@ -106,61 +100,73 @@ receipt_dir="target/jankurai/proof-receipts/run-${current_head:0:12}-$$"
 # A rerun can reuse this name (same head, recycled pid); every receipt read
 # below has to be one this run wrote.
 rm -rf -- "${receipt_dir}"
-jankurai proof . --changed-from origin/main --out target/jankurai/proof-plan.json --md target/jankurai/proof-plan.md
-jankurai prove . --plan target/jankurai/proof-plan.json --out-dir "${receipt_dir}" --evidence-index target/jankurai/evidence-index.json
+receipt_count=0
+proofmark_review=0
+if [[ "${#changed_paths[@]}" -eq 0 ]]; then
+  # Nothing changed since the fork point (protected main gating its own head):
+  # there is no change surface to plan, prove or bind. The audit, security,
+  # migration and ratchet checks below still run against this exact head.
+  printf 'proof evidence: empty change set from fork point %s; no change surface to prove\n' \
+    "${fork_commit}" >&2
+else
+  jankurai proof . --changed-from "${fork_commit}" --out target/jankurai/proof-plan.json --md target/jankurai/proof-plan.md
+  jankurai prove . --plan target/jankurai/proof-plan.json --out-dir "${receipt_dir}" --evidence-index target/jankurai/evidence-index.json
 
-jq -e \
-  --arg head "${current_head}" \
-  --argjson changed "${expected_changed}" \
-  '.schema_version == "1.0.0" and
-   .git_head == $head and
-   (.changed_paths | sort | unique) == $changed and
-   (.risk_notes | length) == 0 and
-   (.human_approval_requirements | length) == 0 and
-   ([.route_decisions[] | select(.decision != "pass")] | length) == 0 and
-   (.commands | length) > 0' \
-  target/jankurai/proof-plan.json >/dev/null
-jq -e \
-  --arg head "${current_head}" \
-  --arg receipt_dir "${receipt_dir}" \
-  --argjson changed "${expected_changed}" \
-  '.schema_version == "1.2.0" and
-   .git_head == $head and
-   .receipt_dir == $receipt_dir and
-   (.changed_paths | sort | unique) == $changed and
-   (.failed_receipts | length) == 0 and
-   (.receipts | length) == (.commands | length) and
-   (.receipts | length) > 0' \
-  target/jankurai/evidence-index.json >/dev/null
-for receipt in "${receipt_dir}"/*.json; do
-  [[ -f "${receipt}" && ! -L "${receipt}" ]] || {
-    printf 'missing regular proof receipt in %s\n' "${receipt_dir}" >&2
-    exit 1
-  }
   jq -e \
     --arg head "${current_head}" \
-    '.schema_version == "1.9.0" and .git_head == $head and
-     .dirty_worktree == false and .exit_code == 0 and
-     (.command | type == "string" and length > 0) and
-     (.log_sha256 | test("^sha256:[0-9a-f]{64}$"))' \
-    "${receipt}" >/dev/null
-done
+    --argjson changed "${expected_changed}" \
+    '.schema_version == "1.0.0" and
+     .git_head == $head and
+     (.changed_paths | sort | unique) == $changed and
+     (.risk_notes | length) == 0 and
+     (.human_approval_requirements | length) == 0 and
+     ([.route_decisions[] | select(.decision != "pass")] | length) == 0 and
+     (.commands | length) > 0' \
+    target/jankurai/proof-plan.json >/dev/null
+  jq -e \
+    --arg head "${current_head}" \
+    --arg receipt_dir "${receipt_dir}" \
+    --argjson changed "${expected_changed}" \
+    '.schema_version == "1.2.0" and
+     .git_head == $head and
+     .receipt_dir == $receipt_dir and
+     (.changed_paths | sort | unique) == $changed and
+     (.failed_receipts | length) == 0 and
+     (.receipts | length) == (.commands | length) and
+     (.receipts | length) > 0' \
+    target/jankurai/evidence-index.json >/dev/null
+  for receipt in "${receipt_dir}"/*.json; do
+    [[ -f "${receipt}" && ! -L "${receipt}" ]] || {
+      printf 'missing regular proof receipt in %s\n' "${receipt_dir}" >&2
+      exit 1
+    }
+    jq -e \
+      --arg head "${current_head}" \
+      '.schema_version == "1.9.0" and .git_head == $head and
+       .dirty_worktree == false and .exit_code == 0 and
+       (.command | type == "string" and length > 0) and
+       (.log_sha256 | test("^sha256:[0-9a-f]{64}$"))' \
+      "${receipt}" >/dev/null
+  done
 
-jankurai proof-verify . \
-  --plan target/jankurai/proof-plan.json \
-  --evidence-index target/jankurai/evidence-index.json \
-  --out target/jankurai/proof-verification.json \
-  --md target/jankurai/proof-verification.md
-jq -e '.schema_version == "1.0.0" and .verdict == "pass" and
-       ((.issues // []) | length) == 0' \
-  target/jankurai/proof-verification.json >/dev/null
+  jankurai proof-verify . \
+    --plan target/jankurai/proof-plan.json \
+    --evidence-index target/jankurai/evidence-index.json \
+    --out target/jankurai/proof-verification.json \
+    --md target/jankurai/proof-verification.md
+  jq -e '.schema_version == "1.0.0" and .verdict == "pass" and
+         ((.issues // []) | length) == 0' \
+    target/jankurai/proof-verification.json >/dev/null
 
-# Proofbind/proofmark remain diagnostic in Jankurai 1.6.10: required mode
-# incorrectly demands Rust line/mutation evidence for non-Rust contract prose.
-# They still run without fallbacks, against the exact extant changed surface,
-# and their unresolved review count is retained in the summary below.
-jankurai proofbind verify . --changed-from origin/main --mode advisory --proof-receipts "${receipt_dir}" --out target/jankurai/proofbind/surface-witness.json --obligations-out target/jankurai/proofbind/obligations.json --md target/jankurai/proofbind/proofbind.md
-jankurai proofmark rust . --obligations target/jankurai/proofbind/obligations.json --changed-from origin/main --mode advisory --out target/jankurai/proofmark/proofmark-receipt.json --proof-receipt target/jankurai/proofmark/proof-receipt.json --md target/jankurai/proofmark/proofmark.md
+  # Proofbind/proofmark remain diagnostic in Jankurai 1.6.10: required mode
+  # incorrectly demands Rust line/mutation evidence for non-Rust contract prose.
+  # They still run without fallbacks, against the exact extant changed surface,
+  # and their unresolved review count is retained in the summary below.
+  jankurai proofbind verify . --changed-from "${fork_commit}" --mode advisory --proof-receipts "${receipt_dir}" --out target/jankurai/proofbind/surface-witness.json --obligations-out target/jankurai/proofbind/obligations.json --md target/jankurai/proofbind/proofbind.md
+  jankurai proofmark rust . --obligations target/jankurai/proofbind/obligations.json --changed-from "${fork_commit}" --mode advisory --out target/jankurai/proofmark/proofmark-receipt.json --proof-receipt target/jankurai/proofmark/proof-receipt.json --md target/jankurai/proofmark/proofmark.md
+
+  receipt_count="$(jq -er '.receipts | length' target/jankurai/evidence-index.json)"
+fi
 
 jankurai copy-code . --json target/jankurai/copy-code/report.json --md target/jankurai/copy-code/report.md
 jankurai rust map . --out-dir target/jankurai/rust
@@ -257,18 +263,20 @@ jq -e --arg base "${short_base}" --arg base_full "${base_commit}" \
 jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.json --json target/jankurai/repo-score.json --md target/jankurai/repo-score.md --policy agent/audit-policy.toml --fail-under "${effective_floor}" --repair-queue-jsonl target/jankurai/repair-queue.jsonl --full --no-score-history
 
 short_head="${current_head:0:7}"
-jq -e --arg head "${short_head}" --argjson changed "${expected_changed}" \
-  '.schema_version == "1.0.0" and .git_head == $head and
-   (.changed_paths | sort | unique) == $changed and
-   (.summary.changed_surface_count | type == "number")' \
-  target/jankurai/proofbind/surface-witness.json >/dev/null
-jq -e --arg head "${short_head}" \
-  '.schema_version == "1.0.0" and .git_head == $head and
-   (.summary.total_obligations | type == "number") and
-   (.summary.satisfied_obligations | type == "number") and
-   (.summary.review_obligations | type == "number") and
-   (.summary.verdict == "pass" or .summary.verdict == "review")' \
-  target/jankurai/proofmark/proofmark-receipt.json >/dev/null
+if [[ "${#changed_paths[@]}" -gt 0 ]]; then
+  jq -e --arg head "${short_head}" --argjson changed "${expected_changed}" \
+    '.schema_version == "1.0.0" and .git_head == $head and
+     (.changed_paths | sort | unique) == $changed and
+     (.summary.changed_surface_count | type == "number")' \
+    target/jankurai/proofbind/surface-witness.json >/dev/null
+  jq -e --arg head "${short_head}" \
+    '.schema_version == "1.0.0" and .git_head == $head and
+     (.summary.total_obligations | type == "number") and
+     (.summary.satisfied_obligations | type == "number") and
+     (.summary.review_obligations | type == "number") and
+     (.summary.verdict == "pass" or .summary.verdict == "review")' \
+    target/jankurai/proofmark/proofmark-receipt.json >/dev/null
+fi
 jq -e --arg head "${current_head}" \
   '.schema_version == "1.0.0" and .git_head == $head and
    .lane == "security" and .wrapper.path == "tools/security-lane.sh" and
@@ -342,27 +350,41 @@ if [[ "$(git rev-parse --verify 'HEAD^{commit}')" != "${current_head}" ||
   exit 1
 fi
 
-proofmark_review="$(jq -er '.summary.review_obligations' \
-  target/jankurai/proofmark/proofmark-receipt.json)"
+# An empty change set has no plan, evidence index, verification or proofmark
+# receipt: their digests are null and the verification is not_applicable.
+plan_sha256=null
+evidence_index_sha256=null
+verification_sha256=null
+proof_verification=not_applicable
+if [[ "${#changed_paths[@]}" -gt 0 ]]; then
+  proofmark_review="$(jq -er '.summary.review_obligations' \
+    target/jankurai/proofmark/proofmark-receipt.json)"
+  plan_sha256="\"$(sha256sum target/jankurai/proof-plan.json | awk '{print $1}')\""
+  evidence_index_sha256="\"$(sha256sum target/jankurai/evidence-index.json | awk '{print $1}')\""
+  verification_sha256="\"$(sha256sum target/jankurai/proof-verification.json | awk '{print $1}')\""
+  proof_verification=pass
+fi
 jq -n \
   --arg head "${current_head}" \
   --arg base "${base_commit}" \
   --arg receipt_dir "${receipt_dir}" \
-  --arg plan_sha256 "$(sha256sum target/jankurai/proof-plan.json | awk '{print $1}')" \
-  --arg evidence_index_sha256 "$(sha256sum target/jankurai/evidence-index.json | awk '{print $1}')" \
-  --arg verification_sha256 "$(sha256sum target/jankurai/proof-verification.json | awk '{print $1}')" \
+  --arg fork "${fork_commit}" \
+  --argjson plan_sha256 "${plan_sha256}" \
+  --argjson evidence_index_sha256 "${evidence_index_sha256}" \
+  --argjson verification_sha256 "${verification_sha256}" \
+  --arg proof_verification "${proof_verification}" \
   --arg security_sha256 "$(sha256sum target/jankurai/security/evidence.json | awk '{print $1}')" \
   --arg supply_chain_sha256 "$(sha256sum target/security/evidence.json | awk '{print $1}')" \
   --arg sbom_sha256 "$(sha256sum target/security/sbom.cdx.json | awk '{print $1}')" \
   --arg baseline_sha256 "${baseline_sha256}" \
   --argjson changed_count "${#changed_paths[@]}" \
-  --argjson receipt_count "$(jq -er '.receipts | length' target/jankurai/evidence-index.json)" \
+  --argjson receipt_count "${receipt_count}" \
   --argjson proofmark_review "${proofmark_review}" \
   --argjson baseline_score "${baseline_score}" \
   --argjson migration_liability "$(jq -er .liability_score target/jankurai/migration-report.json)" \
   --argjson baseline_migration_liability "$(jq -er .liability_score target/jankurai/baseline-migration-report.json)" \
   '{schema_version:"jeryu.ci-runner.proof-evidence/v1",git_head:$head,
-    base_commit:$base,dirty_worktree:false,changed_path_count:$changed_count,
+    base_commit:$base,fork_point:$fork,dirty_worktree:false,changed_path_count:$changed_count,
     receipt_count:$receipt_count,receipt_dir:$receipt_dir,
     proof_plan_sha256:$plan_sha256,evidence_index_sha256:$evidence_index_sha256,
     proof_verification_sha256:$verification_sha256,security_sha256:$security_sha256,
@@ -370,12 +392,11 @@ jq -n \
     baseline_score:$baseline_score,baseline_sha256:$baseline_sha256,
     migration_liability_score:$migration_liability,
     baseline_migration_liability_score:$baseline_migration_liability,
-    proof_verification:"pass",proofmark_mode:"advisory",
+    proof_verification:$proof_verification,proofmark_mode:"advisory",
     proofmark_review_obligations:$proofmark_review,
     synthetic_fallbacks:0,conclusion:"success"}' \
   > target/jankurai/proof-evidence-summary.json
 
 printf 'proof evidence ok: head=%s base=%s paths=%s receipts=%s proofmark_review=%s\n' \
   "${current_head}" "${base_commit}" "${#changed_paths[@]}" \
-  "$(jq -r '.receipts | length' target/jankurai/evidence-index.json)" \
-  "${proofmark_review}"
+  "${receipt_count}" "${proofmark_review}"

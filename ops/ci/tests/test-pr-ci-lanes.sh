@@ -6,7 +6,12 @@
 # One block is exempt by name: the jankurai pin drift check that jeryu-tool
 # renders into pr-ci.sh (from `JERYU_TOOL_RENDER=` to its `fi`). It is generated,
 # so it cannot be changed here; making it fail closed is a jeryu-tool template
-# change. Every other conditional lane is a failure.
+# change. A second is exempt by shape: in proof_evidence.sh, the change-surface
+# commands (jankurai proof, prove, proof-verify, proofbind verify, proofmark
+# rust) inside the block that opens on an empty change set. With nothing changed
+# since the fork point they have no surface to look at (jankurai proof refuses
+# one), and the rest of the lane still runs. Every other conditional lane is a
+# failure.
 #
 # This is a tripwire over entry scripts, not a proof: it reads lines, not a
 # shell AST.
@@ -14,6 +19,7 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 pr_ci="${repo_root}/ops/ci/pr-ci.sh"
 check_sh="${repo_root}/ops/ci/check.sh"
+proof_sh="${repo_root}/ops/ci/proof_evidence.sh"
 entry_scripts=(
   "${repo_root}/ops/ci/pr-ci.sh"
   "${repo_root}/ops/ci/run-suites.sh"
@@ -36,28 +42,35 @@ flunk() { printf 'FAIL %s\n' "$1" >&2; failures=$((failures + 1)); }
 # guarded_lanes <script>: print every lane invocation (bash/just/cargo) that
 # sits inside a multi-line if/case, or behind `then`, `&&` or `||` on one line.
 guarded_lanes() {
-  awk -v check_sh="${check_sh}" '
+  awk -v check_sh="${check_sh}" -v proof_sh="${proof_sh}" '
     function is_lane_command(line) {
       return line ~ /^[[:space:]]*(bash|just|cargo|actionlint|jankurai|syft)[[:space:]]/
     }
     function has_guarded_lane(line) {
       return line ~ /(then|&&|\|\|)[[:space:]]*(bash|just|cargo|actionlint|jankurai|syft)[[:space:]]/
     }
-    FNR == 1 { depth = 0; generated = 0; full_check_depth = 0 }
+    FNR == 1 { depth = 0; generated = 0; full_check_depth = 0; empty_change_depth = 0 }
     /^JERYU_TOOL_RENDER=/ { generated = 1 }
     generated { if ($0 ~ /^fi[[:space:]]*$/) generated = 0; next }
     # check.sh gates its expensive full-check command by JERYU_SPLIT_FULL_CHECK;
     # that is the only conditional cargo-check exemption.
     FILENAME == check_sh && full_check_depth > 0 &&
       /^[[:space:]]*cargo check --locked --workspace --all-targets/ { next }
+    # proof_evidence.sh skips the change-surface commands for an empty change
+    # set; that is the only conditional jankurai exemption.
+    FILENAME == proof_sh && empty_change_depth > 0 &&
+      /^[[:space:]]*jankurai (proof|prove|proof-verify|proofbind verify|proofmark rust)[[:space:]]/ { next }
     has_guarded_lane($0) { print FILENAME ":" FNR ":" $0; next }
     /^[[:space:]]*(if|case)[[:space:]]/ && !/;[[:space:]]*(fi|esac)[[:space:]]*$/ {
       depth += 1
       if (FILENAME == check_sh && $0 ~ /JERYU_SPLIT_FULL_CHECK/) full_check_depth = depth
+      if (FILENAME == proof_sh && depth == 1 &&
+          $0 == "if [[ \"${#changed_paths[@]}\" -eq 0 ]]; then") empty_change_depth = depth
       next
     }
     /^[[:space:]]*(fi|esac)[[:space:]]*$/ {
       if (depth > 0 && depth == full_check_depth) full_check_depth = 0
+      if (depth > 0 && depth == empty_change_depth) empty_change_depth = 0
       if (depth > 0) depth -= 1
       next
     }
@@ -115,6 +128,31 @@ if (( ${#caught[@]} == 1 )); then
   pass "cargo check exemption is scoped to check.sh"
 else
   flunk "cargo check exemption is scoped to check.sh"
+fi
+
+# The empty-change-set exemption covers only the change-surface commands, only
+# in that block, and only in proof_evidence.sh.
+cat >"${fixture}" <<'FIXTURE'
+if [[ "${#changed_paths[@]}" -eq 0 ]]; then
+  true
+else
+  jankurai proof . --changed-from "${fork_commit}"
+  jankurai audit . --mode ratchet
+fi
+if [[ -x "$E" ]]; then
+  jankurai prove . --plan plan.json
+fi
+FIXTURE
+mapfile -t caught < <(proof_sh="${fixture}" guarded_lanes "${fixture}")
+expected=$"${fixture}"':5:  jankurai audit . --mode ratchet
+'"${fixture}"':8:  jankurai prove . --plan plan.json'
+actual="$(printf '%s\n' "${caught[@]}")"
+mapfile -t caught_elsewhere < <(guarded_lanes "${fixture}")
+if [[ "${actual}" == "${expected}" && ${#caught_elsewhere[@]} == 3 ]]; then
+  pass "the empty-change-set exemption is scoped to the change-surface commands in proof_evidence.sh"
+else
+  printf '%s\n' "${caught[@]}" "${caught_elsewhere[@]}" >&2
+  flunk "the empty-change-set exemption is scoped to the change-surface commands in proof_evidence.sh"
 fi
 
 grep -q 'required_lane_result "sandbox escape matrix" skipped' "${pr_ci}" &&
