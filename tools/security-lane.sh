@@ -56,7 +56,7 @@ if [[ "$(syft version -o json | jq -r '.version // empty')" != "${SYFT_VERSION}"
   printf 'syft version mismatch: expected %s\n' "${SYFT_VERSION}" >&2
   exit 1
 fi
-cargo audit --deny warnings
+bash ops/ci/audit-advisories.sh
 cargo deny check advisories bans licenses sources
 bash ops/ci/dependency-sources.sh
 if [[ "$(<VERSION)" != "${SOURCE_VERSION}" ]]; then
