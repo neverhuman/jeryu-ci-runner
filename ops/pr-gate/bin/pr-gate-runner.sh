@@ -1000,23 +1000,24 @@ gate_regate_wanted() { # owner repo number sha
   [[ "$at" != "$(cat "$HOME_DIR/regate/$1-$2-$4" 2>/dev/null || true)" ]]
 }
 
-# Heads never gated go first after the queue. A sibling's main moving invalidates every open result in
+# Explicit re-gates go directly after the queue, ahead of never-gated heads and wake-up hints.
+# Heads never gated then go first among the remaining heads. A sibling's main moving invalidates every open result in
 # the family, and re-proving those in PR order put each new head behind all of them, one tree
 # preparation at a time. Only the order changes; every head is still decided exactly as before.
 # Those re-gates are automatic, and bounded by coalescing (see gate_regate_settling): while the family's
 # mains moved within GATE_RUNNER_REGATE_SETTLE seconds (default 90), an already-gated head waits for the
 # burst to end. --repo/--pr is never deferred.
-fresh=() seen_before=()
+requested=() fresh=() seen_before=()
 for candidate in "${candidates[@]}"; do
   read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
   [[ "$owner" != . && "$owner" != .. && "$repo" != . && "$repo" != .. ]] || die "invalid repository path in dispatch"
-  if ! gate_attempted "$owner" "$repo" "$sha"; then fresh+=("$candidate"); continue; fi
-  # Somebody asked for this head: it is as urgent as a new one, and coalescing a burst of merges is
-  # not a reason to make them wait for it.
+  # A requested retry must not starve behind a continuous stream of never-gated heads,
+  # even when the wake-up hint has already been consumed by a busy slot.
   if gate_regate_wanted "$owner" "$repo" "$number" "$sha"; then
     say "re-gate requested for $owner/$repo#$number at $sha"
-    fresh+=("$candidate"); continue
+    requested+=("$candidate"); continue
   fi
+  if ! gate_attempted "$owner" "$repo" "$sha"; then fresh+=("$candidate"); continue; fi
   if [[ "$main_health" == 0 && -z "$only_pr" ]] && gate_regate_settling "$HOME_DIR/cache/mains/$owner/$repo" "$REGATE_SETTLE"; then
     say "deferring re-gate of $owner/$repo#$number: $owner mains moved within ${REGATE_SETTLE}s"; continue
   fi
@@ -1031,16 +1032,15 @@ for candidate in "${candidates[@]}"; do
   fi
   seen_before+=("$candidate")
 done
-# The head this slot was woken for goes first of the pull-request heads: that is what makes a woken
-# slot gate the head it was woken for rather than whatever its own pass reached first. Merge-queue
-# entries stay ahead of all of them, each being one gate from landing. Without a wake-up the order
-# is exactly what it was.
+# The head this slot was woken for goes first of the remaining pull-request heads. Merge-queue
+# entries stay first, each being one gate from landing, followed by explicit re-gates: even a
+# continuous stream of wake-ups for new heads must not starve a requested retry.
 woken=() rest=()
 for candidate in "${fresh[@]}" "${seen_before[@]}"; do
   read -r owner repo number sha qref contributed cbase ready <<<"$candidate"
   if dispatch_names "$owner" "$repo" "$number" "$sha"; then woken+=("$candidate"); else rest+=("$candidate"); fi
 done
-candidates=("${queued[@]}" "${woken[@]}" "${rest[@]}")
+candidates=("${queued[@]}" "${requested[@]}" "${woken[@]}" "${rest[@]}")
 
 if [[ -n "$only_branch" && -n "$only_repo" ]] && ((branch_refused && ${#candidates[@]} == 0)); then
   die "--branch $only_branch: $only_repo was refused (see above)"

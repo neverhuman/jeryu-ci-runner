@@ -1062,6 +1062,38 @@ grep -q 'preparing acme/fixture#1' "$fixture/runner.log" \
   || { printf 'without a wake-up the tick did not take the first head of its pass\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 printf 'PASS a woken slot gates the head it was woken for before the rest of its pass\n'
 
+# An explicit re-gate survives a consumed wake-up and outranks a never-gated head earlier in
+# the forge's listing. Merge-queue entries retain precedence over both.
+new_head
+jq -nc --arg s "$(cat "$fixture/head2")" \
+  '{requests:[{repo:"acme/fixture",number:2,head_sha:$s,requested_at:"2026-10-29T04:03:00Z"}]}' \
+  >"$fixture/regate.json"
+queue_entry "$qsha2" refs/queue/main/1
+listed=$("${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list 2>"$fixture/list.err")
+mapfile -t ordered < <(grep '^acme fixture ' <<<"$listed")
+[[ "${ordered[0]}" == "acme fixture 1 $qsha2 refs/queue/main/1 "* \
+   && "${ordered[1]}" == "acme fixture 2 $(cat "$fixture/head2") - "* \
+   && "${ordered[2]}" == "acme fixture 1 $head - "* ]] \
+  || { printf 'expected queue, explicit re-gate, then new head:\n%s\n' "$listed" >&2; exit 1; }
+# A new head woke this slot, but that must not let a stream of new wake-ups starve the retry.
+rm -f "$fixture/queue.json"
+printf 'acme/fixture 1 %s pr-head -\n' "$head" >"$dispatch"
+before_count=$(count)
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 1))"
+grep -q 'woken for acme/fixture#1' "$fixture/runner.log" || { cat "$fixture/runner.log"; exit 1; }
+grep -q 'preparing acme/fixture#2' "$fixture/runner.log" \
+  || { printf 'explicit re-gate starved behind a never-gated head\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+! grep -q 'preparing acme/fixture#1' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
+# Once honoured, the request no longer takes precedence and the new head runs next.
+invoke
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$((before_count + 2))"
+grep -q 'preparing acme/fixture#1' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/regate.json"
+printf 'PASS explicit re-gates precede never-gated heads, follow the queue, and relinquish priority after dispatch\n'
+
 # The link on the status and the check run names the PR actually gated, never the last one listed:
 # with #1 and #2 open, a tick that gates #1 links #1's checks page.
 new_head
