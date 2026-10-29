@@ -973,11 +973,14 @@ gate_publish() {
       '{state:$state,context:$context,description:$description}')
     api POST "/repos/$owner/$repo/statuses/$sha" "$(jq -c --arg url "$checks_url" \
       '. + (if $url == "" then {} else {target_url:$url} end)' <<<"$status_payload")"
-    : "${code:?}" "${body:?}"
+    # An empty response is an unacknowledged publication, not a shell invariant failure.
+    : "${code?}" "${body?}"
     # The link never decides a gate: a forge that refuses it (422) gets the same status without it.
     if [[ "$code" == 422 && -n "$checks_url" ]]; then api POST "/repos/$owner/$repo/statuses/$sha" "$status_payload"; fi
-    if [[ "$code" != 201 ]] || ! jq -e '.id != null' <<<"$body" >/dev/null; then
+    if [[ "$code" != 201 ]] || ! jq -se 'length == 1 and .[0].id != null' <<<"$body" >/dev/null 2>&1; then
       gate_update --arg code "$code" '.recovery_required="required-status publication rejected or unacknowledged" | .publication.http_status=$code' || return
+      cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
+      printf 'required-status publication unacknowledged for %s/%s@%s (HTTP %s); retained for recovery\n' "$owner" "$repo" "$sha" "$code" >&2
       return 1
     fi
     gate_update --argjson response "$body" '.publication.required_status=true | .publication.status_id=$response.id | .publication.http_status=201' || return

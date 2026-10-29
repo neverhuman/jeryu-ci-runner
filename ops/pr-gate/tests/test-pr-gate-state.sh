@@ -17,6 +17,12 @@ mkdir -p "$HOME_DIR"
 publication_mode=201
 api() {
   code=$publication_mode
+  case "$publication_mode" in
+    empty-201) code=201 body=""; return;;
+    blank-201) code=201 body='   '; return;;
+    invalid-201) code=201 body='not JSON'; return;;
+    000|503) body=""; return;;
+  esac
   if [[ "$code" != 201 ]]; then body='{"message":"rejected"}'; return; fi
   export body='{"id":"verified-publication-id"}'
   printf '%s\n' "$3" >>"$scratch/published.jsonl"
@@ -90,19 +96,23 @@ for input in source dependencies toolchain fixtures; do
 done
 printf 'PASS deterministic failure needs explicit retry or changed bound inputs\n'
 
-gate_begin "$identity"
-printf 'passed\n' >"$gate_attempt_dir/build.log"
-gate_finish success 0 "$gate_attempt_dir/build.log"
-publication_mode=403
-if gate_publish; then exit 1; fi
-jq -e '.terminal and .exit_code==0 and .recovery_required!=null and (.publication.required_status|not)' "$gate_receipt" >/dev/null
-gate_decision "$identity" 0 "$statuses"
-[[ "$gate_action" == republish ]]
-publication_mode=201
-gate_recover
-gate_decision "$identity" 0 "$statuses"
-[[ "$gate_action" == reuse ]]
-printf 'PASS publication rejection persists terminal evidence and replays without computation\n'
+for publication_mode in 403 000 503 empty-201 blank-201 invalid-201; do
+  gate_begin "$identity"
+  printf 'passed\n' >"$gate_attempt_dir/build.log"
+  gate_finish success 0 "$gate_attempt_dir/build.log"
+  # A subshell also catches a fatal parameter expansion, which used to abort the whole slot.
+  if (gate_publish); then exit 1; fi
+  jq -e '.terminal and .exit_code==0 and .recovery_required!=null
+    and (.publication.http_status | type == "string") and (.publication.required_status|not)' "$gate_receipt" >/dev/null
+  cmp "$gate_receipt" "$gate_key_dir/last-result.json"
+  gate_decision "$identity" 0 "$statuses"
+  [[ "$gate_action" == republish ]]
+  publication_mode=201
+  gate_recover
+  gate_decision "$identity" 0 "$statuses"
+  [[ "$gate_action" == reuse ]]
+done
+printf 'PASS rejected, empty and malformed publications retain terminal evidence and replay without computation\n'
 
 log=$(jq -r '.log' "$gate_key_dir/last-result.json")
 printf 'tampered\n' >>"$log"

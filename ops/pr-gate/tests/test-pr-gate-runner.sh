@@ -200,6 +200,9 @@ case "$method $url" in
     if [[ -f "$FAKE_FORGE/reject-terminal" && "$(jq -r '.state' <<<"$payload")" != pending ]]; then
       printf '{"message":"publication denied"}\n403'; exit
     fi
+    if [[ -f "$FAKE_FORGE/empty-terminal" && "$(jq -r '.state' <<<"$payload")" != pending ]]; then
+      printf '\n%s' "$(cat "$FAKE_FORGE/empty-terminal")"; exit
+    fi
     # forge-5xx holds how many more status posts answer 503 before the forge recovers (-1: never).
     if [[ -f "$FAKE_FORGE/forge-5xx" ]]; then
       read -r left <"$FAKE_FORGE/forge-5xx"
@@ -480,6 +483,33 @@ rm -f "$fixture/reject-terminal"
 invoke
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 printf 'PASS complete runner: an unpublishable head is left for the next tick, not fatal\n'
+
+# A completed green recipe whose status POST has no body must keep its recovery marker. The
+# next tick republishes the same attempt and log, without executing the recipe a second time.
+for response_code in 201 503 000; do
+  printf '%s\n' "$response_code" >"$fixture/empty-terminal"
+  before_count=$(count)
+  invoke --repo acme/fixture --pr 1
+  [[ "$runner_exit" == 1 ]] || { cat "$fixture/runner.log"; exit 1; }
+  expect_count "$((before_count + 1))"
+  head=$(cat "$fixture/head")
+  receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
+  jq -e --arg code "$response_code" '.terminal and .outcome=="success" and .exit_code==0
+    and .recovery_required!=null and (.publication.required_status|not)
+    and .publication.http_status==$code' "$receipt" >/dev/null \
+    || { cat "$receipt" "$fixture/runner.log" >&2; exit 1; }
+  attempt=$(jq -r .id "$receipt")
+  digest=$(jq -r .log_sha256 "$receipt")
+  grep -q 'publication recovery required' "$fixture/runner.log"
+  rm -f "$fixture/empty-terminal"
+  invoke
+  [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+  expect_count "$((before_count + 1))"
+  jq -e --arg id "$attempt" --arg digest "$digest" '.id==$id and .log_sha256==$digest
+    and .publication.required_status and .publication.check_run and .recovery_required==null' "$receipt" >/dev/null
+  jq -se 'last.state=="success"' "$fixture/statuses.jsonl" >/dev/null
+done
+printf 'PASS complete runner: empty status responses retain a green result and the next tick republishes without rerun\n'
 
 # A family sibling with no canonical main is skipped, not fatal: a repository with only a scaffold
 # branch once made a fatal mirror step stop every gate of its family before any commit was tested.
