@@ -187,10 +187,11 @@ JERYU_SECURITY_NETWORK=1 jankurai security run . --out target/jankurai/security/
 
 # Build the ratchet baseline from authenticated protected main, never from the
 # candidate. The no-local clone is exact-SHA isolation and is always removed.
-baseline_parent="$(mktemp -d "${TMPDIR:-/tmp}/jeryu-ci-runner-baseline.XXXXXXXX")"
+mkdir -p "${ROOT}/target"
+baseline_parent="$(mktemp -d "${ROOT}/target/jeryu-ci-runner-baseline.XXXXXXXX")"
 cleanup_baseline() {
   case "${baseline_parent}" in
-    "${TMPDIR:-/tmp}"/jeryu-ci-runner-baseline.*)
+    "${ROOT}/target"/jeryu-ci-runner-baseline.*)
       rm -rf -- "${baseline_parent}"
       ;;
     *)
@@ -237,10 +238,19 @@ if [[ ! -f "${baseline_policy}" || -L "${baseline_policy}" ||
   printf 'protected-main audit policy must be a canonical one-link regular file\n' >&2
   exit 1
 fi
-if [[ "$(sha256sum "${candidate_policy}" | awk '{print $1}')" != \
-      "$(sha256sum "${baseline_policy}" | awk '{print $1}')" ]]; then
-  printf 'candidate audit policy must be byte-identical to protected main\n' >&2
-  exit 1
+proof_require_governed_policy "$candidate_policy" "$baseline_policy"
+audit_base_commit="$base_commit"
+if ! cmp -s "$candidate_policy" "$baseline_policy"; then
+  # The baseline audit must remain clean and use the very same scoring policy
+  # as this head. Commit exactly the already-checked version line on main.
+  cp -- "$candidate_policy" "$baseline_policy"
+  git -C "${baseline_parent}/repo" -c user.name=proof-evidence \
+    -c user.email=proof-evidence@invalid -c commit.gpgsign=false \
+    commit --quiet -m 'proof baseline: governed version only' -- agent/audit-policy.toml
+  audit_base_commit="$(git -C "${baseline_parent}/repo" rev-parse HEAD)"
+  [[ "$(git -C "${baseline_parent}/repo" rev-parse HEAD^)" == "$base_commit" &&
+     "$(git -C "${baseline_parent}/repo" diff --name-only "$base_commit" "$audit_base_commit")" == agent/audit-policy.toml &&
+     -z "$(git -C "${baseline_parent}/repo" status --porcelain=v1 --untracked-files=all)" ]]
 fi
 (
   cd "${baseline_parent}/repo"
@@ -271,8 +281,8 @@ cleanup_baseline
 
 # Jankurai 1.6.11 writes git.head as a 7-character prefix; 1.7 writes the full
 # commit id. Either names exactly this commit.
-short_base="${base_commit:0:7}"
-jq -e --arg base "${short_base}" --arg base_full "${base_commit}" \
+short_base="${audit_base_commit:0:7}"
+jq -e --arg base "${short_base}" --arg base_full "${audit_base_commit}" \
   --argjson floor "${effective_floor}" \
   '(.git.head == $base or .git.head == $base_full) and .git.dirty_worktree == false and
    (.score | type == "number") and .decision.minimum_score == $floor and

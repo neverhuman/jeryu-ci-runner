@@ -169,3 +169,19 @@ proof_require_migration() {
     return 1
   }
 }
+
+# Keep scoring/scan policy byte-identical. The sole transition allowed here is
+# the currently governed generated version line; normalize that exact line and
+# compare every other byte, so duplicates and additional settings still refuse.
+proof_require_governed_policy() {
+  local candidate="$1" protected="$2"
+  cmp -s "$candidate" "$protected" && return 0
+  if [[ "${JERYU_JANKURAI_SEMVER:-}" == 1.7.6 &&
+        "$(grep -Fxc 'required_tool_version = "1.7.6"' "$candidate")" == 1 &&
+        "$(grep -Fxc 'required_tool_version = "1.7.5"' "$protected")" == 1 ]] &&
+     cmp -s <(sed 's/^required_tool_version = "1\.7\.6"$/required_tool_version = "1.7.5"/' "$candidate") "$protected"; then
+    return 0
+  fi
+  printf 'candidate audit policy must be byte-identical to protected main except the governed1.7.6 version line\n' >&2
+  return 1
+}

@@ -8,7 +8,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/../../.."
 source ops/ci/proof_guards.sh
-fixture="$(mktemp -d)"
+mkdir -p target
+fixture="$(mktemp -d "$PWD/target/proof-guards.XXXXXXXX")"
 trap 'rm -rf -- "$fixture"' EXIT
 fail() { printf 'not ok - %s\n' "$1" >&2; exit 1; }
 
@@ -158,6 +159,17 @@ proof_require_migration "$fixture/base" /base "$fixture/head" . ||
   fail 'gated on free-text rollback notes'
 printf 'proof migration guard ok\n'
 
+# The rendered auditor version is the only policy transition allowed.
+printf '%s\n' 'minimum_score = 80' 'required_tool_version = "1.7.5"' > "$fixture/protected-policy"
+printf '%s\n' 'minimum_score = 80' 'required_tool_version = "1.7.6"' > "$fixture/candidate-policy"
+JERYU_JANKURAI_SEMVER=1.7.6 proof_require_governed_policy "$fixture/candidate-policy" "$fixture/protected-policy" || fail 'governed version-only update refused'
+if JERYU_JANKURAI_SEMVER=1.7.5 proof_require_governed_policy "$fixture/candidate-policy" "$fixture/protected-policy"; then fail 'ungoverned version accepted'; fi
+printf '%s\n' 'minimum_score = 79' 'required_tool_version = "1.7.6"' > "$fixture/candidate-policy"
+if JERYU_JANKURAI_SEMVER=1.7.6 proof_require_governed_policy "$fixture/candidate-policy" "$fixture/protected-policy"; then fail 'lowered floor accepted'; fi
+printf '%s\n' 'minimum_score = 80' 'required_tool_version = "1.7.6"' 'required_tool_version = "1.7.7"' > "$fixture/candidate-policy"
+if JERYU_JANKURAI_SEMVER=1.7.6 proof_require_governed_policy "$fixture/candidate-policy" "$fixture/protected-policy"; then fail 'duplicate version accepted'; fi
+printf 'proof governed policy guard ok\n'
+
 # --- wiring tripwires ---------------------------------------------------------
 lane=ops/ci/proof_evidence.sh
 
@@ -167,7 +179,7 @@ grep -q 'git clone --quiet --no-local' "$lane" ||
   fail 'the ratchet baseline is not cloned from protected main'
 grep -q 'agent/baselines' "$lane" &&
   fail 'the lane names agent/baselines, an in-tree baseline' || :
-grep -q 'candidate audit policy must be byte-identical to protected main' "$lane" ||
+grep -q 'proof_require_governed_policy "$candidate_policy" "$baseline_policy"' "$lane" ||
   fail 'the lane does not check that main policy judges this head'
 # Every `>` redirect into target/ is this run's summary; a `printf > target/...`
 # fallback would be a result nobody produced. (cp and tee are not covered.)
