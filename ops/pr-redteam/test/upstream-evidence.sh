@@ -543,19 +543,18 @@ b="$(snap family-same)"; echo '# unchanged' >>"$D/family.lock"
 o="$(evidence "$b" "$(snap family-comment)")"
 [ ! -e "$o/upstream" ] || fail 'unchanged family pin produced evidence'
 
-# A newly introduced family lock pin has no base revision, but still gets forge evidence.
+# A new family lock/member preserves the base-pinned-only credential boundary.
 dep family-new; echo init | put readme; b="$(snap family-empty)"
 printf "[[repo]]\nname = 'core'\ncommit = '%s'\ntag = 'core-v3'\nlocal_path = '/evil/core'\n" "$r3" | put family.lock
-o="$(evidence "$b" "$(snap family-new)")"; p="$(pin_of "$o" "$r3")"
-jq -e '.verified and .old_rev == "" and .lock_entry and (.already_reviewed_upstream == false)' "$p" >/dev/null || fail 'new family pin lacks independent evidence'
+o="$(evidence "$b" "$(snap family-new)")"
+grep -q "acme/core ${r3:0:12}: new-pin-unverified" "$o/upstream/SUMMARY.txt" || fail 'new family pin not distinguished'
+[ ! -s "$t/api.log" ] && [ ! -e "$(pin_of "$o" "$r3")" ] || fail 'new family pin spent reviewer credentials'
 nofetch || fail 'family local path redirected fetch'
-grep -q '^+three' "$(dirname "$p")/diff.patch" || fail 'new family pin lacks full-tree diff'
-# Adding a member to an existing lock also gets evidence; its large tree is capped.
 b="$(snap family-member-base)"
 printf "\n[[repo]]\nname = 'big'\ncommit = '%s'\n" "$k2" >>"$D/family.lock"
 o="$(evidence "$b" "$(snap family-member-added)")"
-p="$o/upstream/acme@big-${k2:0:12}/pin.json"
-jq -e '.verified and .old_rev == "" and .diff.fetched and .diff.truncated and (.already_reviewed_upstream == false)' "$p" >/dev/null || fail 'new member evidence missing'
+grep -q "acme/big ${k2:0:12}: new-pin-unverified" "$o/upstream/SUMMARY.txt" || fail 'added family member not distinguished'
+[ ! -s "$t/api.log" ] && [ ! -e "$o/upstream/acme@big-${k2:0:12}/pin.json" ] || fail 'added member spent reviewer credentials'
 [ ! -e "$(pin_of "$o" "$r3")" ] || fail 'unchanged core was collected with new member'
 # A changed member uses its actual previous revision.
 printf "[[repo]]\nname = 'big'\ncommit = '%s'\n" "$k1" | put family.lock
@@ -577,12 +576,28 @@ commit = '$r3'"; do
   [ ! -s "$t/api.log" ] || fail 'malformed family input was fetched'
 done
 
-# Fourteen changed release pins retain the configured limit and expose omitted evidence.
+# Fourteen entries already present at the base retain explicit pin-budget truncation.
+{ lockfile; entry core core-v1 "$r1" "$dist1"; for i in {1..13}; do entry "member$i" member-v1 "$r1" "$dist1"; done; } | put family.lock
+b="$(snap family-fourteen-base)"
 { lockfile; entry core core-v3 "$r3" "$dist3"; for i in {1..13}; do entry "member$i" member-v3 "$r3" "$dist3"; done; } | put family.lock
 saved_max="$upstream_max_pins"; upstream_max_pins=1
 o="$(evidence "$b" "$(snap family-fourteen)")"; upstream_max_pins="$saved_max"
 grep -q '13 more moved pins were not fetched (REDTEAM_UPSTREAM_MAX_PINS=1)' "$o/upstream/SUMMARY.txt" || fail 'family pin truncation hidden'
-ok 'family locks collect changed/new pins, ignore unchanged pins, reject malformed input and disclose limits'
+ok 'family locks collect changed pins, leave new pins unverified, reject malformed input and disclose limits'
+
+# Existing lock shapes keep their old meaning: empty lists, metadata and pending self pins.
+for empty in '' 'schema_version = "1"' 'repo = []'; do
+  parsed="$(printf '%s\n' "$empty" | upstream_manifest_pins repolock)"
+  [ -z "$parsed" ] || fail 'empty release lock was not empty'
+done
+for pending in PENDING PENDING_SELF; do
+  printf "[[repo]]\nname = 'core'\ncommit = '%s'\ndescription = 'Core service'\ncount = 1\nflags = ['x']\n" "$pending" | put family.lock
+  b="$(snap family-pending-base)"
+  { lockfile; entry core core-v3 "$r3" "$dist3"; } | put family.lock
+  o="$(evidence "$b" "$(snap family-pending-head)")"; p="$(pin_of "$o" "$r3")"
+  jq -e '.verified and .old_rev == "" and (.diff.fetched == false)' "$p" >/dev/null || fail 'pending base lock entry lost its previous semantics'
+done
+ok 'empty release locks, descriptive metadata and both pending sentinels preserve prior semantics'
 
 # More changed manifests than upstream_pins reads leaves pin movement unknown for all of them,
 # rather than silently analysing the first fifty and reporting the rest as unmoved.

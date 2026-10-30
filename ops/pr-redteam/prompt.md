@@ -74,7 +74,7 @@ The review directory (its path is given below) contains:
                      `rev-not-on-forge` — the rev could not be fetched at all.
                      `new-pin-unverified` — not pinned at the base; nothing was fetched.
                      `unmapped-host` — not on this forge and not mapped to it; nothing was fetched.
-                     A release lock entry (a `[[repo]]` table of a root `*.lock.toml`; `pin.json`
+                     A release lock entry (a `[[repo]]` table of root `family.lock` or a root `*.lock.toml`; `pin.json`
                      `lock_entry`) names a commit and a tag. It is verified only when the commit is
                      `merged-tip` / `ancestor-of-tip` AND the forge's tag peels to that commit
                      (`tag_resolves_to`, `tag_matches_commit`; `tag_annotated` says whether it is an

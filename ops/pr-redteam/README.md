@@ -373,7 +373,7 @@ the same rules: only an entry the base already has (same file, same `repo =` nam
 new entry is `new-pin-unverified`. The repository fetched is `<the dependent repository's
 owner>/<repo>` on this forge, and only once the forge says it exists; otherwise the entry is
 `repo-not-on-forge` and nothing is fetched. URL fields such as `github` are never fetch targets. A
-`commit` that is not 40 hex (`PENDING`) is not fetched; at the base it simply means no old rev.
+`commit` of `PENDING` or `PENDING_SELF` is not fetched; at the base it simply means no old rev. Other malformed commit values make the input `NOT ANALYSED`. Empty repository lists are valid; descriptive metadata outside the bounded scalar evidence fields is ignored, as before.
 
 For a lock entry, `upstream/` adds `diffstat.txt` (the whole repository's diff stat; `diff.patch`
 covers the whole repository within the cap), and `pin.json` adds `lock_entry`, `tag`, `old_tag`,
@@ -746,15 +746,13 @@ a separately documented plumbing-equivalent reinstall. It stays unset for
 this integration; new receipts use the current input identity.
 
 `family.lock` at the repository root is also a release lock. Release locks are
-parsed with isolated Python `tomllib`, with byte and entry limits. Invalid or
-unsupported input produces `NOT ANALYSED` in the upstream summary, never a claim
+parsed with isolated Python `tomllib`, with byte and entry limits. Invalid pin identities or
+oversized input produces `NOT ANALYSED` in the upstream summary, never a claim
 that no pins moved. Repository names resolve under the dependent owner on the
 configured forge; lock URLs and local paths cannot select a fetch target.
-New family members get forge ancestry/tag evidence and a bounded full-tree diff,
-without claiming independent review coverage: a release composition's new member
-is source the dependent ships, so `family.lock` fetches a `[[repo]]` the change
-introduces instead of reporting it `new-pin-unverified`, as a `*.lock.toml`
-entry new at the head still is. Unchanged commit/tag pairs are omitted. The
+A new member remains `new-pin-unverified`: it is not fetched, even when named
+in `family.lock`. Only entries present at the base are eligible for collection.
+Unchanged commit/tag pairs are omitted. The
 existing pin and byte budgets still apply: a fourteen-pin release can exceed the
 pin limit, and the summary reports how many were not fetched. More changed
 manifests than `upstream_pins` reads is also `NOT ANALYSED`, for the whole
