@@ -1871,11 +1871,21 @@ upstream_pin_evidence() { # cache-root review-dir owner/name old new named-branc
   ! $log_cut && ! $diff_cut && ! $pulls_cut && [ "$total" -le "$upstream_max_commits" ] || up_row+=" [truncated: see pin.json]"
 }
 
+# The SUMMARY row suffix for a pin whose source is a configured alias host or a mapped base source.
+upstream_row_suffix() { # source mapped-base repo
+  if [[ "$1" =~ ^https://([^/]+)/git/ && "${BASH_REMATCH[1],,}" != "${forge_host,,}" ]]; then
+    printf ' [source %s: forge alias host %s (REDTEAM_FORGE_ALIASES); verified and fetched on %s only]' "${1:0:120}" "${BASH_REMATCH[1]}" "$forge_host"
+  fi
+  if [ -n "$2" ]; then
+    printf ' [base source %s mapped to %s by REDTEAM_SOURCE_MAPPINGS; head source %s; verified and fetched on %s only]' "${2:0:120}" "$3" "${1:0:120}" "$forge_host"
+  fi
+}
+
 # Writes <review-dir>/upstream/ for a change that moves a git pin; writes nothing otherwise.
 # The total bytes of upstream evidence across every pin are capped by `budget`.
 upstream_evidence() { # git-dir base head review-dir default-owner budget
-  local pins out="$4/upstream" up_source="" st repo old new named crates source tag old_tag fields base_fields mapped_base n=0 fetchable=0 skipped=0 summary="" allow
-  local -a lockargs=()
+  local pins out="$4/upstream" up_source="" st repo old new named crates source tag old_tag fields base_fields mapped_base n=0 fetchable=0 skipped=0 summary="" allow spent old_row r
+  local -a lockargs=() redo=() rec=()
   up_left="$6"; up_row=""
   pins="$(upstream_pins "$1" "$2" "$3" "$5")" || pins=not-analysed
   [ -n "$pins" ] || return 0
@@ -1894,21 +1904,45 @@ upstream_evidence() { # git-dir base head review-dir default-owner budget
           summary+="$repo ${new:0:12}: not fetched: its share of the upstream evidence budget ($allow bytes) is too small"$'\n'; continue
         fi
         up_source="$source"
+        before="$up_left"
         upstream_pin_evidence "$state/cache/upstream" "$out" "$repo" "$old" "$new" "$named" "$crates" "$allow" "${lockargs[@]}" ||
           up_row="$repo ${new:0:12}: evidence failed"
-        # A pin whose source names a configured alias host was verified and fetched on this forge, never on
-        # the alias: say so on its row, so the route a verified status took is visible.
-        if [[ "$source" =~ ^https://([^/]+)/git/ && "${BASH_REMATCH[1],,}" != "${forge_host,,}" ]]; then
-          up_row+=" [source ${source:0:120}: forge alias host ${BASH_REMATCH[1]} (REDTEAM_FORGE_ALIASES); verified and fetched on $forge_host only]"
-        fi
-        if [ -n "$mapped_base" ]; then
-          up_row+=" [base source ${mapped_base:0:120} mapped to $repo by REDTEAM_SOURCE_MAPPINGS; head source ${source:0:120}; verified and fetched on $forge_host only]"
+        up_row+="$(upstream_row_suffix "$source" "$mapped_base" "$repo")"
+        # A pin cut by its even share may use what the pins after it left unspent: remember it for the
+        # second pass below.
+        if jq -e '.log.truncated or .diff.truncated' "$out/${repo/\//@}-${new:0:12}/pin.json" >/dev/null 2>&1; then
+          redo+=("$((before - up_left))"$'\037'"$up_row"$'\037'"$repo"$'\037'"$old"$'\037'"$new"$'\037'"$named"$'\037'"$crates"$'\037'"$source"$'\037'"$tag"$'\037'"$old_tag"$'\037'"$fields"$'\037'"$base_fields"$'\037'"$mapped_base")
         fi
         summary+="$up_row"$'\n' ;;
       new-pin-unverified) summary+="$repo ${new:0:12}: new-pin-unverified (not pinned at the base; not fetched)"$'\n' ;;
       unmapped-host) summary+="${source:0:120} ${new:0:12}: unmapped-host (not on this forge, no mapping at the base; not fetched)"$'\n' ;;
     esac
   done <<<"$pins"
+  # Second pass: the even share left later pins' unused bytes idle. Each cut pin, in order, is fetched
+  # again with its own earlier spend returned plus everything still unspent (shared among the cut pins
+  # that follow), so the aggregate stays within the budget. The first-pass directory is kept until the
+  # second one is written, so a failed retry leaves the first pass's evidence and its truncation notice.
+  local k=0
+  for r in "${redo[@]}"; do
+    k=$((k + 1))
+    [ "$up_left" -gt 0 ] || break
+    IFS=$'\037' read -r spent old_row repo old new named crates source tag old_tag fields base_fields mapped_base <<<"$r"
+    lockargs=(); [[ "$source" != lock:* ]] || lockargs=(lock "$tag" "$old_tag" "$fields" "$base_fields")
+    local key="${repo/\//@}-${new:0:12}" left_before="$up_left"
+    rm -rf "$out/.first-$key"; mv "$out/$key" "$out/.first-$key" || continue
+    up_left=$((up_left + spent))
+    allow=$((up_left / (${#redo[@]} - k + 1)))
+    [ "$allow" -ge "$upstream_min_share" ] || { rm -rf "$out/$key"; mv "$out/.first-$key" "$out/$key"; up_left="$left_before"; continue; }
+    up_source="$source"
+    if upstream_pin_evidence "$state/cache/upstream" "$out" "$repo" "$old" "$new" "$named" "$crates" "$allow" "${lockargs[@]}" &&
+      [ -s "$out/$key/pin.json" ]; then
+      up_row+="$(upstream_row_suffix "$source" "$mapped_base" "$repo")"
+      summary="${summary/"$old_row"$'\n'/"$up_row"$'\n'}"
+      rm -rf "$out/.first-$key"
+    else
+      rm -rf "$out/$key"; mv "$out/.first-$key" "$out/$key"; up_left="$left_before"
+    fi
+  done
   [ "$skipped" -eq 0 ] || summary+="$skipped more moved pins were not fetched (REDTEAM_UPSTREAM_MAX_PINS=$upstream_max_pins)"$'\n'
   {
     echo "# Upstream evidence for the git pins this change moves, fetched from this forge only, with the"

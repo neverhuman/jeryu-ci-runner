@@ -12,7 +12,7 @@ trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_manifest_pins upstream_url_map upstream_pins upstream_tag upstream_remote upstream_git \
-    upstream_capped upstream_drop_refs upstream_pull_approved upstream_replay_tree upstream_pin_evidence upstream_evidence; do
+    upstream_capped upstream_drop_refs upstream_pull_approved upstream_replay_tree upstream_pin_evidence upstream_row_suffix upstream_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done
@@ -388,6 +388,22 @@ pulls_more=false upstream_max_commits=50 upstream_max_pull_pages=10
   || fail "pull page cut: $(cat "$p")"
 grep -q "${r1:0:12}: .*truncated" "$o/upstream/SUMMARY.txt" || fail "summary notes the cut"
 ok 'a backwards pin, a cut commit list and unread pull request pages are noted'
+
+# 11b. A large pin ahead of a small one is cut by its even share, then fetched again with the bytes the
+# small pin left unspent: more than half of the budget, never more than all of it, and still noted as cut.
+D="$t/dep-size"
+rev2() { printf '[dependencies]\nbig = { git = "https://forge.test/git/acme/big.git", rev = "%s" }\nacme-core = { git = "https://forge.test/git/acme/core.git", rev = "%s" }\n' "$1" "$2"; }
+rev2 "$k1" "$r1" | put Cargo.toml; b2="$(snap bigfirst-base)"; rev2 "$k2" "$r3" | put Cargo.toml
+o="$(budget=12000 evidence "$b2" "$(snap bigfirst)")"
+bigdiff="$(wc -c <"$o/upstream/acme@big-${k2:0:12}/diff.patch")"
+used="$(cat "$o"/upstream/*/log.txt "$o"/upstream/*/diff.patch "$o"/upstream/*/diffstat.txt "$o"/upstream/*/pulls.json 2>/dev/null | wc -c || true)"
+[ "$bigdiff" -gt 6000 ] || fail "the large first pin did not reuse the small pin's unused bytes: diff is $bigdiff bytes"
+[ "$used" -le 12000 ] || fail "second pass overspent a 12000-byte budget: $used"
+[ "$(jq -r .diff.truncated "$o/upstream/acme@big-${k2:0:12}/pin.json")" = true ] && grep -q 'diff.patch cut' "$o/upstream/acme@big-${k2:0:12}/note.txt" \
+  || fail "the cut is still noted after the second pass"
+[ -z "$(find "$o/upstream" -name '.first-*')" ] || fail "a first-pass directory was left behind"
+[ "$(grep -c . "$o/upstream/SUMMARY.txt")" -ge 2 ] && [ "$(grep -c 'big ' "$o/upstream/SUMMARY.txt")" = 1 ] || fail "SUMMARY.txt row duplicated: $(cat "$o/upstream/SUMMARY.txt")"
+ok 'a large first pin reuses bytes the later small pins left unspent, within the budget, with its cut noted'
 
 # 12b. A budget too small to hold anything fetches nothing and writes no negative byte count.
 D="$t/dep-size"; b="$(git -C "$D" rev-list --max-parents=0 HEAD)"
