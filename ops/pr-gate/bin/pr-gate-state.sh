@@ -626,11 +626,11 @@ gate_inputs() {
     [[ -d "$directory/.git" ]] || continue
     clean=$(git -C "$directory" status --porcelain --untracked-files=normal) || return
     if [[ -n "$clean" ]]; then
-      # Keep diagnostics outside the portable identity. Porcelain quotes unusual paths;
-      # retain at most 20 lines, without reading or publishing any file contents.
-      GATE_INPUTS_ERROR="dirty repository $owner/$(basename -- "$directory") (first 20 porcelain lines):
-$(printf '%s\n' "$clean" | sed -n '1,20p')"
-      printf '%s\n' "$GATE_INPUTS_ERROR" >&2
+      # Raw paths are operator evidence only. The receipt carries a bounded,
+      # allowlisted projection, never the head-controlled porcelain text.
+      printf 'dirty checkout %s (first 20 porcelain lines):\n' "$directory" >&2
+      printf '%s\n' "$clean" | sed -n '1,20p' >&2
+      GATE_INPUTS_ERROR=$(printf '%s\n' "$clean" | sed -n '1,20p' | gate_dirty_input_error "$directory")
       return 1
     fi
     # A directory with a .git but no commits is not an input: a repository with only a scaffold
@@ -649,6 +649,44 @@ $(printf '%s\n' "$clean" | sed -n '1,20p')"
   gate_input_tools "$inputs" "$versions" || return
   gate_input_render "$output" "$rows" "$inputs" "$versions" "$recipe_name" || return
   rm -f -- "$rows" "$inputs" "$versions"
+}
+
+# Project the first 20 porcelain lines into public metadata. A checkout name is
+# trusted only with the canonical hosted origin. Contributed runs must not name
+# sibling repositories or their paths on an outside contributor's status.
+gate_dirty_input_error() { # checkout; first 20 porcelain lines on stdin
+  local directory=$1 name public_repo="" disclose=false origin
+  name=$(basename -- "$directory")
+  origin=$(git -C "$directory" remote get-url origin 2>/dev/null) || origin=""
+  if [[ "$owner/$name" =~ ^[A-Za-z0-9_.-]{1,80}/[A-Za-z0-9_.-]{1,80}$ &&
+        "$origin" == "${BASE:-}/git/$owner/$name.git" ]] &&
+      { [[ "${GATE_SANDBOX:-0}" != 1 ]] || [[ "$name" == "$repo" ]]; }; then
+    public_repo="$owner/$name" disclose=true
+  fi
+  jq -Rsc --arg repository "$public_repo" --argjson disclose "$disclose" '
+    split("\n")[:-1][:20] as $lines |
+    [$lines[] | select($disclose and length <= 80) |
+      select(test("\\A[ MADRCU?!]{2} [A-Za-z0-9_./-]+( -> [A-Za-z0-9_./-]+)?\\z"))] as $safe |
+    {repository:$repository, porcelain:$safe, omitted:(($lines|length)-($safe|length))}'
+}
+
+# Revalidate the receipt at publication too, including recovery of older records.
+# At most 20 ASCII lines of 80 bytes plus a 161-byte repository label are named;
+# the whole diagnostic is below 2048 bytes. No path can inject a status delimiter.
+gate_input_error_text() { # receipt
+  jq -r '
+    .input_capture_error as $error |
+    if $error == null then ""
+    elif ($error|type) != "object" then "dirty checkout (details withheld, see operator log)"
+    elif (($error.repository // "")|type) != "string" then "dirty checkout (details withheld, see operator log)"
+    elif (($error.repository // "")|test("\\A[A-Za-z0-9_.-]{1,80}/[A-Za-z0-9_.-]{1,80}\\z")|not)
+      then "dirty checkout (repository and paths withheld, see operator log)"
+    else
+      [$error.porcelain // [] | arrays | .[:20][] | strings |
+        select(length <= 80 and test("\\A[ MADRCU?!]{2} [A-Za-z0-9_./-]+( -> [A-Za-z0-9_./-]+)?\\z"))] as $paths |
+      "dirty repository " + $error.repository + " (first 20 porcelain lines): " +
+      ($paths|join(", ")) + " (unsafe or long entries withheld, full details in operator log)"
+    end' "$1"
 }
 
 # Everything in the input identity that is not a family source: the executables on PATH, the
@@ -977,7 +1015,7 @@ gate_publish() {
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
   local steps_dir="" steps_end="" status_payload check_payload proof_base
   local check_state title changed="" step_state fault capture_error
-  capture_error=$(jq -r '.input_capture_error // ""' "$gate_receipt")
+  capture_error=$(gate_input_error_text "$gate_receipt")
   outcome=$(jq -r '.outcome' "$gate_receipt")
   id=$(jq -r '.id' "$gate_receipt")
   digest=$(jq -r '.log_sha256 // "none"' "$gate_receipt")
@@ -996,7 +1034,8 @@ gate_publish() {
       | select(.repository | test("^[A-Za-z0-9._-]+$"))
       | select((.head | test("^[0-9a-f]{40}$")) and ($before.head | test("^[0-9a-f]{40}$")))
       | "\(.repository): \($before.head) -> \(.head)"] | join("; ")' "$gate_receipt")
-    changed=${capture_error:-${changed:-tools, fixtures, or working-tree inputs changed}}
+    changed=${changed:-tools, fixtures, or working-tree inputs changed}
+    [[ -z "$capture_error" ]] || changed="dirty checkout, see required status and attempt log"
     title="Passed, but inputs changed during the run ($changed); re-running on the next tick"
     # Only a pull-request head of a scheduled pass is held (see inputs_changed_holds in the runner);
     # --branch, --main-health and merge-queue gates re-run on each pass however long the chain.
@@ -1085,6 +1124,7 @@ gate_publish() {
     check_payload=$(jq -nc --arg sha "$sha" --arg state "$check_state" \
       --arg title "$title${cause:+: $cause}" \
       --arg summary "${changed:+$title
+}${capture_error:+Input capture: $capture_error
 }${steps:+$steps
 }Attempt $id; log sha256 $digest; $kind${note:+; changes its own gate}$review" \
       --arg note "$note" \

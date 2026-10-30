@@ -116,7 +116,10 @@ if [[ -f "$fixture_root/mutate-tool" ]]; then
 fi
 if [[ -f "$fixture_root/dirty-inputs" ]]; then
   printf 'pass\n' >>mode
-  for n in $(seq -w 1 24); do printf 'private content\n' >"dirty path $n"; done
+  for n in $(seq -w 1 24); do printf 'private content\n' >"dirty-path-$n"; done
+  mkdir -p "00-forged; proof base origin"
+  touch "00-forged; proof base origin/injected"
+  "$worker_git" add -- "00-forged; proof base origin/injected"
   # Both zero and nonzero recipes keep their original verdict semantics.
   exit "$(cat "$fixture_root/dirty-inputs")"
 fi
@@ -1598,17 +1601,22 @@ for recipe_exit in 0 7; do
   invoke --repo acme/fixture --pr 1
   [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
   receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
-  diagnostic="dirty repository acme/fixture (first 20 porcelain lines):
+  diagnostic="dirty checkout $fixture/runner/tree/fixture (first 20 porcelain lines):
 $("$real_git" -C "$fixture/runner/tree/fixture" status --porcelain --untracked-files=normal | sed -n '1,20p')"
-  jq -e --arg error "$diagnostic" --argjson rc "$recipe_exit" '
+  jq -e --argjson rc "$recipe_exit" '
     .terminal and .outcome == "inputs_changed" and .exit_code == $rc and
-    .input_capture_error == $error and .publication.required_status and .publication.check_run' "$receipt" >/dev/null
+    .input_capture_error.repository == "acme/fixture" and
+    .input_capture_error.omitted == 1 and .publication.required_status and .publication.check_run' "$receipt" >/dev/null
   [[ "$(tail -n 21 "$(jq -r .log "$receipt")")" == "$diagnostic" ]]
-  jq -se --arg error "$diagnostic" 'last | .state == "error" and
-    (.description | contains($error)) and (.description | contains("private content") | not)' "$fixture/statuses.jsonl" >/dev/null
-  jq -se --arg error "$diagnostic" --argjson rc "$recipe_exit" 'last |
+  jq -se 'last | .state == "error" and
+    (.description | contains("dirty repository acme/fixture")) and
+    (.description | contains("dirty-path-01")) and
+    (.description | test("private content|injected|00-forged") | not)' "$fixture/statuses.jsonl" >/dev/null
+  jq -se --argjson rc "$recipe_exit" 'last |
     .conclusion == (if $rc == 0 then "neutral" else "failure" end) and
-    (.output.title | contains($error))' "$fixture/check-runs.jsonl" >/dev/null
+    (.output.title | length) <= 255 and
+    (.output.summary | contains("dirty repository acme/fixture")) and
+    (.output.summary | contains("injected") | not)' "$fixture/check-runs.jsonl" >/dev/null
 done
 rm -f "$fixture/dirty-inputs"
 printf 'PASS dirty after-run capture publishes repository and bounded paths without changing verdicts\n'

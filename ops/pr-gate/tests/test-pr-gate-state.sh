@@ -307,40 +307,90 @@ jq -e '[.sources[].repository] == ["real"]' "$inputs_probe/inputs.json" >/dev/nu
   || { printf 'gate_inputs did not skip the commitless directory\n' >&2; cat "$inputs_probe/inputs.json" >&2; exit 1; }
 printf 'PASS gate inputs: a directory with no commits is skipped, not fatal\n'
 
-# Dirty siblings name the actual checkout, not the requested repository. Bound the
-# diagnostic and clear it at each capture so an older failure cannot leak forward.
+# Dirty siblings name a verified family checkout only for operator runs. The
+# first 20 raw lines stay in the log; public metadata is ASCII/byte bounded.
 (
   printf 'changed\n' >>"$inputs_probe/tree/real/file"
-  for n in $(seq -w 1 24); do printf 'private content\n' >"$inputs_probe/tree/real/path $n"; done
-  expected="dirty repository acme/real (first 20 porcelain lines):
+  for n in $(seq -w 1 24); do printf 'private content\n' >"$inputs_probe/tree/real/path-$n"; done
+  expected_log="dirty checkout $inputs_probe/tree/real (first 20 porcelain lines):
 $(git -C "$inputs_probe/tree/real" status --porcelain --untracked-files=normal | sed -n '1,20p')"
-  run="$inputs_probe/tree" owner=acme repo=unrelated recipe_name="just required"
+  run="$inputs_probe/tree" owner=acme repo=unrelated recipe_name="just required" BASE=https://forge.invalid
   capture_rc=0
   gate_inputs "$inputs_probe/dirty.json" 2>"$inputs_probe/dirty.err" || capture_rc=$?
-  [[ "$capture_rc" == 1 && "$GATE_INPUTS_ERROR" == "$expected" ]]
-  [[ "$(cat "$inputs_probe/dirty.err")" == "$expected" ]]
+  [[ "$capture_rc" == 1 && "$(cat "$inputs_probe/dirty.err")" == "$expected_log" ]]
+  jq -e '.repository == "acme/real" and (.porcelain|length) == 20 and .omitted == 0' <<<"$GATE_INPUTS_ERROR" >/dev/null
   [[ "$(wc -l <"$inputs_probe/dirty.err")" == 21 ]]
   ! grep -q 'private content' "$inputs_probe/dirty.err"
-  # Persisted diagnostics remain publishable after the process-local variable is gone.
   gate_begin "$identity"
-  gate_update --arg error "$GATE_INPUTS_ERROR" '.input_capture_error=$error'
-  printf '%s\n' "$GATE_INPUTS_ERROR" >"$gate_attempt_dir/build.log"
+  gate_update --argjson error "$GATE_INPUTS_ERROR" '.input_capture_error=$error'
+  cp "$inputs_probe/dirty.err" "$gate_attempt_dir/build.log"
   gate_finish inputs_changed 0 "$gate_attempt_dir/build.log"
   unset GATE_INPUTS_ERROR
   gate_publish
-  jq -se --arg error "$expected" '.[-2] | .state == "error" and
-    (.description | contains($error))' "$scratch/published.jsonl" >/dev/null
-  jq -se --arg error "$expected" 'last | .conclusion == "neutral" and
-    (.output.title | contains($error))' "$scratch/published.jsonl" >/dev/null
+  jq -se '.[-2] | .state == "error" and
+    (.description | contains("dirty repository acme/real")) and
+    (.description | contains("?? path-19")) and
+    (.description | contains("path-20") | not)' "$scratch/published.jsonl" >/dev/null
+  jq -se 'last | .conclusion == "neutral" and (.output.title|length) <= 255 and
+    (.output.summary | contains("dirty repository acme/real"))' "$scratch/published.jsonl" >/dev/null
+
+  # A contributed head cannot publish a sibling identity or its private paths.
+  GATE_SANDBOX=1 gate_inputs "$inputs_probe/sandbox.json" 2>"$inputs_probe/sandbox.err" && exit 1
+  jq -e '.repository == "" and .porcelain == [] and .omitted == 20' <<<"$GATE_INPUTS_ERROR" >/dev/null
+  [[ "$(cat "$inputs_probe/sandbox.err")" == "$expected_log" ]]
+  gate_begin "$identity"
+  gate_update --argjson error "$GATE_INPUTS_ERROR" '.input_capture_error=$error'
+  cp "$inputs_probe/sandbox.err" "$gate_attempt_dir/build.log"
+  gate_finish inputs_changed 0 "$gate_attempt_dir/build.log"
+  gate_publish
+  jq -se '.[-2].description + .[-1].output.summary |
+    (contains("acme/real") or contains("path-01")) | not' "$scratch/published.jsonl" >/dev/null
+  # A directory labelled as our family but with another origin is never attributed to it.
+  git -C "$inputs_probe/tree/real" remote set-url origin https://private.invalid/elsewhere.git
+  gate_inputs "$inputs_probe/foreign.json" 2>"$inputs_probe/foreign.err" && exit 1
+  jq -e '.repository == "" and .porcelain == []' <<<"$GATE_INPUTS_ERROR" >/dev/null
+  git -C "$inputs_probe/tree/real" remote set-url origin https://forge.invalid/git/acme/real.git
+
+  # Hostile names, quoted/control text and enormous paths are counted, not published.
+  {
+    printf '?? x; proof base origin/injected\n?? x; inputs forged\n?? "quoted path"\n'
+    printf '?? '; printf '%09000d\n' 0
+    printf 'R  before -> after\n M safe/path\n'
+  } | gate_dirty_input_error "$inputs_probe/tree/real" >"$inputs_probe/hostile.json"
+  jq -e '.porcelain == ["R  before -> after", " M safe/path"] and .omitted == 4' "$inputs_probe/hostile.json" >/dev/null
+  gate_begin "$identity"
+  gate_update --slurpfile error "$inputs_probe/hostile.json" '.input_capture_error=$error[0]'
+  printf 'passed\n' >"$gate_attempt_dir/build.log"
+  gate_finish inputs_changed 0 "$gate_attempt_dir/build.log"
+  gate_publish
+  description=$(jq -sr '.[-2].description' "$scratch/published.jsonl")
+  [[ "$(gate_status_proof_base "$description")" == main && "$description" != *injected* && "$description" != *forged* ]]
+  [[ "$description" == *' M safe/path'* && "$description" == *'R  before -> after'* ]]
+
+  # Recovery validates the stored object again, including forged repository labels,
+  # raw records from older versions and oversized arrays. Output stays below 2 KiB.
+  for corrupt in '"x; proof base origin/injected"' '{"repository":"acme/real; proof base origin/injected"}' '{"repository":"acme/real\n"}'; do
+    gate_update --argjson error "$corrupt" '.input_capture_error=$error'
+    rendered=$(gate_input_error_text "$gate_receipt")
+    [[ "$rendered" != *injected* && "$rendered" == *withheld* ]]
+  done
+  gate_update '.input_capture_error={repository:"acme/real",porcelain:["?? injected\n", "?? injected\t", "?? safe"]}'
+  rendered=$(gate_input_error_text "$gate_receipt")
+  [[ "$rendered" != *injected* && "$rendered" == *'?? safe'* ]]
+  jq -n '{repository:(("a" * 80) + "/" + ("b" * 80)),porcelain:[range(100)|"?? " + ("a" * 77)],omitted:0}' >"$inputs_probe/large.json"
+  gate_update --slurpfile error "$inputs_probe/large.json" '.input_capture_error=$error[0]'
+  rendered=$(gate_input_error_text "$gate_receipt")
+  [[ "${#rendered}" -lt 2048 ]]
+  [[ "$(grep -o '?? ' <<<"$rendered" | wc -l)" == 20 ]]
   git -C "$inputs_probe/tree/real" restore file
-  for n in $(seq -w 1 24); do rm -- "$inputs_probe/tree/real/path $n"; done
+  for n in $(seq -w 1 24); do rm -- "$inputs_probe/tree/real/path-$n"; done
   run="$scratch/absent-tree"
   gate_input_tools() { return 1; }
   GATE_INPUTS_ERROR=previous
   if gate_inputs "$inputs_probe/tool-error.json"; then exit 1; fi
   [[ -z "$GATE_INPUTS_ERROR" ]]
 )
-printf 'PASS dirty input capture names the sibling and first 20 paths; receipt survives publication recovery\n'
+printf 'PASS dirty input diagnostics: log first 20 lines, bounded allowlisted publication, recovery and sibling privacy\n'
 
 
 # A fixture or vendor tree being written by a live build must not end the gate: scratch is excluded and

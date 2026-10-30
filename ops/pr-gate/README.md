@@ -700,6 +700,25 @@ at the installed commit, and each heartbeat reports the installed code as
 `code: {repo, commit, version, installedAt}`, where `repo` is `PR_GATE_CODE_REPO` (no code is
 reported without it), `commit` the installed commit, and `version` e.g. `pr-gate 1.0.0`.
 
+### Dirty input capture diagnostics
+
+A dirty checkout still yields `inputs_changed` with the recipe's original exit code and the
+same rerun limits. The attempt log names the checkout and records its first 20 raw Git porcelain
+lines. Those operator-only lines are never copied into a public status or check title.
+
+The optional `input_capture_error` receipt object stores a verified `repository` label,
+`porcelain` (at most 20 allowlisted entries), and `omitted` (the count withheld from those 20).
+Repository labels must match the canonical hosted origin and contain only the bounded owner/repo
+charset. Contributed/sandbox runs with a dirty sibling, and unverified checkout identities, withhold
+both that repository label and its paths from public metadata; the operator log retains the details.
+
+The required-status description and check summary name validated paths from those first 20 lines:
+ASCII Git status codes plus relative paths using letters, digits, `_`, `.`, `/`, or `-` (and the
+literal rename separator ` -> `), at most 80 bytes per entry. Other entries are withheld. Publication
+revalidates the receipt, including on recovery. The public diagnostic is below 2048 bytes and cannot
+contain a semicolon or newline, so it cannot inject a status metadata field. The check title remains
+a short verdict referring readers to the status and attempt log; it never embeds the path list.
+
 ## Installation and updates
 
 `pr-gate-install.sh` runs from `pr-gate-install.timer` every 10 minutes. It fetches
