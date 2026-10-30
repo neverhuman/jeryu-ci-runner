@@ -241,6 +241,42 @@ maintainer approves has to be readable from the log, and an unconfigured git
 writes a name that says nothing. This decides only whether a head is reviewed,
 so it does not move `review_format`: a head already reviewed keeps its receipt.
 
+## Governed tool version evidence
+
+A repository's `agent/audit-policy.toml` carries `required_tool_version`, the governed auditor
+version. That scalar is generated: the repository's own `ops/ci/pr-ci.sh` never reads it, it
+delegates to the authority's renderer, so neither a one-line diff nor the pull request's prose shows
+what the version is supposed to be. A change that moves it (in any changed `audit-policy.toml` or
+`default-audit-policy.toml`) gets `governance/` in the review directory: the authority manifest, the
+authority's own renderer sources that own the scalar, `authority.json` and `SUMMARY.txt`.
+
+Nothing the author writes picks any of it. The moved values are read from the git blobs at the pull
+request's base and head, never from its text. The authority repository
+(`REDTEAM_GOVERNED_AUTHORITY_REPO`, a name in the reviewed repository's own owner), the manifest path
+in it (`REDTEAM_GOVERNED_AUTHORITY_MANIFEST`) and the renderer paths
+(`REDTEAM_GOVERNED_RENDERER_PATHS`) are site configuration. The manifest is read only from a branch
+the forge itself reports as the repository's default or as protected -- the default first, then the
+protected branches -- fetched from this forge with the reviewer's own credential and no ambient git
+configuration, exactly as a pin is. A manifest the change commits into the consumer, or a branch the
+forge does not protect, is never the authority.
+
+`authority.json` records where the bytes came from, all computed from the fetched objects:
+`authority_branch` and `authority_branch_kind`, `authority_commit`, `authority_tree`,
+`manifest_blob` (the git object id) and `manifest_sha256` (of the whole blob, even when the copy in
+the directory was cut), `fetched_at`, and a `renderers` entry per renderer source with its own object
+id and sha256. `authority_version` is the version that manifest declares (`[jankurai] semver`).
+
+A moved scalar is verified only by `status` `authority-verified` with its `consumers` row
+`matches-authority`: the head value is `authority_version`. `DIFFERS-FROM-AUTHORITY` is a version the
+authority does not hold -- a value that is not a version (`!invalid`) and a policy that stops
+declaring one (`!none`) are reported the same way, so a malformed move is never read as agreement.
+Every other status (`authority-not-on-forge`, `authority-branch-unknown`,
+`authority-manifest-missing`, `authority-not-readable`, `authority-not-configured`) leaves every row
+`unverified`. Nothing is rendered or built here: the evidence shows the authority and the rule, and
+the review draws the conclusion. The whole packet is capped at `REDTEAM_GOVERNED_MAX_BYTES` within
+what the diff and the upstream pins leave of `REDTEAM_MAX_DIFF_BYTES`; every cut is noted in
+`SUMMARY.txt` and `authority.json` (`test/governed-version-evidence.sh`).
+
 ## Lock-source report
 
 `signals.txt` carries a lock-source section from `lock-source-report`, a shell wrapper that runs `python3 -I`. The
@@ -459,7 +495,7 @@ release-line ancestry for a verifier's required ancestry on `main`.
 ## Qualification
 
 `bash test/required.sh` runs offline quality-gate, draft-skip, review-identity, verdict, binary-payload,
-upstream-evidence, credential-transport, heartbeat contract, poke, watch, publication/recovery, merge-pass, queue-rework, contributed-origin, owner-decision and installation checks. The actual repository required lane
+upstream-evidence, governed-version-evidence, credential-transport, heartbeat contract, poke, watch, publication/recovery, merge-pass, queue-rework, contributed-origin, owner-decision and installation checks. The actual repository required lane
 runs this suite. Tests use local fixture repositories, dummy credentials and
 stand-in model/forge processes. They cover malformed and failed model results,
 publication refusal, restart, duplicate dispatch, worker loss and changed heads,
