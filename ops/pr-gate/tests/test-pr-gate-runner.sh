@@ -294,22 +294,24 @@ case "$method $url" in
     printf '%s\n' "$payload" >>"$FAKE_FORGE/check-runs.jsonl"
     printf '{"id":"check"}\n201';;
   'POST '*'/api/v1/gate-claims')
-    # The forge-held lease on one head: exactly one holder until it expires. Held leases live in
-    # claims/<repo>-<number>-<sha>; claim-ttl holds the lease length in seconds (default 180), and
+    # The forge-held lease on one head: exactly one holder until it expires. The forge keys a lease
+    # on (repo, head sha) and carries `number` as metadata, so held leases live in
+    # claims/<repo>-<sha>; claim-ttl holds the lease length in seconds (default 180), and
     # no-gate-claims stands in for a forge that predates the route.
     [[ ! -f "$FAKE_FORGE/no-gate-claims" ]] || { printf '<html>not found</html>\n404'; exit; }
-    repo=$(jq -r '.repo' <<<"$payload"); number=$(jq -r '.number' <<<"$payload")
+    repo=$(jq -r '.repo' <<<"$payload")
     sha=$(jq -r '.head_sha // .queue_sha' <<<"$payload")
     runner=$(jq -r '.runner_id' <<<"$payload"); host=$(jq -r '.host' <<<"$payload")
     ttl=180; [[ ! -f "$FAKE_FORGE/claim-ttl" ]] || read -r ttl <"$FAKE_FORGE/claim-ttl"
     mkdir -p "$FAKE_FORGE/claims"
-    file="$FAKE_FORGE/claims/${repo//\//-}-$number-$sha"
+    file="$FAKE_FORGE/claims/${repo//\//-}-$sha"
     now=$(date +%s)
     # What the repository requires of a host, as the forge reads it from the base branch's
     # .jeryu/repo.toml; here, the repositories listed in require-host-ci.
     if [[ -f "$FAKE_FORGE/require-host-ci" ]] && grep -qx "$repo" "$FAKE_FORGE/require-host-ci"; then
-      # What this host advertises, from the heartbeats it has sent, as the forge matches it.
-      advertised=$(jq -sc --arg h "$host" '[.[] | select(.host == $h) | .capabilities // []] | last // []' \
+      # What this very slot advertises, from the heartbeats it has sent, as the forge matches it.
+      advertised=$(jq -sc --arg h "$host" --arg r "$runner" \
+        '[.[] | select(.host == $h and .runnerId == $r) | .capabilities // []] | last // []' \
         "$FAKE_FORGE/heartbeats.jsonl" 2>/dev/null || printf '[]')
       if ! jq -e 'index("host-ci")' <<<"${advertised:-[]}" >/dev/null 2>&1; then
         printf '%s\n' "$repo $sha $host" >>"$FAKE_FORGE/claims-refused.log"
@@ -333,9 +335,9 @@ case "$method $url" in
     printf '\n201';;
   'POST '*'/api/v1/gate-claims/release')
     [[ ! -f "$FAKE_FORGE/no-gate-claims" ]] || { printf '<html>not found</html>\n404'; exit; }
-    repo=$(jq -r '.repo' <<<"$payload"); number=$(jq -r '.number' <<<"$payload")
+    repo=$(jq -r '.repo' <<<"$payload")
     sha=$(jq -r '.head_sha // .queue_sha' <<<"$payload"); runner=$(jq -r '.runner_id' <<<"$payload")
-    file="$FAKE_FORGE/claims/${repo//\//-}-$number-$sha"
+    file="$FAKE_FORGE/claims/${repo//\//-}-$sha"
     if [[ -f "$file" ]]; then
       read -r held_runner _ _ <"$file"
       if [[ "$held_runner" != "$runner" ]]; then
@@ -2377,7 +2379,7 @@ date +%s%N >"$fixture/source/claims-marker"   # a head of its own, whatever the 
 "$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
 "$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
 head=$(cat "$fixture/head")
-claim="$fixture/claims/acme-fixture-1-$head"
+claim="$fixture/claims/acme-fixture-$head"
 claims_count=$(count)
 fail_claims() { printf '%s\n--- runner.log\n' "$1" >&2; cat "$fixture/runner.log" >&2; exit 1; }
 
