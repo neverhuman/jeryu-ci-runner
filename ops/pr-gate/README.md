@@ -244,6 +244,14 @@ at most the newest 64 hints. Dated hints older than `GATE_RUNNER_DISPATCH_TTL` s
 600) are dropped when read.
 This is bounded priority, not a durable work queue: current forge state remains authoritative.
 
+A queue entry can land between discovery and preparation, removing its advertised ref. Git then
+returns 128 from the queue fetch; an unguarded fetch used to end the slot at `preparing`. The runner
+now logs the repository, PR, SHA, ref, exit code and Git diagnostic, releases the candidate locks,
+and leaves rediscovery to the next tick. Transport failures take the same retry path without being
+reported as confirmed landings. No gate or terminal status is produced from an earlier cached ref.
+`test-pr-gate-runner.sh` deletes a real advertised ref at fetch time, checks the diagnostic and clean
+exit, and proves that the next available replay can run normally.
+
 ## How long a head waited
 
 Every gate records its queue wait on the attempt as

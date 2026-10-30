@@ -66,6 +66,17 @@ if [[ " $* " == *' fetch --quiet cache-mirror '* && -f "$FAKE_FORGE/advance-mirr
   "$REAL_GIT" -C "$FAKE_FORGE/source.git" update-ref refs/heads/main "$future"
   "$REAL_GIT" -C "$FAKE_FORGE/runner/mirror/fixture.git" fetch -q "$FAKE_FORGE/source.git" '+refs/heads/main:refs/heads/main'
 fi
+# Remove the advertised ref only when preparation fetches it, after discovery has selected it.
+if [[ " $* " == *' +refs/queue/main/1:refs/gate/queue '* ]]; then
+  if [[ -f "$FAKE_FORGE/drop-queue-ref" ]]; then
+    "$REAL_GIT" --git-dir="$FAKE_FORGE/source.git" update-ref -d refs/queue/main/1
+    printf '{"entries":[]}\n' >"$FAKE_FORGE/queue.json"
+  elif [[ -f "$FAKE_FORGE/fail-queue-fetch" ]]; then
+    printf 'fixture transport unavailable\n' >&2
+    exit 128
+  fi
+
+fi
 case " $* " in
   *' fetch '*|*' clone '*|*' ls-remote '*)
     for index in "${!args[@]}"; do
@@ -949,6 +960,29 @@ qsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
 queue_entry() { jq -nc --arg s "$1" --arg r "$2" --arg h "$(cat "$fixture/head")" \
   '{entries:[{repo:"acme/fixture",number:1,base:"main",queue_ref:$r,queue_sha:$s,pr_head_sha:$h}]}' >"$fixture/queue.json"; }
 queue_entry "$qsha" refs/queue/main/1
+# A listed replay lands before its fetch: real Git returns 128 for the deleted ref. Leave an
+# matching local ref too, to prove a failed fetch cannot gate cached queue content.
+"$real_git" -C "$fixture/runner/tree/fixture" fetch --quiet "$fixture/source.git" \
+  "+refs/queue/main/1:refs/gate/queue"
+for failure in drop-queue-ref fail-queue-fetch; do
+  touch "$fixture/$failure"
+  before_count=$(count)
+  before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+  invoke
+  [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+  expect_count "$before_count"
+  [[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]]
+  grep -q "cannot fetch merge-queue entry acme/fixture#1 at $qsha (refs/queue/main/1; exit 128)" "$fixture/runner.log"
+  if [[ "$failure" == drop-queue-ref ]]; then
+    grep -q "couldn't find remote ref refs/queue/main/1" "$fixture/runner.log"
+  else
+    grep -q 'fixture transport unavailable' "$fixture/runner.log"
+  fi
+  rm "$fixture/$failure"
+  "$real_git" -C "$fixture/source" push -q "$fixture/source.git" "$qsha:refs/queue/main/1"
+  queue_entry "$qsha" refs/queue/main/1
+done
+printf 'PASS merge queue: disappearing ref and transport failure retain diagnostics without gating cached content\n'
 before_count=$(count)
 before_statuses=$(wc -l <"$fixture/statuses.jsonl")
 invoke

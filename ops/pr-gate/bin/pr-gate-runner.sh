@@ -1481,7 +1481,18 @@ elif [[ "$qref" == - ]]; then
 else
   # A queue commit is fetched by its advertised ref, and must still be the entry's exact sha: the forge
   # rebuilds an entry on a fresh commit when main moves, and a rebuilt entry is gated on its own tick.
-  git -C "$run/$repo" fetch --quiet "$BASE/git/$owner/$repo.git" "+$qref:refs/gate/queue"
+  # Another slot can publish success and land the entry after listing, deleting its ref.
+  # Keep Git's reason for any fetch failure (including transport failures), and retry through
+  # discovery on the next tick. Never use a refs/gate/queue left by an earlier fetch.
+  if queue_fetch_error=$(git -C "$run/$repo" fetch --quiet "$BASE/git/$owner/$repo.git" "+$qref:refs/gate/queue" 2>&1); then
+    :
+  else
+    queue_fetch_rc=$?
+    say "cannot fetch merge-queue entry $owner/$repo#$number at $sha ($qref; exit $queue_fetch_rc); it may have landed or disappeared; leaving it for the next tick"
+    say "$queue_fetch_error"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
   if [[ "$(git -C "$run/$repo" rev-parse refs/gate/queue)" != "$sha" ]]; then
     say "merge-queue entry $owner/$repo#$number moved on from $sha; leaving it for the next tick"
     exec 6>&-; exec 7>&-
