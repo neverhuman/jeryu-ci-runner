@@ -336,6 +336,12 @@ gates the current tip of `<name>`:
   owner with a `PR_GATE_PROOF_BASE_VARS` entry; anything else -- unprotected, missing, a forge that
   cannot answer, an owner whose recipe cannot be told the base -- is refused and named, and with
   `--repo` the run exits 1. Nothing is posted on a refused branch;
+- `--branch main` is the supported retry of a protected main tip whose latest `<repo>/required` is an
+  error (a merged pull request's revalidation that returned `inputs_changed`, say; a merged or closed
+  PR is never listed, so `--pr` cannot select it). It needs no `PR_GATE_PROOF_BASE_VARS` entry: the
+  recipe keeps its own baseline, protected `origin/main` in the prepared tree, and nothing a caller
+  or a PR controls is passed. The tree's `origin/main` must equal the tip observed and admitted, or
+  the run leaves it for the next tick; the other rules below (own work, never over a green) apply;
 - never the runner's own work: a branch named `<gate identity>/...`, or a tip authored or committed
   as the gate identity (the forge does not say who pushed a tip; a protected branch moves by merge),
   is refused;

@@ -142,6 +142,8 @@ if [[ -f "$FAKE_FORGE/rate-limit" && "$method" == GET ]]; then
 fi
 case "$method $url" in
   'GET '*'/pulls?state=open')
+    # pr-merged: the pull request has merged, so the forge no longer lists it as open.
+    if [[ -f "$FAKE_FORGE/pr-merged" ]]; then printf '{"items":[]}\n200'; exit; fi
     # A second open pull request while $FAKE_FORGE/head2 names its head, for the order the tick gates in.
     if [[ -f "$FAKE_FORGE/head2" ]]; then
       jq -nc --arg sha "$head" --arg sha2 "$(cat "$FAKE_FORGE/head2")" \
@@ -2119,3 +2121,51 @@ invoke --branch release/v1 --main-health
 expect_count "$((before_count + 2))"
 unset PR_GATE_PROOF_BASE_VARS
 printf 'PASS --branch: a protected tip is proved against the branch before it, posted as <repo>/required, held, never re-proved over, never held on input drift, and refused when it may not be\n'
+
+# --branch main: the retry after a merged PR's revalidation returned inputs_changed. main needs no
+# PR_GATE_PROOF_BASE_VARS entry: the recipe keeps its own protected origin/main baseline, and nothing
+# a caller or a PR controls is passed to it. A merged PR is no longer listed, so --pr cannot retry it.
+refs_json main release/v1
+touch "$fixture/pr-merged"
+before_count=$(count) before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+PR_GATE_PROOF_BASE_VARS='' invoke --repo acme/fixture --pr 1
+expect_count "$before_count"
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb 'a merged PR was retried as a pull request'
+rm -f "$fixture/pr-merged"
+# A valid latest success on the main tip is never overwritten.
+jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" '{sha:$s,context:"fixture/required",state:"success",description:($m + " earlier green"),created_at:"2026-10-30T00:00:00Z"}' >>"$fixture/statuses.jsonl"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+PR_GATE_PROOF_BASE_VARS='' invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || fail_pb '--branch main over a green: runner failed'
+expect_count "$before_count"
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb '--branch main overwrote a valid success'
+grep -q "skip acme/fixture main: its tip ${mainsha:0:12} already carries a fixture/required success" "$fixture/runner.log" \
+  || fail_pb '--branch main over a green did not skip'
+# The latest required status is the inputs_changed error: the retry runs the recipe fresh, with no
+# proof-base variable at all (the recipe's own origin/main), and posts success on the same tip.
+jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" '{sha:$s,context:"fixture/required",state:"error",description:($m + " inputs_changed"),created_at:"2026-10-30T01:00:00Z",updated_at:"2026-10-30T01:00:00Z"}' >>"$fixture/statuses.jsonl"
+PR_GATE_PROOF_BASE_VARS='' invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || fail_pb '--branch main retry: runner failed'
+expect_count "$((before_count + 1))"
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == unset ]] || fail_pb '--branch main passed a baseline to the recipe'
+last_status "$mainsha" | jq -e '.state == "success" and (.description | contains("proof base") | not)' >/dev/null \
+  || fail_pb '--branch main did not post a fresh required success on the tip'
+# The tip moved since the forge listed it: nothing is gated or posted for the stale sha.
+stale=$("$real_git" -C "$fixture/source.git" rev-parse "$mainsha^1")
+jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" '{sha:$s,context:"fixture/required",state:"error",description:($m + " inputs_changed"),created_at:"2026-10-30T02:00:00Z",updated_at:"2026-10-30T02:00:00Z"}' >>"$fixture/statuses.jsonl"
+jq -c --arg s "$stale" 'map(if .name == "main" then .sha = $s else . end)' "$fixture/refs.json" >"$fixture/refs.tmp" && mv "$fixture/refs.tmp" "$fixture/refs.json"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+PR_GATE_PROOF_BASE_VARS='' invoke --branch main --repo acme/fixture
+expect_count "$((before_count + 1))"
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb 'a moved main tip got a status'
+# main must still be protected, and a non-main branch without a mapping stays refused.
+refs_json release/v1
+PR_GATE_PROOF_BASE_VARS='' invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 1 ]] && grep -q 'refusing acme/fixture main: the forge does not report it as protected' "$fixture/runner.log" \
+  || fail_pb 'an unprotected main was gated'
+refs_json main release/v1
+PR_GATE_PROOF_BASE_VARS='' invoke --branch release/v1 --repo acme/fixture
+[[ "$runner_exit" == 1 ]] && grep -q 'acme has no PR_GATE_PROOF_BASE_VARS entry' "$fixture/runner.log" \
+  || fail_pb 'a non-main branch without a mapping was gated'
+expect_count "$((before_count + 1))"
+printf 'PASS --branch main: retried after a latest error with the strict baseline, never over a success, a merged PR, a moved tip or a non-main branch\n'

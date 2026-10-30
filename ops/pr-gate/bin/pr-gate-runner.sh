@@ -771,8 +771,10 @@ for qualified in $REPOS; do
     fi
     # Without the owner's proof-base variable the recipe would compare the tip against origin/main,
     # which a release line does not descend from: the run would prove nothing about the line.
+    # main is the exception: the recipe's own baseline is protected origin/main, which no variable
+    # or caller can change, so it needs no mapping. Every other protected branch still does.
     owner_proof_base_var "$owner"
-    if [[ -z "$pb_var" ]]; then
+    if [[ -z "$pb_var" && "$only_branch" != main ]]; then
       say "refusing $owner/$repo $only_branch: $owner has no PR_GATE_PROOF_BASE_VARS entry, so its recipe cannot be told the base"
       branch_refused=1; continue
     fi
@@ -1095,7 +1097,11 @@ fi
 GATE_PROOF_BASE="" pb_var="" pb_branch="" pb_sha="" pb_note="" proof_base=0 proof_base_env=()
 if ((main_health == 0)); then
   owner_proof_base_var "$owner"
-  if [[ -n "$only_branch" ]]; then
+  if [[ "$only_branch" == main ]]; then
+    # The strict baseline: the recipe's default, protected origin/main, with nothing passed to it.
+    # Verified against the observed tip once the tree is prepared.
+    :
+  elif [[ -n "$only_branch" ]]; then
     proof_base=1 pb_branch=$only_branch pb_sha=$sha
   elif [[ -n "$pb_var" ]]; then
     proof_base=1
@@ -1451,6 +1457,21 @@ if ((proof_base)); then
     proof_base_env=("$pb_var=origin/$pb_branch~1")
   fi
   say "$owner/$repo@$sha is proved against origin/$pb_branch at ${pb_sha:0:12}${pb_note:+ -- $pb_note}"
+fi
+if [[ "$only_branch" == main ]]; then
+  # Protected main is gated against its own mirrored tip (the recipe's default baseline), never a
+  # caller-supplied ref: the tree's origin/main must be exactly the tip observed and admitted.
+  [[ "$(git -C "$run/$repo" rev-parse --verify --quiet refs/remotes/origin/main)" == "$sha" ]] || {
+    say "$owner/$repo main moved on from $sha in the prepared tree; leaving it for the next tick"
+    exec 6>&-; exec 7>&-
+    continue
+  }
+  if git -C "$run/$repo" log -1 --format='%an%n%cn' "$sha" | grep -qxF -- "$IDENTITY"; then
+    say "refusing $owner/$repo $only_branch at $sha: authored or committed as $IDENTITY, which this runner must not prove"
+    exec 6>&-; exec 7>&-
+    continue
+  fi
+  say "$owner/$repo@$sha is proved against its protected origin/main baseline (the tip itself)"
 fi
 # Does this head change the gate it is judged by? The recipe below is the head's own, so a diff that
 # touches the Justfile, ops/ci or the jankurai and policy files it reads rewrote the check that is
