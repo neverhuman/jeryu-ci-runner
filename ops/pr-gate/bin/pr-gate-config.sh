@@ -92,22 +92,27 @@ pr_gate_listed() { # list name...
   return 1
 }
 
-# Advertised gate environments. Keep this vocabulary aligned with the forge's heartbeat validator.
-# Whitespace separates names; unknown and repeated names are configuration errors.
+# Advertised gate environments. Keep this vocabulary aligned with the forge's heartbeat validator
+# (PR_GATE_KNOWN_CAPABILITIES). Whitespace separates names; unknown and repeated names are
+# configuration errors. Prints the names as a JSON array, in the order given.
+PR_GATE_KNOWN_CAPABILITIES="host-ci"
 pr_gate_capabilities() {
   local - capability
-  local seen=0
+  local -A known=() seen=()
+  local names=()
   set -f
+  for capability in $PR_GATE_KNOWN_CAPABILITIES; do known[$capability]=1; done
   for capability in ${GATE_RUNNER_CAPABILITIES:-}; do
-    if [[ "$capability" != host-ci ]]; then
-      printf 'GATE_RUNNER_CAPABILITIES: unknown capability %s (expected host-ci)\n' "$capability" >&2
+    if [[ -z "${known[$capability]+set}" ]]; then
+      printf 'GATE_RUNNER_CAPABILITIES: unknown capability %s (expected one of: %s)\n' "$capability" "$PR_GATE_KNOWN_CAPABILITIES" >&2
       return 2
     fi
-    if ((seen)); then
-      printf 'GATE_RUNNER_CAPABILITIES: duplicate capability host-ci\n' >&2
+    if [[ -n "${seen[$capability]+set}" ]]; then
+      printf 'GATE_RUNNER_CAPABILITIES: duplicate capability %s\n' "$capability" >&2
       return 2
     fi
-    seen=1
+    seen[$capability]=1
+    names+=("$capability")
   done
-  if ((seen)); then printf '["host-ci"]'; else printf '[]'; fi
+  jq -nc '$ARGS.positional' --args "${names[@]}"
 }

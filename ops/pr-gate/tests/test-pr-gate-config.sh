@@ -102,4 +102,11 @@ for invalid in 'host-ci host-ci' 'host_ci' '*'; do
     exit 1
   fi
 done
+# Uniqueness is per name, and the advertisement carries every name: a second capability in the
+# vocabulary is neither mistaken for a duplicate nor dropped.
+[[ "$(PR_GATE_KNOWN_CAPABILITIES='host-ci gpu' GATE_RUNNER_CAPABILITIES='host-ci gpu' pr_gate_capabilities)" == '["host-ci","gpu"]' ]]
+if PR_GATE_KNOWN_CAPABILITIES='host-ci gpu' GATE_RUNNER_CAPABILITIES='gpu host-ci gpu' pr_gate_capabilities 2>/dev/null; then
+  printf 'accepted a repeated second capability\n' >&2
+  exit 1
+fi
 printf 'PASS capability vocabulary and uniqueness\n'

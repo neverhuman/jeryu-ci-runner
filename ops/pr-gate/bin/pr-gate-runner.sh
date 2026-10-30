@@ -529,7 +529,8 @@ LAST_GATE="$HOME_DIR/cache/slot-$SLOT-last.json"
 # The heartbeat also says what code this runner is (gate_runner_code) and what it evaluates with
 # (gate_runner_tools). A forge that predates either field refuses the whole heartbeat with 422, so a
 # 422 is retried once without tools (keeping code), and if that is refused too, once without code;
-# each is logged once, and the rest of this run sends neither refused field.
+# each is logged once, and the rest of this run sends neither refused field. A refused
+# `capabilities` field is dropped for the rest of the run the same way.
 HEARTBEAT_CODE="$(gate_runner_code "$HOME_DIR")"
 HEARTBEAT_TOOLS="$(gate_runner_tools "$HOME_DIR")"
 heartbeat() { # [current-gate-json]
@@ -541,6 +542,7 @@ heartbeat() { # [current-gate-json]
   api POST "/api/v1/runners/heartbeat" "$(gate_heartbeat_with "$payload" "$HEARTBEAT_CODE" "$HEARTBEAT_TOOLS")"
   if [[ "$code" == 422 && "$CAPABILITIES" != '[]' && "$body" == *capabilities* ]]; then
     say "heartbeat capabilities refused (422); retrying without them"
+    CAPABILITIES='[]'
     payload=$(jq -c 'del(.capabilities)' <<<"$payload")
     api POST "/api/v1/runners/heartbeat" "$(gate_heartbeat_with "$payload" "$HEARTBEAT_CODE" "$HEARTBEAT_TOOLS")"
   fi
@@ -568,24 +570,39 @@ heartbeat() { # [current-gate-json]
 # The forge-held claim on the head this slot is about to gate.
 #
 # Several gate hosts gate at once: each takes an exclusive lease on a head from the forge
-# (POST /api/v1/gate-claims) before it posts `pending`, renews it while the gate runs, and releases
-# it on publication. A second host asking for the same head is refused, so only one host ever posts
-# a head's required check; a lease nobody renews expires, and any live host with the capabilities
-# the repository declares in .jeryu/repo.toml claims that head next, which is how a dead host's work
-# is picked up with nobody editing a configuration file. The slot's own lock and head claim stay the
-# fast path: the lease is asked for only once this slot has decided to execute a head.
+# (POST /api/v1/gate-claims) before it posts `pending`, renews it from the moment it is granted
+# until the result is published, and releases it on publication. A second host asking for the same
+# head is refused, so while every gate host runs this version only the lease holder posts a head's
+# required check: a slot whose lease is lost (refused on renewal, or not renewed within one TTL)
+# stops its recipe and posts nothing more for that head, and the result is checked against the lease
+# once more immediately before publication. A lease nobody renews expires, and any live host with the
+# capabilities the repository declares in .jeryu/repo.toml claims that head next, which is how a
+# dead host's work is picked up with nobody editing a configuration file. The slot's own lock and
+# head claim stay the fast path: the lease is asked for only once this slot has decided to execute a
+# head.
 #
-# A forge without the route (a 404 that is not a typed refusal) is gated the way it was before the
-# route existed: the local claim is then the only exclusion, as on a single-host site. A refusal
-# (another host holds the head, or this host lacks a capability the repository requires) leaves the
-# head to that host, and so does a forge that cannot answer at all: posting `pending` for a head
-# this host may not be gating is exactly what the lease exists to prevent.
-GATE_CLAIM_ROUTE=1   # 0 once a forge has shown it has no gate-claims route
+# A forge without the route answers 404 with the typed code `api_route_not_found`; it is gated the
+# way it was before the route existed: the local claim is then the only exclusion, as on a
+# single-host site. Any other 404 (a proxy, a misrouted forge URL, a token that lost access) is not
+# taken as proof of an older forge: the head is left for the next tick and the route is asked again.
+# A refusal (another host holds the head, or this host lacks a capability the repository requires)
+# leaves the head to that host, and so does a forge that cannot answer at all: posting `pending` for
+# a head this host may not be gating is exactly what the lease exists to prevent.
+#
+# The forge does not replay these routes from an Idempotency-Key, and the runner sends none: an ask
+# repeated by the runner that holds the lease (same runner_id) is the renewal, so a runner that lost
+# an answer to a timeout asks again and gets the lease it holds, and an ask from any other runner is
+# refused while the lease is live.
+GATE_CLAIM_ROUTE=1   # 0 once the forge has answered that it has no gate-claims route
 GATE_CLAIM_HELD=0    # 1 while this slot holds a lease on the head named below
 GATE_CLAIM_OWNER="" GATE_CLAIM_REPO="" GATE_CLAIM_NUMBER=0 GATE_CLAIM_SHA=""
 # Which field names the head: a queue entry is claimed by its queue sha, a pull request by its head.
 GATE_CLAIM_FIELD=head_sha
 GATE_CLAIM_TTL=180
+# The renewer's state: `lost` (why the lease was lost) and `worker` (the recipe's process group, which
+# a lost lease stops). One directory per slot; the slot lock makes it this run's.
+GATE_CLAIM_STATE="$HOME_DIR/cache/gate-claim-slot$SLOT"
+gate_claim_renewer=""
 gate_claim_payload() {
   jq -nc --arg repo "$GATE_CLAIM_OWNER/$GATE_CLAIM_REPO" --argjson number "$GATE_CLAIM_NUMBER" \
     --arg sha "$GATE_CLAIM_SHA" --arg field "$GATE_CLAIM_FIELD" \
@@ -593,8 +610,13 @@ gate_claim_payload() {
     '{repo:$repo,number:$number,runner_id:$id,host:$host} + {($field):$sha}'
 }
 # gate_claim_take OWNER REPO NUMBER SHA FIELD -- 0: this slot holds the head (granted or renewed);
-# 1: it does not, and must not gate it now.
+# 1: it does not, and must not gate it now. A lease this slot holds on another head is given back
+# first, and every answer that grants nothing leaves GATE_CLAIM_HELD at 0, so the exit handler never
+# releases a head this slot was refused.
 gate_claim_take() {
+  if ((GATE_CLAIM_HELD)) && [[ "$1/$2@$4" != "$GATE_CLAIM_OWNER/$GATE_CLAIM_REPO@$GATE_CLAIM_SHA" ]]; then
+    gate_claim_release
+  fi
   GATE_CLAIM_OWNER=$1 GATE_CLAIM_REPO=$2 GATE_CLAIM_NUMBER=$3 GATE_CLAIM_SHA=$4 GATE_CLAIM_FIELD=${5:-head_sha}
   ((GATE_CLAIM_ROUTE)) || return 0
   api POST "/api/v1/gate-claims" "$(gate_claim_payload)"
@@ -604,15 +626,20 @@ gate_claim_take() {
       GATE_CLAIM_TTL=$(jq -r '.ttl_seconds // empty' <<<"$body" 2>/dev/null || true)
       [[ "$GATE_CLAIM_TTL" =~ ^[0-9]+$ ]] && ((GATE_CLAIM_TTL >= 30)) || GATE_CLAIM_TTL=180
       say "$1/$2@$4: gate claim held for ${GATE_CLAIM_TTL}s"
+      gate_claim_renewer_start
       return 0;;
+  esac
+  gate_claim_stop_renewer
+  GATE_CLAIM_HELD=0
+  case "$code" in
     404)
-      if jq -e 'has("code")' <<<"$body" >/dev/null 2>&1; then
-        say "$1/$2@$4: the forge refused its gate claim ($(jq -r '.message // .code' <<<"$body"))"
-        return 1
+      if [[ "$(jq -r '.code? // empty' <<<"$body" 2>/dev/null || true)" == api_route_not_found ]]; then
+        say "this forge has no gate-claims route; gating on the local claim alone"
+        GATE_CLAIM_ROUTE=0
+        return 0
       fi
-      say "this forge has no gate-claims route; gating on the local claim alone"
-      GATE_CLAIM_ROUTE=0
-      return 0;;
+      say "$1/$2@$4: asking for its gate claim answered 404 ($(jq -r '.message // .code // empty' <<<"$body" 2>/dev/null || echo 'not a forge answer')); leaving the head for this tick"
+      return 1;;
     409)
       say "$1/$2@$4: $(jq -r '.message // "another host holds its gate claim"' <<<"$body" 2>/dev/null || true)"
       return 1;;
@@ -621,17 +648,19 @@ gate_claim_take() {
       return 1;;
   esac
 }
-# gate_claim_renew -- hold the lease while the gate runs. Best effort: a refused renewal is logged
-# and the gate carries on; what a lost lease costs is that another host may gate the same head too,
-# not a lost verdict.
+# gate_claim_renew -- ask for the held lease again, which is the renewal. 0: renewed; 1: refused
+# (the lease is lost); 2: no answer that says either (5xx, 000, 429), so the lease may still be held.
 gate_claim_renew() {
   ((GATE_CLAIM_HELD)) || return 0
   api POST "/api/v1/gate-claims" "$(gate_claim_payload)"
-  [[ "$code" =~ ^2 ]]
+  [[ ! "$code" =~ ^2 ]] || return 0
+  [[ ! "$code" =~ ^(5[0-9][0-9]|000|429)$ ]] || return 2
+  return 1
 }
 # gate_claim_release -- give the head back once its result is published, so the next host does not
 # wait out the TTL. Releasing a lease the forge has already forgotten is not an error.
 gate_claim_release() {
+  gate_claim_stop_renewer
   ((GATE_CLAIM_HELD)) || return 0
   api POST "/api/v1/gate-claims/release" "$(gate_claim_payload)"
   [[ "$code" =~ ^2 ]] \
@@ -639,15 +668,79 @@ gate_claim_release() {
   GATE_CLAIM_HELD=0
   return 0
 }
-# gate_claim_renew_loop SECONDS -- renew until this subshell is killed. Started beside the progress
-# watcher while the recipe runs, with the slot and repository locks closed so nothing it starts can
-# hold them.
+# gate_claim_renew_loop SECONDS RUNNER-PID -- renew every SECONDS while the runner lives. It ends on
+# its own when the runner is gone (a `kill -9` of the slot must not leave a process renewing a head
+# nobody gates), and when the lease is lost: refused on renewal, or no renewal answered within one
+# TTL of the last that was, after which another host may legitimately hold the head. A lost lease is
+# recorded in $GATE_CLAIM_STATE/lost and stops the recipe's process group, so the runner abandons the
+# attempt and posts nothing more for the head.
 gate_claim_renew_loop() {
-  local every=$1
+  local every=$1 runner=$2 last_ok now rc worker=""
   ((every >= 10)) || every=10
-  while sleep "$every"; do
-    gate_claim_renew || say "renewing the gate claim on $GATE_CLAIM_SHA answered $code"
+  last_ok=$(date +%s)
+  while kill -0 "$runner" 2>/dev/null; do
+    sleep "$every" & wait "$!"
+    kill -0 "$runner" 2>/dev/null || break
+    rc=0; gate_claim_renew || rc=$?
+    now=$(date +%s)
+    if ((rc == 0)); then last_ok=$now; continue; fi
+    if ((rc == 2 && now - last_ok < GATE_CLAIM_TTL)); then
+      say "renewing the gate claim on $GATE_CLAIM_SHA answered $code; retrying"
+      continue
+    fi
+    printf 'renewal answered %s, %ss after the last renewal\n' "$code" "$((now - last_ok))" \
+      | gate_atomic "$GATE_CLAIM_STATE/lost"
+    say "lost the gate claim on $GATE_CLAIM_OWNER/$GATE_CLAIM_REPO@$GATE_CLAIM_SHA (renewal answered $code); stopping its gate"
+    [[ ! -f "$GATE_CLAIM_STATE/worker" ]] || read -r worker <"$GATE_CLAIM_STATE/worker" || true
+    [[ ! "$worker" =~ ^[0-9]+$ ]] || kill -TERM -- "-$worker" 2>/dev/null || true
+    break
   done
+}
+# The renewer runs from the grant until publication, through the slot's preparation (prefetch, cache
+# restart) as well as the recipe: a lease that lapsed during preparation would let a second host
+# gate the head. One per slot; a renewal of the head it already renews keeps it.
+gate_claim_renewer_start() {
+  if [[ -n "$gate_claim_renewer" ]] && kill -0 "$gate_claim_renewer" 2>/dev/null; then return 0; fi
+  rm -rf -- "$GATE_CLAIM_STATE" && mkdir -m 0700 -p "$GATE_CLAIM_STATE"
+  ( exec 6>&- 7>&- 9>&-; gate_claim_renew_loop "$((GATE_CLAIM_TTL / 3))" "$$" ) </dev/null >>"$GATE_CLAIM_STATE/renewer.log" 2>&1 &
+  gate_claim_renewer=$!
+}
+gate_claim_stop_renewer() {
+  [[ -n "$gate_claim_renewer" ]] || return 0
+  kill "$gate_claim_renewer" 2>/dev/null || true
+  wait "$gate_claim_renewer" 2>/dev/null || true
+  gate_claim_renewer=""
+}
+# gate_claim_lost -- 0 (and prints why) when this slot's lease on the head it is gating is gone.
+# Before a result is published the lease is asked for once more (a renewal), with the same retries a
+# status post gets on a forge that cannot answer: a result is published only by the lease's holder.
+gate_claim_lost() { # [verify]
+  ((GATE_CLAIM_HELD)) || return 1
+  if [[ -f "$GATE_CLAIM_STATE/lost" ]]; then cat "$GATE_CLAIM_STATE/lost"; return 0; fi
+  [[ "${1:-}" == verify ]] || return 1
+  local attempt=1 rc
+  while :; do
+    rc=0; gate_claim_renew || rc=$?
+    ((rc != 0)) || return 1
+    if ((rc == 2 && attempt < STATUS_ATTEMPTS)); then
+      attempt=$((attempt + 1)); sleep "$STATUS_RETRY_SLEEP"; continue
+    fi
+    echo "the renewal before publication answered $code"
+    return 0
+  done
+}
+# gate_claim_abandon WHY -- the attempt this slot ran without its lease ends here: terminal, nothing
+# published and nothing owed (another host holds the head and posts its result), and the next tick
+# gates the head again if it is still this host's to gate.
+gate_claim_abandon() {
+  say "$owner/$repo@$sha: gate claim lost ($1); abandoning attempt $(jq -r '.id' "$gate_receipt") without publishing"
+  gate_update --arg why "gate claim lost: $1" --arg at "$(date -u +%FT%TZ)" \
+    'if .terminal then . else .terminal=true | .outcome="claim_lost" | .finished_at=$at end
+     | .publication.superseded_by=$why | .recovery_required=null' || return
+  cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json"
+  gate_receipt=""
+  GATE_CLAIM_HELD=0
+  gate_claim_stop_renewer
 }
 
 # ---------------------------------------------------------------------------
@@ -2114,6 +2207,11 @@ root_env+=("${proof_base_env[@]}")
 # runner prepares and revokes, never create a nested target/ that survives between gates.
 # Incremental state is never reused across gates, whether or not sccache is present to pin it.
 ((build_cache == 0)) || root_env+=(JERYU_CI_BUILD_CACHE_DIR="$worker_root/$repo/target/build-cache" CARGO_INCREMENTAL=0)
+# Preparation can take longer than a lease: a lease lost meanwhile ends the attempt before the recipe.
+if claim_lost_why=$(gate_claim_lost); then
+  gate_claim_abandon "$claim_lost_why"
+  break
+fi
 if ((sandbox)); then
   # The sandbox contract: <command> <tree-root> <repo> <recipe...>. The site's command puts the tree
   # root in an ephemeral, network-restricted VM or container at that same path, enters <repo> there
@@ -2150,23 +2248,14 @@ gate_update --argjson worker "$gate_worker" '.worker_pid=$worker'
 gate_progress_watch "$log" "$steps_tsv" "$gate_worker" "$owner" "$repo" "$sha" \
   "$(gate_planned_path "$owner" "$repo")" "$step_sources" "$checks_url" >/dev/null 2>&1 &
 progress_watcher=$!
-# The lease on this head, renewed at a third of its TTL while the recipe runs, so a gate that takes
-# hours keeps the head and one that dies loses it within one TTL.
-claim_renewer=""
-if ((GATE_CLAIM_HELD)); then
-  ( exec 6>&- 7>&- 9>&-; gate_claim_renew_loop "$((GATE_CLAIM_TTL / 3))" ) >/dev/null 2>&1 &
-  claim_renewer=$!
-fi
+# The lease's renewer (started when it was granted) stops this process group if the lease is lost.
+((GATE_CLAIM_HELD == 0)) || printf '%s\n' "$gate_worker" | gate_atomic "$GATE_CLAIM_STATE/worker"
 worker_exit=0
 wait "$gate_worker" || worker_exit=$?
 gate_worker=""
 kill "$progress_watcher" 2>/dev/null || true
 wait "$progress_watcher" 2>/dev/null || true
-if [[ -n "$claim_renewer" ]]; then
-  kill "$claim_renewer" 2>/dev/null || true
-  wait "$claim_renewer" 2>/dev/null || true
-  claim_renewer=""
-fi
+rm -f -- "$GATE_CLAIM_STATE/worker"
 gate_steps_record "$log" "$steps_tsv" || true
 date +%s >"$gate_attempt_dir/steps.end"
 state=success
@@ -2185,6 +2274,13 @@ if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" "$log" \
   if jq -e 'type == "object"' "$after_inputs" >/dev/null 2>&1; then
     gate_update --slurpfile after "$after_inputs" '.after_inputs=$after[0]'
   fi
+fi
+# A result is published only by the lease's holder: a lost lease (or one the forge no longer confirms)
+# means another host may be gating this head, and this attempt ends without a word on the PR.
+if claim_lost_why=$(gate_claim_lost verify); then
+  ((build_cache == 0)) || rm -rf -- "$run/$repo/target/build-cache"
+  gate_claim_abandon "$claim_lost_why"
+  break
 fi
 gate_finish "$state" "$worker_exit" "$log"
 # Only an approved commit on its way to main feeds the shared cache: a green merge-queue replay or a
@@ -2230,6 +2326,9 @@ if [[ "$tier" == fast && "$state" != success ]]; then
   break
 fi
 done
+# Whatever ended the tiers (the last one published, or one left early: recovery owed, a reused or held
+# result, a republication), this host is done with the head, so no other host waits out its lease.
+gate_claim_release
 GATE_CONTEXT_KIND=required
 ((main_health == 0)) || GATE_CONTEXT_KIND=main-health
 if ((ran_tier == 0)); then

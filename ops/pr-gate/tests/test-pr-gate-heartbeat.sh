@@ -336,6 +336,17 @@ tail -1 "$HEARTBEAT_TEST_CAPTURE" | jq -e '.body.capabilities == ["host-ci"]' >/
 GATE_RUNNER_CAPABILITIES=host-ci HEARTBEAT_TEST_REJECT_CAPABILITIES=1 bash "$source_file" 2>"$fixture/capabilities.log"
 grep -q 'capabilities refused' "$fixture/capabilities.log"
 tail -1 "$HEARTBEAT_TEST_CAPTURE" | jq -e '(.body | has("capabilities") | not) and (.body.last | has("recipe"))' >/dev/null
+# The refusal is remembered: the next beats within 30 minutes leave the field out without a refused
+# request, and the field is tried again once the memory lapses.
+[[ -f "$fixture/home/cache/heartbeat-no-capabilities" ]]
+before=$(wc -l <"$HEARTBEAT_TEST_CAPTURE")
+GATE_RUNNER_CAPABILITIES=host-ci HEARTBEAT_TEST_REJECT_CAPABILITIES=1 bash "$source_file" 2>"$fixture/capabilities.log"
+! grep -q 'capabilities refused' "$fixture/capabilities.log"
+[[ "$(( $(wc -l <"$HEARTBEAT_TEST_CAPTURE") - before ))" == "$(tail -n +$((before + 1)) "$HEARTBEAT_TEST_CAPTURE" | jq -s '[.[] | select(.body | has("capabilities") | not)] | length')" ]]
+touch -d '-31 minutes' "$fixture/home/cache/heartbeat-no-capabilities"
+GATE_RUNNER_CAPABILITIES=host-ci bash "$source_file"
+tail -1 "$HEARTBEAT_TEST_CAPTURE" | jq -e '.body.capabilities == ["host-ci"]' >/dev/null
+rm -f "$fixture/home/cache/heartbeat-no-capabilities"
 refuse env GATE_RUNNER_CAPABILITIES='host-ci host-ci' bash "$source_file"
 refuse env GATE_RUNNER_CAPABILITIES=host_ci bash "$source_file"
 printf 'PASS capabilities reach the forge; older forges retain task evidence; invalid configuration sends nothing\n'

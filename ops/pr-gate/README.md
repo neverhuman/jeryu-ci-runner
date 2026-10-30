@@ -915,25 +915,48 @@ owner list an operator edits:
    `capability_missing` names what the repository needs. A refused head is
    left where it was -- no status, no attempt, no local state -- and the host
    goes on to the next candidate;
-3. while the recipe runs, the slot repeats the same ask every third of the TTL;
-   it is the renewal (the lease keeps its `granted_at` and moves its
-   `expires_at`). A slot that is killed, or a host that hangs or loses power,
-   stops renewing;
-4. on publication the slot gives the head back
-   (`POST /api/v1/gate-claims/release`), so the next host does not wait out
-   the TTL. Releasing a head nobody holds is not an error, which is what a
-   publication retry or a recovering tick does;
-5. a lease nobody renews expires. The head is then claimable by any live host,
+3. from the moment the lease is granted -- through preparation (the locked-crate
+   prefetch, the compile-cache restart) as well as the recipe -- a background
+   renewer repeats the same ask every third of the TTL; it is the renewal (the
+   lease keeps its `granted_at` and moves its `expires_at`). The renewer ends
+   with the runner: a slot that is killed outright (`kill -9`), or a host that
+   hangs or loses power, stops renewing;
+4. a lease the slot loses -- a renewal refused, or no renewal answered within
+   one TTL of the last one that was, after which another host may hold the
+   head -- stops the recipe. The attempt is recorded as `claim_lost`
+   (superseded, nothing owed) and the slot posts nothing more for the head;
+5. immediately before publication the slot asks once more (retried like a
+   status post on a forge that cannot answer). Only a slot the forge confirms
+   as the holder publishes; any other answer abandons the attempt as in 4;
+6. on publication, or when its tiers end early (a reused, held or recovered
+   result), the slot gives the head back (`POST /api/v1/gate-claims/release`),
+   so the next host does not wait out the TTL. A slot that moves on to another
+   head gives back the one it held first, and a slot that was refused a head
+   holds nothing, so it never releases a head another host is gating. Only the
+   holder may release a lease; releasing one the forge has forgotten is not an
+   error;
+7. a lease nobody renews expires. The head is then claimable by any live host,
    so a dead host's work is picked up automatically, within one TTL.
 
-Repeating an ask with an `Idempotency-Key` replays the forge's first answer, so
-a runner that lost the answer to a timeout can ask again safely.
+While every gate host runs this version, only the lease holder posts a head's
+required check. The forge does not refuse a status from a host without a lease
+(an older runner keeps working), so a host still on an older runner can gate a
+head another host holds.
 
-A forge without the route (a 404 that is not a typed refusal) is gated the way
-it was before the lease existed: the local claim is the only exclusion, as on a
-single-host site. A forge that cannot answer at all leaves the head for the
-next tick -- posting `pending` for a head this host may not be gating is
-exactly what the lease prevents.
+The runner sends no `Idempotency-Key` on these routes, and the forge does not
+replay them from one: an ask repeated by the runner that holds the lease (the
+same `runner_id`) is the renewal, so a runner that lost an answer to a timeout
+asks again and is answered from the lease it holds, while an ask from any other
+runner is refused for as long as the lease is live.
+
+A forge without the route answers `404` with the typed code
+`api_route_not_found`; it is gated the way it was before the lease existed: the
+local claim is the only exclusion, as on a single-host site. Any other `404` (a
+proxy, a misrouted forge URL, a token that lost access) is not taken as an older
+forge: the head is left for the next tick and the route is asked again. A forge
+that cannot answer at all also leaves the head for the next tick -- posting
+`pending` for a head this host may not be gating is exactly what the lease
+prevents.
 
 ### Capabilities instead of owners
 
@@ -944,7 +967,10 @@ and duplicate names before making requests. Both the slot runner and heartbeat
 timer send the setting in the heartbeat's `capabilities` array, and
 `/api/v1/control-plane/runners` shows it per node. A heartbeat without the
 field clears a previous advertisement; a forge that refuses the field gets a
-retry without it, and cannot match on capabilities at all.
+retry without it (in the same shape the beat was sent in), and cannot match on
+capabilities at all. The heartbeat timer remembers that refusal for 30 minutes
+(`cache/heartbeat-no-capabilities`), as it remembers refused tools and code; the
+slot runner drops the field for the rest of its run.
 
 A repository declares what a gate of it needs in its own `.jeryu/repo.toml`:
 
@@ -953,9 +979,9 @@ A repository declares what a gate of it needs in its own `.jeryu/repo.toml`:
 capabilities = ["host-ci"]
 ```
 
-The forge reads that file at the gated head's base branch (the default branch
-for a head with no pull request), never at the pull request's own head, so a
-pull request cannot change what its own gate requires. A claim is granted only
+The forge reads that file at the tip of the repository's default branch, for
+every head of the repository, never at the pull request's own head or at the
+branch it targets, so a pull request cannot change what its own gate requires. A claim is granted only
 to a host whose advertised set covers the repository's required set; an unknown
 or repeated name, or a file that cannot be read as a policy, refuses every
 claim rather than quietly requiring nothing.

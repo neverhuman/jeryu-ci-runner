@@ -154,6 +154,11 @@ if [[ -n "$(find "$LEVEL_FILE" -mmin -30 2>/dev/null)" ]]; then level="$(cat "$L
 ((level < 2)) || runner_code=""
 ((level < 3)) || minimal=1
 level_seen=$level
+# A forge that refuses the capabilities field is remembered the same way (cache/heartbeat-no-
+# capabilities), so it costs one refused beat per 30 minutes rather than one per slot per tick.
+CAPS_FILE="$HOME_DIR/cache/heartbeat-no-capabilities"
+caps_refused=0
+[[ -z "$(find "$CAPS_FILE" -mmin -30 2>/dev/null)" ]] || CAPABILITIES='[]'
 
 for slot in $SLOTS; do
   body=$(jq -nc --arg id "$HOST/slot$slot" --arg host "$HOST" --argjson slot "$slot" \
@@ -169,7 +174,14 @@ for slot in $SLOTS; do
   if [[ "$code" == 422 && "$CAPABILITIES" != '[]' && "$out" == *capabilities* ]]; then
     printf 'heartbeat capabilities refused (422); retrying without them\n' >&2
     body=$(jq -c 'del(.capabilities)' <<<"$body")
-    post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "$runner_tools")"
+    CAPABILITIES='[]' caps_refused=1
+    if ((minimal)); then
+      post_heartbeat "$(gate_heartbeat_minimal "$body")"
+    elif [[ -n "$runner_code$runner_tools" ]]; then
+      post_heartbeat "$(gate_heartbeat_with "$body" "$runner_code" "$runner_tools")"
+    else
+      post_heartbeat "$body"
+    fi
   fi
   if [[ "$code" == 422 && -n "$runner_tools" ]]; then
     printf 'heartbeat tools refused (422); retrying without them\n' >&2
@@ -192,6 +204,10 @@ done
 if ((level != level_seen)); then
   mkdir -p "$HOME_DIR/cache"
   printf '%s\n' "$level" >"$LEVEL_FILE"
+fi
+if ((caps_refused)); then
+  mkdir -p "$HOME_DIR/cache"
+  touch "$CAPS_FILE"
 fi
 
 # ---- finished attempts -> pipeline events -------------------------------------------------------
