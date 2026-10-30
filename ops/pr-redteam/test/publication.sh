@@ -25,7 +25,11 @@ fixture_git init -q -b main "$t/repo"
 g() { fixture_git -C "$t/repo" -c user.name=fixture -c user.email=fixture@example.invalid "$@"; }
 printf 'base\n' > "$t/repo/README.md"; g add .; g commit -qm base
 g rev-parse HEAD > "$t/base"
+cp "$t/base" "$t/initial-base"
 g switch -qc topic
+printf 'accepted prerequisite\n' > "$t/repo/prerequisite"; g add .; g commit -qm 'Accepted prerequisite (#35)'
+g rev-parse HEAD > "$t/prerequisite"
+g branch -f main HEAD
 printf 'candidate\n' >> "$t/repo/README.md"; g commit -qam candidate
 g rev-parse HEAD > "$t/head"
 cat > "$t/bin/git" <<'FIXTURE'
@@ -64,6 +68,9 @@ row() {
     | if .required_contexts == null then del(.required_contexts) else . end'
 }
 case "$url" in
+  */refs)
+    jq -nc --arg sha "$(cat "$PUBLISH_FIXTURE/prerequisite")" '[{name:"main",kind:"branch",sha:$sha,protected:true}]'
+    printf '\n200' ;;
   */branches/*/protection)
     # The base branch's enforced required contexts: this fixture's main enforces the quality proof,
     # exactly as the row reports it on the head.
@@ -109,6 +116,13 @@ if [[ "${1:-}" == --version ]]; then echo '9.9.9 (Claude Code)'; exit 0; fi
 PUBLISH_FIXTURE="$(dirname "$(dirname "$0")")"
 printf 'called\n' >> "$PUBLISH_FIXTURE/model-calls"
 touch "$PUBLISH_FIXTURE/model-started"
+# Production collection reaches the model with both the retained diff and effective view.
+if [[ "$(cat "$PUBLISH_FIXTURE/base")" == "$(cat "$PUBLISH_FIXTURE/initial-base")" ]]; then
+grep -q "Accepted prerequisite boundary: $(cat "$PUBLISH_FIXTURE/prerequisite")" ../review/prerequisites/SUMMARY.txt
+grep -q '+accepted prerequisite' ../review/diff.patch
+if grep -q '+accepted prerequisite' ../review/prerequisites/effective.patch; then exit 1; fi
+grep -q '+candidate' ../review/prerequisites/effective.patch
+fi
 while [[ -e "$PUBLISH_FIXTURE/gate" ]]; do sleep 0.05; done
 # The proof gets its (failing) result while the agent runs.
 if [[ -e "$PUBLISH_FIXTURE/model-turns-red" ]]; then rm -f "$PUBLISH_FIXTURE/gate-pending"; touch "$PUBLISH_FIXTURE/gate-blocked"; fi

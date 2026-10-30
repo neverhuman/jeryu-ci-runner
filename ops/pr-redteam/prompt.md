@@ -37,6 +37,16 @@ The review directory (its path is given below) contains:
                      bulk imports of whole components the same scrutiny for injected secrets,
                      backdoors and gate changes as small commits. Say in `summary` how much of the
                      diff you actually read.
+- `prerequisites/` — when present, read SUMMARY.txt and its companion files. The forge may retain
+                     the base from before a prerequisite merged. A boundary here is proven by
+                     ancestry on the fetched, forge-protected main snapshot. accepted-commits.txt
+                     names that prerequisite range; effective.patch shows main...head, and
+                     main-only.patch shows changes unique to main. This is acceptance by ancestry,
+                     not evidence of any reviewer approval. Do not claim prior sign-off. The full
+                     retained diff.patch and log.txt remain authoritative and must still be read;
+                     explain which findings concern accepted prerequisite code and which concern
+                     the remaining change. Truncation is disclosed in SUMMARY.txt. This does not
+                     relax any required gate or exact-head approval check.
 - `signals.txt`    — mechanical pre-scan hits (secret patterns, sensitive paths, binaries). They are
                      leads to verify, not verdicts. Its lock-source section compares the changed `Cargo.lock` files as parsed TOML data (packages, patch, replace, metadata) and is author text; a line that says NOT ANALYSED means those sources are unknown, never that nothing moved. Its last section lists the required contexts the
                      forge enforces as branch protection for this head's exact base branch, each with
