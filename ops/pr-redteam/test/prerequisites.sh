@@ -27,12 +27,18 @@ echo main-only >"$t/repo/main-only"
 g add .; g commit -qm 'Other accepted work'
 tip="$(g rev-parse HEAD)"
 g update-ref refs/pr/36/base "$tip"
-protected=true api_tip="$tip" api_code=200
+protected=true api_tip="$tip" api_code=200 api_shape=normal api_calls=0
 api() {
   [ "$2" = /api/v1/repos/acme%2Ftool/refs ]
+  api_calls=$((api_calls + 1))
   code="$api_code"
   body="$(jq -nc --arg sha "$api_tip" --argjson protected "$protected" \
     '[{name:"main", kind:"branch", sha:$sha, protected:$protected}]')"
+  case "$api_shape" in
+    missing_sha) body="$(jq 'map(del(.sha))' <<<"$body")" ;;
+    missing_main) body='[]' ;;
+    malformed) body='{}' ;;
+  esac
 }
 g diff "$base...$head" >"$t/full.patch"
 mkdir "$t/review"
@@ -49,18 +55,38 @@ if grep -q '+prerequisite' "$out/effective.patch"; then exit 1; fi
 grep -q '+main-only' "$out/main-only.patch"
 cmp "$t/full.patch" "$t/review/diff.patch"
 grep -q '+prerequisite' "$t/review/diff.patch"
-for scenario in unprotected stale unavailable unchanged divergent; do
-  protected=true api_tip="$tip" api_code=200 retained="$base"
+for scenario in unprotected stale unavailable missing_sha missing_main malformed unchanged divergent missing_ref unrelated; do
+  protected=true api_tip="$tip" api_code=200 retained="$base" api_shape=normal
+  expected='' calls_before="$api_calls"
+  g update-ref refs/pr/36/base "$tip"
   case "$scenario" in
-    unprotected) protected=false ;;
-    stale) api_tip="$base" ;;
-    unavailable) api_code=503 ;;
+    unprotected) protected=false; expected='main is not reported protected' ;;
+    stale) api_tip="$base"; expected='main SHA is stale' ;;
+    unavailable) api_code=503; expected='HTTP 503' ;;
+    missing_sha) api_shape=missing_sha; expected='main SHA missing or invalid' ;;
+    missing_main|malformed) api_shape="$scenario"; expected='missing main branch or malformed' ;;
     unchanged) retained="$tip" ;;
-    divergent) retained="$head" ;;
+    divergent) retained="$head"; expected='does not descend' ;;
+    missing_ref) g update-ref -d refs/pr/36/base; expected='fetched base ref missing' ;;
+    unrelated)
+      tree="$(g rev-parse "$base^{tree}")"
+      unrelated="$(echo unrelated | g commit-tree "$tree")"
+      g update-ref refs/pr/36/base "$unrelated"; expected='unrelated histories' ;;
   esac
+  mkdir "$t/$scenario"
   prerequisite_evidence "$t/repo" acme/tool 36 "$retained" "$head" "$t/$scenario" 100000
-  grep -q 'No accepted prerequisite boundary established' "$t/$scenario/prerequisites/SUMMARY.txt"
+  [[ ! -d "$t/$scenario/prerequisites" ]]
+  if [[ -n "$expected" ]]; then
+    grep -q "$expected" "$t/$scenario/prerequisite-status.txt"
+  else
+    [[ ! -e "$t/$scenario/prerequisite-status.txt" ]]
+  fi
+  case "$scenario" in unchanged|divergent|missing_ref|unrelated) [[ "$api_calls" == "$calls_before" ]] ;; esac
 done
+g update-ref refs/pr/36/base "$tip"
+protected=true api_tip="$tip" api_code=200 api_shape=normal
+mkdir "$t/capped"
 prerequisite_evidence "$t/repo" acme/tool 36 "$base" "$head" "$t/capped" 10
-grep -q 'effective.patch: 10 bytes; truncated=true' "$t/capped/prerequisites/SUMMARY.txt"
+grep -q 'effective.patch: 3 bytes; truncated=true' "$t/capped/prerequisites/SUMMARY.txt"
+[[ "$(cat "$t/capped/prerequisites/"*.patch "$t/capped/prerequisites/accepted-commits.txt" | wc -c)" -le 10 ]]
 echo 'ok stacked retained-base packet preserves complete diff, proves protected-main boundary, and discloses effective diff and limits'

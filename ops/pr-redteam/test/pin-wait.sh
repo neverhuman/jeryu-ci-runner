@@ -77,6 +77,7 @@ case "$url" in
       '{head_sha: $sha, base_sha: "b", truncated: $truncated,
         files: ($files[0] | map({path: ., old_path: null, status: "modified", hunks: []}))}'
     printf '\n200' ;;
+  */refs) printf '[]\n200' ;; # No protected-main boundary in this fixture.
   */branches/*/protection)
     ref="${url#*/branches/}"; ref="${ref%/protection}"
     if [[ "$(cat "$PIN_FIXTURE/protection")" == unreadable ]]; then printf '{"message":"server error"}\n500'; exit 0; fi

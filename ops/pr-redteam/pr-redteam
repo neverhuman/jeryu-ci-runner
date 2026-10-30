@@ -427,21 +427,40 @@ quality_gate_verdict() { # gate reason -> verdict JSON
 # Presence on main is acceptance, never evidence of an approval on this PR's head.
 prerequisite_evidence() { # cache repo number retained-base head review-dir allowance
   local g="$1" repo="$2" number="$3" retained="$4" head="$5" d="$6" allowance="$7"
-  local tip boundary original refs cut bytes
-  mkdir -p "$d/prerequisites"
-  local out="$d/prerequisites"
-  echo 'No accepted prerequisite boundary established; review the complete retained diff.patch.' >"$out/SUMMARY.txt"
-  tip="$(git -C "$g" rev-parse "refs/pr/$number/base")" || return 0
-  boundary="$(git -C "$g" merge-base "$tip" "$head")" || return 0
-  original="$(git -C "$g" merge-base "$retained" "$head")" || return 0
+  local tip boundary original refs cut bytes reason row
+  local out="$d/prerequisites" status="$d/prerequisite-status.txt"
+  # Keep diagnostics outside prerequisites/: that directory promises a proven boundary.
+  tip="$(git -C "$g" rev-parse --verify "refs/pr/$number/base" 2>/dev/null)" || {
+    echo 'Prerequisite evidence unavailable: fetched base ref missing; review complete diff.patch.' >"$status"; return 0;
+  }
+  boundary="$(git -C "$g" merge-base "$tip" "$head")" || {
+    echo 'Prerequisite evidence unavailable: main and head have unrelated histories; review complete diff.patch.' >"$status"; return 0;
+  }
+  original="$(git -C "$g" merge-base "$retained" "$head")" || {
+    echo 'Prerequisite evidence unavailable: retained base and head have unrelated histories; review complete diff.patch.' >"$status"; return 0;
+  }
   [ "$original" != "$boundary" ] || return 0
-  git -C "$g" merge-base --is-ancestor "$original" "$boundary" || return 0
+  git -C "$g" merge-base --is-ancestor "$original" "$boundary" || {
+    echo 'No accepted prerequisite: main boundary does not descend from retained boundary; review complete diff.patch.' >"$status"; return 0;
+  }
   api GET "/api/v1/repos/${repo/\//%2F}/refs"
-  [ "$code" = 200 ] || return 0
-  refs="$body"
-  # The fetched snapshot must match the forge's protected main, not a stale API row or another base.
-  jq -e --arg tip "$tip" 'any(.[]; .kind == "branch" and .name == "main" and .protected == true and .sha == $tip)' \
-    <<<"$refs" >/dev/null 2>&1 || return 0
+  if [ "$code" != 200 ]; then
+    reason="refs API unavailable (HTTP $code)"
+  else
+    refs="$body"
+    # repo_refs in jeryu-deploy web/repositories/source.rs returns name/kind/sha/protected.
+    row="$(jq -ce 'map(select(.kind == "branch" and .name == "main")) | .[0] // empty' <<<"$refs" 2>/dev/null)" || row=''
+    if [ -z "$row" ]; then reason='refs response missing main branch or malformed';
+    elif ! jq -e '.protected == true' <<<"$row" >/dev/null; then reason='main is not reported protected';
+    elif ! jq -e '.sha | type == "string" and test("^[0-9a-f]{40}$")' <<<"$row" >/dev/null; then reason='main SHA missing or invalid in refs response';
+    elif [ "$(jq -r .sha <<<"$row")" != "$tip" ]; then reason='main SHA is stale relative to fetched snapshot';
+    else reason=''; fi
+  fi
+  if [ -n "$reason" ]; then
+    printf 'Prerequisite evidence unavailable: %s; review complete diff.patch.\n' "$reason" >"$status"
+    return 0
+  fi
+  mkdir -p "$out"
   {
     echo "Retained diff base: $retained (merge base $original)"
     echo "Protected main snapshot: $tip"
@@ -453,14 +472,17 @@ prerequisite_evidence() { # cache repo number retained-base head review-dir allo
     echo 'Changes unique to main are excluded by the three-dot comparison; main-only.patch shows boundary..main, so these changes remain visible.'
     echo "Exact PR head: $head"
   } >"$out/SUMMARY.txt"
+  # A separate, bounded supplement never changes PR sizing or pin-evidence room.
+  local log_budget=$((allowance / 4)) patch_budget=$((allowance * 3 / 8))
+  [ "$log_budget" -le 16384 ] || log_budget=16384
   cut=false
-  bytes="$(git -C "$g" log --format='%H %s' "$original..$boundary" | upstream_capped "$out/accepted-commits.txt" 16384)" || cut=true
+  bytes="$(git -C "$g" log --format='%H %s' "$original..$boundary" | upstream_capped "$out/accepted-commits.txt" "$log_budget")" || cut=true
   echo "accepted-commits.txt: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
   cut=false
-  bytes="$(git -C "$g" diff "$tip...$head" | upstream_capped "$out/effective.patch" "$allowance")" || cut=true
+  bytes="$(git -C "$g" diff "$tip...$head" | upstream_capped "$out/effective.patch" "$patch_budget")" || cut=true
   echo "effective.patch: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
   cut=false
-  bytes="$(git -C "$g" diff "$head...$tip" | upstream_capped "$out/main-only.patch" "$allowance")" || cut=true
+  bytes="$(git -C "$g" diff "$head...$tip" | upstream_capped "$out/main-only.patch" "$patch_budget")" || cut=true
   echo "main-only.patch: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
 }
 
@@ -479,6 +501,7 @@ pending_review_key() { # review-dir sha base-sha origin -> key
     sha256sum <"$d/description.md"
     # signals.txt less its last section, the required contexts' live states (required_contexts_signal).
     sed '/^## required contexts on this head/,$d' "$d/signals.txt" | sha256sum
+    if [ -f "$d/prerequisite-status.txt" ]; then sha256sum <"$d/prerequisite-status.txt"; fi
     if [ -d "$d/prerequisites" ]; then
       (cd "$d/prerequisites" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
     fi
@@ -2426,18 +2449,13 @@ review_one() { # owner/name number dry-run force include-drafts
   git -C "$cache" diff "$base_sha...$sha" -- . ':(exclude,glob)**/*.lock' ':(exclude,glob)**/package-lock.json' \
     ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/yarn.lock' ':(exclude,glob)**/go.sum' >"$d/diff.patch"
   if [ "$base_ref" = main ]; then
-    prerequisite_evidence "$cache" "$repo" "$number" "$base_sha" "$sha" "$d" "$max_diff_bytes"
+    prerequisite_evidence "$cache" "$repo" "$number" "$base_sha" "$sha" "$d" "$((max_diff_bytes / 4))"
   fi
   git -C "$cache" archive "$sha" | tar -x -C "$d/checkout"
   signals "$d"
   { echo; lock_source_report "$cache" "$base_sha" "$sha" "$d/files.nul"; } >>"$d/signals.txt"
   { echo; required_contexts_signal "$row" "$repo" "$number" "$sha"; } >>"$d/signals.txt"
   local diff_bytes files_count; diff_bytes="$(wc -c <"$d/diff.patch")"; files_count="$(wc -l <"$d/files.txt")"
-  if [ -d "$d/prerequisites" ]; then
-    local prerequisite_bytes
-    prerequisite_bytes="$(find "$d/prerequisites" -type f -exec cat {} + | wc -c)"
-    diff_bytes=$((diff_bytes + prerequisite_bytes))
-  fi
   # Upstream evidence is reading the agent is told to do, so it shares the diff's size limit: at most
   # a quarter of it, and never more than the diff leaves.
   local up_budget=$((max_diff_bytes / 4)) up_room=$((max_diff_bytes - diff_bytes))

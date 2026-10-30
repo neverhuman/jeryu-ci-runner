@@ -63,6 +63,7 @@ row() {
       mergeable:{can_merge:true,reason:"ready"}}'
 }
 case "$url" in
+  */refs) printf '[]\n200' ;; # No protected-main boundary in this fixture.
   */branches/*/protection)
     # The base branch's enforced required contexts, which a review reads. This suite's base enforces
     # none; what a review does with enforced contexts is covered in test/pin-wait.sh.

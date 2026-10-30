@@ -37,6 +37,7 @@ The review directory (its path is given below) contains:
                      bulk imports of whole components the same scrutiny for injected secrets,
                      backdoors and gate changes as small commits. Say in `summary` how much of the
                      diff you actually read.
+- `prerequisite-status.txt` — when present, reports why no prerequisite boundary could be proven.
 - `prerequisites/` — when present, read SUMMARY.txt and its companion files. The forge may retain
                      the base from before a prerequisite merged. A boundary here is proven by
                      ancestry on the fetched, forge-protected main snapshot. accepted-commits.txt

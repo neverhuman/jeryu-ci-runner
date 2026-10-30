@@ -29,7 +29,13 @@ cp "$t/base" "$t/initial-base"
 g switch -qc topic
 printf 'accepted prerequisite\n' > "$t/repo/prerequisite"; g add .; g commit -qm 'Accepted prerequisite (#35)'
 g rev-parse HEAD > "$t/prerequisite"
-g branch -f main HEAD
+# Unrelated main progress exceeds the PR limit but must not charge this PR.
+g switch -q main
+g merge --ff-only topic >/dev/null
+printf '%030000d\n' 0 > "$t/repo/main-only"
+g add .; g commit -qm 'Unrelated main progress'
+g rev-parse HEAD > "$t/main-tip"
+g switch -q topic
 printf 'candidate\n' >> "$t/repo/README.md"; g commit -qam candidate
 g rev-parse HEAD > "$t/head"
 cat > "$t/bin/git" <<'FIXTURE'
@@ -69,7 +75,7 @@ row() {
 }
 case "$url" in
   */refs)
-    jq -nc --arg sha "$(cat "$PUBLISH_FIXTURE/prerequisite")" '[{name:"main",kind:"branch",sha:$sha,protected:true}]'
+    jq -nc --arg sha "$(cat "$PUBLISH_FIXTURE/main-tip")" '[{name:"main",kind:"branch",sha:$sha,protected:true}]'
     printf '\n200' ;;
   */branches/*/protection)
     # The base branch's enforced required contexts: this fixture's main enforces the quality proof,
@@ -122,6 +128,11 @@ grep -q "Accepted prerequisite boundary: $(cat "$PUBLISH_FIXTURE/prerequisite")"
 grep -q '+accepted prerequisite' ../review/diff.patch
 if grep -q '+accepted prerequisite' ../review/prerequisites/effective.patch; then exit 1; fi
 grep -q '+candidate' ../review/prerequisites/effective.patch
+grep -q 'main-only.patch: 768 bytes; truncated=true' ../review/prerequisites/SUMMARY.txt
+[[ "$(wc -c < ../review/diff.patch)" -lt 8192 ]]
+# The production check reports the retained PR bytes, without duplicate or main-only bytes.
+jq -se --arg measure "Diff: $(wc -l < ../review/files.txt) files, $(wc -c < ../review/diff.patch) bytes." \
+  'any(.[]; .output.summary | contains($measure))' "$PUBLISH_FIXTURE/check-runs" >/dev/null
 fi
 while [[ -e "$PUBLISH_FIXTURE/gate" ]]; do sleep 0.05; done
 # The proof gets its (failing) result while the agent runs.
@@ -144,7 +155,7 @@ export PATH="$t/bin:$PATH" JERYU_TOKEN_FILE="$t/token" REDTEAM_MERGE_TOKEN_FILE=
 export REDTEAM_STATE="$t/state" REDTEAM_CLAUDE="$t/bin/model" REDTEAM_CLAUDE_VERSION=9.9.9 REDTEAM_TIMEOUT=10
 export JERYU_BASE=https://forge.invalid
 # This suite publishes holds on head after head; the hold cap is hold-cap.sh's subject, not this one's.
-export REDTEAM_HOLD_CAP=0
+export REDTEAM_HOLD_CAP=0 REDTEAM_MAX_DIFF_BYTES=8192
 # Exercise publication after the admission wait expires; pin-wait.sh covers admission itself.
 export REDTEAM_GATE_WAIT_SECS=0
 review() { "$here/pr-redteam" _review 0 0 0 jeryu/fixture 1 >> "$t/controller.log" 2>&1; }
