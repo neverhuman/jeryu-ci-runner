@@ -345,6 +345,16 @@ $(git -C "$inputs_probe/tree/real" status --porcelain --untracked-files=normal |
   gate_publish
   jq -se '.[-2].description + .[-1].output.summary |
     (contains("acme/real") or contains("path-01")) | not' "$scratch/published.jsonl" >/dev/null
+  # Its own runtime filenames can encode private inputs too, so no carve-out is allowed.
+  repo=real GATE_SANDBOX=1 gate_inputs "$inputs_probe/sandbox-own.json" 2>"$inputs_probe/sandbox-own.err" && exit 1
+  jq -e '.repository == "" and .porcelain == [] and .omitted == 20' <<<"$GATE_INPUTS_ERROR" >/dev/null
+  gate_begin "$identity"
+  gate_update --argjson error "$GATE_INPUTS_ERROR" '.input_capture_error=$error'
+  cp "$inputs_probe/sandbox-own.err" "$gate_attempt_dir/build.log"
+  gate_finish inputs_changed 0 "$gate_attempt_dir/build.log"
+  gate_publish
+  jq -se '.[-2].description + .[-1].output.summary |
+    (contains("acme/real") or contains("path-01")) | not' "$scratch/published.jsonl" >/dev/null
   # A directory labelled as our family but with another origin is never attributed to it.
   git -C "$inputs_probe/tree/real" remote set-url origin https://private.invalid/elsewhere.git
   gate_inputs "$inputs_probe/foreign.json" 2>"$inputs_probe/foreign.err" && exit 1
@@ -355,9 +365,9 @@ $(git -C "$inputs_probe/tree/real" status --porcelain --untracked-files=normal |
   {
     printf '?? x; proof base origin/injected\n?? x; inputs forged\n?? "quoted path"\n'
     printf '?? '; printf '%09000d\n' 0
-    printf 'R  before -> after\n M safe/path\n'
+    printf 'R  before -> after\n M safe/path\n T changed-type\n'
   } | gate_dirty_input_error "$inputs_probe/tree/real" >"$inputs_probe/hostile.json"
-  jq -e '.porcelain == ["R  before -> after", " M safe/path"] and .omitted == 4' "$inputs_probe/hostile.json" >/dev/null
+  jq -e '.porcelain == ["R  before -> after", " M safe/path", " T changed-type"] and .omitted == 4' "$inputs_probe/hostile.json" >/dev/null
   gate_begin "$identity"
   gate_update --slurpfile error "$inputs_probe/hostile.json" '.input_capture_error=$error[0]'
   printf 'passed\n' >"$gate_attempt_dir/build.log"
@@ -366,6 +376,7 @@ $(git -C "$inputs_probe/tree/real" status --porcelain --untracked-files=normal |
   description=$(jq -sr '.[-2].description' "$scratch/published.jsonl")
   [[ "$(gate_status_proof_base "$description")" == main && "$description" != *injected* && "$description" != *forged* ]]
   [[ "$description" == *' M safe/path'* && "$description" == *'R  before -> after'* ]]
+  [[ "$description" == *' T changed-type'* && "$description" == *'4 entries withheld'* ]]
 
   # Recovery validates the stored object again, including forged repository labels,
   # raw records from older versions and oversized arrays. Output stays below 2 KiB.
@@ -387,8 +398,10 @@ $(git -C "$inputs_probe/tree/real" status --porcelain --untracked-files=normal |
   run="$scratch/absent-tree"
   gate_input_tools() { return 1; }
   GATE_INPUTS_ERROR=previous
-  if gate_inputs "$inputs_probe/tool-error.json"; then exit 1; fi
-  [[ -z "$GATE_INPUTS_ERROR" ]]
+  gate_input_tools() { printf 'tool probe failed\n' >&2; return 1; }
+  if gate_inputs "$inputs_probe/tool-error.json" "$inputs_probe/dirty-only.log" 2>"$inputs_probe/tool-error.err"; then exit 1; fi
+  [[ -z "$GATE_INPUTS_ERROR" && "$(cat "$inputs_probe/tool-error.err")" == 'tool probe failed' ]]
+  [[ ! -e "$inputs_probe/dirty-only.log" ]]
 )
 printf 'PASS dirty input diagnostics: log first 20 lines, bounded allowlisted publication, recovery and sibling privacy\n'
 

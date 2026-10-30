@@ -1596,6 +1596,20 @@ printf 'PASS passing input drift is neutral, re-runs first on the next two ticks
 # Failed after-run capture carries the same bounded diagnostic into the attempt
 # log, durable receipt and published status, for passing and failing recipes.
 rm -f "$fixture/mutate-tool"
+# Exercise a failed diagnostic receipt update through the complete runner, while
+# leaving later chain accounting and terminal publication able to persist.
+export REAL_JQ="$(command -v jq)"
+cat >"$fixture/tools/jq" <<'SH'
+#!/usr/bin/env bash
+for arg in "$@"; do
+  if [[ "$arg" == '.input_capture_error=$error' && -f "$FAKE_FORGE/fail-input-error" ]]; then
+    printf 'diagnostic update failed\n' >&2
+    exit 73
+  fi
+done
+exec "$REAL_JQ" "$@"
+SH
+chmod +x "$fixture/tools/jq"
 for recipe_exit in 0 7; do
   printf '%s\n' "$recipe_exit" >"$fixture/dirty-inputs"
   invoke --repo acme/fixture --pr 1
@@ -1618,7 +1632,16 @@ $("$real_git" -C "$fixture/runner/tree/fixture" status --porcelain --untracked-f
     (.output.summary | contains("dirty repository acme/fixture")) and
     (.output.summary | contains("injected") | not)' "$fixture/check-runs.jsonl" >/dev/null
 done
-rm -f "$fixture/dirty-inputs"
+printf '0\n' >"$fixture/dirty-inputs"
+touch "$fixture/fail-input-error"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -e '.terminal and .outcome == "inputs_changed" and .exit_code == 0 and
+  .inputs_changed_count == 1 and .input_capture_error == null and
+  .publication.required_status and .publication.check_run' "$receipt" >/dev/null
+grep -q 'could not record input-capture diagnostics' "$fixture/runner.log"
+rm -f "$fixture/dirty-inputs" "$fixture/fail-input-error" "$fixture/tools/jq"
+printf 'PASS diagnostic update failure preserves terminal result, publication and rerun accounting\n'
 printf 'PASS dirty after-run capture publishes repository and bounded paths without changing verdicts\n'
 
 # Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.

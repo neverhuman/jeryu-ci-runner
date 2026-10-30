@@ -709,12 +709,15 @@ lines. Those operator-only lines are never copied into a public status or check 
 The optional `input_capture_error` receipt object stores a verified `repository` label,
 `porcelain` (at most 20 allowlisted entries), and `omitted` (the count withheld from those 20).
 Repository labels must match the canonical hosted origin and contain only the bounded owner/repo
-charset. Contributed/sandbox runs with a dirty sibling, and unverified checkout identities, withhold
-both that repository label and its paths from public metadata; the operator log retains the details.
+charset. Contributed/sandbox runs withhold all runtime checkout identities and paths, including their
+own: even an allowlisted filename could encode private input. Unverified checkout identities are also
+withheld. The operator log retains the raw details; other capture errors remain in the runner journal.
+Recording this optional diagnostic is best effort and cannot abort normal rerun accounting or publication.
 
 The required-status description and check summary name validated paths from those first 20 lines:
 ASCII Git status codes plus relative paths using letters, digits, `_`, `.`, `/`, or `-` (and the
-literal rename separator ` -> `), at most 80 bytes per entry. Other entries are withheld. Publication
+literal rename separator ` -> `), at most 80 bytes per entry. Other entries are withheld and counted
+in the public diagnostic. Typechange (`T`) status entries are included. Publication
 revalidates the receipt, including on recovery. The public diagnostic is below 2048 bytes and cannot
 contain a semicolon or newline, so it cannot inject a status metadata field. The check title remains
 a short verdict referring readers to the status and attempt log; it never embeds the path list.

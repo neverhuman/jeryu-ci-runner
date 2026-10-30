@@ -612,11 +612,11 @@ gate_inputs_digest() { # inputs-json
   printf '%s\n' "$canonical" | sha256sum | cut -c1-64
 }
 
-gate_inputs() {
+gate_inputs() { # output-json [dirty-diagnostic-log]
   : "${run:?}" "${recipe_name:?}"
   # Bind all actual family sources, locks, executable tools and external fixtures.
   # The full identity is retained, so cache invalidation can be independently read.
-  local output=$1 directory lock_digest head tree origin clean
+  local output=$1 dirty_log=${2:-/dev/stderr} directory lock_digest head tree origin clean
   GATE_INPUTS_ERROR=""
   local rows="$output.rows" inputs="$output.inputs" versions="$output.versions"
   : >"$rows" || return
@@ -628,8 +628,10 @@ gate_inputs() {
     if [[ -n "$clean" ]]; then
       # Raw paths are operator evidence only. The receipt carries a bounded,
       # allowlisted projection, never the head-controlled porcelain text.
-      printf 'dirty checkout %s (first 20 porcelain lines):\n' "$directory" >&2
-      printf '%s\n' "$clean" | sed -n '1,20p' >&2
+      {
+        printf 'dirty checkout %s (first 20 porcelain lines):\n' "$directory"
+        printf '%s\n' "$clean" | sed -n '1,20p'
+      } >>"$dirty_log"
       GATE_INPUTS_ERROR=$(printf '%s\n' "$clean" | sed -n '1,20p' | gate_dirty_input_error "$directory")
       return 1
     fi
@@ -652,21 +654,20 @@ gate_inputs() {
 }
 
 # Project the first 20 porcelain lines into public metadata. A checkout name is
-# trusted only with the canonical hosted origin. Contributed runs must not name
-# sibling repositories or their paths on an outside contributor's status.
+# trusted only with the canonical hosted origin. Contributed runs publish no
+# runtime checkout details: even their own filenames could encode private inputs.
 gate_dirty_input_error() { # checkout; first 20 porcelain lines on stdin
   local directory=$1 name public_repo="" disclose=false origin
   name=$(basename -- "$directory")
   origin=$(git -C "$directory" remote get-url origin 2>/dev/null) || origin=""
   if [[ "$owner/$name" =~ ^[A-Za-z0-9_.-]{1,80}/[A-Za-z0-9_.-]{1,80}$ &&
-        "$origin" == "${BASE:-}/git/$owner/$name.git" ]] &&
-      { [[ "${GATE_SANDBOX:-0}" != 1 ]] || [[ "$name" == "$repo" ]]; }; then
+        "$origin" == "${BASE:-}/git/$owner/$name.git" && "${GATE_SANDBOX:-0}" != 1 ]]; then
     public_repo="$owner/$name" disclose=true
   fi
   jq -Rsc --arg repository "$public_repo" --argjson disclose "$disclose" '
     split("\n")[:-1][:20] as $lines |
     [$lines[] | select($disclose and length <= 80) |
-      select(test("\\A[ MADRCU?!]{2} [A-Za-z0-9_./-]+( -> [A-Za-z0-9_./-]+)?\\z"))] as $safe |
+      select(test("\\A[ MTADRCU?!]{2} [A-Za-z0-9_./-]+( -> [A-Za-z0-9_./-]+)?\\z"))] as $safe |
     {repository:$repository, porcelain:$safe, omitted:(($lines|length)-($safe|length))}'
 }
 
@@ -682,10 +683,12 @@ gate_input_error_text() { # receipt
     elif (($error.repository // "")|test("\\A[A-Za-z0-9_.-]{1,80}/[A-Za-z0-9_.-]{1,80}\\z")|not)
       then "dirty checkout (repository and paths withheld, see operator log)"
     else
-      [$error.porcelain // [] | arrays | .[:20][] | strings |
-        select(length <= 80 and test("\\A[ MADRCU?!]{2} [A-Za-z0-9_./-]+( -> [A-Za-z0-9_./-]+)?\\z"))] as $paths |
+      [$error.porcelain // [] | arrays | .[:20][]] as $entries |
+      [$entries[] | strings | select(length <= 80 and test("\\A[ MTADRCU?!]{2} [A-Za-z0-9_./-]+( -> [A-Za-z0-9_./-]+)?\\z"))] as $paths |
+      ($error.omitted // 0 | if type == "number" and . >= 0 and . <= 20 then floor else 0 end) as $omitted |
+      ([20, $omitted + ($entries|length) - ($paths|length)] | min) as $omitted |
       "dirty repository " + $error.repository + " (first 20 porcelain lines): " +
-      ($paths|join(", ")) + " (unsafe or long entries withheld, full details in operator log)"
+      ($paths|join(", ")) + " (" + ($omitted|tostring) + " entries withheld, full details in operator log)"
     end' "$1"
 }
 
