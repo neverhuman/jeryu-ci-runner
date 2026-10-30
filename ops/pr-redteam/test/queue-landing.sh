@@ -108,7 +108,13 @@ evidence() { # old new -> review dir (a dependent bumping acme/<name> from old t
   snap() { git -C "$D" add -A; git -C "$D" -c user.name=t -c user.email=t@t commit -q -m s; git -C "$D" rev-parse HEAD; }
   pin "$1"; b="$(snap)"; pin "$2"
   o="$(mktemp -d "$t/out-XXXXXX")"; : >"$t/api.log"
-  upstream_evidence "$D/.git" "$b" "$(snap)" "$o" acme "${budget:-100000}"; echo "$o"
+  # A helper the fixture did not load fails with "command not found" and the run could still pass:
+  # the production call's stderr is captured and any diagnostic other than the expected ones fails.
+  upstream_evidence "$D/.git" "$b" "$(snap)" "$o" acme "${budget:-100000}" 2>"$t/evidence.err"
+  if grep -v '^error: unknown option$' "$t/evidence.err" >"$t/evidence.unexpected"; [ -s "$t/evidence.unexpected" ]; then
+    fail "upstream_evidence wrote unexpected stderr (a helper not loaded?): $(cat "$t/evidence.unexpected")"
+  fi
+  echo "$o"
 }
 pin_of() { echo "$1/upstream/acme@$NAME-${2:0:12}/pin.json"; }
 
