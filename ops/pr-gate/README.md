@@ -20,6 +20,7 @@ identity authored.
 | `bin/pr-gate-heartbeat.sh` | reports every slot to the forge's `/runners` page and finished attempts as events |
 | `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears, moves, or is asked for again -- on the forge's `gate-wanted` signal and from the open-PR view -- and hands it the head it started it for |
 | `bin/pr-gate-install.sh` | keeps the installed copy equal to the source branch (drains slots first) |
+| `bin/pr-gate-tool-update.sh` | runs one host tool update inside the same drain, so a self-updating tool never lands mid-gate |
 | `bin/pr-gate-audit.sh` | claims the forge's queued jankurai audit jobs, scores each head with the governed jankurai in a throwaway clone, and submits the report (see [Scoring heads with jankurai](#scoring-heads-with-jankurai)) |
 | `bin/pr-gate-advisory-refresh.sh`, `bin/pr-gate-grype-db-refresh.sh` | keep security databases fresh outside the gates |
 | `systemd/` | the `--user` units and timers; `pr-gate-runner@N` is one slot |
@@ -671,7 +672,8 @@ An operator-run result names its inputs independently of the host that computed 
 name, never by the path a host installed it at:
 
 - the named tools, governed tools, runtime fixtures, vendor tree and every sourced runner/config/state/backoff script;
-- every directory on the recipe's `PATH` (`RECIPE_PATH`, the only PATH a recipe and its prefetch get):
+- every directory on the recipe's `PATH` (`RECIPE_PATH`: the governed tool directory and then
+  `PR_GATE_RECIPE_PATH`, the only PATH a recipe and its prefetch get):
   a system directory (under `/usr`, not `/usr/local`; `/bin`, `/sbin`) by its listing plus the
   installed package set, which also covers `/usr/lib`; any other directory (`~/.local/bin`,
   `~/.cargo/bin`, `/usr/local/bin`, ...) by the content of every file in it;
@@ -689,6 +691,26 @@ results remain host-specific until an independently bound guest-image contract e
 A changed package, executable or Python distribution during a recipe invalidates that attempt as
 `inputs_changed`, even when the recipe exits zero. Keep operator installations outside gate windows;
 freezing mutable tools would permit publishing a result for bytes that changed during execution.
+
+A tool that updates itself on its own schedule is such an installation, and it discards whole gates:
+attempt 5538ab4e of jeryu-ci-runner#165 (2026-10-30) passed the full required and proof recipe at
+score 94 and ended `inputs_changed` because the only input that had moved was the agent executable
+`~/.local/bin/claude`, which had replaced itself while the gate ran. Two ways out, and nothing is
+frozen either way:
+
+- update it inside a drain: `bin/pr-gate-tool-update.sh [--timeout SECONDS] -- <command...>` takes the
+  installer's lock, stops the slot timers, waits until no runner process is left (at most
+  `GATE_INSTALL_DRAIN_SECONDS`), runs the command once, then starts the timers again and records
+  `{command, exit_code, finished_at, drained_slots}` in `tool-update.json`. It exits the command's
+  status, or 75 when nothing ran (an install holds the lock, or the slots did not drain in time), so
+  the gate user's own timer can simply try again. Point the tool's updater at it instead of letting
+  the tool update itself whenever it happens to run.
+- keep it off the recipe's PATH: `PR_GATE_RECIPE_PATH` replaces everything after the governed tool
+  directory (absolute paths separated by `:`, or home-relative as elsewhere; the governed directory
+  always comes first and no setting can drop it or shadow it), so a host can give its recipes a
+  directory it owns rather than a `~/.local/bin` other software writes to. The setting is itself bound
+  into the identity, and every directory on it is still bound by content exactly as before: nothing
+  the recipe can execute goes unbound either way.
 
 The required status carries the identity's digest (`; inputs <sha256>`, the SHA-256 of the compact,
 key-sorted inputs JSON; `gate_inputs_digest`). Who posted a status is the forge's `creator.login` on
@@ -773,6 +795,11 @@ is installed atomically with its predecessor kept as `<file>.<old>-pre-<new>.bak
 reloads systemd and enables the managed singleton timers. The installed commit is recorded in
 `installed-main.json` (`{commit, previous, installed_at, files, version}`, or `{commit, verified_at,
 version}` when nothing differed), and every run records what the gates evaluate with in `tools.json`.
+
+A tool the gates evaluate with but the installer does not manage -- an agent binary, a linter with its
+own updater -- is updated with `bin/pr-gate-tool-update.sh`, which drains the same slots the installer
+does before letting the update run (see [Results across hosts](#results-across-hosts)). It is not on a
+timer of its own: the gate user points the tool's own updater or timer at it.
 
 First installation on a new host: put the site file in place, copy `bin/*.sh` to `~/gate-runner/bin`
 and `systemd/*` to `~/.config/systemd/user`, `systemctl --user daemon-reload`, then enable

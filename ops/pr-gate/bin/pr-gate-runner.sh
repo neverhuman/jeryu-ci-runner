@@ -119,9 +119,27 @@ pr_gate_dependencies_valid "$DEPENDENCIES" || {
   exit 2
 }
 TOOLS="${GATE_RUNNER_TOOLS:-$HOME_DIR/governed-tools/bin}"
+not_recipe_path() { printf 'pr-gate-runner: PR_GATE_RECIPE_PATH is not usable: %s\n' "$1" >&2; exit 2; }
 # The one PATH a recipe (and its locked-crate prefetch) runs with. gate_inputs binds every directory on
-# it (gate_host_environment), so a result names everything the recipe could have executed.
-RECIPE_PATH="$TOOLS:$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+# it (gate_host_environment), so a result names everything the recipe could have executed -- and an
+# executable that changes while the recipe runs ends that attempt as inputs_changed. A host whose
+# tools update themselves on their own schedule therefore either updates them inside a drain
+# (pr-gate-tool-update.sh) or keeps them off this PATH: PR_GATE_RECIPE_PATH replaces everything after
+# the governed tool directory, which always comes first and cannot be configured away or shadowed.
+# Absolute paths only, as PATH spells them; a directory that does not exist contributes nothing,
+# exactly as it does to the default.
+recipe_dirs=() recipe_tail=()
+IFS=: read -r -a recipe_dirs <<<"${PR_GATE_RECIPE_PATH:-$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin}"
+for recipe_dir in "${recipe_dirs[@]}"; do
+  # Each entry on its own, as every other configured path is read: "~/x" and "x" are under the gate
+  # user's home, and an empty entry (PATH's "the working directory") is never one of them.
+  [[ -n "$recipe_dir" ]] || not_recipe_path 'it has an empty entry, which would mean the working directory'
+  recipe_dir="$(pr_gate_path "$recipe_dir")"
+  [[ "$recipe_dir" != *..* ]] || not_recipe_path "$recipe_dir walks up out of itself"
+  recipe_tail+=("$recipe_dir")
+done
+((${#recipe_tail[@]} > 0)) || not_recipe_path "it names no directory"
+RECIPE_PATH="$TOOLS:$(IFS=:; printf '%s' "${recipe_tail[*]}")"
 # A native vendor tree (prebuilt third-party sources) linked at <repo>/target/native-vendor for the
 # repositories in PR_GATE_NATIVE_VENDOR_REPOS, and hashed into the inputs of those in
 # PR_GATE_NATIVE_VENDOR_INPUT_REPOS. Unset: no repository gets one.

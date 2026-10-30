@@ -109,6 +109,8 @@ printf '%s\n' "$((count + 1))" >"$fixture_root/executions"
 printf '%s\n' "$1" >>"$fixture_root/recipes"
 # recipe-sleep: a recipe that runs that many seconds, for the lease renewal cases.
 [[ ! -f "$fixture_root/recipe-sleep" ]] || sleep "$(cat "$fixture_root/recipe-sleep")"
+# The one PATH the recipe got, for the PR_GATE_RECIPE_PATH assertions.
+printf '%s\n' "$PATH" >"$fixture_root/recipe-path"
 if [[ "$1" == required-fast && "$(cat mode)" == fast-fail ]]; then exit 8; fi
 if [[ "$1" == required && -f "$fixture_root/full-fail" ]]; then exit 9; fi
 if [[ -f "$fixture_root/require-sibling" ]]; then
@@ -1772,6 +1774,50 @@ grep -q 'could not record input-capture diagnostics' "$fixture/runner.log"
 rm -f "$fixture/dirty-inputs" "$fixture/fail-input-error" "$fixture/tools/jq"
 printf 'PASS diagnostic update failure preserves terminal result, publication and rerun accounting\n'
 printf 'PASS dirty after-run capture publishes repository and bounded paths without changing verdicts\n'
+# The recipe's PATH: the governed tool directory, then PR_GATE_RECIPE_PATH. A host whose
+# ~/.local/bin is written by software it does not schedule (an agent binary that replaces itself
+# mid-gate) points the recipes at directories it owns instead; what the recipe can execute stays
+# bound by content either way.
+rm -f "$fixture/mutate-tool"
+mkdir -p "$fixture/home/.local/bin" "$fixture/recipe-tools"
+printf 'a tool the gate host does not manage\n' >"$fixture/home/.local/bin/stray"
+printf 'a tool the gate host owns\n' >"$fixture/recipe-tools/recipe-probe"
+# Also a `just` that would fail every gate: the governed directory comes first and cannot be shadowed.
+printf '#!/usr/bin/env bash\nexit 99\n' >"$fixture/recipe-tools/just"
+chmod +x "$fixture/recipe-tools/just"
+new_head
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+[[ "$(cat "$fixture/recipe-path")" == "$fixture/tools:$fixture/home/.local/bin:$fixture/home/.cargo/bin:/usr/local/bin:/usr/bin:/bin" ]] \
+  || { printf 'the default recipe PATH changed: %s\n' "$(cat "$fixture/recipe-path")" >&2; exit 1; }
+jq -e '.inputs.tools | contains("path:~/.local/bin/stray")' "$receipt" >/dev/null \
+  || { printf 'the default recipe PATH did not bind ~/.local/bin by content\n' >&2; exit 1; }
+new_head
+PR_GATE_RECIPE_PATH="$fixture/recipe-tools:/usr/bin:/bin" invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+jq -e '.outcome == "success"' "$receipt" >/dev/null \
+  || { printf 'a configured recipe PATH did not gate the head\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+[[ "$(cat "$fixture/recipe-path")" == "$fixture/tools:$fixture/recipe-tools:/usr/bin:/bin" ]] \
+  || { printf 'the configured recipe PATH was not the one the recipe got: %s\n' "$(cat "$fixture/recipe-path")" >&2; exit 1; }
+jq -e --arg d "$fixture/recipe-tools" '.inputs.tools | contains("path:" + $d + "/recipe-probe")
+  and (contains("path:~/.local/bin") | not)' "$receipt" >/dev/null \
+  || { printf 'a configured recipe PATH is not what the identity binds\n' >&2; exit 1; }
+# A tool replaced in a directory the configuration dropped cannot invalidate a gate any more; the
+# same bytes changing inside the configured PATH still do.
+printf 'self-updated during the gate\n' >"$fixture/home/.local/bin/stray"
+new_head
+PR_GATE_RECIPE_PATH="$fixture/recipe-tools:/usr/bin:/bin" invoke --repo acme/fixture --pr 1
+jq -e '.outcome == "success"' "$receipt" >/dev/null \
+  || { printf 'a tool outside the configured recipe PATH still invalidated a gate\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+rm -f "$fixture/recipe-tools/just" "$fixture/home/.local/bin/stray"
+# A PATH that is not absolute directories is refused before anything is gated.
+for bad in "/usr/bin::/bin" "/usr/../bin"; do
+  runner_exit=0
+  PR_GATE_RECIPE_PATH="$bad" invoke --list
+  [[ "$runner_exit" == 2 ]] && grep -q 'PR_GATE_RECIPE_PATH is not usable' "$fixture/runner.log" \
+    || { printf 'PR_GATE_RECIPE_PATH %s was accepted (exit %s)\n' "$bad" "$runner_exit" >&2; cat "$fixture/runner.log" >&2; exit 1; }
+done
+printf 'PASS the recipe PATH is the governed tools then PR_GATE_RECIPE_PATH, bound by content, unshadowable, and refused unless absolute\n'
 
 # Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.
 rm -f "$fixture/mutate-tool"
