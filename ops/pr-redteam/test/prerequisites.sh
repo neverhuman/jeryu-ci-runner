@@ -9,6 +9,9 @@ trap 'rm -rf "$t"' EXIT
 for f in prerequisite_evidence upstream_capped; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
 done
+# The supplemental views must hide exactly what diff.patch hides, so they share its pathspecs.
+eval "$(sed -n '/^read_pathspecs=(/,/go.sum/p' "$script")"
+[ "${#read_pathspecs[@]}" -ge 2 ]
 git init -q "$t/repo"
 g() { git -C "$t/repo" "$@"; }
 g config user.name Fixture
@@ -20,10 +23,12 @@ echo prerequisite >>"$t/repo/code"
 g commit -qam 'Accepted gate prerequisite (#35)'
 prerequisite="$(g rev-parse HEAD)"
 echo remaining >"$t/repo/remaining"
+echo head-lock >"$t/repo/Cargo.lock"
 g add .; g commit -qm 'Release promotion (#36)'
 head="$(g rev-parse HEAD)"
 g checkout -q --detach "$prerequisite"
 echo main-only >"$t/repo/main-only"
+echo main-lock >"$t/repo/package-lock.json"
 g add .; g commit -qm 'Other accepted work'
 tip="$(g rev-parse HEAD)"
 g update-ref refs/pr/36/base "$tip"
@@ -40,7 +45,7 @@ api() {
     malformed) body='{}' ;;
   esac
 }
-g diff "$base...$head" >"$t/full.patch"
+g diff "$base...$head" -- "${read_pathspecs[@]}" >"$t/full.patch"
 mkdir "$t/review"
 cp "$t/full.patch" "$t/review/diff.patch"
 prerequisite_evidence "$t/repo" acme/tool 36 "$base" "$head" "$t/review" 100000
@@ -48,11 +53,16 @@ out="$t/review/prerequisites"
 grep -q "Accepted prerequisite boundary: $prerequisite" "$out/SUMMARY.txt"
 grep -q "$prerequisite Accepted gate prerequisite (#35)" "$out/accepted-commits.txt"
 grep -q 'not reviewer approval' "$out/SUMMARY.txt"
-g diff "$tip...$head" >"$t/effective"
+g diff "$tip...$head" -- "${read_pathspecs[@]}" >"$t/effective"
 cmp "$t/effective" "$out/effective.patch"
 grep -q '+remaining' "$out/effective.patch"
 if grep -q '+prerequisite' "$out/effective.patch"; then exit 1; fi
 grep -q '+main-only' "$out/main-only.patch"
+grep -q 'Lock files are excluded' "$out/SUMMARY.txt"
+# Lock files are excluded from the supplemental views exactly as from diff.patch.
+for lock in head-lock main-lock; do
+  if grep -q "+$lock" "$out/effective.patch" "$out/main-only.patch" "$t/review/diff.patch"; then exit 1; fi
+done
 cmp "$t/full.patch" "$t/review/diff.patch"
 grep -q '+prerequisite' "$t/review/diff.patch"
 for scenario in unprotected stale unavailable missing_sha missing_main malformed unchanged divergent missing_ref unrelated; do

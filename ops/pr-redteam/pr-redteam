@@ -423,6 +423,12 @@ quality_gate_verdict() { # gate reason -> verdict JSON
         evidence: $reason}]}'
 }
 
+# The pathspecs that keep lock files out of every patch the agent is told to read. Lock files stay
+# in files.txt/stat.txt and signals.txt; they are the bulk of large PRs and are verified by the
+# required lanes, not by reading. One definition so every view the agent reads is comparable.
+read_pathspecs=(. ':(exclude,glob)**/*.lock' ':(exclude,glob)**/package-lock.json'
+  ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/yarn.lock' ':(exclude,glob)**/go.sum')
+
 # Supplement the retained forge diff with a boundary proven by protected main ancestry.
 # Presence on main is acceptance, never evidence of an approval on this PR's head.
 prerequisite_evidence() { # cache repo number retained-base head review-dir allowance
@@ -470,6 +476,7 @@ prerequisite_evidence() { # cache repo number retained-base head review-dir allo
     echo 'diff.patch, log.txt and all original scans still cover the complete retained range.'
     echo 'effective.patch shows the remaining effective diff: protected main...exact PR head.'
     echo 'Changes unique to main are excluded by the three-dot comparison; main-only.patch shows boundary..main, so these changes remain visible.'
+    echo 'Lock files are excluded from effective.patch and main-only.patch exactly as from diff.patch.'
     echo "Exact PR head: $head"
   } >"$out/SUMMARY.txt"
   # A separate, bounded supplement never changes PR sizing or pin-evidence room.
@@ -479,10 +486,10 @@ prerequisite_evidence() { # cache repo number retained-base head review-dir allo
   bytes="$(git -C "$g" log --format='%H %s' "$original..$boundary" | upstream_capped "$out/accepted-commits.txt" "$log_budget")" || cut=true
   echo "accepted-commits.txt: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
   cut=false
-  bytes="$(git -C "$g" diff "$tip...$head" | upstream_capped "$out/effective.patch" "$patch_budget")" || cut=true
+  bytes="$(git -C "$g" diff "$tip...$head" -- "${read_pathspecs[@]}" | upstream_capped "$out/effective.patch" "$patch_budget")" || cut=true
   echo "effective.patch: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
   cut=false
-  bytes="$(git -C "$g" diff "$head...$tip" | upstream_capped "$out/main-only.patch" "$patch_budget")" || cut=true
+  bytes="$(git -C "$g" diff "$head...$tip" -- "${read_pathspecs[@]}" | upstream_capped "$out/main-only.patch" "$patch_budget")" || cut=true
   echo "main-only.patch: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
 }
 
@@ -2444,10 +2451,7 @@ review_one() { # owner/name number dry-run force include-drafts
   git -C "$cache" diff --stat=200 "$base_sha...$sha" >"$d/stat.txt"
   git -C "$cache" diff --numstat "$base_sha...$sha" >"$d/numstat.txt"
   changed_files "$cache" "$base_sha" "$sha" "$d/files.nul" >"$d/files.txt"
-  # Lock files stay in files.txt/stat.txt and are listed in signals.txt, but not in the diff the agent
-  # reads: they are the bulk of large PRs and are verified by the required lanes, not by reading.
-  git -C "$cache" diff "$base_sha...$sha" -- . ':(exclude,glob)**/*.lock' ':(exclude,glob)**/package-lock.json' \
-    ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/yarn.lock' ':(exclude,glob)**/go.sum' >"$d/diff.patch"
+  git -C "$cache" diff "$base_sha...$sha" -- "${read_pathspecs[@]}" >"$d/diff.patch"
   if [ "$base_ref" = main ]; then
     prerequisite_evidence "$cache" "$repo" "$number" "$base_sha" "$sha" "$d" "$((max_diff_bytes / 4))"
   fi
