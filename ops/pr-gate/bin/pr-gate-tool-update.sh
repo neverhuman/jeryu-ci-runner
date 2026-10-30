@@ -2,7 +2,7 @@
 # ---------------------------------------------------------------------------
 # pr-gate-tool-update.sh — update a tool on the gate host inside a gate drain.
 #
-# Every executable the recipe can reach is bound by content into a gate's input identity, and the
+# The recipe PATH and its tools are bound into a gate's input identity, and the
 # identity is computed again when the recipe finishes: a tool replaced while a gate ran ends that
 # attempt as "inputs_changed" however green its recipe was (jeryu-ci-runner#165 attempt 5538ab4e,
 # 2026-10-30: a full required/proof pass at score 94 discarded because an agent tool under
@@ -11,10 +11,10 @@
 # instead, exactly as installing a new runner does:
 #
 #   1. take the installer's lock, so an install and a tool update never overlap;
-#   2. stop every pr-gate-runner@N.timer and wait until no runner process is left (at most
+#   2. pause active slot, main-health, wake and audit timers and wait until no runner process is left (at most
 #      GATE_INSTALL_DRAIN_SECONDS, default 45 minutes; else nothing is updated);
 #   3. run the update command given on the command line, once, with this script's environment;
-#   4. start the slot timers again, whatever the command did, and record the outcome in
+#   4. restore the previously active timers, whatever the command did, and record the outcome in
 #      tool-update.json.
 #
 # Usage, from the gate user's own timer or by hand -- the command after `--` is run verbatim,
@@ -25,6 +25,8 @@
 # Exit status: the command's, or 75 (nothing was run: an install holds the lock, or the slots did not
 # drain in time) so a timer can simply try again later. It never gates, approves, merges or touches a
 # gate's evidence; the one thing it changes is what the host has installed.
+# A command can itself exit 75: tool-update.json records whether it actually ran.
+# SIGKILL or host loss cannot run the EXIT trap; operators must restore paused timers after that.
 #
 # The alternative, for a tool that cannot be told when to update, is to keep it off the recipe's PATH
 # and put the version the gate uses in a directory the gate owns (PR_GATE_RECIPE_PATH, README.md
@@ -61,11 +63,17 @@ mkdir -p "$HOME_DIR"
 exec 9>"$HOME_DIR/.install.lock"
 flock -w "$LOCK_WAIT" 9 || { say "an install is running; nothing updated"; exit 75; }
 
-slots=$(systemctl --user list-units --no-legend --plain --all 'pr-gate-runner@*.timer' \
-  | sed -n 's/^pr-gate-runner@\([0-9]\+\)\.timer.*/\1/p' | sort -un | tr '\n' ' ')
-resume() { local i; for i in $slots; do systemctl --user start "pr-gate-runner@$i.timer" || true; done; }
-trap resume EXIT   # armed before the first stop: a stop that fails leaves no slot timer stopped
-for i in $slots; do systemctl --user stop "pr-gate-runner@$i.timer"; done
+# Pause every scheduled source of gates, including wake when it has explicitly configured
+# slots. Restore only the timers that were active; an operator's paused timer stays paused.
+timers=$(systemctl --user list-units --no-legend --plain --state=active \
+  'pr-gate-runner@*.timer' 'pr-gate-main-health@*.timer' pr-gate-wake.timer pr-gate-audit.timer \
+  | sed -n '/^pr-gate-\(runner@[0-9]\+\|main-health@[^ ]\+\|wake\|audit\)\.timer /s/ .*//p' | sort -u)
+slots=$(printf '%s\n' "$timers" | sed -n 's/^pr-gate-runner@\([0-9]\+\)\.timer$/\1/p' | sort -un | tr '\n' ' ')
+resume() { local timer; for timer in $timers; do systemctl --user start "$timer" || true; done; }
+trap resume EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+for timer in $timers; do systemctl --user stop "$timer"; done
 deadline=$(( $(date +%s) + DRAIN_SECONDS ))
 while pgrep -f "$BIN/pr-gate-runner.sh" >/dev/null; do
   if (( $(date +%s) >= deadline )); then

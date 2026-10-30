@@ -15,7 +15,7 @@ printf 'PR_GATE_CODE_REPO=example/gate-code\n' >"$fx/pr-gate.env"
 cat >"$fx/stub/systemctl" <<SH
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$fx/calls.log"
-if [[ "\$*" == *list-units* ]]; then printf 'pr-gate-runner@0.timer loaded active waiting x\npr-gate-runner@1.timer loaded active waiting x\n'; fi
+if [[ "\$*" == *list-units* ]]; then printf 'pr-gate-runner@0.timer loaded active waiting x\npr-gate-runner@1.timer loaded active waiting x\npr-gate-main-health@jeryu.timer loaded active waiting x\npr-gate-wake.timer loaded active waiting x\npr-gate-audit.timer loaded active waiting x\n'; fi
 exit 0
 SH
 cat >"$fx/stub/pgrep" <<SH
@@ -26,6 +26,7 @@ SH
 cat >"$fx/stub/fixture-update" <<SH
 #!/usr/bin/env bash
 printf 'update ran %s\n' "\$*" >>"$fx/calls.log"
+[[ ! -e "$fx/term-parent" ]] || kill -TERM "\$PPID"
 [[ ! -e "$fx/update-fails" ]] || exit 4
 exit 0
 SH
@@ -61,6 +62,12 @@ must 'slot 0 stopped' called 'stop pr-gate-runner@0.timer'
 must 'slot 1 stopped' called 'stop pr-gate-runner@1.timer'
 must 'slot 0 resumed' called 'start pr-gate-runner@0.timer'
 must 'slot 1 resumed' called 'start pr-gate-runner@1.timer'
+for timer in pr-gate-main-health@jeryu.timer pr-gate-wake.timer pr-gate-audit.timer; do
+  must "$timer stopped" called "stop $timer"
+  must "$timer resumed" called "start $timer"
+  must "update preceded $timer pause" test "$(at 'update ran')" -gt "$(at "stop $timer")"
+done
+must 'only active timers requested' grep -q -- '--state=active' "$fx/calls.log"
 must 'the update ran before the slots were stopped' test "$(at 'update ran')" -gt "$(at 'stop pr-gate-runner@0.timer')"
 must 'the update ran before the host was checked for running gates' test "$(at 'update ran')" -gt "$(at '^pgrep ')"
 must 'the slots resumed before the update finished' test "$(at 'start pr-gate-runner@0.timer')" -gt "$(at 'update ran')"
@@ -76,6 +83,19 @@ must 'slot 1 resumed after a failure' called 'start pr-gate-runner@1.timer'
 must 'the failure is recorded' jq -e '.exit_code == 4' "$state" >/dev/null
 rm -f "$fx/update-fails"
 printf 'PASS a failing update keeps its status and still resumes the slots\n'
+
+# A TERM during the command still restores every scheduled entry point, and cannot claim
+# completion of an interrupted update by overwriting the last finished receipt.
+cp "$state" "$fx/before-term.json"
+touch "$fx/term-parent"
+run -- fixture-update
+must 'TERM was hidden' test "$status" == 143
+for timer in pr-gate-runner@0.timer pr-gate-main-health@jeryu.timer pr-gate-wake.timer pr-gate-audit.timer; do
+  must "$timer not resumed after TERM" called "start $timer"
+done
+must 'TERM rewrote finished receipt' cmp -s "$state" "$fx/before-term.json"
+rm -f "$fx/term-parent"
+printf 'PASS TERM restores all scheduled gate sources and leaves finished receipt intact\n'
 
 # A host that will not drain updates nothing: the record of the last update is left as it was.
 cp "$state" "$fx/before.json"

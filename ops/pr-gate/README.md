@@ -699,18 +699,22 @@ score 94 and ended `inputs_changed` because the only input that had moved was th
 frozen either way:
 
 - update it inside a drain: `bin/pr-gate-tool-update.sh [--timeout SECONDS] -- <command...>` takes the
-  installer's lock, stops the slot timers, waits until no runner process is left (at most
-  `GATE_INSTALL_DRAIN_SECONDS`), runs the command once, then starts the timers again and records
+  installer's lock, pauses active slot, main-health, wake and audit timers, waits until no runner process is left (at most
+  `GATE_INSTALL_DRAIN_SECONDS`), runs the command once, then restores those timers and records
   `{command, exit_code, finished_at, drained_slots}` in `tool-update.json`. It exits the command's
   status, or 75 when nothing ran (an install holds the lock, or the slots did not drain in time), so
-  the gate user's own timer can simply try again. Point the tool's updater at it instead of letting
+  the gate user's own timer can try again. An update command may also exit 75; the receipt tells
+  whether it ran. INT/TERM restore the prior active timers; SIGKILL or host loss requires operator
+  recovery of paused timers. Point the tool's updater at it instead of letting
   the tool update itself whenever it happens to run.
 - keep it off the recipe's PATH: `PR_GATE_RECIPE_PATH` replaces everything after the governed tool
   directory (absolute paths separated by `:`, or home-relative as elsewhere; the governed directory
   always comes first and no setting can drop it or shadow it), so a host can give its recipes a
   directory it owns rather than a `~/.local/bin` other software writes to. The setting is itself bound
-  into the identity, and every directory on it is still bound by content exactly as before: nothing
-  the recipe can execute goes unbound either way.
+  into the identity. The directory binding follows the rules above: system directories use listings
+  and package metadata, while other directories bind file content. Absolute executable paths outside
+  the configured PATH are not covered by this setting. Relocate tools recipes use into a gate-owned
+  directory rather than merely removing their directory from PATH.
 
 The required status carries the identity's digest (`; inputs <sha256>`, the SHA-256 of the compact,
 key-sorted inputs JSON; `gate_inputs_digest`). Who posted a status is the forge's `creator.login` on
