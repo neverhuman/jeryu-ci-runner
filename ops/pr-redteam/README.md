@@ -264,13 +264,27 @@ forge does not protect, is never the authority.
 `authority_branch` and `authority_branch_kind`, `authority_commit`, `authority_tree`,
 `manifest_blob` (the git object id) and `manifest_sha256` (of the whole blob, even when the copy in
 the directory was cut), `fetched_at`, and a `renderers` entry per renderer source with its own object
-id and sha256. `authority_version` is the version that manifest declares (`[jankurai] semver`).
+id and sha256. `authority_version` is the version that manifest declares (`[jankurai] semver`, read
+with either quoting TOML allows and with the table header written any way TOML writes it).
+
+The defaults name the family's own authority as it stands today: `jeryu-tool`'s `tool-manifest.toml`
+declares the governed auditor in `[jankurai] semver`, and `ops/render-tool-manifest.sh` with
+`crates/jeryu-tool-control/src/render_paths.rs`, `render_rules.rs` and `render.rs` are the sources
+that render each consumer from it. A site whose authority differs sets the three variables; a
+manifest path that is there but declares no readable version is reported
+(`AUTHORITY-VALUE-UNREADABLE`) rather than compared.
 
 A moved scalar is verified only by `status` `authority-verified` with its `consumers` row
-`matches-authority`: the head value is `authority_version`. `DIFFERS-FROM-AUTHORITY` is a version the
-authority does not hold -- a value that is not a version (`!invalid`) and a policy that stops
-declaring one (`!none`) are reported the same way, so a malformed move is never read as agreement.
-Every other status (`authority-not-on-forge`, `authority-branch-unknown`,
+`matches-authority`: the manifest and the renderer sources were both read from one protected commit
+and the head value is `authority_version`. `DIFFERS-FROM-AUTHORITY` is a version the authority does
+not hold -- a value that is not a version (`!invalid`) and a policy that stops declaring one
+(`!none`) are reported the same way, so a malformed move is never read as agreement. Neither
+sentinel is ever compared with the authority's own: when the manifest itself declares no
+`[jankurai] semver` or declares something that is not a version, every row is
+`AUTHORITY-VALUE-UNREADABLE`, because there is nothing to compare against. When the manifest copy
+was cut or no renderer source could be read, the status is `authority-partial` and an agreeing row
+is `matches-authority-partial`: the values match, but the rule that writes the consumer scalar is
+not shown in full. Every other status (`authority-not-on-forge`, `authority-branch-unknown`,
 `authority-manifest-missing`, `authority-not-readable`, `authority-not-configured`) leaves every row
 `unverified`. Nothing is rendered or built here: the evidence shows the authority and the rule, and
 the review draws the conclusion. The whole packet is capped at `REDTEAM_GOVERNED_MAX_BYTES` within

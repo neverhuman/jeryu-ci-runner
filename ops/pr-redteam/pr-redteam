@@ -218,6 +218,10 @@ upstream_max_pull_pages="${REDTEAM_UPSTREAM_MAX_PULL_PAGES:-10}"
 upstream_fetch_timeout="${REDTEAM_UPSTREAM_FETCH_TIMEOUT:-300}"
 # A pin whose share of that budget is smaller than this is not fetched: it could hold nothing.
 upstream_min_share=1024
+# How much of its budget upstream_evidence has left: it assigns this as it spends, and its caller
+# reads it afterwards to know what the pins left for the governed-tool evidence. Declared here
+# because it is shared across that boundary, not a local of either side.
+up_left=0
 # Governed-tool evidence for a change that moves a consumer's `required_tool_version`: the authority
 # repository (a name in the reviewed repository's own owner), the manifest path in it that declares
 # the governed version, the authority's own sources that own the consumer scalar, and the bytes all
@@ -2116,30 +2120,50 @@ upstream_evidence() { # git-dir base head review-dir default-owner budget
 #   - the manifest is authority only on a branch the forge reports default or protected, and the
 #     bytes shown are the ones that commit holds, never a copy the change under review carries.
 
+# A sentinel is not a version: `!none` for a key that is not declared at all and `!invalid` for one
+# declared with something that is not a dotted version. Both are reported, never compared.
+governed_is_sentinel() { # value
+  case "$1" in '!'*) return 0;; *) return 1;; esac
+}
+
+# The dotted-version value a `<key> = <value>` line declares, for the parsers below: the value of
+# the first such assignment with either quoting TOML allows, `!invalid` when it is present but is
+# not a dotted version (an unquoted or multi-line value included, which is never read as absent)
+# and empty when the key is not there. Reads only the first 256 KiB: a manifest or policy longer
+# than that is not one of ours.
+governed_quoted_version() { # key
+  head -c 262144 | awk -v key="$1" -v q="'" '
+    index($0, key) == 0 { next }
+    match($0, "^[[:space:]]*" key "[[:space:]]*=[[:space:]]*") {
+      v = substr($0, RSTART + RLENGTH)
+      if (match(v, "^\"[^\"]*\"") || match(v, "^" q "[^" q "]*" q)) {
+        v = substr(v, 2, RLENGTH - 2)
+        print (v ~ /^[0-9]+(\.[0-9]+){1,3}([-+][0-9A-Za-z.-]+)?$/) ? v : "!invalid"
+      } else print "!invalid"
+      exit
+    }'
+}
+
 # The `required_tool_version` one audit policy declares: the first such assignment, `!none` when it
 # declares none and `!invalid` when the value is not a dotted version.
 governed_scalar_value() { # < policy
-  local v
-  v="$(head -c 262144 | awk '
-    match($0, /^[[:space:]]*required_tool_version[[:space:]]*=[[:space:]]*"[^"]*"/) {
-      v = substr($0, RSTART, RLENGTH); sub(/^[^"]*"/, "", v); sub(/"$/, "", v)
-      print (v ~ /^[0-9]+(\.[0-9]+){1,3}([-+][0-9A-Za-z.-]+)?$/) ? v : "!invalid"
-      exit
-    }')"
+  local v; v="$(governed_quoted_version required_tool_version)"
   printf '%s\n' "${v:-!none}"
 }
 
 # The governed version a tool manifest declares: `semver` in its `[jankurai]` table, `!none` when
-# the table or the key is missing and `!invalid` when the value is not a dotted version.
+# the table or the key is missing and `!invalid` when the value is not a dotted version. The table
+# header is matched the way TOML writes it -- inner spacing and a trailing comment are the same
+# header -- so an authority that merely reformats its manifest does not read as declaring nothing.
+# `[jankurai]` only: a sub-table such as `[jankurai.auditor]` declares its own keys, not this one.
 governed_manifest_version() { # < manifest
   local v
   v="$(head -c 262144 | awk '
-    /^[[:space:]]*\[/ { in_tool = ($0 ~ /^[[:space:]]*\[jankurai\][[:space:]]*$/); next }
-    in_tool && match($0, /^[[:space:]]*semver[[:space:]]*=[[:space:]]*"[^"]*"/) {
-      v = substr($0, RSTART, RLENGTH); sub(/^[^"]*"/, "", v); sub(/"$/, "", v)
-      print (v ~ /^[0-9]+(\.[0-9]+){1,3}([-+][0-9A-Za-z.-]+)?$/) ? v : "!invalid"
-      exit
-    }')"
+    /^[[:space:]]*\[/ {
+      h = $0; sub(/[[:space:]]*(#.*)?$/, "", h); gsub(/[[:space:]]+/, "", h)
+      in_tool = (h == "[jankurai]"); next
+    }
+    in_tool { print }' | governed_quoted_version semver)"
   printf '%s\n' "${v:-!none}"
 }
 
@@ -2150,15 +2174,21 @@ governed_manifest_version() { # < manifest
 governed_scalar_moves() { # git-dir base head
   local g="$1" b="$2" h="$3" f n=0 old new
   local -a files=()
-  mapfile -t files < <(git --git-dir="$g" diff --name-only --no-renames "$b" "$h" -- \
+  # NUL-delimited, the way changed_files reads paths, so no path is quoted or escaped: git quotes a
+  # non-ASCII, quote, backslash or control-character path on the default listing, and that row then
+  # names no file on either side, so a move inside such a path would drop out as no movement.
+  mapfile -d '' -t files < <(git --git-dir="$g" diff -z --name-only --no-renames "$b" "$h" -- \
     ':(glob)**/audit-policy.toml' ':(glob)audit-policy.toml' \
     ':(glob)**/default-audit-policy.toml' ':(glob)default-audit-policy.toml' 2>/dev/null)
   for f in "${files[@]}"; do
+    [ -n "$f" ] || continue
     if ((++n > 20)); then printf '!limit\t\t\n'; return 0; fi
     old="$(git --git-dir="$g" show "$b:$f" 2>/dev/null | governed_scalar_value)"
     new="$(git --git-dir="$g" show "$h:$f" 2>/dev/null | governed_scalar_value)"
     [ "$old" != "$new" ] || continue
-    printf '%s\t%s\t%s\n' "$f" "$old" "$new"
+    # A row is one line, so a newline inside a path is shown as '?' (the values are read from the
+    # blobs at the real path above, as changed_files does).
+    printf '%s\t%s\t%s\n' "${f//$'\n'/?}" "$old" "$new"
   done
 }
 
@@ -2285,6 +2315,14 @@ governed_version_evidence() { # git-dir base head review-dir default-owner budge
                 '{path: $path, blob: $oid, sha256: $sha, bytes: $bytes, truncated: $truncated}')")
             done
             [ "${#renderers[@]}" -gt 0 ] || notes+=("no renderer source was read: the rules that own the scalar are not in this evidence")
+            # The manifest alone is not the whole authority: the rule that writes the consumer
+            # scalar is what makes the manifest's value the one a consumer must carry. A packet
+            # with no renderer source, or a manifest copy cut short, is reported as partial so a
+            # reviewer reading only the status is never told the rule was shown when it was not.
+            if [ "$status" = authority-verified ] && { ${manifest_cut:-false} || [ "${#renderers[@]}" -eq 0 ]; }; then
+              status=authority-partial
+              notes+=("the authority was read only in part (the manifest copy was cut, or no renderer source was read): the rule that writes the consumer scalar is not shown in full")
+            fi
           fi
           upstream_drop_refs "$g" "$ns"
           flock -u "$lockfd"; exec {lockfd}>&-
@@ -2305,9 +2343,15 @@ governed_version_evidence() { # git-dir base head review-dir default-owner budge
       summary+=("NOT ANALYSED: more audit policies changed than this evidence reads; the governed scalar's movement is unknown")
       continue
     fi
-    if [ "$status" != authority-verified ]; then verdict=unverified
-    elif [ "$head_v" = "$authority_version" ]; then verdict=matches-authority
-    else verdict=DIFFERS-FROM-AUTHORITY
+    # A sentinel is not a version, so it is never compared: `!none` on both sides is two policies
+    # that declare nothing, not agreement, and an authority value this parser cannot read leaves
+    # every row unreadable rather than matching whatever the change happens to say.
+    if [ "$status" != authority-verified ] && [ "$status" != authority-partial ]; then verdict=unverified
+    elif governed_is_sentinel "$authority_version"; then verdict=AUTHORITY-VALUE-UNREADABLE
+    elif governed_is_sentinel "$head_v"; then verdict=DIFFERS-FROM-AUTHORITY
+    elif [ "$head_v" != "$authority_version" ]; then verdict=DIFFERS-FROM-AUTHORITY
+    elif [ "$status" = authority-partial ]; then verdict=matches-authority-partial
+    else verdict=matches-authority
     fi
     consumers="$(jq -c --arg path "$path" --arg was "$base_v" --arg now "$head_v" --arg verdict "$verdict" \
       '. + [{path: $path, base_value: $was, head_value: $now, verdict: $verdict}]' <<<"$consumers")"
@@ -2348,9 +2392,22 @@ governed_version_evidence() { # git-dir base head review-dir default-owner budge
     echo "# when the copy below was cut). tool-manifest.toml under this directory is that commit's copy;"
     echo "# renderer/ holds the authority's own sources that own the scalar (renderers[]), so the rule"
     echo "# that writes it can be read rather than assumed."
-    echo "# A status other than authority-verified means no immutable copy was read, and every row below"
-    echo "# is then unverified. Nothing was rendered or built here: the manifest's own version"
-    echo "# (authority_version) is what a row is compared against."
+    echo "# A row is verified only by status authority-verified with verdict matches-authority: the"
+    echo "# manifest and the renderer rules were both read from one protected commit and the head value"
+    echo "# is the version that manifest declares. Every other verdict proves less:"
+    echo "#   matches-authority-partial  the values agree, but status is authority-partial: the manifest"
+    echo "#                              copy was cut or no renderer source was read, so the rule that"
+    echo "#                              writes the consumer scalar is not shown in full here"
+    echo "#   DIFFERS-FROM-AUTHORITY     the head value is not the version the manifest declares, the"
+    echo "#                              head declares none (!none) or the head value is not a version"
+    echo "#                              (!invalid) -- a malformed or dropped scalar is never agreement"
+    echo "#   AUTHORITY-VALUE-UNREADABLE the manifest itself declares no [jankurai] semver (!none) or one"
+    echo "#                              that is not a version (!invalid): there is nothing to compare"
+    echo "#                              against, whatever the head value says"
+    echo "#   unverified                 no immutable copy was read at all (any other status)"
+    echo "# A sentinel (!none, !invalid) is never compared with another sentinel: two values that both"
+    echo "# fail to declare a version do not agree. Nothing was rendered or built here: the manifest's"
+    echo "# own version (authority_version) is what a row is compared against."
     echo "# Evidence is capped at $6 bytes; every cut is noted here and in authority.json."
     printf '%s\n' "authority: ${repo:-<none>} $governed_authority_manifest: $status${branch:+ (branch $branch, $branch_kind, commit ${commit:0:12}, tree ${tree:0:12})}${authority_version:+; declares $authority_version}"
     printf '%s\n' "${summary[@]}"
@@ -2772,7 +2829,7 @@ review_one() { # owner/name number dry-run force include-drafts
   local up_spent=0
   if [ "$up_budget" -gt 0 ]; then
     upstream_evidence "$cache" "$base_sha" "$sha" "$d" "${repo%%/*}" "$up_budget" || say "$tag: upstream evidence failed; the review goes on without it"
-    up_spent=$((up_budget - ${up_left:-$up_budget}))
+    up_spent=$((up_budget - up_left))
   fi
   # The governed tool version's authority is reading too, so it shares the same room: its own cap,
   # within what the diff and the pins leave of the diff limit.

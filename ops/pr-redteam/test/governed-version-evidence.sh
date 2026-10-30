@@ -14,7 +14,8 @@ trap 'rm -rf "$t"' EXIT
 fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_remote upstream_git upstream_capped upstream_drop_refs \
-    governed_scalar_value governed_manifest_version governed_scalar_moves governed_blob_copy governed_version_evidence; do
+    governed_is_sentinel governed_quoted_version governed_scalar_value governed_manifest_version \
+    governed_scalar_moves governed_blob_copy governed_version_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done
@@ -180,7 +181,69 @@ o="$(evidence "$b" "$(snap quiet)")"
 [ ! -e "$o/governance" ] || fail "governance/ written for a change that moves no governed version: $(find "$o" -type f)"
 ok 'a change that leaves the governed version alone gets no governance evidence'
 
-# 7. A budget too small to hold the manifest still records the identity of the whole blob.
+# 7. An authority manifest whose own value this parser cannot read never reads as agreement, however
+# the change spells its scalar: not a dropped key, not a floating string, not the same sentinel.
+mkdir -p "$t/odd"
+odd_authority() { # manifest-text -> bare repo the stub serves as acme/jeryu-tool
+  local d="$t/odd/$1"; git init -q -b main "$d"
+  printf '%s' "$2" >"$d/tool-manifest.toml"
+  mkdir -p "$d/ops"; printf '#!/bin/sh\n# renders every consumer\n' >"$d/ops/render-tool-manifest.sh"
+  git -C "$d" add -A; git -C "$d" -c user.name=t -c user.email=t@t commit -qm "$1"
+  rm -rf "$t/forge/git/acme/jeryu-tool.git"; git clone -q --bare "$d" "$t/forge/git/acme/jeryu-tool.git"
+}
+for spec in 'no-semver:[jankurai]
+tag = "v1.7.6"
+' 'not-a-version:[jankurai]
+semver = "latest"
+'; do
+  odd_authority "${spec%%:*}" "${spec#*:}"
+  dep "odd-${spec%%:*}"; policy 1.7.5 | put agent/audit-policy.toml; dec="$(snap base)"
+  for head in '1.7.6' 'latest'; do
+    policy "$head" | put agent/audit-policy.toml
+    o="$(evidence "$dec" "$(snap "head-$head")")"
+    [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = AUTHORITY-VALUE-UNREADABLE ] \
+      || fail "authority ${spec%%:*} with head $head: $(jq -c '.status, .authority_version, .consumers' "$o/governance/authority.json")"
+  done
+  # A policy that drops the key entirely, against the same unreadable authority: still not agreement.
+  printf '[audit]\nminimum_score = 85\n' | put agent/audit-policy.toml
+  o="$(evidence "$dec" "$(snap dropped)")"
+  [ "$(field "$o" authority_version)" != 1.7.6 ] \
+    && [ "$(jq -r '.consumers[0].head_value' "$o/governance/authority.json")" = '!none' ] \
+    && [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = AUTHORITY-VALUE-UNREADABLE ] \
+    || fail "a dropped scalar against an unreadable authority: $(jq -c '.authority_version, .consumers' "$o/governance/authority.json")"
+done
+# Restore the well-formed authority for the cases below.
+rm -rf "$t/forge/git/acme/jeryu-tool.git"; git clone -q --bare "$t/authority" "$t/forge/git/acme/jeryu-tool.git"
+ok 'a manifest that declares no readable version leaves every row unreadable, never matching'
+
+# 8. The authority's own spellings of the governed version: the inner spacing, trailing comment and
+# single quotes TOML allows are the same declaration, so a reformatted manifest still verifies.
+odd_authority spelled "[ jankurai ]  # the governed auditor
+semver   =  '1.7.6'
+"
+dep spelled; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
+policy 1.7.6 | put agent/audit-policy.toml
+o="$(evidence "$b" "$(snap bump)")"
+[ "$(field "$o" authority_version)" = 1.7.6 ] && [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = matches-authority ] \
+  || fail "a reformatted manifest: $(jq -c '.status, .authority_version, .consumers' "$o/governance/authority.json")"
+rm -rf "$t/forge/git/acme/jeryu-tool.git"; git clone -q --bare "$t/authority" "$t/forge/git/acme/jeryu-tool.git"
+ok 'the governed version is read however TOML spells the table header and the value'
+
+# 9. A policy path git would quote on the default listing is still read, so a move inside it cannot
+# hide: a non-ASCII directory name, which `git diff --name-only` writes as "ag\303\253nt/...".
+dep quoted; policy 1.7.5 | put "$(printf 'ag\303\253nt')/audit-policy.toml"; b="$(snap base)"
+policy 9.9.9 | put "$(printf 'ag\303\253nt')/audit-policy.toml"; h="$(snap moved)"
+[ "$(git -C "$D" diff --name-only "$b" "$h")" != "$(git -C "$D" diff -z --name-only "$b" "$h" | tr -d '\000')" ] \
+  || fail "the fixture path is not one git quotes, so this case proves nothing"
+o="$(evidence "$b" "$h")"
+[ -e "$o/governance/authority.json" ] || fail "no governance evidence for a move inside a quoted path: $(find "$o" -type f)"
+[ "$(jq -r '.consumers[0].base_value' "$o/governance/authority.json")" = 1.7.5 ] \
+  && [ "$(jq -r '.consumers[0].head_value' "$o/governance/authority.json")" = 9.9.9 ] \
+  && [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = DIFFERS-FROM-AUTHORITY ] \
+  || fail "a move inside a quoted path: $(jq -c .consumers "$o/governance/authority.json")"
+ok 'a move inside a path git quotes is read from the blobs, not dropped'
+
+# 10. A budget too small to hold the manifest still records the identity of the whole blob.
 dep tiny; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
 policy 1.7.6 | put agent/audit-policy.toml; h="$(snap bump)"
 o="$(budget=80 evidence "$b" "$h")"
@@ -190,7 +253,12 @@ o="$(budget=80 evidence "$b" "$h")"
   && grep -q 'was cut at' "$o/governance/SUMMARY.txt" || fail "truncated manifest: $(cat "$o/governance/authority.json")"
 [ "$(jq -r '.renderers | length' "$o/governance/authority.json")" = 0 ] \
   && grep -q 'too small' "$o/governance/SUMMARY.txt" || fail "renderers skipped on a spent budget"
-ok 'a cut copy is still identified by the blob the authority commit holds'
+# Evidence that read no renderer source, or cut the manifest, is partial, never verified: the value
+# agrees but the rule that writes it was not shown, and `verified` and the row both say so.
+[ "$(field "$o" status)" = authority-partial ] && [ "$(field "$o" verified)" = false ] \
+  && [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = matches-authority-partial ] \
+  || fail "a packet with no renderer and a cut manifest: $(jq -c '.status, .verified, .consumers' "$o/governance/authority.json")"
+ok 'a cut copy is still identified by the blob the authority commit holds, and is reported partial'
 
 [ ! -e "$t/api.unexpected" ] || fail "unexpected forge API paths: $(sort -u "$t/api.unexpected")"
 [ ! -e "$t/ambient-called" ] || fail "an ambient credential helper was called"

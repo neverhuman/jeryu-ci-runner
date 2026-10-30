@@ -134,10 +134,16 @@ The review directory (its path is given below) contains:
                      A scalar is verified only by `status` `authority-verified` with its row
                      `matches-authority`: the head value is the version that manifest declares
                      (`authority_version`). `DIFFERS-FROM-AUTHORITY` is a version the authority does not
-                     hold. Any other `status` (`authority-not-on-forge`, `authority-branch-unknown`,
-                     `authority-manifest-missing`, `authority-not-readable`, `authority-not-configured`)
-                     means no immutable copy was read and every row is unverified. Nothing was rendered or
-                     built here, and a cut copy (`manifest_truncated`, `truncated`) was not read whole.
+                     hold, a head that declares none (`!none`) or a head value that is not a version
+                     (`!invalid`). `AUTHORITY-VALUE-UNREADABLE` is the manifest itself declaring no
+                     version: nothing was compared, whatever the head says. `matches-authority-partial`
+                     with `status` `authority-partial` is agreement on the value where the manifest copy
+                     was cut or no renderer source was read, so the rule that writes the scalar is not
+                     shown in full -- treat the rule as unread. Any other `status`
+                     (`authority-not-on-forge`, `authority-branch-unknown`, `authority-manifest-missing`,
+                     `authority-not-readable`, `authority-not-configured`) means no immutable copy was
+                     read and every row is unverified. Nothing was rendered or built here, and a cut copy
+                     (`manifest_truncated`, `truncated`) was not read whole.
 - `checkout/`      — the repository at the exact head commit, for context around the diff
 
 You have read-only tools. Read the whole diff. For any change that touches something sensitive, open
