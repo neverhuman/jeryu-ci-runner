@@ -17,7 +17,6 @@ if [[ ! -f "${candidate_policy}" || -L "${candidate_policy}" ||
   printf 'candidate audit policy must be a canonical one-link regular file\n' >&2
   exit 1
 fi
-effective_floor="$(audit_effective_floor "${candidate_policy}")"
 
 BASE_REF="${JERYU_JANKURAI_BASE_REF:-origin/main}"
 if [[ "${BASE_REF}" != origin/main ]]; then
@@ -247,11 +246,14 @@ fi
 # candidate policy needs a digest-pinned transition recorded on protected main.
 proof_require_governed_policy "$candidate_policy" "$baseline_policy" \
   "${baseline_parent}/repo/ops/ci/policy-transitions.txt"
+# Main's floor judges both trees, including a digest-authorized version change.
+effective_floor="$(audit_effective_floor "${baseline_policy}")"
 # Record the policy that was just accepted as main's, so the checks below can
 # prove the tree that produced the baseline score is still that tree.
 baseline_policy_sha256="$(sha256sum -- "${baseline_policy}")"
 baseline_policy_sha256="${baseline_policy_sha256%% *}"
-audit_base_commit="$base_commit"
+proof_require_protected_baseline "${baseline_parent}/repo" "$base_commit" \
+  "$baseline_policy_sha256"
 (
   cd "${baseline_parent}/repo"
   mkdir -p .jankurai
@@ -259,6 +261,8 @@ audit_base_commit="$base_commit"
     --md .jankurai/repo-score.md --policy agent/audit-policy.toml \
     --fail-under "${effective_floor}" --full --no-score-history
 )
+proof_require_protected_baseline "${baseline_parent}/repo" "$base_commit" \
+  "$baseline_policy_sha256"
 cp "${baseline_parent}/repo/.jankurai/repo-score.json" \
   target/jankurai/accepted-baseline.json
 baseline_score="$(jq -er '.score | select(type == "number") | floor' \
@@ -285,8 +289,8 @@ cleanup_baseline
 
 # Jankurai 1.6.11 writes git.head as a 7-character prefix; 1.7 writes the full
 # commit id. Either names exactly this commit.
-short_base="${audit_base_commit:0:7}"
-jq -e --arg base "${short_base}" --arg base_full "${audit_base_commit}" \
+short_base="${base_commit:0:7}"
+jq -e --arg base "${short_base}" --arg base_full "${base_commit}" \
   --argjson floor "${effective_floor}" \
   '(.git.head == $base or .git.head == $base_full) and .git.dirty_worktree == false and
    (.score | type == "number") and .decision.minimum_score == $floor and

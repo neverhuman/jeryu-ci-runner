@@ -208,6 +208,7 @@ printf 'proof governed policy guard ok\n'
 git init -q -b main "$fixture/protected"
 mkdir -p "$fixture/protected/agent"
 printf '%s\n' 'minimum_score = 80' > "$fixture/protected/agent/audit-policy.toml"
+printf 'protected source\n' > "$fixture/protected/source.txt"
 git -C "$fixture/protected" add -A
 git -C "$fixture/protected" commit -q --no-gpg-sign -m policy
 pbase="$(git -C "$fixture/protected" rev-parse HEAD)"
@@ -224,6 +225,11 @@ if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'edited ba
 git -C "$fixture/protected" -c user.name=t -c user.email=t@invalid \
   commit -q --no-gpg-sign -m tamper -- agent/audit-policy.toml
 if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'committed baseline policy edit accepted'; fi
+git -C "$fixture/protected" checkout -q --detach "$pbase"
+printf 'candidate source\n' > "$fixture/protected/source.txt"
+if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'edited non-policy baseline input accepted'; fi
+git -C "$fixture/protected" restore source.txt
+if $b "$fixture/protected" "$pbase" "$zero" 2>/dev/null; then fail 'wrong baseline policy digest accepted'; fi
 printf 'proof protected baseline guard ok\n'
 
 # --- the authorization file the lane really reads ----------------------------
@@ -333,7 +339,12 @@ grep -q 'proof_report_security_failure' ops/ci/proof_evidence.sh ||
   fail 'the proof lane does not report a failed security run'
 printf 'security failure evidence ok\n'
 
-(( $(line_of '^proof_require_migration' "$lane") < $(line_of '^proof_require_protected_baseline' "$lane") )) ||
-  fail 'the baseline is checked for tampering before the work that could tamper with it'
+[[ "$(grep -c '^proof_require_protected_baseline' "$lane")" == 3 ]] ||
+  fail 'baseline integrity is not checked before audit, after audit, and after migration'
+(( $(line_of '^proof_require_migration' "$lane") < $(grep -n '^proof_require_protected_baseline' "$lane" | tail -1 | cut -d: -f1) )) ||
+  fail 'the final baseline integrity check runs before migration'
 (( $(line_of 'proof_require_governed_policy' "$lane") < $(line_of 'baseline_policy_sha256=' "$lane") )) ||
   fail 'the baseline policy digest is recorded before it is accepted as main policy'
+grep -Fqx 'effective_floor="$(audit_effective_floor "${baseline_policy}")"' "$lane" ||
+  fail 'the proof floor is not derived from protected-main policy'
+grep -q 'audit_base_commit' "$lane" && fail 'the baseline binding can name a synthetic commit' || :

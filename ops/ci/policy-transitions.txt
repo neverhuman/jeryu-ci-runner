@@ -1,7 +1,6 @@
 # Authorized audit-policy transitions.
 #
-# The proof lane scores every head with protected main's own
-# agent/audit-policy.toml, so a head may not bring its own scoring policy. A
+# The baseline always uses protected main's own agent/audit-policy.toml. A
 # head whose policy differs from protected main's is refused unless this file
 # -- read from the protected-main clone, never from the head under test --
 # pins that exact change as one line:
@@ -9,12 +8,19 @@
 #   <protected sha256> <candidate sha256>
 #
 # both of `sha256sum agent/audit-policy.toml`, protected main's first. A
-# transition therefore lands in two steps: one change adds the pin here and
-# merges, then the change carrying the new policy bytes merges against it. A
-# pin may not lower minimum_score; raising the merge floor needs no pin on the
-# protected side, only the pinned bytes.
+# transition requires prior review: one change adds the pin here and merges
+# before a head can request those policy bytes. A pin may not lower
+# minimum_score. Both audit runs use main's effective floor. A pin never
+# rewrites the baseline or bypasses the auditor's policy_changed ratchet.
+# Jankurai 1.7.6 rejects changed policy fingerprints, so this authorization
+# alone cannot make a future policy migration pass. Such a migration needs
+# reviewed auditor support for judging candidate code under main's policy.
 #
 # Blank lines and #-comments are ignored. Any other line shape refuses the
 # whole file: a pin nobody can parse must not become a pin nobody checks.
 #
-# No transition is authorized right now.
+# Historical 1.7.5 -> 1.7.6 version-only transition, already completed by PR171
+# (ad7191181360eb418c6a1af4e501eba663c7ff83). Exact full-file digests, verified
+# against protected d19269ff and ad719118; every other byte is identical.
+# Main already has the target digest, so this entry grants no current exception.
+da5cb2572abca03ae5777f570208e5bb73c2e6e2d8f3fb94b94ca96e57cb5771 77cc588348ad42861cf52ff266fc685feff56bead9a21a57d3c79f43f404971d

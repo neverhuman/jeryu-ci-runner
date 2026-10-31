@@ -37,6 +37,19 @@ directory and proofmark count are null and `proof_verification` is
 is deepened from the forge first. Run the narrower `just` lanes above on a tree
 that is not yet a pushed, rebased head.
 
+The baseline audit and migration analysis run on the unchanged protected-main
+commit. The lane checks its HEAD, tracked files and policy digest before and
+after auditing and after migration; the baseline report and summary name that
+same commit. Both audits receive the floor derived from protected main's policy.
+Candidate policy bytes must match main unless their exact digest pair was
+previously reviewed into main's `ops/ci/policy-transitions.txt`. A candidate
+cannot authorize itself by editing that file. The recorded 1.7.5 to 1.7.6 entry
+names the completed historical transition; main already has its target bytes.
+An authorization never rewrites the baseline or overrides the auditor's
+`policy_changed == false` ratchet. Jankurai 1.7.6 rejects changed fingerprints,
+so a future migration also needs reviewed auditor support for evaluating
+candidate code under main's policy; a digest entry alone is insufficient.
+
 The security lane runs networked dependency checks by default through
 `just security`. It preserves Cargo's immutable source identity while
 `ops/ci/dependency-sources.sh` proves the active Git transport policy, hosted
