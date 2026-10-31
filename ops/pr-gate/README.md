@@ -961,10 +961,25 @@ owner list an operator edits:
    hangs or loses power, stops renewing;
 4. a lease the slot loses -- a renewal refused, or no renewal answered within
    one TTL of the last one that was, after which another host may hold the
-   head -- stops the recipe. The attempt is recorded as `claim_lost`
-   (superseded, nothing owed) and the slot posts nothing more for the head;
+   head -- stops the recipe, and the slot posts nothing more for the head. What
+   is owed afterwards follows from what the loss proves:
+   * a `409` names another holder. That host posts the head's result, so the
+     attempt is recorded as `claim_lost` (superseded, nothing owed);
+   * any other definitive answer, or no answer within one TTL, leaves ownership
+     unknown: this slot has no lease and no proof of who does. An attempt the
+     loss interrupted has no verdict, so it too is recorded as `claim_lost`
+     (superseded, nothing owed) -- a host that does not hold the head never
+     invents a result for it. A recipe that had already finished has a real
+     verdict, which is never discarded: the receipt stays owed, and recovery
+     publishes it only under a fresh lease and only while no newer verdict of
+     the required context stands on the forge (one posted after this attempt
+     finished by anything but this attempt supersedes it). That obligation is
+     bounded: after `PR_GATE_RECOVERY_ATTEMPTS` recovery ticks (10 by default)
+     the receipt is kept, left for a person on the heartbeat, and the head is
+     gated again instead of asked for forever;
 5. immediately before publication the slot asks once more (retried like a
-   status post on a forge that cannot answer). Only a slot the forge confirms
+   status post on a forge that cannot answer), and once more after the shared
+   build-cache upload, which can outlast a lease. Only a slot the forge confirms
    as the holder publishes. An unavailable renewal posts nothing and retains
    the finished verdict for recovery under a newly confirmed lease on a later tick,
    without executing the recipe again;

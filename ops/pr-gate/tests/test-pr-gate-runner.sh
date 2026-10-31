@@ -148,6 +148,11 @@ if [[ -f "$fixture_root/dirty-inputs" ]]; then
   # Both zero and nonzero recipes keep their original verdict semantics.
   exit "$(cat "$fixture_root/dirty-inputs")"
 fi
+# Make the claims route answer 403 from after a completed recipe: the slot loses its lease and no
+# answer ever names another holder, which is the ownership-unknown path through publication recovery.
+if [[ -f "$fixture_root/deny-claims-after-recipe" ]]; then
+  touch "$fixture_root/claims-denied"
+fi
 # Lose the lease only after a completed recipe, to exercise terminal outbox recovery.
 if [[ -f "$fixture_root/steal-after-recipe" ]]; then
   recipe_head=$("$worker_git" rev-parse HEAD)
@@ -321,6 +326,10 @@ case "$method $url" in
     [[ ! -f "$FAKE_FORGE/no-gate-claims" ]] \
       || { printf '{"code":"api_route_not_found","message":"API route not found"}\n404'; exit; }
     [[ ! -f "$FAKE_FORGE/gate-claims-html-404" ]] || { printf '<html>not found</html>\n404'; exit; }
+    # claims-denied stands in for a definitive answer that names no holder at all (a token that lost
+    # access to the route): the slot has no lease and no proof of who does.
+    [[ ! -f "$FAKE_FORGE/claims-denied" ]] \
+      || { printf '{"code":"forbidden","message":"no access to gate claims"}\n403'; exit; }
     repo=$(jq -r '.repo' <<<"$payload")
     sha=$(jq -r '.head_sha // .queue_sha' <<<"$payload")
     runner=$(jq -r '.runner_id' <<<"$payload"); host=$(jq -r '.host' <<<"$payload")
@@ -2233,7 +2242,11 @@ grep -q "skip acme/fixture release/v1: its tip ${relsha:0:12} already carries a 
 "$real_git" -C "$fixture/source" checkout -q release/v1
 printf 'by the gate\n' >>"$fixture/source/release-note"
 "$real_git" -C "$fixture/source" add release-note
-"$real_git" -C "$fixture/source" -c user.name=runner-bot -c user.email=bot@example.invalid commit -qm by-the-gate
+# Git reads its identity from the environment before any config, so a host or an outer gate that
+# exports GIT_AUTHOR_NAME would author this commit as itself and the tip would not be the gate's own.
+GIT_AUTHOR_NAME=runner-bot GIT_COMMITTER_NAME=runner-bot \
+  GIT_AUTHOR_EMAIL=bot@example.invalid GIT_COMMITTER_EMAIL=bot@example.invalid \
+  "$real_git" -C "$fixture/source" commit -qm by-the-gate
 "$real_git" -C "$fixture/source" push -q "$fixture/source.git" release/v1
 relsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
 refs_json main release/v1
@@ -2592,6 +2605,77 @@ expect_count "$((claims_count + 4))"
 jq -e '.publication.required_status and .publication.check_run and .recovery_required==null' "$receipt" >/dev/null \
   || fail_claims 'the saved result was not recovered under a fresh lease'
 printf 'PASS gate claims: publication loss retains the completed verdict and recovery requires a new lease\n'
+
+# A definitive answer that names no holder loses the lease after the recipe without proving who owns
+# the head. The completed verdict is retained and owed, nothing is published, and the next tick
+# publishes it only once a verdict of another attempt stands on the head -- in which case that one
+# wins and this receipt is recorded as superseded, still never deleted.
+rm -f "$fixture/steal-after-recipe"
+claims_head
+touch "$fixture/deny-claims-after-recipe"
+results=$(non_pending)
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" != 0 ]] || fail_claims 'an unproven loss did not retain the verdict for recovery'
+expect_count "$((claims_count + 5))"
+[[ "$(non_pending)" == "$results" ]] || fail_claims 'a result was published after an unproven loss'
+! grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'a finished verdict was abandoned on an unproven loss'
+receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
+jq -e '.terminal and .outcome=="success" and .recovery_required!=null
+       and .publication.ownership=="unknown" and (.publication.required_status|not)' "$receipt" >/dev/null \
+  || fail_claims 'an unproven loss did not record the verdict as owed with unknown ownership'
+# Another host took the expired lease and published its own verdict for the head. Recovery must defer
+# to it: publish nothing, and record this receipt as superseded rather than overwrite a newer result.
+rm -f "$fixture/deny-claims-after-recipe" "$fixture/claims-denied" "$claim"
+jq -nc --argjson clock "$(( $(wc -l <"$fixture/statuses.jsonl") + 1000 ))" --arg sha "$head" \
+  '{id:"other-host",context:"fixture/required",state:"failure",sha:$sha,updated_at:$clock,
+    creator:{login:"runner-bot"},
+    description:"pr-gate-runner@gate-b operator-unsealed failure; exit 1; attempt other-host-attempt"}' \
+  >>"$fixture/statuses.jsonl"
+owed_attempt=$(jq -r '.id' "$receipt")
+invoke --repo acme/fixture --pr 1
+jq -e '.recovery_required==null and (.publication.required_status|not)
+       and (.publication.superseded_by|test("newer verdict"))' \
+  "$fixture/runner/attempts/acme-fixture-$head/$owed_attempt/receipt.json" >/dev/null \
+  || fail_claims 'recovery did not record the newer verdict as superseding the owed one'
+# Its own `pending` is on the head; no verdict of it ever is.
+jq -se --arg a "attempt $owed_attempt" \
+  'all(.[]; .state == "pending" or ((.description // "") | contains($a) | not))' \
+  "$fixture/statuses.jsonl" >/dev/null \
+  || fail_claims 'the owed attempt published over a newer verdict from another holder'
+# The other holder reported a failure, so the head is gated afresh -- under its own new lease, as a
+# new attempt with its own verdict. The owed one stays discharged and unpublished.
+expect_count "$((claims_count + 6))"
+grep -q 'a newer verdict stands on its head, published while this attempt held no lease' "$fixture/runner.log" \
+  || fail_claims 'recovery did not report the newer verdict it yielded to'
+printf 'PASS gate claims: an unproven loss owes its real verdict and yields to a newer one\n'
+
+# An answer that never names a holder must not hold the head for ever: recovery stays fail-closed for
+# a bounded number of ticks, then keeps the receipt for a person and lets the head be gated again.
+claims_head
+touch "$fixture/deny-claims-after-recipe"
+results=$(non_pending)
+PR_GATE_RECOVERY_ATTEMPTS=2 invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" != 0 ]] || fail_claims 'the bounded-recovery gate published without a lease'
+expect_count "$((claims_count + 7))"
+owed_attempt=$(jq -r '.id' "$fixture/runner/attempts/acme-fixture-$head/last-result.json")
+receipt="$fixture/runner/attempts/acme-fixture-$head/$owed_attempt/receipt.json"
+for tick in 1 2; do
+  PR_GATE_RECOVERY_ATTEMPTS=2 invoke --repo acme/fixture --pr 1
+  grep -q 'recovery required for' "$fixture/runner.log" \
+    || fail_claims "recovery tick $tick gave up before its bound"
+done
+jq -e '.publication.recovery_deferred==null' "$receipt" >/dev/null \
+  || fail_claims 'recovery was deferred before its bound'
+PR_GATE_RECOVERY_ATTEMPTS=2 invoke --repo acme/fixture --pr 1
+jq -e '.publication.recovery_deferred==true and .recovery_required!=null and .outcome=="success"
+       and (.publication.required_status|not)' "$receipt" >/dev/null \
+  || fail_claims 'a permanently unproven ownership was not deferred with its receipt kept'
+! grep -q 'recovery required for' "$fixture/runner.log" \
+  || fail_claims 'the deferred receipt still held its head in recovery'
+[[ "$(non_pending)" == "$results" ]] || fail_claims 'the deferred receipt was published without a lease'
+expect_count "$((claims_count + 7))"
+rm -f "$fixture/deny-claims-after-recipe" "$fixture/claims-denied" "$claim"
+printf 'PASS gate claims: an ownership that stays unknown is deferred after a bounded recovery\n'
 
 # A lease lost while the recipe runs stops the recipe: the slot does not spend the rest of a gate on
 # a head another host now gates, and publishes nothing for it.

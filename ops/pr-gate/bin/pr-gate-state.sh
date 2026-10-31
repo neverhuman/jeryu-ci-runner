@@ -1014,8 +1014,19 @@ gate_publication_fault() {
 # Receipt types: publication.http_status is the number 201 once the forge acknowledged the required
 # status, and a string otherwise (the curl code, or "unacknowledged" when nothing was assigned), so
 # a failure like "000" keeps its leading zeros. publication.fault names the failure class.
+
+# The ownership of the head recorded on a receipt a publication could not write: `refused` or
+# `unknown` when the slot observed its lease lost (gate_claim_lost_kind), and nothing when no loss was
+# observed, which is every other reason a write was refused. Recovery reads it to decide what it must
+# prove before publishing the retained verdict (gate_recover).
+gate_publication_ownership() {
+  declare -F gate_claim_lost_kind >/dev/null && [[ -f "${GATE_CLAIM_STATE:-}/lost" ]] || return 1
+  gate_claim_lost_kind
+}
+
 gate_publish() {
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
+  local ownership
   local steps_dir="" steps_end="" status_payload check_payload proof_base
   local check_state title changed="" step_state fault capture_error
   capture_error=$(gate_input_error_text "$gate_receipt")
@@ -1097,7 +1108,11 @@ gate_publish() {
     fi
     if [[ "$code" != 201 ]] || ! jq -se 'length == 1 and .[0].id != null' <<<"$body" >/dev/null 2>&1; then
       fault=$(gate_publication_fault)
-      gate_update --arg code "$code" --arg fault "$fault" '.recovery_required="required-status publication rejected or unacknowledged" | .publication.http_status=$code | .publication.fault=$fault' || return
+      ownership=$(gate_publication_ownership) || ownership=""
+      gate_update --arg code "$code" --arg fault "$fault" --arg ownership "$ownership" \
+        '.recovery_required="required-status publication rejected or unacknowledged"
+         | .publication.http_status=$code | .publication.fault=$fault
+         | .publication.ownership=(if $ownership == "" then null else $ownership end)' || return
       cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
       printf 'required-status publication unacknowledged for %s/%s@%s (HTTP %s, %s); retained for recovery\n' "$owner" "$repo" "$sha" "$code" "$fault" >&2
       return 1
@@ -1153,8 +1168,46 @@ gate_publish() {
   cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json"
 }
 
+# How many ticks a receipt whose lease ownership is unknown may hold its head in recovery before it
+# is deferred to a person (gate_recover). Bounded because the answer that made ownership unknown can
+# be permanent -- a token that lost access to the claims route answers 4xx for every later ask too --
+# and an unbounded obligation would leave the head neither gated nor published on every tick.
+GATE_RECOVERY_ATTEMPTS=${PR_GATE_RECOVERY_ATTEMPTS:-10}
+[[ "$GATE_RECOVERY_ATTEMPTS" =~ ^[0-9]+$ ]] && ((GATE_RECOVERY_ATTEMPTS >= 1)) || GATE_RECOVERY_ATTEMPTS=10
+
+# gate_ownership_superseded RECEIPT -- 0 when the forge already carries a verdict of this gate's
+# required context that another attempt posted after this one announced itself: the host that took
+# the head once this slot's lease was lost has spoken for it, and a verdict from before it must never
+# be published over it. 1 otherwise, including when the forge cannot be read and when this attempt's
+# own `pending` is not on the head: the proof is positional, never a clock the forge and the runner
+# would have to agree on, and without this attempt's own row there is nothing to order against, so
+# an older verdict of an earlier attempt is never mistaken for a newer one. A lease is what
+# authorises a publication; this only ever withholds one, and only on proof another holder published.
+gate_ownership_superseded() { # receipt
+  local snapshot id proved=1
+  id=$(jq -r '.id // ""' "$1")
+  [[ -n "$id" ]] || return 1
+  api GET "/repos/$owner/$repo/commits/$sha/status"
+  [[ "$code" == 200 ]] || return 1
+  snapshot=$(mktemp "$HOME_DIR/cache/ownership-$SLOT.XXXXXXXX") || return 1
+  printf '%s\n' "$body" >"$snapshot"
+  jq -e --arg context "$(gate_status_context "$owner" "$repo")" --arg prefix "$GATE_RUNNER_NAME@" \
+    --arg own "${MARKER:-} " --arg identity "${IDENTITY:-}" --arg mine "attempt $id" '
+    [.statuses[]? | select(.context == $context)] | sort_by(.updated_at // .created_at)
+    | ((map((.description // "") | contains($mine)) | indices(true)) | last) as $mine_at
+    | $mine_at != null
+      and ([.[($mine_at + 1):][]
+            | select(((.description // "") | startswith($prefix)) and .state != "pending")
+            | select(((.description // "") | contains($mine)) | not)
+            | select(if (.creator.login // "") == "" then (.description | startswith($own))
+                     else $identity != "" and .creator.login == $identity end)] | length > 0)' \
+    "$snapshot" >/dev/null 2>&1 || proved=0
+  rm -f -- "$snapshot"
+  ((proved))
+}
+
 gate_recover() {
-  local receipt newest="" sequence maximum=0 newest_id=""
+  local receipt newest="" sequence maximum=0 newest_id="" owed
   for receipt in "$gate_key_dir"/*/receipt.json; do
     [[ -f "$receipt" ]] || continue
     sequence=$(jq -er '.sequence' "$receipt") || return
@@ -1174,10 +1227,39 @@ gate_recover() {
     # Discharged when the head was gated under another proof base (gate_discharge_other_keys): a result
     # for a base it is no longer proved against is never published.
     if jq -e '.publication.superseded_by != null' "$receipt" >/dev/null; then continue; fi
+    # Deferred to a person after its bounded recovery (below): the receipt and its recovery_required
+    # are kept, and the head is gated again rather than asked for forever.
+    if jq -e '.publication.recovery_deferred == true' "$receipt" >/dev/null; then continue; fi
     if ! jq -e '.terminal' "$receipt" >/dev/null; then
       gate_finish interrupted null "" 'exclusive descendant lock recovered without a process-exit receipt' || return
     fi
     if ! jq -e '.publication.required_status and .publication.check_run' "$receipt" >/dev/null; then
+      # A receipt owed after its lease was lost is published only once this host holds the head
+      # again (gate_publish takes the lease) and only while no newer verdict of the required context
+      # stands: whoever took the head meanwhile has already spoken for it.
+      if jq -e '.publication.ownership != null' "$receipt" >/dev/null; then
+        if gate_ownership_superseded "$receipt"; then
+          say "$owner/$repo@$sha: a newer verdict stands on its head, published while this attempt held no lease; publishing nothing"
+          gate_update --arg at "$(date -u +%FT%TZ)" \
+            '.publication.superseded_by=("a newer verdict stands on the forge, read at " + $at)
+             | .publication.ownership=null | .recovery_required=null' || return
+          cat "$receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
+          continue
+        fi
+        owed=$(($(jq -r '.publication.recovery_attempts // 0' "$receipt") + 1))
+        gate_update --argjson n "$owed" '.publication.recovery_attempts=$n' || return
+        # A refusal names another holder, whose own verdict ends this obligation above. An ownership
+        # that stays unknown has no such end, so the asking is bounded.
+        if ((owed > GATE_RECOVERY_ATTEMPTS)) && jq -e '.publication.ownership == "unknown"' "$receipt" >/dev/null; then
+          # Kept, never published by this host and never deleted: the evidence and its
+          # recovery_required stay on the receipt, which is what the heartbeat raises for a person.
+          # Releasing the head lets the next tick gate it instead of asking again forever.
+          say "$owner/$repo@$sha: its lease ownership stayed unknown for $GATE_RECOVERY_ATTEMPTS recovery ticks; left for a person and the head re-gated"
+          gate_update '.publication.recovery_deferred=true' || return
+          cat "$receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
+          continue
+        fi
+      fi
       gate_publish || return 1
     fi
   done

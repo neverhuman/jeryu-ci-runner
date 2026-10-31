@@ -48,6 +48,7 @@ curl() {
       denied) printf '{}\n409'; return;;
       lost) if ((count > 0)); then printf '{}\n409'; return; fi;;
       outage) printf '{}\n503'; return;;
+      forbidden) printf '{}\n403'; return;;
       missing) printf '{"code":"api_route_not_found"}\n404'; return;;
     esac
     printf '%s\n' "$payload" >>"$scratch/grants"
@@ -55,6 +56,7 @@ curl() {
   elif [[ "$path" == /api/v1/gate-claims/release ]]; then
     printf '{}\n200'
   elif [[ "$method" == GET ]]; then
+    if [[ -s "$scratch/status.json" ]]; then printf '%s\n200' "$(cat "$scratch/status.json")"; return; fi
     printf '{"statuses":[{"state":"success","description":"old","context":"fixture/required"}]}\n200'
   else
     printf '%s %s %s\n' "$method" "$path" "$payload" >>"$scratch/writes"
@@ -64,7 +66,8 @@ curl() {
 reset_claim() {
   gate_claim_release
   GATE_CLAIM_ROUTE=1 GATE_CLAIM_HELD=0 GATE_CLAIM_OWNER='' GATE_CLAIM_REPO='' GATE_CLAIM_SHA=''
-  rm -f "$scratch/asks" "$scratch/writes" "$scratch/grants" "$GATE_CLAIM_STATE/lost"
+  rm -f "$scratch/asks" "$scratch/writes" "$scratch/grants" "$scratch/status.json" \
+    "$GATE_CLAIM_STATE/lost" "$GATE_CLAIM_STATE/lost-kind"
   printf '%s\n' "$1" >"$scratch/mode"
 }
 no_writes() { [[ ! -s "$scratch/writes" ]] || { cat "$scratch/writes" >&2; exit 1; }; }
@@ -189,35 +192,131 @@ for qref in refs/heads/main refs/heads/release refs/queue/main/12; do
   jq -se --arg field "$field" 'all(.[]; has($field))' "$scratch/grants" >/dev/null
 done
 printf 'PASS branch/health and queue claims use the correct head field\n'
-# A loss that proves no other owner keeps a real verdict owed; a refusal hands the head over.
+# What an abandoned attempt owes follows from the ownership its loss proves, and from whether the
+# recipe had produced a verdict at all. The ownership is state the renewer records, not marker text.
+lose_claim() { # kind why
+  printf '%s\n' "$1" >"$GATE_CLAIM_STATE/lost-kind"
+  printf '%s\n' "$2" >"$GATE_CLAIM_STATE/lost"
+}
 reset_claim granted
 gate_begin "$identity"; gate_finish failure 1 ''
 receipt=$gate_receipt
 gate_claim_take "$owner" "$repo" "$number" "$sha"
-printf 'unproven: renewal answered 503, 200s after the last renewal\n' >"$GATE_CLAIM_STATE/lost"
+lose_claim unknown 'renewal answered 503, 200s after the last renewal'
 gate_claim_abandon "$(gate_claim_lost)"
-jq -e '.outcome=="failure" and .publication.superseded_by==null and (.recovery_required|test("ownership unknown"))' \
-  "$receipt" >/dev/null
+jq -e '.outcome=="failure" and .publication.superseded_by==null and .publication.ownership=="unknown"
+       and (.recovery_required|test("ownership unknown"))' "$receipt" >/dev/null
 no_writes
 printf 'PASS an unproven loss keeps the real failed receipt owed for recovery\n'
+# An attempt the loss interrupted has no verdict: a host that does not hold the head must not invent
+# one, so nothing is owed and the head is simply gated again.
+reset_claim granted
+gate_begin "$identity"
+receipt=$gate_receipt
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+lose_claim unknown 'renewal answered 500, 300s after the last renewal'
+gate_claim_abandon "$(gate_claim_lost)"
+jq -e '.terminal and .outcome=="claim_lost" and .publication.superseded_by!=null
+       and .publication.ownership==null and .recovery_required==null' "$receipt" >/dev/null
+no_writes
+gate_receipt=''
+printf 'PASS an unproven loss of an unfinished attempt owes nothing and publishes nothing\n'
 reset_claim granted
 gate_begin "$identity"; gate_finish failure 1 ''
 receipt=$gate_receipt
 gate_claim_take "$owner" "$repo" "$number" "$sha"
-printf 'refused: renewal answered 409\n' >"$GATE_CLAIM_STATE/lost"
+lose_claim refused 'renewal answered 409'
 gate_claim_abandon "$(gate_claim_lost)"
 jq -e '.outcome=="failure" and .publication.superseded_by!=null and .recovery_required==null' "$receipt" >/dev/null
 no_writes
 printf 'PASS a refused renewal records the other holder, owing nothing\n'
-# After a long cache upload the lease is asked again: a refusal is recorded, an outage is not.
+# A marker left by a runner that recorded no ownership keeps the meaning it was written with.
 reset_claim granted
 gate_claim_take "$owner" "$repo" "$number" "$sha"
-printf 'outage\n' >"$scratch/mode"
-gate_claim_recheck
-[[ ! -f "$GATE_CLAIM_STATE/lost" ]]
-printf 'denied\n' >"$scratch/mode"
-gate_claim_recheck
-grep -q '^refused: ' "$GATE_CLAIM_STATE/lost"
-printf 'PASS the post-upload recheck records a refusal and tolerates an outage\n'
+printf 'renewal answered 409: fixture-private-detail\n' >"$GATE_CLAIM_STATE/lost"
+[[ "$(gate_claim_lost_kind)" == refused ]]
+printf 'renewal answered 403, 400s after the last renewal\n' >"$GATE_CLAIM_STATE/lost"
+[[ "$(gate_claim_lost_kind)" == unknown ]]
+printf 'PASS a marker written without recorded ownership is classified from its own answer\n'
+# After a long cache upload the lease is asked again: a definitive answer is recorded with the
+# ownership it proves, and an outage is not recorded at all.
+for mode in outage denied forbidden; do
+  reset_claim granted
+  gate_claim_take "$owner" "$repo" "$number" "$sha"
+  printf '%s\n' "$mode" >"$scratch/mode"
+  gate_claim_recheck
+  case "$mode" in
+    outage) [[ ! -f "$GATE_CLAIM_STATE/lost" ]];;
+    denied) [[ "$(gate_claim_lost_kind)" == refused ]];;
+    forbidden) [[ "$(gate_claim_lost_kind)" == unknown ]];;
+  esac
+done
+printf 'PASS the post-upload recheck records the ownership each answer proves\n'
+# Recovery of a verdict owed while ownership was unknown: a verdict posted after this attempt
+# finished, by anything but this attempt, is another holder's and is never published over.
+reset_claim granted
+gate_begin "$identity"; gate_finish failure 1 ''
+receipt=$gate_receipt
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+lose_claim unknown 'renewal answered 503, 200s after the last renewal'
+gate_claim_abandon "$(gate_claim_lost)"
+printf 'granted\n' >"$scratch/mode"
+IDENTITY=gate-user
+# This attempt's own `pending` is on the head, and a terminal verdict of another attempt follows it.
+jq -nc --arg mine "pr-gate-runner@gate-a operator-unsealed required running; attempt $(jq -r .id "$receipt")" \
+  '{statuses:[{state:"pending",context:"fixture/required",description:$mine,
+               creator:{login:"gate-user"},updated_at:1},
+              {state:"success",context:"fixture/required",creator:{login:"gate-user"},updated_at:2,
+               description:"pr-gate-runner@gate-b operator-unsealed success; exit 0; attempt other-host"}]}' \
+  >"$scratch/status.json"
+gate_recover
+no_writes
+jq -e '.outcome=="failure" and .publication.ownership==null and .recovery_required==null
+       and (.publication.superseded_by|test("newer verdict"))' "$receipt" >/dev/null
+printf 'PASS recovery defers to a verdict another holder published while ownership was unknown\n'
+# The same receipt with nothing newer on the forge is published, under a lease taken afresh.
+reset_claim granted
+gate_begin "$identity"; gate_finish failure 1 ''
+receipt=$gate_receipt
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+lose_claim unknown 'renewal answered 503, 200s after the last renewal'
+gate_claim_abandon "$(gate_claim_lost)"
+printf 'granted\n' >"$scratch/mode"
+# An earlier attempt's verdict precedes this attempt's own `pending`: nothing newer stands.
+jq -nc --arg mine "pr-gate-runner@gate-a operator-unsealed required running; attempt $(jq -r .id "$receipt")" \
+  '{statuses:[{state:"failure",context:"fixture/required",creator:{login:"gate-user"},updated_at:1,
+               description:"pr-gate-runner@gate-a operator-unsealed failure; exit 1; attempt earlier"},
+              {state:"pending",context:"fixture/required",description:$mine,
+               creator:{login:"gate-user"},updated_at:2}]}' >"$scratch/status.json"
+gate_recover
+jq -e '.publication.required_status and .publication.check_run and .recovery_required==null
+       and .publication.superseded_by==null' "$receipt" >/dev/null
+grep -q 'failure' "$scratch/writes"
+printf 'PASS recovery publishes the owed verdict under a fresh lease when no newer verdict stands\n'
+# An answer that never proves ownership must not hold the head for ever: recovery stays fail-closed
+# for a bounded number of ticks, then keeps the receipt, leaves it for a person and frees the head.
+reset_claim granted
+gate_begin "$identity"; gate_finish failure 1 ''
+receipt=$gate_receipt
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+lose_claim unknown 'renewal answered 403, 400s after the last renewal'
+gate_claim_abandon "$(gate_claim_lost)"
+GATE_RECOVERY_ATTEMPTS=3
+printf 'forbidden\n' >"$scratch/mode"
+for tick in 1 2 3; do
+  if gate_recover; then printf 'recovery gave up on tick %s\n' "$tick" >&2; exit 1; fi
+  gate_receipt=''
+done
+no_writes
+jq -e '.publication.recovery_deferred==null and .recovery_required!=null' "$receipt" >/dev/null
+gate_recover
+no_writes
+jq -e '.publication.recovery_deferred==true and .recovery_required!=null and .outcome=="failure"
+       and (.publication.required_status|not)' "$receipt" >/dev/null
+gate_recover
+no_writes
+printf 'PASS an ownership that stays unknown is deferred after a bounded number of recovery ticks\n'
+unset IDENTITY
+GATE_RECOVERY_ATTEMPTS=10
 gate_claim_release
 gate_receipt=''
