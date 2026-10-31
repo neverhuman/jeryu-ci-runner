@@ -29,6 +29,13 @@
 #   generated verifier installed beside this script (pr-gate-ensure-jankurai.sh). A job left alone
 #   lapses with its lease.
 #
+# A merge-queue ticket (branch refs/queue/<base>/<number>) names a synthetic commit no branch or pull
+# request holds. Under either contract it is admitted only while the forge's live merge queue still holds
+# that exact repository, ref and commit as a building entry and every source pull request of its stack
+# (the entry and each one below it) is open, marked internal and at the head the entry was built from; one
+# contributed or unmarked source refuses it before any checkout. The commit is then fetched through that
+# exact ref and must still match the ticket. Metadata and policy still come from main.
+#
 # Bound tickets admit every served head regardless of pushing clone. Contributions require the
 # site's sandbox command; unbound tickets retain the internal-PR admission contract.
 #
@@ -410,6 +417,71 @@ prepare_tree() {
     | xargs -0 -r "${git_auth[@]}" git -C "$root" update-index --assume-unchanged -- || return 1
 }
 
+# A label is a string or a {name} object, on the row or under its summary (as the slots read it).
+label_on() { jq -e --arg name "$2" 'any((.labels // .summary.labels // [])[]?; (if type == "string" then . else (.name // "") end) == $name)' <<<"$1" >/dev/null 2>&1; }
+
+# queue_ref_of BRANCH: the exact merge-queue ref a ticket names (refs/queue/<base>/<number>), else nothing.
+# The forge may spell it with or without the refs/ prefix; the ref fetched and compared is always the full one.
+queue_ref_of() {
+  local ref=$1
+  [[ "$ref" == queue/* ]] && ref="refs/$ref"
+  [[ "$ref" =~ ^refs/queue/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/[0-9]+$ && "$ref" != *..* ]] && printf '%s' "$ref"
+  return 0
+}
+
+# forge_pages PATH: every item of a paged forge listing (under .items, else .entries) as one JSON array in
+# $pages, at most 20 pages of 500. A page that fails sets $pages_code to its status and returns 1.
+forge_pages() {
+  local path=$1 page more sep='?' chunk
+  [[ "$path" != *\?* ]] || sep='&'
+  pages='[]' pages_code=200
+  for ((page = 1; page <= 20; page++)); do
+    api GET "$path${sep}per_page=500&page=$page"
+    [[ "$code" == 200 ]] || { pages_code=$code; return 1; }
+    chunk="$(jq -c '[(.items // .entries // [])[]?]' <<<"$body" 2>/dev/null)" || { pages_code=200; return 1; }
+    pages="$(jq -cn --argjson a "$pages" --argjson b "$chunk" '$a + $b')"
+    more="$(jq -r '.page.has_more // false' <<<"$body" 2>/dev/null)"
+    [[ "$more" == true ]] || return 0
+  done
+  pages_code=200
+  return 1
+}
+
+# queue_admission OWNER REPO REF HEAD: nothing when the forge still holds exactly this queue entry and every
+# source pull request of its stack (the entry and each one below it, down to the base tip) is an open
+# pull request the forge marks internal with the head the entry was built from; else why not, as
+# "<release reason>|<explanation>". A queue commit is a synthetic replay no pull request holds, so the
+# live entry and its sources stand in for the open-pull-request match. One contributed or unmarked source
+# anywhere in the stack refuses the whole ticket: the gate host checks out nothing of it.
+queue_admission() {
+  local owner=$1 repo=$2 ref=$3 head=$4 entries prs entry number pr_head parent base depth=0 pr
+  forge_pages "/api/v1/repos/$owner%2F$repo/merge-queue" \
+    || { printf '|the forge answered %s listing its merge queue' "$pages_code"; return; }
+  entries=$pages
+  forge_pages "/api/v1/repos/$owner%2F$repo/pulls?state=open" \
+    || { printf '|the forge answered %s listing its pull requests' "$pages_code"; return; }
+  prs=$pages
+  entry="$(jq -c --arg r "$owner/$repo" --arg ref "$ref" --arg sha "$head" \
+    'first(.[] | select(.repo == $r and .queue_ref == $ref and .queue_sha == $sha and .state == "building")) // empty' <<<"$entries")"
+  [[ -n "$entry" ]] || { printf '|the merge queue holds no building entry %s at this head' "$ref"; return; }
+  while [[ -n "$entry" ]]; do
+    ((++depth <= 64)) || { printf '|the queue stack under %s is deeper than 64 entries' "$ref"; return; }
+    number="$(jq -r '.number // ""' <<<"$entry")" pr_head="$(jq -r '.pr_head_sha // ""' <<<"$entry")"
+    base="$(jq -r '.base // ""' <<<"$entry")" parent="$(jq -r '.base_sha // ""' <<<"$entry")"
+    [[ "$number" =~ ^[0-9]+$ && "$pr_head" =~ ^[0-9a-f]{40}$ ]] \
+      || { printf '|a queue entry under %s is malformed' "$ref"; return; }
+    pr="$(jq -c --argjson n "$number" --arg h "$pr_head" 'first(.[] | select(.number == $n and .head_sha == $h)) // empty' <<<"$prs")"
+    [[ -n "$pr" ]] || { printf '|no open pull request #%s holds the head %s queued under %s' "$number" "${pr_head:0:12}" "$ref"; return; }
+    if label_on "$pr" "$CONTRIBUTED_LABEL"; then
+      printf 'contributed|a contribution (%s) is in the stack under %s: the gate host checks out nothing of it' "$CONTRIBUTED_LABEL" "$ref"; return
+    fi
+    label_on "$pr" "$INTERNAL_LABEL" || { printf '|pull request #%s in the stack under %s is not marked %s' "$number" "$ref" "$INTERNAL_LABEL"; return; }
+    # The entry below is the one whose queue commit this one was replayed on; none means the base tip.
+    entry="$(jq -c --arg r "$owner/$repo" --arg b "$base" --arg sha "$parent" \
+      'first(.[] | select(.repo == $r and .base == $b and .queue_sha == $sha and .state == "building")) // empty' <<<"$entries")"
+  done
+}
+
 # admission OWNER REPO BRANCH HEAD [ORIGIN]: nothing when this host can audit the ticket; else why not, as "<release reason>|<explanation>". main is reviewed by protection (checked after
 # the clone, against the clone's own main). A bound job carries the forge's word on its origin; an
 # unbound one must be held by an open pull request the forge marks internal (jeryu's own rows label
@@ -423,6 +495,11 @@ admission() {
   else
     pr_gate_listed "$OWNERS" "$owner" || { printf 'not-served-by-this-host|%s is not an owner this host serves' "$owner"; return; }
   fi
+  # A merge-queue ticket is admitted only against the live queue entry and its internal source stack,
+  # whichever contract delivered it.
+  local qref
+  qref="$(queue_ref_of "$branch")"
+  if [[ -n "$qref" ]]; then queue_admission "$owner" "$repo" "$qref" "$head"; return; fi
   if ((BOUND)); then
     [[ "$origin" == internal || "$sandbox_ready" == true ]] || printf 'contributed|a contribution (origin %s): the gate host checks out nothing of it' "${origin:-unknown}"
     return
@@ -436,8 +513,6 @@ admission() {
     [[ -z "$row" && "$more" == true ]] || break
   done
   [[ -n "$row" ]] || { printf '|no open pull request holds this head'; return; }
-  # A label is a string or a {name} object, on the row or under its summary (as the slots read it).
-  label_on() { jq -e --arg name "$2" 'any((.labels // .summary.labels // [])[]?; (if type == "string" then . else (.name // "") end) == $name)' <<<"$1" >/dev/null 2>&1; }
   if label_on "$row" "$CONTRIBUTED_LABEL"; then
     printf 'contributed|a contribution (%s): the gate host checks out nothing of it' "$CONTRIBUTED_LABEL"; return
   fi
@@ -523,6 +598,16 @@ audit_one() { # ticket-json
   # A head the branch no longer points at (or one only a pull request ref holds) is fetched by ref.
   if ! "${git_auth[@]}" git -C "$src" cat-file -e "$head^{commit}" 2>/dev/null; then
     "${git_auth[@]}" git -C "$src" fetch -q origin '+refs/pull/*/head:refs/remotes/origin/pull/*' 2>&1 || true
+  fi
+  # A queue commit is reachable only through its queue ref: fetch exactly that ref and require it to
+  # still name the ticketed commit (a restacked or dequeued entry no longer does).
+  local qref
+  qref="$(queue_ref_of "$branch")"
+  if [[ -n "$qref" ]]; then
+    if ! "${git_auth[@]}" git -C "$src" fetch -q origin "+$qref:refs/remotes/origin/queue-ticket" 2>&1 \
+       || [[ "$("${git_auth[@]}" git -C "$src" rev-parse -q --verify 'refs/remotes/origin/queue-ticket^{commit}' 2>/dev/null)" != "$head" ]]; then
+      refuse stale-queue-ref "the queue ref $qref no longer names the ticketed commit" failed; return 0
+    fi
   fi
   # main is admitted only when the head really is main's: reachable from the clone's own main.
   if [[ "$branch" == main ]] && ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$head" refs/remotes/origin/main 2>/dev/null; then

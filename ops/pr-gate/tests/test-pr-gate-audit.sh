@@ -114,8 +114,11 @@ case "\$url" in
     cp "\${data#@}" "$fx/forge/score-\$n.json"
     printf '%s\n' "\${data#@}" >>"$fx/score-bodies.log"
     answer "\$(cat "$fx/forge/score.body" 2>/dev/null || echo '{"score":91}')" "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
+  */merge-queue\?*)
+    answer "\$(jq -c '{entries: ., page: {has_more: false}}' "$fx/forge/queue.json")" 200;;
   */pulls\?state=open*)
-    if [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"; else
+    if [[ -e "$fx/forge/pulls-raw.json" ]]; then answer "\$(jq -c '{items: ., page: {has_more: false}}' "$fx/forge/pulls-raw.json")" 200
+    elif [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"; else
     page=\$(sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p' <<<"\$url")
     if [[ -e "$fx/forge/paged" && "\${page:-1}" == 1 ]]; then answer '{"items":[],"page":{"has_more":true}}' 200; else
     items=\$( { sed 's/.*/{"number":1,"head_sha":"&","labels":["origin:internal"]}/' "$fx/forge/internal-heads" 2>/dev/null
@@ -559,3 +562,81 @@ run
 must 'a bound host with nothing staged claims nothing' test "$(last_beat | jq -r .last.reason)" == "no staged jankurai under $fx/tools/jankurai verifies on its receipt"
 rm -f "$fx/forge/bound"; mv "$fx/verifier.bound-off" "$fx/install/pr-gate-ensure-jankurai.sh"
 printf 'PASS a bound host with no staged auditor says so on /runners\n'
+
+# --- merge-queue tickets: a queue commit exists only under refs/queue --------------------------------
+# The synthetic queue commits are pushed to the bare repository's refs/queue/main/N and no branch holds
+# them, so only a fetch of that exact ref can check them out; no pull request has their sha as its head.
+qw="$fx/w-queue"
+git init -q -b main "$qw"
+qgit() { git -C "$qw" -c user.name=t -c user.email=t@example.test "$@"; }
+qgit commit -q --allow-empty -m base
+QBASE=$(git -C "$qw" rev-parse HEAD)
+git clone -q --bare "$qw" "$fx/git/qrepo.git"
+qcommit() { # file -> sha of a commit on QBASE (or $2) that no branch holds
+  qgit checkout -q --detach "${2:-$QBASE}"; echo "$1" >"$qw/$1"; qgit add "$1"; qgit commit -q -m "$1"; git -C "$qw" rev-parse HEAD
+}
+QSRC1=$(qcommit pr1); QQ1=$(qcommit queue1 "$QSRC1")
+QSRC2=$(qcommit pr2 "$QQ1"); QQ2=$(qcommit queue2 "$QSRC2")
+for sha in "$QSRC1" "$QQ1" "$QSRC2" "$QQ2"; do git -C "$qw" push -q "$fx/git/qrepo.git" "$sha:refs/qtmp/$sha"; done
+git -C "$fx/git/qrepo.git" update-ref refs/queue/main/1 "$QQ1"
+git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ2"
+for sha in "$QSRC1" "$QQ1" "$QSRC2" "$QQ2"; do git -C "$fx/git/qrepo.git" update-ref -d "refs/qtmp/$sha"; done
+must 'the fixture queue commit is on no branch' test -z "$(git -C "$fx/git/qrepo.git" branch --contains "$QQ2")"
+qlive() { # writes the live queue and open pull requests the forge reports; $1 = labels of PR 1
+  jq -n --arg b "$QBASE" --arg s1 "$QSRC1" --arg q1 "$QQ1" --arg s2 "$QSRC2" --arg q2 "$QQ2" '[
+    {repo:"acme/qrepo",base:"main",number:1,pr_head_sha:$s1,base_sha:$b,queue_ref:"refs/queue/main/1",queue_sha:$q1,state:"building"},
+    {repo:"acme/qrepo",base:"main",number:2,pr_head_sha:$s2,base_sha:$q1,queue_ref:"refs/queue/main/2",queue_sha:$q2,state:"building"}]' >"$fx/forge/queue.json"
+  jq -n --arg s1 "$QSRC1" --arg s2 "$QSRC2" --argjson l1 "${1:-[\"origin:internal\"]}" \
+    '[{number:1,head_sha:$s1,labels:$l1},{number:2,head_sha:$s2,labels:["origin:internal"]}]' >"$fx/forge/pulls-raw.json"
+}
+qticket() { # ref sha base
+  printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"qrepo","branch":"%s","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' \
+    "$1" "$2" "$3" >"$fx/forge/claim.json"
+}
+qlive
+before=$(scores)
+qticket refs/queue/main/2 "$QQ2" "$QQ1"
+run
+must 'a stacked queue ticket is admitted and audited' grep -q "acme/qrepo@$QQ2 scored" "$fx/out"
+must 'it is submitted under its exact queue ref and sha' test "$(jq -r '[.branch, .commit_sha] | join(" ")' "$fx/forge/score-$before.json")" == "refs/queue/main/2 $QQ2"
+must 'the audited tree is the queue commit' grep -q 'queue2' <(git -C "$fx/git/qrepo.git" ls-tree --name-only "$QQ2")
+printf 'PASS a queue commit reachable only through refs/queue is fetched, audited and submitted\n'
+
+before=$(scores)
+git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ1"
+qticket refs/queue/main/2 "$QQ2" "$QQ1"
+run
+must 'a queue ref that moved since the ticket is refused' grep -q 'no longer names the ticketed commit' "$fx/out"
+must 'a moved queue ref submits nothing' test "$(scores)" == "$before"
+git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ2"
+qticket refs/queue/main/2 "$QSRC2" "$QQ1"
+run
+must 'a ticket whose sha is not the live entry s is refused' grep -q 'merge queue holds no building entry refs/queue/main/2' "$fx/out"
+qticket refs/queue/main/1 "$QQ2" "$QQ1"
+run
+must 'a ref and sha that belong to different entries are refused' grep -q 'merge queue holds no building entry refs/queue/main/1' "$fx/out"
+qticket refs/queue/main/2 "$QQ2" "$QQ1"
+jq 'map(if .number == 2 then .state = "landed" else . end)' "$fx/forge/queue.json" >"$fx/forge/queue.tmp"; mv "$fx/forge/queue.tmp" "$fx/forge/queue.json"
+run
+must 'an entry the queue no longer builds is refused' grep -q 'merge queue holds no building entry' "$fx/out"
+qlive
+jq 'map(select(.number != 2))' "$fx/forge/pulls-raw.json" >"$fx/forge/pulls.tmp"; mv "$fx/forge/pulls.tmp" "$fx/forge/pulls-raw.json"
+qticket refs/queue/main/2 "$QQ2" "$QQ1"
+run
+must 'a source pull request that is no longer open is refused' grep -q "no open pull request #2 holds the head" "$fx/out"
+printf 'PASS stale, mismatched and dequeued queue tickets are refused\n'
+
+qlive '["origin:contributed"]'
+: >"$fx/git-helper.log"; before=$(scores)
+qticket refs/queue/main/2 "$QQ2" "$QQ1"
+run
+must 'a stack holding a contribution is refused' grep -q 'a contribution (origin:contributed) is in the stack under refs/queue/main/2' "$fx/out"
+must 'a contributed stack is never cloned' test ! -s "$fx/git-helper.log"
+must 'a contributed stack submits nothing' test "$(scores)" == "$before"
+qlive '[]'
+qticket refs/queue/main/2 "$QQ2" "$QQ1"
+run
+must 'a stack source the forge does not mark internal is refused' grep -q 'is not marked origin:internal' "$fx/out"
+must 'an unmarked stack is never cloned' test ! -s "$fx/git-helper.log"
+rm -f "$fx/forge/pulls-raw.json" "$fx/forge/queue.json"
+printf 'PASS a contributed or unmarked source anywhere in the stack refuses the queue ticket\n'

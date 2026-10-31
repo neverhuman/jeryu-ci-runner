@@ -541,7 +541,11 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    head of an open pull request the forge marks `origin:internal` (`PR_GATE_INTERNAL_LABEL`; every page
    of open pull requests is read, and a label may sit on the row or under its summary). A contribution (`origin:contributed`), a head no open
    pull request holds, or a forge that cannot answer is left alone -- like the slots, this host checks
-   out nothing of a contribution. A job left alone is not refused on the forge (there is no route for
+   out nothing of a contribution. A merge-queue ticket (branch `refs/queue/<base>/<number>`, under either
+   contract) is admitted only while the forge's live merge queue still holds that exact repository, ref
+   and commit as a building entry and every source pull request of its stack is open, `origin:internal`
+   and at the head the entry was built from; it is then fetched through that exact ref and must still
+   match the ticket. A job left alone is not refused on the forge (there is no route for
    that on the unbound contract); its claim lapses with its lease;
 3. clone the head under the gate home (`audit-work/`, swept at the start of each pass) with the gate's own credential (through a git credential
    helper that reads the token file; it is in no argv, environment or clone config);
