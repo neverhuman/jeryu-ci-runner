@@ -213,3 +213,43 @@ mk 5 success '0\tlint\n14\ttemp on /dev/shm/x.BBBB\n220\tbuild\n' 270
 out=$(GATE_RUNNER_HOME="$fx/runner" bash "$report")
 must 'one row for a step whose temp path differs per run' grep -qE '^temp on <tmp> +3m10s +3m26s +3m26s +[0-9]+% +2$' <<<"$out"
 printf 'PASS steps compare and group by key: a per-run temp path or digest is one step, not one per run\n'
+
+# A live watcher and its children must not keep the runner's locks after the
+# runner releases them. Hold the watcher in a controlled child wait so this
+# tests descriptor ownership, rather than the timing of its polling sleep.
+(
+  watcher="" child=""
+  sleep 120 & worker=$!
+  cleanup_watch() {
+    [[ ! -s "$fx/watcher-child" ]] || read -r child <"$fx/watcher-child"
+    [[ -z "$child" ]] || kill "$child" 2>/dev/null || true
+    [[ -z "$watcher" ]] || kill "$watcher" 2>/dev/null || true
+    kill "$worker" 2>/dev/null || true
+    [[ -z "$watcher" ]] || wait "$watcher" 2>/dev/null || true
+    wait "$worker" 2>/dev/null || true
+  }
+  trap cleanup_watch EXIT
+  exec 6>"$fx/watcher-head.lock" 7>"$fx/watcher-repo.lock" 9>"$fx/watcher-slot.lock"
+  flock -n 6; flock -n 7; flock -n 9
+  gate_steps_record() {
+    sleep 120 & local child_pid=$!
+    printf '%s\n' "$child_pid" >"$fx/watcher-child"
+    : >"$fx/watcher-ready"
+    wait "$child_pid" || true
+    return 1
+  }
+  gate_progress_watch "$fx/build.log" "$fx/watch.tsv" "$worker" acme web test \
+    "$fx/planned.tsv" "$fx/vocab" '' & watcher=$!
+  deadline=$((SECONDS + 60))
+  until [[ -f "$fx/watcher-ready" ]]; do
+    kill -0 "$watcher" 2>/dev/null && ((SECONDS < deadline)) || {
+      printf 'FAIL: watcher did not reach its controlled child wait\n' >&2; exit 1;
+    }
+    sleep 0.1
+  done
+  exec 6>&- 7>&- 9>&-
+  for lock in head repo slot; do
+    must "progress watcher retained the runner's $lock lock" flock -n "$fx/watcher-$lock.lock" true
+  done
+)
+printf 'PASS a live progress watcher and its child cannot retain the runner locks\n'

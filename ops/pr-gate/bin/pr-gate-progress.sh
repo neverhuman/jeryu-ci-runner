@@ -278,6 +278,9 @@ gate_progress_watch() {
   # The runner's exit and signal handlers finish the attempt as interrupted. This subshell must
   # never run them: stopping the watcher would mark a gate that is about to record its real result.
   trap - EXIT TERM INT HUP
+  # Only the runner owns its head, repository and slot locks. A watcher child
+  # (for example its polling sleep) can outlive this subshell when it is stopped.
+  exec 6>&- 7>&- 9>&-
   export GATE_API_PASSIVE=1
   while kill -0 "$worker" 2>/dev/null; do
     now=$(date +%s)
