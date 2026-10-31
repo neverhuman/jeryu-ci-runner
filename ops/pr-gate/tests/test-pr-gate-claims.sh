@@ -126,6 +126,28 @@ gate_recover
 [[ $(wc -l <"$scratch/writes") == 2 ]]
 jq -e '.publication.required_status and .publication.check_run and .recovery_required==null' "$receipt" >/dev/null
 printf 'PASS renewal outage recovers the saved verdict with no new attempt\n'
+# The renewer can record a loss before the foreground publication check runs.
+# Exercise that ordering without sleeps: retain the completed result, report why
+# it cannot be published, and recover it only after a fresh grant clears the loss.
+reset_claim granted
+gate_begin "$identity"; gate_finish success 0 ''
+receipt=$gate_receipt
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+asks_before=$(cat "$scratch/asks")
+printf 'renewal answered 409: fixture-private-detail\n' >"$GATE_CLAIM_STATE/lost"
+if gate_publish; then exit 1; fi
+no_writes
+[[ $(cat "$scratch/asks") == "$asks_before" ]]
+grep -Fq 'publication lease was lost; posting nothing' "$scratch/operator.log"
+if grep -Fq 'fixture-private-detail' "$scratch/operator.log"; then
+  printf 'lost-marker contents reached the operator log\n' >&2; exit 1
+fi
+jq -e '.terminal and .outcome=="success" and .recovery_required!=null and (.publication.required_status|not)' "$receipt" >/dev/null
+gate_claim_release
+gate_recover
+[[ $(wc -l <"$scratch/writes") == 2 ]]
+jq -e '.publication.required_status and .publication.check_run and .recovery_required==null' "$receipt" >/dev/null
+printf 'PASS a recorded renewal loss is reported and recovery requires a fresh lease\n'
 # Verify immediately before BOTH writes, never only once at gate_publish entry.
 reset_claim granted
 gate_begin "$identity"; gate_finish success 0 ''

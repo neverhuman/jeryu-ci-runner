@@ -216,7 +216,9 @@ gate_claim_authorize_path() { # method path payload
   fi
   # The background renewer may have detected a definitive loss since the last write.
   if [[ -f "$GATE_CLAIM_STATE/lost" ]]; then
-    code=lease_unavailable body='publication lease was lost'; return 1
+    code=lease_unavailable body='publication lease was lost'
+    say "$target_owner/$target_repo@$target_sha: $body; posting nothing"
+    return 1
   fi
   gate_claim_renew || rc=$?
   if ((rc == 0 && GATE_CLAIM_HELD)); then return 0; fi
