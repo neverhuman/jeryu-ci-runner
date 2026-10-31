@@ -153,14 +153,18 @@ fi
 if [[ -f "$fixture_root/deny-claims-after-recipe" ]]; then
   touch "$fixture_root/claims-denied"
 fi
-# Lose the lease only after a completed recipe, to exercise terminal outbox recovery.
+# Lose the lease only after a completed recipe, to exercise terminal outbox recovery. The recipe only
+# registers its pid; the fake forge takes the lease on the next claim request after that process has
+# exited, so the theft can never land while the recipe still runs (and be mistaken for a mid-recipe loss).
 if [[ -f "$fixture_root/steal-after-recipe" ]]; then
   recipe_head=$("$worker_git" rev-parse HEAD)
   target=$(cat "$fixture_root/steal-after-recipe")
   if [[ -z "$target" || "$target" == "$recipe_head" ]]; then
-    printf 'gate-b/slot0 gate-b %s\n' "$(( $(date +%s) + 3600 ))" >"$fixture_root/claims/acme-fixture-$recipe_head"
+    printf '%s\n' "$$" >"$fixture_root/steal-pending-$recipe_head"
   fi
 fi
+# recipe-slept: the recipe ran its whole sleep, which a lease lost mid-recipe must prevent.
+[[ ! -f "$fixture_root/recipe-sleep" ]] || touch "$fixture_root/recipe-slept"
 printf 'error: expected rejection in a passing negative test\n'
 # Step lines, one of them the gate's own credential: what a head's recipe may print, never publish.
 printf '[pr-ci] fixture recipe step\n==> %s\n' "$(cat "$fixture_root/token")"
@@ -362,6 +366,16 @@ case "$method $url" in
       if [[ -f "$FAKE_FORGE/steal-on-renew" && -f "$FAKE_FORGE/pending-$sha" && "$held_runner" == "$runner" ]]; then
         held_runner=gate-b/slot0 held_host=gate-b held_until=$((now + 3600))
         printf '%s %s %s\n' "$held_runner" "$held_host" "$held_until" >"$file"
+      fi
+      # steal-after-recipe: the recipe has exited (not running, or only awaiting its parent's wait).
+      if [[ -f "$FAKE_FORGE/steal-pending-$sha" && "$held_runner" == "$runner" ]]; then
+        read -r steal_pid <"$FAKE_FORGE/steal-pending-$sha"
+        steal_state=$(ps -o stat= -p "$steal_pid" 2>/dev/null || true)
+        if [[ -z "${steal_state// }" || "$steal_state" == Z* ]]; then
+          rm -f -- "$FAKE_FORGE/steal-pending-$sha"
+          held_runner=gate-b/slot0 held_host=gate-b held_until=$((now + 3600))
+          printf '%s %s %s\n' "$held_runner" "$held_host" "$held_until" >"$file"
+        fi
       fi
       if [[ "$held_runner" != "$runner" ]] && ((held_until > now)); then
         printf '%s\n' "$repo $sha $runner" >>"$FAKE_FORGE/claims-refused.log"

@@ -136,7 +136,9 @@ gate_claim_stop_worker() {
       and .owner==$owner and .repo==$repo and .sha==$sha' "$receipt" >/dev/null 2>&1 || return 0
   read -r parent group < <(ps -o ppid=,pgid= -p "$worker") || return 0
   [[ "$parent" == "$$" && "$group" == "$worker" ]] || return 0
-  kill -TERM -- "-$worker" 2>/dev/null || true
+  # Evidence that the loss, not the recipe, ended the worker: the runner abandons an attempt only
+  # when this stop reached a live group, and keeps a verdict the recipe completed on its own.
+  if kill -TERM -- "-$worker" 2>/dev/null; then : >"$GATE_CLAIM_STATE/worker-stopped"; fi
 }
 # gate_claim_mark_lost KIND WHY -- record that this slot no longer holds the lease. KIND is the
 # ownership this answer proves, as its own state and not as text inside WHY: `refused` (the forge

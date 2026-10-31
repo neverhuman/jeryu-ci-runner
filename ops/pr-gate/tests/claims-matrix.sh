@@ -141,7 +141,7 @@ grep -qE 'publication lease renewal refused|publication lease was lost' "$fixtur
 receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
 jq -e '.terminal and .outcome=="success" and .recovery_required!=null and (.publication.required_status|not)' "$receipt" >/dev/null \
   || fail_claims 'the finished verdict was not retained'
-rm -f "$fixture/steal-after-recipe"
+rm -f "$fixture/steal-after-recipe" "$fixture/steal-pending-$head"
 invoke
 expect_count "$((claims_count + 4))"
 [[ "$(non_pending)" == "$results" ]] || fail_claims 'recovery published while another host held the lease'
@@ -232,10 +232,12 @@ printf '30\n' >"$fixture/claim-ttl"
 printf '25\n' >"$fixture/recipe-sleep"
 touch "$fixture/steal-on-renew"
 results=$(non_pending)
-started=$(date +%s)
+rm -f "$fixture/recipe-slept"
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || fail_claims 'a lease lost mid-recipe failed the runner'
-(( $(date +%s) - started < 24 )) || fail_claims 'the recipe ran on after its lease was lost'
+# The recipe marks the end of its sleep; a stopped recipe never reaches it, however long the host's
+# preparation took.
+[[ ! -e "$fixture/recipe-slept" ]] || fail_claims 'the recipe ran on after its lease was lost'
 [[ "$(non_pending)" == "$results" ]] || fail_claims 'a result was published after the lease was lost mid-recipe'
 grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'the mid-recipe loss was not reported'
 grep -qE 'renewal answered|publication renewal refused' "$fixture/runner/cache/gate-claim-slot0/lost" \
@@ -278,5 +280,5 @@ jq -e '.outcome=="success" and .recovery_required!=null and (.publication.requir
   "$fixture/runner/attempts/acme-fixture-$first/last-result.json" >/dev/null
 jq -se --arg sha "$first" '[.[] | select(.sha==$sha and .state!="pending")] | length==0' "$fixture/statuses.jsonl" >/dev/null
 jq -se --arg sha "$second" 'any(.[]; .sha==$sha and .state=="success")' "$fixture/statuses.jsonl" >/dev/null
-rm -f "$fixture/head2" "$fixture/steal-after-recipe"
+rm -f "$fixture/head2" "$fixture/steal-after-recipe" "$fixture/steal-pending-$first"
 printf 'PASS publication handover retains the first verdict and gates the remaining candidate\n'

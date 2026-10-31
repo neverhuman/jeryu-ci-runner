@@ -2161,10 +2161,12 @@ if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" "$log" \
     gate_update --slurpfile after "$after_inputs" '.after_inputs=$after[0]'
   fi
 fi
-# A definitive background loss stopped this worker; its interrupted execution
-# cannot be recovered as a completed verdict. Transient renewal outages are handled
-# at the publication boundary instead, retaining a genuinely completed recipe.
-if claim_lost_why=$(gate_claim_lost); then
+# A definitive background loss that stopped this worker interrupted its execution, which cannot be
+# recovered as a completed verdict. A loss that landed after the recipe finished on its own (it
+# exited 0 or never received the stop) leaves a real verdict: it is saved below and publication,
+# which refuses without the lease, retains it for recovery. Transient renewal outages are handled
+# at the publication boundary too.
+if claim_lost_why=$(gate_claim_lost) && [[ -f "$GATE_CLAIM_STATE/worker-stopped" ]] && ((worker_exit != 0)); then
   ((build_cache == 0)) || rm -rf -- "$run/$repo/target/build-cache"
   gate_claim_abandon "$claim_lost_why"
   break
