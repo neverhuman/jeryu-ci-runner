@@ -2578,6 +2578,7 @@ invoke --repo acme/fixture --pr 1
 expect_count "$((claims_count + 4))"
 [[ "$(non_pending)" == "$results" ]] || fail_claims 'a result was published without the lease'
 grep -qE 'publication lease renewal refused|publication lease was lost' "$fixture/runner.log" || fail_claims 'the refusal was not reported'
+! grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'a finished verdict was abandoned instead of retained'
 receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
 jq -e '.terminal and .outcome=="success" and .recovery_required!=null and (.publication.required_status|not)' "$receipt" >/dev/null \
   || fail_claims 'the finished verdict was not retained'

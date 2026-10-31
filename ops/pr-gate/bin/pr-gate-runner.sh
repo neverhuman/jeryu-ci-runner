@@ -2163,11 +2163,11 @@ elif ((build_cache)); then
   rm -rf -- "$run/$repo/target/build-cache"
 fi
 # The upload above can outlast the lease: confirm it once more before the final status.
+# A loss seen here is recorded in the lost marker, and the finished verdict is already saved: it is
+# not abandoned, since the recipe completed and its real receipt must survive. gate_publish writes
+# nothing without the lease (gate_claim_authorize_path refuses on the marker) and retains the result
+# with recovery_required, so recovery publishes it only under a fresh lease and never restores a green.
 gate_claim_recheck
-if claim_lost_why=$(gate_claim_lost); then
-  gate_claim_abandon "$claim_lost_why"
-  break
-fi
 gate_publish || die "terminal $state saved; publication recovery required in $gate_receipt"
 # Published. The head is given back once this host is done with it: a passing fast tier keeps the
 # lease for the full tier that follows, so no other host can start on the head in between.
