@@ -98,7 +98,10 @@ protected=true api_tip="$tip" api_code=200 api_shape=normal
 mkdir "$t/capped"
 prerequisite_evidence "$t/repo" acme/tool 36 "$base" "$head" "$t/capped" 10
 grep -q 'effective.patch: 3 bytes; truncated=true; git_error=false' "$t/capped/prerequisites/SUMMARY.txt"
-[[ "$(cat "$t/capped/prerequisites/"*.patch "$t/capped/prerequisites/accepted-commits.txt" | wc -c)" -le 10 ]]
+capped_total="$(cat "$t/capped/prerequisites/"*.patch "$t/capped/prerequisites/accepted-commits.txt" | wc -c)"
+[[ "$capped_total" -le 10 ]]
+# The charge is exactly the bytes the successful views hold, not merely positive or under the cap.
+[[ "$prerequisite_spent" -eq "$capped_total" ]]
 # A Git failure is reported as an error, not as truncation, and spends nothing of the allowance.
 mkdir "$t/giterr"
 g update-ref refs/pr/36/base "$tip"
@@ -109,9 +112,20 @@ chmod +x "$t/shim/git"
 PATH="$t/shim:$PATH" prerequisite_evidence "$t/repo" acme/tool 36 "$base" "$head" "$t/giterr" 100000
 grep -q 'main-only.patch: git_error=true' "$t/giterr/prerequisites/SUMMARY.txt"
 grep -q 'effective.patch: .*truncated=false; git_error=false' "$t/giterr/prerequisites/SUMMARY.txt"
-[[ ! -s "$t/giterr/prerequisites/main-only.patch" ]]
+[[ ! -e "$t/giterr/prerequisites/main-only.patch" ]]
 if grep -q 'main-only.patch.*truncated' "$t/giterr/prerequisites/SUMMARY.txt"; then exit 1; fi
+# Only the successful views are charged: exactly the bytes of the two files that exist.
+[[ "$prerequisite_spent" -eq "$(cat "$t/giterr/prerequisites/effective.patch" "$t/giterr/prerequisites/accepted-commits.txt" | wc -c)" ]]
 [[ "$prerequisite_spent" -gt 0 ]]
-# The supplement is bounded by the allowance it is given, summed across views.
-[[ "$(cat "$t/capped/prerequisites/"*.patch "$t/capped/prerequisites/accepted-commits.txt" | wc -c)" -le 10 ]]
+# A failed effective diff discards the packet and says so instead of leaving an empty view.
+mkdir "$t/efferr"
+printf '#!/bin/sh\ncase "$*" in *"diff %s...%s"*) exit 128 ;; esac\nexec "%s" "$@"\n' "$tip" "$head" "$real_git" >"$t/shim/git"
+PATH="$t/shim:$PATH" prerequisite_evidence "$t/repo" acme/tool 36 "$base" "$head" "$t/efferr" 100000
+[[ ! -e "$t/efferr/prerequisites" ]]
+grep -q 'git_error' "$t/efferr/prerequisite-status.txt"
+[[ "$prerequisite_spent" -eq 0 ]]
+# The statuses survive inherit_errexit and POSIX mode.
+mkdir "$t/inherit"
+( shopt -s inherit_errexit; set -e; prerequisite_evidence "$t/repo" acme/tool 36 "$base" "$head" "$t/inherit" 10 )
+grep -q 'effective.patch: 3 bytes; truncated=true; git_error=false' "$t/inherit/prerequisites/SUMMARY.txt"
 echo 'ok stacked retained-base packet preserves complete diff, proves protected-main boundary, and discloses effective diff and limits'

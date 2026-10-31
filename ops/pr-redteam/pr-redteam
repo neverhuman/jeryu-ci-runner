@@ -481,7 +481,7 @@ read_pathspecs=(. ':(exclude,glob)**/*.lock' ':(exclude,glob)**/package-lock.jso
 # Presence on main is acceptance, never evidence of an approval on this PR's head.
 prerequisite_evidence() { # cache repo number retained-base head review-dir allowance
   local g="$1" repo="$2" number="$3" retained="$4" head="$5" d="$6" allowance="$7"
-  local tip boundary original refs cut bytes reason row
+  local tip boundary original refs reason row
   local out="$d/prerequisites" status="$d/prerequisite-status.txt"
   # Keep diagnostics outside prerequisites/: that directory promises a proven boundary.
   tip="$(git -C "$g" rev-parse --verify "refs/pr/$number/base" 2>/dev/null)" || {
@@ -532,23 +532,32 @@ prerequisite_evidence() { # cache repo number retained-base head review-dir allo
   local log_budget=$((allowance / 4)) patch_budget=$((allowance * 3 / 8))
   [ "$log_budget" -le 16384 ] || log_budget=16384
   prerequisite_spent=0
-  prerequisite_view "$out" accepted-commits.txt "$log_budget" git -C "$g" log --format='%H %s' "$original..$boundary"
-  prerequisite_view "$out" effective.patch "$patch_budget" git -C "$g" diff "$tip...$head" -- "${read_pathspecs[@]}"
-  prerequisite_view "$out" main-only.patch "$patch_budget" git -C "$g" diff "$head...$tip" -- "${read_pathspecs[@]}"
+  prerequisite_view "$out" accepted-commits.txt "$log_budget" git -C "$g" log --format='%H %s' "$original..$boundary" || :
+  if ! prerequisite_view "$out" effective.patch "$patch_budget" git -C "$g" diff "$tip...$head" -- "${read_pathspecs[@]}"; then
+    # Without the effective diff the packet's header would describe evidence that is not there.
+    rm -rf "$out"
+    prerequisite_spent=0
+    echo 'Prerequisite evidence unavailable: git failed reading the effective diff (git_error); review complete diff.patch.' >"$status"
+    return 0
+  fi
+  prerequisite_view "$out" main-only.patch "$patch_budget" git -C "$g" diff "$head...$tip" -- "${read_pathspecs[@]}" || :
 }
 
 # One supplemental view, at most `limit` bytes, noted in SUMMARY.txt. A Git failure is reported as
-# git_error and never as truncation: only the reader cutting a view short is truncation.
+# git_error and never as truncation: only the reader cutting a view short is truncation. A failed
+# view is removed, never left behind as an empty file, and the function returns 1.
 prerequisite_view() { # out-dir name limit git-command...
   local out="$1" name="$2" limit="$3" bytes gst cst cut=false
   shift 3
-  { read -r bytes; read -r gst cst; } <<<"$("$@" | upstream_capped "$out/$name" "$limit"; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}")"
+  # The subshell turns errexit off itself, so the statuses are captured whatever the caller's shell
+  # options (inherit_errexit, POSIX mode) are.
+  { read -r bytes; read -r gst cst; } <<<"$(set +e; "$@" | upstream_capped "$out/$name" "$limit"; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}")"
   [ "$cst" = 0 ] || cut=true
   # A cut makes the reader leave early, so git may end on SIGPIPE (141); that is not a failure.
   if [ "$gst" != 0 ] && { [ "$gst" != 141 ] || [ "$cut" = false ]; }; then
-    : >"$out/$name"
-    echo "$name: git_error=true (git exited $gst); no evidence was read" >>"$out/SUMMARY.txt"
-    return 0
+    rm -f "$out/$name"
+    echo "$name: git_error=true (git exited $gst); view removed, no evidence was read" >>"$out/SUMMARY.txt"
+    return 1
   fi
   prerequisite_spent=$((prerequisite_spent + bytes))
   echo "$name: $bytes bytes; truncated=$cut; git_error=false" >>"$out/SUMMARY.txt"
@@ -2964,6 +2973,8 @@ review_one() { # owner/name number dry-run force include-drafts
     prerequisite_spent=0
     prerequisite_evidence "$cache" "$repo" "$number" "$base_sha" "$sha" "$d" "$pre_room"
     pre_spent="$prerequisite_spent"
+  elif [ "$base_ref" = main ]; then
+    echo 'Prerequisite evidence omitted: the diff, pin evidence and governed reserve leave no room in the shared reading limit; a boundary may exist. Review complete diff.patch.' >"$d/prerequisite-status.txt"
   fi
   review_check_diff "$repo" "$number" "$sha" "$files_count" "$diff_bytes" "$me" "$check_publish"
   if [ "$diff_bytes" -gt "$max_diff_bytes" ]; then
