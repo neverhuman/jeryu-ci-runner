@@ -140,7 +140,8 @@ gate_claim_renew_loop() {
       say "renewing the gate claim on $GATE_CLAIM_SHA answered $code; retrying"
       continue
     fi
-    gate_claim_mark_lost "renewal answered $code, $((now - last_ok))s after the last renewal"
+    if ((rc == 1)) && [[ "$code" == 409 ]]; then gate_claim_mark_lost "refused: renewal answered $code"
+    else gate_claim_mark_lost "unproven: renewal answered $code, $((now - last_ok))s after the last renewal"; fi
     break
   done
 }
@@ -166,15 +167,37 @@ gate_claim_lost() {
   [[ -f "$GATE_CLAIM_STATE/lost" ]] || return 1
   cat "$GATE_CLAIM_STATE/lost"
 }
-# gate_claim_abandon WHY -- the attempt this slot ran without its lease ends here: terminal, nothing
-# published and nothing owed (another host holds the head and posts its result), and the next tick
-# gates the head again if it is still this host's to gate.
+# gate_claim_recheck -- ask the forge once more whether this slot still holds the lease, and record a
+# definitive answer in the lost marker. Used after long work (a cache upload) that follows the last
+# check and precedes the final status; an outage (5xx, 000, 429) records nothing, because publication
+# itself retains the verdict for recovery.
+gate_claim_recheck() {
+  local rc=0
+  ((GATE_CLAIM_HELD)) && [[ ! -f "$GATE_CLAIM_STATE/lost" ]] || return 0
+  gate_claim_renew || rc=$?
+  if ((rc == 1)); then
+    if [[ "$code" == 409 ]]; then gate_claim_mark_lost "refused: recheck answered $code"
+    else gate_claim_mark_lost "unproven: recheck answered $code"; fi
+  fi
+  return 0
+}
+# gate_claim_abandon WHY -- the attempt this slot ran without its lease ends here, with nothing
+# published. A refusal proves another host holds the head: that host posts its result, nothing is owed
+# here, and the next tick gates the head again if it is still this host's to gate. Any other loss
+# (an outage past the TTL, an unexpected answer) proves no other owner, so the receipt stays owed for
+# recovery, which publishes it only under a lease, and never discards a real verdict.
 gate_claim_abandon() {
   local owner=${owner:?} repo=${repo:?} sha=${sha:?} gate_key_dir=${gate_key_dir:?}
   say "$owner/$repo@$sha: gate claim lost ($1); abandoning attempt $(jq -r '.id' "$gate_receipt") without publishing"
-  gate_update --arg why "gate claim lost: $1" --arg at "$(date -u +%FT%TZ)" \
-    'if .terminal then . else .terminal=true | .outcome="claim_lost" | .finished_at=$at end
-     | .publication.superseded_by=$why | .recovery_required=null' || return
+  if [[ "$1" == refused:* ]]; then
+    gate_update --arg why "gate claim lost: $1" --arg at "$(date -u +%FT%TZ)" \
+      'if .terminal then . else .terminal=true | .outcome="claim_lost" | .finished_at=$at end
+       | .publication.superseded_by=$why | .recovery_required=null' || return
+  else
+    gate_update --arg why "gate claim ownership unknown: $1" --arg at "$(date -u +%FT%TZ)" \
+      'if .terminal then . else .terminal=true | .outcome="claim_lost" | .finished_at=$at end
+       | .recovery_required=$why' || return
+  fi
   cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json"
   gate_receipt=""
   GATE_CLAIM_HELD=0
@@ -226,7 +249,8 @@ gate_claim_authorize_path() { # method path payload
     # Nothing is published while authority is uncertain. gate_publish retains recovery_required.
     code=503 body='publication lease renewal unavailable; retain result for recovery'
   else
-    gate_claim_mark_lost "publication renewal refused (HTTP $code)"
+    if [[ "$code" == 409 ]]; then gate_claim_mark_lost "refused: publication renewal answered $code"
+    else gate_claim_mark_lost "unproven: publication renewal answered $code"; fi
     code=lease_unavailable body='publication lease renewal refused'
   fi
   say "$target_owner/$target_repo@$target_sha: $body; posting nothing"

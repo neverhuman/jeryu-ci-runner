@@ -2162,6 +2162,12 @@ elif ((build_cache)); then
   fi
   rm -rf -- "$run/$repo/target/build-cache"
 fi
+# The upload above can outlast the lease: confirm it once more before the final status.
+gate_claim_recheck
+if claim_lost_why=$(gate_claim_lost); then
+  gate_claim_abandon "$claim_lost_why"
+  break
+fi
 gate_publish || die "terminal $state saved; publication recovery required in $gate_receipt"
 # Published. The head is given back once this host is done with it: a passing fast tier keeps the
 # lease for the full tier that follows, so no other host can start on the head in between.

@@ -189,5 +189,35 @@ for qref in refs/heads/main refs/heads/release refs/queue/main/12; do
   jq -se --arg field "$field" 'all(.[]; has($field))' "$scratch/grants" >/dev/null
 done
 printf 'PASS branch/health and queue claims use the correct head field\n'
+# A loss that proves no other owner keeps a real verdict owed; a refusal hands the head over.
+reset_claim granted
+gate_begin "$identity"; gate_finish failure 1 ''
+receipt=$gate_receipt
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+printf 'unproven: renewal answered 503, 200s after the last renewal\n' >"$GATE_CLAIM_STATE/lost"
+gate_claim_abandon "$(gate_claim_lost)"
+jq -e '.outcome=="failure" and .publication.superseded_by==null and (.recovery_required|test("ownership unknown"))' \
+  "$receipt" >/dev/null
+no_writes
+printf 'PASS an unproven loss keeps the real failed receipt owed for recovery\n'
+reset_claim granted
+gate_begin "$identity"; gate_finish failure 1 ''
+receipt=$gate_receipt
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+printf 'refused: renewal answered 409\n' >"$GATE_CLAIM_STATE/lost"
+gate_claim_abandon "$(gate_claim_lost)"
+jq -e '.outcome=="failure" and .publication.superseded_by!=null and .recovery_required==null' "$receipt" >/dev/null
+no_writes
+printf 'PASS a refused renewal records the other holder, owing nothing\n'
+# After a long cache upload the lease is asked again: a refusal is recorded, an outage is not.
+reset_claim granted
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+printf 'outage\n' >"$scratch/mode"
+gate_claim_recheck
+[[ ! -f "$GATE_CLAIM_STATE/lost" ]]
+printf 'denied\n' >"$scratch/mode"
+gate_claim_recheck
+grep -q '^refused: ' "$GATE_CLAIM_STATE/lost"
+printf 'PASS the post-upload recheck records a refusal and tolerates an outage\n'
 gate_claim_release
 gate_receipt=''
