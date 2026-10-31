@@ -2,6 +2,19 @@
 # Guards shared by the proof lane and its offline regression tests
 # (ops/ci/tests/test-proof-guards.sh).
 
+# origin must be the hosted source repository before anything is fetched from
+# it. Both callers -- the proof lane and the baseline the recipe resolves before
+# any lane runs (ops/ci/pr-ci.sh) -- check it here, so neither can be made to
+# fetch protected main from a remote somebody else pointed this checkout at.
+proof_require_hosted_origin() {
+  local url
+  url="$(git remote get-url origin)" || return 1
+  [[ "$url" == 'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' ]] || {
+    printf 'proof origin is not the hosted source repository\n' >&2
+    return 1
+  }
+}
+
 # Give this checkout the history the lane's ancestry check and its
 # `git diff origin/main...HEAD` need, then refresh protected main.
 #
@@ -12,8 +25,8 @@
 # branch among them. A checkout still shallow after that (a head the forge does
 # not serve) is refused rather than asked a question it cannot answer.
 #
-# The caller checks that `origin` is the hosted source repository first: this
-# is the lane's only network operation against it.
+# The caller checks that `origin` is the hosted source repository first
+# (proof_require_hosted_origin): this is the only network operation against it.
 proof_require_history() {
   local shallow
   shallow="$(git rev-parse --is-shallow-repository)" || return 1

@@ -20,6 +20,15 @@ source ops/ci/required-lane.sh
 # shellcheck source=ops/ci/proof_guards.sh
 source ops/ci/proof_guards.sh
 require_jankurai
+# A retry baseline answers for protected main's tip, and the gate runner admitted that tip some time
+# before this recipe started. Refresh protected main here, before the baseline is resolved, so a main
+# that has landed another commit since ends this recipe in seconds: the proof lane's own refresh
+# would otherwise find the same movement only after every lane had run. An ordinary gate does not
+# fetch here -- it judges against the protected main its runner put in this checkout.
+if [[ -n "${JERYU_JANKURAI_BASE_REF:-}" && "${JERYU_JANKURAI_BASE_REF}" != origin/main ]]; then
+  proof_require_hosted_origin
+  proof_require_history
+fi
 # The baseline every base-relative lane of this recipe judges against, validated once, before any
 # lane runs: protected origin/main, or, for the supported retry of main's own tip, origin/main~1 or
 # the verified ancestor commit the gate runner resolved (see

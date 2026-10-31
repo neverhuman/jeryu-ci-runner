@@ -19,11 +19,7 @@ if [[ ! -f "${candidate_policy}" || -L "${candidate_policy}" ||
 fi
 
 # origin must be the hosted source repository before anything is fetched from it.
-if [[ "$(git remote get-url origin)" != \
-      'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' ]]; then
-  printf 'proof origin is not the hosted source repository\n' >&2
-  exit 1
-fi
+proof_require_hosted_origin
 proof_require_history
 BASE_REF="$(proof_base_ref)"
 base_commit="$(git rev-parse --verify "${BASE_REF}^{commit}")" || {

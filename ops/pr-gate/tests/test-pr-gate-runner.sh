@@ -175,6 +175,19 @@ if [[ -n "${ACME_PROOF_BASE_REF+set}" ]]; then
 else
   printf 'unset\n' >>"$fixture_root/proof-base.log"
 fi
+# A protected-main retry's tip stops being the tip while its recipe runs: another commit lands on
+# main. The real recipe refuses the baseline it was handed as soon as it refreshes protected main,
+# so land the commit and refuse, after recording the baseline this run was given.
+if [[ -f "$fixture_root/land-on-main-during-recipe" ]]; then
+  rm -f "$fixture_root/land-on-main-during-recipe"
+  "$worker_git" -C "$fixture_root/source" checkout -q main
+  printf 'landed during the retry\n' >"$fixture_root/source/landed-during-retry"
+  "$worker_git" -C "$fixture_root/source" add landed-during-retry
+  "$worker_git" -C "$fixture_root/source" commit -qm landed-during-retry
+  "$worker_git" -C "$fixture_root/source" push -q "$fixture_root/source.git" main
+  printf 'recipe: protected main moved while this retry ran\n' >&2
+  exit 41
+fi
 if [[ -f "$fixture_root/mutate-tool" ]]; then
   printf 'changed during recipe\n' >>"$fixture_root/tools/environment-probe"
 fi
@@ -2720,6 +2733,68 @@ expect_count "$((before_count + 1))"
 read -r _ surface_base surface_count < <(tail -n 1 "$fixture/changed-surface.log")
 [[ "$surface_base" == "$chained_ancestor" && "$surface_count" == 1 ]] \
   || fail_pb "the chained retry judged more than the commit that landed (base $surface_base, $surface_count paths)"
+before_count=$(count)
+# Main lands another commit while the retry's recipe runs. The retry no longer answers for the tip,
+# so nothing is published about it: its attempt is discharged as superseded, and the next tick gates
+# the new tip from the same proved ancestor, which puts both commits in one change set.
+discharged_ancestor=$mainsha
+printf 'retry me\n' >"$fixture/source/retry-me"
+"$real_git" -C "$fixture/source" add retry-me
+"$real_git" -C "$fixture/source" commit -qm retry-me
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+mainsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+refs_json main release/v1
+jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" \
+  '{sha:$s,context:"fixture/required",state:"error",description:($m + " inputs_changed"),created_at:0,updated_at:0}' \
+  >>"$fixture/statuses.jsonl"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+: >"$fixture/land-on-main-during-recipe"
+PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \
+  invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || fail_pb 'a retry whose main moved mid-run failed the tick'
+[[ ! -f "$fixture/land-on-main-during-recipe" ]] || fail_pb 'the mid-run landing was not exercised'
+expect_count "$((before_count + 1))"
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "$discharged_ancestor $discharged_ancestor" ]] \
+  || fail_pb 'the discharged retry was not proved from the ancestor this runner had proved'
+landed_during=$("$real_git" -C "$fixture/source.git" rev-parse refs/heads/main)
+[[ "$landed_during" != "$mainsha" ]] || fail_pb 'main did not move during the recipe'
+# The only row the discharged run left is the `pending` it posted when it started: no verdict was
+# published for the commit, and that pending is on a commit that is no longer main's tip.
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$((before_statuses + 1))" ]] \
+  || fail_pb 'a retry whose main moved mid-run published a verdict'
+last_status "$mainsha" | jq -e '.state == "pending"' >/dev/null \
+  || fail_pb 'the discharged retry left a verdict on its tip'
+grep -q "discharging the acme/fixture main retry of $mainsha (failure): main moved to ${landed_during:0:12} while it ran" \
+  "$fixture/runner.log" || fail_pb 'the superseded main retry was not reported as discharged'
+jq -e --arg m "$landed_during" --arg s "$mainsha" '.terminal and .outcome == "failure" and .exit_code == 41
+  and .publication.required_status == false and .publication.check_run == false
+  and .recovery_required == null
+  and .publication.superseded_by == ("protected main moved to " + $m + " while its retry of " + $s + " ran")' \
+  "$fixture/runner/attempts/acme-fixture-$mainsha/last-result.json" >/dev/null \
+  || fail_pb 'the discharged retry does not record what superseded it'
+# The next tick gates the new tip: its baseline search walks past the commit nothing published a
+# success for, down to the same proved ancestor, so both commits are judged together.
+before_count=$(count)
+mainsha=$landed_during
+refs_json main release/v1
+jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" \
+  '{sha:$s,context:"fixture/required",state:"error",description:($m + " inputs_changed"),created_at:0,updated_at:0}' \
+  >>"$fixture/statuses.jsonl"
+PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \
+  invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || fail_pb 'the tick after a discharged retry failed'
+expect_count "$((before_count + 1))"
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "$discharged_ancestor $discharged_ancestor" ]] \
+  || fail_pb 'the tick after a discharged retry did not bind the proved ancestor'
+read -r _ surface_base surface_count < <(tail -n 1 "$fixture/changed-surface.log")
+[[ "$surface_base" == "$discharged_ancestor" && "$surface_count" == 2 ]] \
+  || fail_pb "the discharged commit is not in the next tick's change set (base $surface_base, $surface_count paths)"
+last_status "$mainsha" | jq -e --arg p "${discharged_ancestor:0:12}" '.state == "success"
+  and (.description | test("; proof base origin/main at its proved ancestor \\(" + $p + "\\)"))' >/dev/null \
+  || fail_pb 'the tick after a discharged retry did not publish a success for the new tip'
+# main is back to a tip the gate proved, so the cases below start from proved history again.
+"$real_git" -C "$fixture/source" checkout -q main
+"$real_git" -C "$fixture/source" reset -q --hard "$mainsha"
 before_count=$(count)
 # A main whose whole first-parent history is unproved: the walk reaches the root commit and refuses
 # rather than binding something nothing proved. (Its tip is not a root commit itself, which is the

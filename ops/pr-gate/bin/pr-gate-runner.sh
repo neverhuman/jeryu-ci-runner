@@ -1225,6 +1225,9 @@ fi
 # (the tip's first parent, bound once the tree has it). main's sha is read from the mirror refreshed in
 # step 3, so it is bound below, after that refresh.
 GATE_PROOF_BASE="" pb_var="" pb_branch="" pb_sha="" pb_note="" proof_base=0 proof_base_env=()
+# Set once a protected-main retry has bound its verified baseline: that mode, and only it, re-reads
+# main before publishing (see the discharge below).
+main_retry=0
 if ((main_health == 0)); then
   owner_proof_base_var "$owner"
   main_proof_base_var "$owner" "$only_branch"
@@ -1605,6 +1608,7 @@ if ((proof_base)); then
         continue
       fi
       pb_sha=$baseline_sha
+      main_retry=1
       # The recipe is handed that exact commit, not a relative ref it would resolve again in its own
       # tree: the receipt, the status description and every lane of the run name one immutable
       # baseline. A main-bound pull request gated at the same commit (base: main's tip) stays a
@@ -2310,6 +2314,7 @@ if ! gate_publish; then
   ran_tier=0
   break
 fi
+
 # Published. The head is given back once this host is done with it: a passing fast tier keeps the
 # lease for the full tier that follows, so no other host can start on the head in between.
 if [[ "$tier" == "${tiers[-1]}" || "$state" != success ]]; then

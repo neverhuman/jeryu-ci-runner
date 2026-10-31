@@ -1042,6 +1042,18 @@ gate_publication_fault() {
   fi
 }
 
+# A terminal attempt whose precondition stopped holding while it ran is discharged, not published:
+# WHY is recorded on the receipt as what superseded it, and both gate_recover and gate_decision_local
+# skip a superseded receipt, so nothing is posted for this attempt and the head is gated again
+# instead. The attempt directory keeps its log. The caller must have finished the attempt first, so
+# the evidence says what the recipe actually did.
+gate_supersede() { # why
+  : "${gate_key_dir:?}" "${gate_receipt:?}"
+  jq -e '.terminal' "$gate_receipt" >/dev/null || return 1
+  gate_update --arg why "$1" '.publication.superseded_by=$why | .recovery_required=null' || return 1
+  cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json"
+}
+
 # Receipt types: publication.http_status is the number 201 once the forge acknowledged the required
 # status, and a string otherwise (the curl code, or "unacknowledged" when nothing was assigned), so
 # a failure like "000" keeps its leading zeros. publication.fault names the failure class.

@@ -398,12 +398,20 @@ gates the current tip of `<name>`:
   receipt, the status description and every lane of the run name one immutable baseline. The search
   is bounded by `PR_GATE_MAIN_RETRY_BASELINE_DEPTH` commits (default 25), one forge read per step,
   and the retry is **refused** -- nothing published, the tip left as it was -- when it finds no such
-  ancestor, reaches a root commit, or the forge will not answer. Jeryu's recipe re-checks the sha it
-  is handed after refreshing protected main,
-  refusing a moved tip so the proof cannot silently take its empty-change-set pass. Main's tip is not re-bound from the shared
+  ancestor, reaches a root commit, or the forge will not answer. Jeryu's recipe refreshes protected main and
+  re-checks the sha it is handed before any lane runs, refusing a moved tip so the proof cannot
+  silently take its empty-change-set pass -- and refusing it in seconds rather than after a whole
+  run. Main's tip is not re-bound from the shared
   mirror in this mode: the base is the tip observed and admitted, and a main that moved under the run
-  before execution leaves the head for the next tick with nothing posted. If Jeryu
-  observes movement in its final proof refresh, the recipe fails and publishes failure. The owner still needs a declared recipe
+  before execution leaves the head for the next tick with nothing posted. Main that lands another
+  commit *while* the recipe runs is not a verdict on this commit either: the runner re-reads
+  protected main before publishing, and when it moved the attempt is discharged as superseded --
+  nothing is posted, nothing is owed, and the attempt keeps its log. The next tick gates the new
+  tip, whose baseline search walks past this unproved commit to the same proved ancestor, so every
+  commit of both landings is judged together. (The discharged tip keeps the `pending` the run
+  posted; it is no longer main's tip, which is where main's health is read from.) A forge that will
+  not answer that re-read is not a reason to discard a finished verdict, which is published as
+  usual. The owner still needs a declared recipe
   variable, but it may come from `PR_GATE_MAIN_PROOF_BASE_VARS` (below) instead of
   `PR_GATE_PROOF_BASE_VARS`. The published context is the ordinary `<repo>/required`;
   `<repo>/main-health` stays the separate diagnostic context it is, and `--main-health` is unchanged;

@@ -104,6 +104,17 @@ for refused in origin/release/v1 main HEAD HEAD~1 "$fork" origin/main~2 origin/m
     fail "proof base $refused was accepted as $out"
   fi
 done
+# Nothing is fetched from an origin that is not the hosted source repository: the retry baseline is
+# resolved against protected main as the forge serves it, so the remote it comes from is checked
+# first. Both the proof lane and the recipe's own resolution go through this one check.
+if (cd "$fixture/retry" && proof_require_hosted_origin) 2>/dev/null; then
+  fail 'a file:// origin passed as the hosted source repository'
+fi
+git -C "$fixture/retry" remote set-url origin \
+  'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git'
+(cd "$fixture/retry" && proof_require_hosted_origin) ||
+  fail 'the hosted source repository was refused as the proof origin'
+git -C "$fixture/retry" remote set-url origin "file://$fixture/forge.git"
 printf 'proof base ref guard ok\n'
 
 # --- change set: from the fork point, never refused for being empty ----------
@@ -556,7 +567,7 @@ line_of() {
   [[ -n "$n" ]] || fail "$2 does not contain: $1"
   printf '%s\n' "$n"
 }
-(( $(line_of 'git remote get-url origin' "$lane") < $(line_of '^proof_require_history$' "$lane") )) ||
+(( $(line_of '^proof_require_hosted_origin$' "$lane") < $(line_of '^proof_require_history$' "$lane") )) ||
   fail 'the lane fetches from origin before checking it is the hosted repository'
 (( $(line_of '^proof_require_history$' "$lane") < $(line_of 'proof_fork_point' "$lane") )) ||
   fail 'ancestry is asked before the checkout has its history'
@@ -583,6 +594,12 @@ grep -q '^command = "bash ops/ci/proof_evidence.sh"$' agent/proof-lanes.toml ||
   fail 'the catalog does not name the command the gate runs'
 (( $(line_of '^proof_require_history$' "$lane") < $(line_of 'BASE_REF="$(proof_base_ref)"' "$lane") )) ||
   fail 'the main retry baseline was selected before protected history was refreshed'
+# The recipe resolves the baseline before any lane runs, so it must refresh protected main there
+# too: only the proof lane used to, which is after a full run has been spent.
+(( $(line_of '^  proof_require_hosted_origin$' "$pr_ci") < $(line_of '^  proof_require_history$' "$pr_ci") )) ||
+  fail 'pr-ci.sh fetches from origin before checking it is the hosted repository'
+(( $(line_of '^  proof_require_history$' "$pr_ci") < $(line_of '^JERYU_CI_PROOF_BASE=' "$pr_ci") )) ||
+  fail 'pr-ci.sh resolves a retry baseline before refreshing protected main'
 printf 'proof lane wiring ok\n'
 
 # --- security lane failure evidence survives cleanup of target/ ---------------
