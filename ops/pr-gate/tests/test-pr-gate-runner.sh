@@ -2149,8 +2149,6 @@ invoke --branch release/v1 --main-health
 [[ "$runner_exit" == 2 ]] || fail_pb '--branch with --main-health was accepted'
 expect_count "$((before_count + 2))"
 unset PR_GATE_PROOF_BASE_VARS
-printf 'PASS --branch: a protected tip is proved against the branch before it, posted as <repo>/required, held, never re-proved over, never held on input drift, and refused when it may not be\n'
-
 # --branch main: the retry after a merged pull request's revalidation returned inputs_changed. It is
 # the ordinary branch-tip gate, with main's own prior tip as the base: the commit that moved main is
 # judged against the main it landed on, never against itself. The status is the ordinary publication
@@ -2296,3 +2294,5 @@ refs_json main release/v1
 expect_count "$((before_count + 2))"
 unset PR_GATE_MAIN_PROOF_BASE_VARS
 printf 'PASS --branch main: retried after a latest error with the strict baseline and nothing a caller controls, never over a success, a merged or closed PR, a moved tip or a non-main branch\n'
+
+printf 'PASS --branch: a protected tip is proved against the branch before it, posted as <repo>/required, held, never re-proved over, never held on input drift, and refused when it may not be\n'
