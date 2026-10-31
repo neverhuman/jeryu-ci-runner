@@ -192,13 +192,24 @@ for word in ${PR_GATE_PROOF_BASE_VARS:-} ${MAIN_PROOF_BASE_VARS:-}; do
   done
 done
 set +f
-# Lockfile sources, besides crates.io, that the locked-crate prefetch may fetch online: URL prefixes
-# as they appear in Cargo.lock (e.g. "git+https://forge.example.test/"). Empty: crates.io only.
+# Lockfile sources, besides crates.io and each gated owner's own path on the governed forge, that the
+# locked-crate prefetch may fetch online: URL prefixes as they appear in Cargo.lock (e.g. a family's
+# declared publishing mirror, "git+https://mirror.example.test/acme/").
 LOCK_SOURCES="${PR_GATE_LOCK_SOURCES:-}"
-LOCK_SOURCES_ERE='registry\+https://github\.com/rust-lang/crates\.io-index|sparse\+https://index\.crates\.io/'
-for prefix in $LOCK_SOURCES; do
-  LOCK_SOURCES_ERE+="|$(printf '%s' "$prefix" | sed -E 's/[][\.^$*+?(){}|]/\\&/g')"
-done
+# The owners this host gates, as the forge names them: GATE_RUNNER_OWNERS, and the owners of a
+# pinned GATE_RUNNER_REPOS (a bare name means PRIMARY_OWNER). Only their own paths on the governed
+# forge join the prefetch's allowed sources (pr_gate_lock_sources_ere).
+set -f
+read -ra lock_source_owners <<<"$OWNERS"
+if [[ "$REPOS" != auto ]]; then
+  for word in $REPOS; do
+    if [[ "$word" == */* ]]; then lock_source_owners+=("${word%%/*}")
+    else lock_source_owners+=("$PRIMARY_OWNER"); fi
+  done
+fi
+set +f
+LOCK_SOURCES_ERE="$(pr_gate_lock_sources_ere "$BASE" "$LOCK_SOURCES" \
+  ${lock_source_owners[@]+"${lock_source_owners[@]}"})" || exit 2
 REGATE_SETTLE="${GATE_RUNNER_REGATE_SETTLE:-90}"
 # Compile cache. Every slot shares one on-disk sccache cache, but sccache keys a Rust compile on its
 # absolute paths (SCCACHE_BASEDIRS does not apply to rustc in 0.15; measured), so a crate
@@ -2033,8 +2044,9 @@ for repo_dir in "$1"/*/; do
     seen[$digest]=1
     out=$(cd "$dir" && cargo fetch --locked --offline 2>&1) && continue
     grep -qE "no matching package named|failed to download|attempting to make an HTTP request" <<<"$out" || continue
-    # Online only for lockfiles whose every source is crates.io or a configured family source
-    # (PR_GATE_LOCK_SOURCES, passed in as $3 already escaped): a PR must not point the runner at an
+    # Online only for lockfiles whose every source is crates.io, a gated owner'"'"'s own path on the
+    # governed forge, or a configured family source such as a declared publishing mirror
+    # (pr_gate_lock_sources_ere, passed in as $3 already escaped): a PR must not point the runner at an
     # arbitrary host through its lock. Each prefix is matched to its path, so a loopback forge listed
     # as git+http://127.0.0.1:<port>/git/<owner>/ admits nothing else on loopback: another port or path
     # is some other local service. Each git source is pinned to a commit. Checking the lock suffices under --locked: every

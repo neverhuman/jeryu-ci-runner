@@ -116,3 +116,47 @@ pr_gate_capabilities() {
   done
   jq -nc '$ARGS.positional' --args "${names[@]}"
 }
+
+# Escape a literal URL prefix for use inside an ERE alternation.
+pr_gate_ere_quote() { # literal
+  printf '%s' "$1" | sed -E 's/[][\.^$*+?(){}|]/\\&/g'
+}
+
+# Which Cargo.lock sources the locked-crate prefetch may fetch online, as one ERE of URL prefixes
+# the prefetch anchors each lock row to. crates.io always; then the site's configured prefixes
+# (PR_GATE_LOCK_SOURCES), which is where a family's declared publishing mirror is named; then, for
+# each owner this host gates, that owner's own path on the governed forge -- <forge>/git/<owner>/,
+# the exact remote discover_repos requires of a gated repository, and the source Cargo records for a
+# crate locked from it. A family that publishes through a mirror locks some rows from the mirror and
+# the rest from that canonical path; with only the mirror configured, one canonical row made the
+# prefetch skip the whole lockfile, and the offline recipe then failed on a crate nobody had
+# fetched. Nothing wider is admitted: not another owner's path on the same forge, not another host,
+# and no URL carrying credentials -- a configured prefix or forge URL that does is a configuration
+# error, refused here rather than handed to git.
+pr_gate_lock_sources_ere() { # forge-base configured-prefixes owner...
+  local base="${1%/}" configured="$2"
+  shift 2
+  local - prefix owner
+  local -A seen=()
+  local ere='registry\+https://github\.com/rust-lang/crates\.io-index|sparse\+https://index\.crates\.io/'
+  set -f
+  for prefix in $configured; do
+    [[ "$prefix" != *@* ]] || {
+      printf 'PR_GATE_LOCK_SOURCES must name no credentials: %s\n' "$prefix" >&2
+      return 2
+    }
+    ere+="|$(pr_gate_ere_quote "$prefix")"
+  done
+  if [[ -n "$base" ]]; then
+    [[ "$base" != *@* ]] || {
+      printf 'the forge URL must name no credentials: %s\n' "$base" >&2
+      return 2
+    }
+    for owner in "$@"; do
+      [[ "$owner" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ && -z "${seen[$owner]+set}" ]] || continue
+      seen[$owner]=1
+      ere+="|$(pr_gate_ere_quote "git+$base/git/$owner/")"
+    done
+  fi
+  printf '%s' "$ere"
+}
