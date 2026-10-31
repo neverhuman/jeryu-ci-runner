@@ -2623,6 +2623,19 @@ render_body() { # verdict-json decision sha origin [owner-decision-json hold-kin
   ' <<<"$1"
 }
 
+# Make directory entries durable one directory at a time: `sync -f` flushes the whole containing
+# filesystem, which on a shared host waits on every other writer's I/O. fsync of each directory from
+# `$1` up to `$state` covers the entries a `mkdir -p` created, and nothing else.
+sync_dirs_to_state() { # directory under $state
+  local dir="$1"
+  while :; do
+    sync "$dir"
+    [ "$dir" != "$state" ] || break
+    dir="$(dirname "$dir")"
+    case "$dir" in "$state"|"$state"/*) ;; *) break ;; esac
+  done
+}
+
 # Keep the admitted attempt visible across process death and archive each terminal
 # result. The per-PR flock is held before reading/recovering the previous claim.
 store_receipt() { # destination; JSON on stdin
@@ -2855,7 +2868,9 @@ review_one() { # owner/name number dry-run force include-drafts
   receipt="$(receipt_path "$repo" "$number" "$sha")"
   mkdir -p "$(dirname "$receipt")" "$state/attempts/$repo" "$state/pending/$repo"
   # Flush newly created receipt/attempt parents before admitting the worker.
-  sync -f "$state"
+  sync_dirs_to_state "$(dirname "$receipt")"
+  sync_dirs_to_state "$state/attempts/$repo"
+  sync_dirs_to_state "$state/pending/$repo"
   # A pending receipt after acquiring the exclusive lock is a recovery obligation.
   if [[ -s "$receipt" ]] && jq -e '.decision == "reviewing"' "$receipt" >/dev/null; then
     history="$(mktemp "$state/attempts/$repo/$number-$sha-recovered.XXXXXX.json")"
@@ -4254,7 +4269,10 @@ watch_once() { # dry
       tail -n "$watch_queue_cap" "$queue" >"$queue.capped" && mv "$queue.capped" "$queue"
     fi
     # The queued heads are on disk before the cursor stops asking for them again.
-    [ "$queued" = 0 ] || sync -f "$state"
+    if [ "$queued" != 0 ]; then
+      [ ! -e "$queue" ] || sync "$queue"
+      sync "$state"
+    fi
     watch_cursor_set "$seq"
   fi
   [ "$queued" != 0 ] || watch_pace "$started"

@@ -153,6 +153,14 @@ else
   printf '{"type":"result","subtype":"success","is_error":false,"structured_output":%s}\n' "$(cat "$PUBLISH_FIXTURE/verdict")"
 fi
 FIXTURE
+# Records every sync; a filesystem-wide `sync -f` is refused because it waits on every writer on the host.
+real_sync="$(command -v sync)"
+cat > "$t/bin/sync" <<SYNC
+#!/usr/bin/env bash
+printf '%s\\n' "\$*" >> "$t/sync.log"
+for a in "\$@"; do [[ "\$a" != -f && "\$a" != --file-system ]] || { echo 'filesystem-wide sync refused' >&2; exit 1; }; done
+exec "$real_sync" "\$@"
+SYNC
 chmod +x "$t/bin/"*
 printf '{"verdict":"approve","summary":"fixture review complete","findings":[]}\n' > "$t/verdict"
 export PUBLISH_FIXTURE="$t" FIXTURE_REAL_GIT="$real_git"
@@ -589,4 +597,12 @@ echo 'ok no findings reported for a review the forge refused'
 [[ ! -e "$t/danger" ]]
 jq -es 'all(.[]; .decision != "reviewing")' "$t/state/attempts/jeryu/fixture/"*.json > /dev/null
 [[ ! -e "$t/state/beats/current/jeryu_fixture-1.json" ]]
+# Reviewer state durability is file- and directory-scoped: no `sync -f`, yet receipts, their
+# directories and the state root were all synced.
+! grep -qE '(^| )(-f|--file-system)( |$)' "$t/sync.log"
+grep -qxF "$t/state" "$t/sync.log"
+grep -qxF "$t/state/attempts/jeryu/fixture" "$t/sync.log"
+grep -qxF "$t/state/pending/jeryu/fixture" "$t/sync.log"
+grep -qE "^$t/state/receipts/jeryu/fixture/1-[0-9a-f]+\\.json\\.[A-Za-z0-9]+$" "$t/sync.log"
+echo 'ok state durability avoids filesystem-wide sync'
 echo 'PUBLICATION AND RECOVERY PASS'
