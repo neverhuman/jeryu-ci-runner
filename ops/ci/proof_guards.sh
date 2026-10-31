@@ -170,26 +170,76 @@ proof_require_migration() {
   }
 }
 
+# Print the single integer minimum_score POLICY configures, refusing a policy
+# that states it zero times or more than once: a merge floor that depends on
+# which duplicate wins is not a floor.
+proof_policy_minimum_score() {
+  awk -F '=' '
+    /^[[:space:]]*minimum_score[[:space:]]*=/ {
+      count += 1
+      value = $2
+      sub(/[[:space:]]*#.*/, "", value)
+      gsub(/[[:space:]]/, "", value)
+      if (value !~ /^[0-9]+$/) exit 2
+      floor = value
+    }
+    END { if (count != 1) exit 3; print floor }
+  ' "$1"
+}
+
 # Keep scoring/scan policy byte-identical to protected main. The one exception
 # is an explicit transition: AUTHZ (read from the protected-main tree, never from
 # the candidate) lists "<protected sha256> <candidate sha256>" lines, and the
 # candidate may differ only when both digests of this pair are pinned there.
 # Blank lines and #-comments are ignored; any other line shape is refused.
+#
+# A pin authorizes those exact bytes, not a weaker gate: a pinned transition
+# that lowers minimum_score is still refused, so a pin landed for one reason
+# cannot be spent on dropping the merge floor.
 proof_require_governed_policy() {
-  local candidate="$1" protected="$2" authz="${3:-}" cd_ pd_ line a b
+  local candidate="$1" protected="$2" authz="${3:-}" cd_ pd_ line a b cf pf matched
   cmp -s "$candidate" "$protected" && return 0
-  if [[ -n "$authz" && -f "$authz" && ! -L "$authz" ]]; then
+  if [[ -n "$authz" && -e "$authz" ]]; then
+    # Same standard the lane holds the policy files to: a canonical regular
+    # file with one link. A pin reached through a symlink is a pin from
+    # wherever that link points, which is not the protected-main tree.
+    if [[ ! -f "$authz" || -L "$authz" ||
+          "$(stat -c '%h' -- "$authz")" != 1 ||
+          "$(realpath -- "$authz")" != "$authz" ]]; then
+      printf 'policy transition authorization must be a canonical one-link regular file: %s\n' \
+        "$authz" >&2
+      return 1
+    fi
     cd_="$(sha256sum -- "$candidate")" && cd_="${cd_%% *}" || return 1
     pd_="$(sha256sum -- "$protected")" && pd_="${pd_%% *}" || return 1
+    # Parse the whole file before honouring any of it: a pin listed above a
+    # line nobody can parse must not decide this gate on its own.
+    matched=
     while IFS= read -r line || [[ -n "$line" ]]; do
       case "$line" in ''|'#'*) continue ;; esac
-      if [[ ! "$line" =~ ^([0-9a-f]{64})\ ([0-9a-f]{64})$ ]]; then
+      if [[ ! "$line" =~ ^([0-9a-f]{64})[[:space:]]+([0-9a-f]{64})$ ]]; then
         printf 'malformed policy transition authorization line\n' >&2
         return 1
       fi
       a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
-      [[ "$a" == "$pd_" && "$b" == "$cd_" ]] && return 0
+      [[ "$a" == "$pd_" && "$b" == "$cd_" ]] && matched=1
     done <"$authz"
+    if [[ -n "$matched" ]]; then
+      cf="$(proof_policy_minimum_score "$candidate")" || {
+        printf 'candidate audit policy must state one integer minimum_score\n' >&2
+        return 1
+      }
+      pf="$(proof_policy_minimum_score "$protected")" || {
+        printf 'protected-main audit policy must state one integer minimum_score\n' >&2
+        return 1
+      }
+      if (( cf < pf )); then
+        printf 'pinned policy transition lowers the merge floor (%s -> %s)\n' \
+          "$pf" "$cf" >&2
+        return 1
+      fi
+      return 0
+    fi
   fi
   printf 'candidate audit policy must be byte-identical to protected main unless a digest-pinned transition is authorized\n' >&2
   return 1
@@ -225,4 +275,27 @@ proof_report_security_failure() {
     fi
     printf '== end security lane failure evidence ==\n'
   } >&2
+}
+
+# Refuse a protected-main baseline clone that this gate changed. The baseline is
+# main's bytes: its HEAD must still be the commit the lane checked out, no
+# tracked file may be modified, and the policy that judged this head must hash
+# to DIGEST. Run after the baseline audit, which leaves untracked .jankurai
+# output behind -- that output is this run's, the tracked tree is main's.
+proof_require_protected_baseline() {
+  local repo="$1" base="$2" digest="$3" now
+  if [[ "$(git -C "$repo" rev-parse 'HEAD^{commit}')" != "$base" ]]; then
+    printf 'protected-main baseline moved off %s during the gate\n' "$base" >&2
+    return 1
+  fi
+  if [[ -n "$(git -C "$repo" status --porcelain=v1 --untracked-files=no)" ]]; then
+    printf 'protected-main baseline has modified tracked files\n' >&2
+    return 1
+  fi
+  now="$(sha256sum -- "$repo/agent/audit-policy.toml")" && now="${now%% *}" || return 1
+  if [[ "$now" != "$digest" ]]; then
+    printf 'protected-main baseline policy changed during the gate (%s -> %s)\n' \
+      "$digest" "$now" >&2
+    return 1
+  fi
 }

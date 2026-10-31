@@ -1,0 +1,20 @@
+# Authorized audit-policy transitions.
+#
+# The proof lane scores every head with protected main's own
+# agent/audit-policy.toml, so a head may not bring its own scoring policy. A
+# head whose policy differs from protected main's is refused unless this file
+# -- read from the protected-main clone, never from the head under test --
+# pins that exact change as one line:
+#
+#   <protected sha256> <candidate sha256>
+#
+# both of `sha256sum agent/audit-policy.toml`, protected main's first. A
+# transition therefore lands in two steps: one change adds the pin here and
+# merges, then the change carrying the new policy bytes merges against it. A
+# pin may not lower minimum_score; raising the merge floor needs no pin on the
+# protected side, only the pinned bytes.
+#
+# Blank lines and #-comments are ignored. Any other line shape refuses the
+# whole file: a pin nobody can parse must not become a pin nobody checks.
+#
+# No transition is authorized right now.

@@ -181,7 +181,65 @@ printf '%s %s extra\n' "$pd" "$cd_" > "$fixture/authz-bad"
 if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-bad" 2>/dev/null; then fail 'malformed authorization accepted'; fi
 ln -s authz "$fixture/authz-link"
 if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-link" 2>/dev/null; then fail 'symlinked authorization accepted'; fi
+cp "$fixture/authz" "$fixture/authz-hard"; ln "$fixture/authz-hard" "$fixture/authz-hard2"
+if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-hard" 2>/dev/null; then fail 'multiply linked authorization accepted'; fi
+printf '%s\t%s\n' "$pd" "$cd_" > "$fixture/authz-tab"
+$g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-tab" || fail 'tab-separated pin refused'
+# A pin buys those exact bytes, never a lower merge floor.
+printf '%s\n' 'minimum_score = 79' 'required_tool_version = "1.7.5"' > "$fixture/lower-policy"
+lower="$(sha256sum "$fixture/lower-policy" | cut -d' ' -f1)"
+printf '%s %s\n' "$pd" "$lower" > "$fixture/authz-lower"
+if $g "$fixture/lower-policy" "$fixture/protected-policy" "$fixture/authz-lower" 2>/dev/null; then fail 'pinned floor reduction accepted'; fi
+printf '%s\n' 'minimum_score = 81' 'required_tool_version = "1.7.5"' > "$fixture/raise-policy"
+raise="$(sha256sum "$fixture/raise-policy" | cut -d' ' -f1)"
+printf '%s %s\n' "$pd" "$raise" > "$fixture/authz-raise"
+$g "$fixture/raise-policy" "$fixture/protected-policy" "$fixture/authz-raise" || fail 'pinned floor raise refused'
+# A pin to bytes whose floor cannot be read at all refuses rather than passes.
+printf '%s\n' 'minimum_score = 80' 'minimum_score = 70' > "$fixture/dup-policy"
+dup="$(sha256sum "$fixture/dup-policy" | cut -d' ' -f1)"
+printf '%s %s\n' "$pd" "$dup" > "$fixture/authz-dup"
+if $g "$fixture/dup-policy" "$fixture/protected-policy" "$fixture/authz-dup" 2>/dev/null; then fail 'pinned duplicate floor accepted'; fi
+# One malformed line refuses the file, including pins listed before it.
+printf '%s %s\nnot-a-pin\n' "$pd" "$cd_" > "$fixture/authz-trailing"
+if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-trailing" 2>/dev/null; then fail 'pin before a malformed line accepted'; fi
 printf 'proof governed policy guard ok\n'
+
+# --- the baseline clone this gate scored against must still be main's bytes ---
+git init -q -b main "$fixture/protected"
+mkdir -p "$fixture/protected/agent"
+printf '%s\n' 'minimum_score = 80' > "$fixture/protected/agent/audit-policy.toml"
+git -C "$fixture/protected" add -A
+git -C "$fixture/protected" commit -q --no-gpg-sign -m policy
+pbase="$(git -C "$fixture/protected" rev-parse HEAD)"
+pdigest="$(sha256sum "$fixture/protected/agent/audit-policy.toml" | cut -d' ' -f1)"
+b=proof_require_protected_baseline
+$b "$fixture/protected" "$pbase" "$pdigest" || fail 'untouched baseline refused'
+# The audit's own untracked output does not count as a change.
+mkdir -p "$fixture/protected/.jankurai"
+printf '{}\n' > "$fixture/protected/.jankurai/repo-score.json"
+$b "$fixture/protected" "$pbase" "$pdigest" || fail 'baseline audit output counted as a change'
+# Editing the policy in the baseline tree is caught, and so is committing it.
+printf '%s\n' 'minimum_score = 70' > "$fixture/protected/agent/audit-policy.toml"
+if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'edited baseline policy accepted'; fi
+git -C "$fixture/protected" -c user.name=t -c user.email=t@invalid \
+  commit -q --no-gpg-sign -m tamper -- agent/audit-policy.toml
+if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'committed baseline policy edit accepted'; fi
+printf 'proof protected baseline guard ok\n'
+
+# --- the authorization file the lane really reads ----------------------------
+authz_path=ops/ci/policy-transitions.txt
+[[ -f "$authz_path" && ! -L "$authz_path" ]] ||
+  fail 'the protected-main policy transition file is missing'
+while IFS= read -r line || [[ -n "$line" ]]; do
+  case "$line" in ''|'#'*) continue ;; esac
+  [[ "$line" =~ ^[0-9a-f]{64}[[:space:]]+[0-9a-f]{64}$ ]] ||
+    fail "ops/ci/policy-transitions.txt has an unparsable line: $line"
+done < "$authz_path"
+# This head carries main's own policy, so it needs no pin: the file is checked
+# for shape, and the guard accepts this tree against itself with it in place.
+proof_require_governed_policy agent/audit-policy.toml agent/audit-policy.toml "$authz_path" ||
+  fail 'the real transition file refuses an unchanged policy'
+printf 'proof policy transition file ok\n'
 
 # --- wiring tripwires ---------------------------------------------------------
 lane=ops/ci/proof_evidence.sh
@@ -196,8 +254,17 @@ grep -q 'proof_require_governed_policy "$candidate_policy" "$baseline_policy"' "
   fail 'the lane does not check that main policy judges this head'
 grep -q 'ops/ci/policy-transitions.txt' "$lane" ||
   fail 'the lane does not read transitions from the protected-main tree'
-grep -q 'cp -- "$candidate_policy" "$baseline_policy"' "$lane" &&
-  fail 'the lane mutates the protected-main baseline policy' || :
+# Any write whose target is the baseline policy or the baseline tree's policy
+# path, however it is spelled, puts the candidate's bytes in main's place.
+grep -nE '(cp|mv|install|tee|ln|printf|cat|sed)[^|&;]*\$\{?baseline_policy|> *"?\$\{?baseline_policy' "$lane" &&
+  fail 'the lane writes to the protected-main baseline policy' || :
+# The lane reads history and never writes it. `HEAD^{commit}` and
+# `${base_commit}` are reads, so only `commit` in git's subcommand position
+# counts -- it is the shape the baseline mutation took.
+grep -vE '^[[:space:]]*#' "$lane" | grep -qE '(^|[^_{])commit[[:space:]]' &&
+  fail 'the lane runs git commit' || :
+grep -q 'proof_require_protected_baseline' "$lane" ||
+  fail 'the lane does not verify the baseline stayed protected-main bytes'
 # Every `>` redirect into target/ is this run's summary; a `printf > target/...`
 # fallback would be a result nobody produced. (cp and tee are not covered.)
 while IFS= read -r line; do
@@ -265,3 +332,8 @@ grep -q 'wrapper-stderr-marker missing tool gitleaks' "$fixture/attempt-build.lo
 grep -q 'proof_report_security_failure' ops/ci/proof_evidence.sh ||
   fail 'the proof lane does not report a failed security run'
 printf 'security failure evidence ok\n'
+
+(( $(line_of '^proof_require_migration' "$lane") < $(line_of '^proof_require_protected_baseline' "$lane") )) ||
+  fail 'the baseline is checked for tampering before the work that could tamper with it'
+(( $(line_of 'proof_require_governed_policy' "$lane") < $(line_of 'baseline_policy_sha256=' "$lane") )) ||
+  fail 'the baseline policy digest is recorded before it is accepted as main policy'

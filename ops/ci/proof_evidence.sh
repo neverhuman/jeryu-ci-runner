@@ -247,6 +247,10 @@ fi
 # candidate policy needs a digest-pinned transition recorded on protected main.
 proof_require_governed_policy "$candidate_policy" "$baseline_policy" \
   "${baseline_parent}/repo/ops/ci/policy-transitions.txt"
+# Record the policy that was just accepted as main's, so the checks below can
+# prove the tree that produced the baseline score is still that tree.
+baseline_policy_sha256="$(sha256sum -- "${baseline_policy}")"
+baseline_policy_sha256="${baseline_policy_sha256%% *}"
 audit_base_commit="$base_commit"
 (
   cd "${baseline_parent}/repo"
@@ -272,6 +276,10 @@ jankurai migrate . --analyze --out target/jankurai/migration-report.json \
 proof_require_migration \
   target/jankurai/baseline-migration-report.json "${baseline_parent}/repo" \
   target/jankurai/migration-report.json .
+# Nothing above may have written to protected main's tree: the baseline score
+# and migration liability this head is held to are main's bytes or no result.
+proof_require_protected_baseline "${baseline_parent}/repo" "$base_commit" \
+  "$baseline_policy_sha256"
 trap - EXIT HUP INT TERM
 cleanup_baseline
 
