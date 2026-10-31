@@ -203,25 +203,69 @@ printf 'PASS older outbox items never overwrite a newer accepted result\n'
 exec 6>&-
 export HOME_DIR owner repo sha SLOT MARKER
 lock_key="acme-interrupted-$sha"
-bash -s -- "$script_dir/pr-gate-state.sh" "$identity" "$lock_key" "$scratch" <<'CHILD' &
+# A FIFO gives one complete ready event, or the child's EXIT status, without polling a
+# partially written PID file. Sixty seconds allows journal fsyncs to compete with hosted
+# builds (the former two-second budget did not); it still bounds a wedged setup.
+mkfifo "$scratch/child-events" "$scratch/worker-release"
+exec 7<>"$scratch/child-events" 8<>"$scratch/worker-release"
+await_child_ready() { # seconds; event on fd 7
+  local event=""
+  if ! IFS= read -r -t "$1" -u 7 event; then
+    printf 'killed-parent readiness: no event within %ss\n' "$1" >&2
+    return 1
+  fi
+  if [[ "$event" != ready ]]; then
+    printf 'killed-parent readiness refused: %s\n' "$event" >&2
+    return 1
+  fi
+}
+# Prove refusal reports both terminal children and a live child that never signals.
+bash -c 'trap '"'"'printf "exit %s\n" "$?" >&7'"'"' EXIT; exit 23' &
+refused_child=$!
+if wait "$refused_child"; then exit 1; else [[ $? == 23 ]]; fi
+if await_child_ready 1 2>"$scratch/ready.err"; then exit 1; fi
+grep -q 'refused: exit 23' "$scratch/ready.err"
+if await_child_ready 0.05 2>"$scratch/ready.err"; then exit 1; fi
+grep -q 'no event within 0.05s' "$scratch/ready.err"
+printf 'PASS readiness reports terminal child status and bounds missing events\n'
+parent="" worker=""
+cleanup_interrupted_child() {
+  if [[ -n "$parent" ]]; then kill -KILL "$parent" 2>/dev/null || :; wait "$parent" 2>/dev/null || :; fi
+  if [[ -f "$scratch/worker-pids" ]]; then worker=$(tail -n 1 "$scratch/worker-pids"); fi
+  if [[ -n "$worker" ]]; then kill -TERM "$worker" 2>/dev/null || :; fi
+}
+trap 'cleanup_interrupted_child; rm -rf -- "$scratch"' EXIT
+bash -s -- "$script_dir/pr-gate-state.sh" "$identity" "$lock_key" "$scratch" >"$scratch/child.log" 2>&1 <<'CHILD' &
 set -euo pipefail
+trap 'printf "exit %s\n" "$?" >&7' EXIT
 source "$1"
 gate_lock "$3"
 gate_begin "$2"
-sleep 30 &
+# Block on an event rather than a sleep that could expire during a loaded run.
+bash -c 'read -r -u 8' &
 worker=$!
 printf '%s\n%s\n' "$BASHPID" "$worker" >"$4/worker-pids"
+printf 'ready\n' >&7
 wait "$worker"
 CHILD
 parent=$!
-for _ in $(seq 1 100); do [[ -f "$scratch/worker-pids" ]] && break; sleep 0.02; done
-[[ -f "$scratch/worker-pids" ]]
+if ! await_child_ready 60; then
+  printf 'killed-parent setup: parent=%s key=%s\n' "$parent" "$lock_key" >&2
+  ps -o pid,ppid,stat,wchan:32,args -p "$parent" >&2 || :
+  cat "$scratch/child.log" >&2
+  find "$HOME_DIR/attempts/$lock_key" -name '*.json' -type f -print -exec cat {} \; >&2
+  exit 1
+fi
 worker=$(tail -n 1 "$scratch/worker-pids")
 if (gate_lock "$lock_key"); then exit 1; fi
 kill -KILL "$parent"
 wait "$parent" 2>/dev/null || true
+parent=""
+# The worker is alive after its parent is killed and still owns the inherited flock.
+kill -0 "$worker"
 if (gate_lock "$lock_key"); then exit 1; fi
 kill -TERM "$worker"
+worker=""
 for _ in $(seq 1 100); do
   if gate_lock "$lock_key"; then break; fi
   sleep 0.02
@@ -230,6 +274,8 @@ done
 gate_recover
 jq -e '.terminal and .outcome=="interrupted" and .exit_code==null and .publication.required_status' \
   "$gate_key_dir/last-result.json" >/dev/null
+trap 'rm -rf -- "$scratch"' EXIT
+exec 7>&- 8>&-
 printf 'PASS duplicate dispatch, killed parent, surviving worker and recovered claim\n'
 
 gate_begin "$identity"
