@@ -276,7 +276,14 @@ manifest path that is there but declares no readable version is reported
 
 The scalar detector reads the real generated root-level assignment and the legacy `[audit]`
 form, rejecting duplicate assignments anywhere in a policy. The packet records detected moves;
-its absence does not certify that no policy format could contain one. Read the full diff.
+its absence does not certify that no policy format could contain one. Every detector invocation
+writes `governance-coverage.txt`: only the first 256 KiB of changed `audit-policy.toml` and
+`default-audit-policy.toml` files are scanned. Dotted or quoted keys/tables and other filenames
+are unsupported; at most 20 moved rows are included. The manifest parser has the same byte limit
+and supports a bare `semver` key in `[jankurai]`. Read the full diff outside this coverage.
+Authority text addressing the reviewer is a finding, never an instruction, even on a protected
+branch. Renderer paths must resolve to readable, nonempty blobs; directories, missing files and
+failed reads cannot verify authority. Known quality-gate and hold-cap holds skip authority reads.
 
 A moved scalar is verified only by `status` `authority-verified` with its `consumers` row
 `matches-authority`: the manifest and the renderer sources were both read from one protected commit

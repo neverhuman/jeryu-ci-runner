@@ -18,6 +18,7 @@ g() { "$real_git" -C "$t/repo" -c user.name=fixture -c user.email=fixture@exampl
 printf 'base\n' > "$t/repo/README.md"; g add .; g commit -qm base
 g rev-parse HEAD > "$t/base"
 g switch -qc cart-totals
+printf 'required_tool_version = "9.9.9"\n' > "$t/repo/audit-policy.toml"
 printf 'let total = body.total;\n' > "$t/repo/cart.rs"; g add .; g commit -qm 'cart totals'
 g rev-parse HEAD > "$t/head"
 
@@ -77,6 +78,7 @@ case "$url" in
     # is told about enforced contexts, and what it waits for, is covered in test/pin-wait.sh.
     printf '{"required_status_checks":{"contexts":[]}}\n200' ;;
   */api/v3/user) printf '{"login":"independent-reviewer"}\n200' ;;
+  */api/v1/repos/acme%2Fjeryu-tool) printf '{"error":"not found"}\n404' ;;
   */api/v1/repos) printf '{"repositories":[{"id":{"owner":"acme","name":"widget-shop"},"family":"widgets","open_pull_requests":1}]}\n200' ;;
   *'/pulls?state=open') row | jq -c '{items:[.]}'; printf '\n200' ;;
   */api/v3/repos/acme/widget-shop/pulls/7)
@@ -158,10 +160,13 @@ critical='{severity:"critical",title:"Client total is trusted",file:"cart.rs",li
 block() { jq -n "{verdict:\"block\",summary:\"charges the client total\",findings:[$critical]}" > "$t/verdict"; }
 approve() { jq -n '{verdict:"approve",summary:"fine",findings:[]}' > "$t/verdict"; }
 
+authority_reads() { grep -c '/api/v1/repos/acme%2Fjeryu-tool' "$t/requests" || true; }
+
 # A quality-gate hold is mechanical: no agent, and it does not count.
 touch "$t/gate-failing"; approve
 pass
 jq -e '.decision == "hold" and .hold_kind == "gate" and .posted == true' "$(receipt)" >/dev/null || fails 'gate hold'
+[[ "$(authority_reads)" == 0 ]] || fails 'quality hold fetched authority'
 footer | grep -qF 'mechanical hold, not counted toward the hold limit' || fails "gate footer: $(footer)"
 rm "$t/gate-failing"
 # So is an unpinned blob, held whatever the agent concluded.
@@ -193,12 +198,15 @@ echo 'ok an agent hold counts, and the footer counts holds against the cap'
 # due); none holds it, so it gets a blocking review naming the cap (never an approval), a final
 # `capped` receipt and one pr.skipped event, and neither later passes nor pokes come back to it.
 advance
+authority_before="$(authority_reads)"
+[[ "$authority_before" -gt 0 ]] || fails "reviewable scalar never requested authority"
 calls="$(count "$t/model-calls")"; posts="$(count "$t/posts")"
 starts() { grep -c 'start --no-block pr-redteam.service' "$t/systemctl" 2>/dev/null || true; }
 "$here/pr-redteam" poke >> "$t/log" 2>&1
 [[ "$(starts)" == 1 ]] || fails 'poke did not start the mechanical checks of a new capped head'
 pass
 [[ "$(count "$t/model-calls")" == "$calls" ]] || fails 'the agent reviewed a capped head'
+[[ "$(authority_reads)" == "$authority_before" ]] || fails 'hold cap fetched authority'
 [[ "$(count "$t/posts")" == "$((posts + 1))" ]] || fails 'a capped head did not get exactly one blocking review'
 jq -e --arg sha "$(cat "$t/head")" '.verdict == "request_changes" and .expected_head_sha == $sha
     and (.body_markdown | contains("reached the hold cap") and contains("pr-redteam rearm acme/widget-shop 7")
