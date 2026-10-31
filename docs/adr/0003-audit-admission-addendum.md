@@ -47,3 +47,14 @@ failure behavior using a fixture forge and local Git repositories. Its adapter
 is a contract fixture, not evidence of operating-system isolation. A live
 probe on the dedicated gate host remains a separate owner/lead operation;
 this change performs no live PR or network probe.
+
+Merge-queue audit tickets have a stricter admission rule under either contract:
+the live building entry must match the ticket's repository, ref, number and head. Every building source in the stack must be an open internal
+PR at its recorded source head; the bottom replay base must be a valid commit
+on the clone's own main before checkout. The diff audit base must be an
+ancestor of that bottom, and the bottom an ancestor of the queue head, so the
+range covers the whole stack (the forge uses its fork with main). A missing/non-building queue ancestor
+is accepted only once its commit is on main. Bound queue jobs additionally
+require authoritative `origin: internal`. Queue contributions are handed back
+even on sandbox-ready hosts; enabling contributed queue audits requires a
+separate reviewed extension of this stack admission and sandbox contract.

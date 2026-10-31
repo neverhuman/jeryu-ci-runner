@@ -545,7 +545,12 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    contract) is admitted only while the forge's live merge queue still holds that exact repository, ref
    and commit as a building entry and every source pull request of its stack is open, `origin:internal`
    and at the head the entry was built from; it is then fetched through that exact ref and must still
-   match the ticket. A job left alone is not refused on the forge (there is no route for
+   match the ticket. The entry's number and base branch must match the ticket ref; every
+   stack base must be a commit SHA. Before checkout, the bottom replay base must be an ancestor of
+   the clone's own `main`; an absent/non-building parent is never treated as main by assumption.
+   A diff ticket must cover the entire stack: its audit base must be an ancestor of that bottom,
+   and the bottom must be an ancestor of the queue head. Bound queue jobs must also say `origin: internal`. Contributions in queue jobs remain refused,
+   even on sandbox-ready hosts (see the ADR 0003 addendum). A job left alone is not refused on the forge (there is no route for
    that on the unbound contract); its claim lapses with its lease;
 3. clone the head under the gate home (`audit-work/`, swept at the start of each pass) with the gate's own credential (through a git credential
    helper that reads the token file; it is in no argv, environment or clone config);

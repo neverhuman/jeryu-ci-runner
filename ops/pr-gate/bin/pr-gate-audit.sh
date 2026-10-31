@@ -435,15 +435,20 @@ forge_pages() {
   local path=$1 page more sep='?' chunk
   [[ "$path" != *\?* ]] || sep='&'
   pages='[]' pages_code=200
+  printf '[]\n' >"$WORK_DIR/listing.json"
   for ((page = 1; page <= 20; page++)); do
     api GET "$path${sep}per_page=500&page=$page"
     [[ "$code" == 200 ]] || { pages_code=$code; return 1; }
-    chunk="$(jq -c '[(.items // .entries // [])[]?]' <<<"$body" 2>/dev/null)" || { pages_code=200; return 1; }
-    pages="$(jq -cn --argjson a "$pages" --argjson b "$chunk" '$a + $b')"
+    chunk="$(jq -ce '(.items // .entries) | select(type == "array")' <<<"$body" 2>/dev/null)" || { pages_code=malformed-page; return 1; }
+    printf '%s\n' "$chunk" >"$WORK_DIR/listing-page.json"
+    jq -cs '.[0] + .[1]' "$WORK_DIR/listing.json" "$WORK_DIR/listing-page.json" >"$WORK_DIR/listing-next.json" \
+      || { pages_code=invalid-listing; return 1; }
+    mv -f -- "$WORK_DIR/listing-next.json" "$WORK_DIR/listing.json"
+    pages="$(cat "$WORK_DIR/listing.json")"
     more="$(jq -r '.page.has_more // false' <<<"$body" 2>/dev/null)"
     [[ "$more" == true ]] || return 0
   done
-  pages_code=200
+  pages_code=pagination-limit
   return 1
 }
 
@@ -455,6 +460,7 @@ forge_pages() {
 # anywhere in the stack refuses the whole ticket: the gate host checks out nothing of it.
 queue_admission() {
   local owner=$1 repo=$2 ref=$3 head=$4 entries prs entry number pr_head parent base depth=0 pr
+  rm -f -- "$WORK_DIR/queue-bottom"
   forge_pages "/api/v1/repos/$owner%2F$repo/merge-queue" \
     || { printf '|the forge answered %s listing its merge queue' "$pages_code"; return; }
   entries=$pages
@@ -464,11 +470,16 @@ queue_admission() {
   entry="$(jq -c --arg r "$owner/$repo" --arg ref "$ref" --arg sha "$head" \
     'first(.[] | select(.repo == $r and .queue_ref == $ref and .queue_sha == $sha and .state == "building")) // empty' <<<"$entries")"
   [[ -n "$entry" ]] || { printf '|the merge queue holds no building entry %s at this head' "$ref"; return; }
+  local ref_base=${ref#refs/queue/}
+  ref_base=${ref_base%/*}
+  [[ "$(jq -r '.number' <<<"$entry")" == "${ref##*/}" &&
+     "$(jq -r '.base' <<<"$entry")" == "$ref_base" ]] \
+    || { printf '|the queue entry does not match the ticket ref'; return; }
   while [[ -n "$entry" ]]; do
     ((++depth <= 64)) || { printf '|the queue stack under %s is deeper than 64 entries' "$ref"; return; }
     number="$(jq -r '.number // ""' <<<"$entry")" pr_head="$(jq -r '.pr_head_sha // ""' <<<"$entry")"
     base="$(jq -r '.base // ""' <<<"$entry")" parent="$(jq -r '.base_sha // ""' <<<"$entry")"
-    [[ "$number" =~ ^[0-9]+$ && "$pr_head" =~ ^[0-9a-f]{40}$ ]] \
+    [[ "$number" =~ ^[0-9]+$ && "$pr_head" =~ ^[0-9a-f]{40}$ && "$parent" =~ ^[0-9a-f]{40}$ && "$base" == "$ref_base" ]] \
       || { printf '|a queue entry under %s is malformed' "$ref"; return; }
     pr="$(jq -c --argjson n "$number" --arg h "$pr_head" 'first(.[] | select(.number == $n and .head_sha == $h)) // empty' <<<"$prs")"
     [[ -n "$pr" ]] || { printf '|no open pull request #%s holds the head %s queued under %s' "$number" "${pr_head:0:12}" "$ref"; return; }
@@ -476,10 +487,11 @@ queue_admission() {
       printf 'contributed|a contribution (%s) is in the stack under %s: the gate host checks out nothing of it' "$CONTRIBUTED_LABEL" "$ref"; return
     fi
     label_on "$pr" "$INTERNAL_LABEL" || { printf '|pull request #%s in the stack under %s is not marked %s' "$number" "$ref" "$INTERNAL_LABEL"; return; }
-    # The entry below is the one whose queue commit this one was replayed on; none means the base tip.
+    # If no building parent remains, its commit must be proved on main after fetch, before checkout.
     entry="$(jq -c --arg r "$owner/$repo" --arg b "$base" --arg sha "$parent" \
       'first(.[] | select(.repo == $r and .base == $b and .queue_sha == $sha and .state == "building")) // empty' <<<"$entries")"
   done
+  printf '%s\n' "$parent" >"$WORK_DIR/queue-bottom"
 }
 
 # admission OWNER REPO BRANCH HEAD [ORIGIN]: nothing when this host can audit the ticket; else why not, as "<release reason>|<explanation>". main is reviewed by protection (checked after
@@ -499,7 +511,12 @@ admission() {
   # whichever contract delivered it.
   local qref
   qref="$(queue_ref_of "$branch")"
-  if [[ -n "$qref" ]]; then queue_admission "$owner" "$repo" "$qref" "$head"; return; fi
+  if [[ -n "$qref" ]]; then
+    if ((BOUND)) && [[ "$origin" != internal ]]; then
+      printf 'contributed|a queue ticket with origin %s is not internal' "${origin:-unknown}"; return
+    fi
+    queue_admission "$owner" "$repo" "$qref" "$head"; return
+  fi
   if ((BOUND)); then
     [[ "$origin" == internal || "$sandbox_ready" == true ]] || printf 'contributed|a contribution (origin %s): the gate host checks out nothing of it' "${origin:-unknown}"
     return
@@ -607,6 +624,18 @@ audit_one() { # ticket-json
     if ! "${git_auth[@]}" git -C "$src" fetch -q origin "+$qref:refs/remotes/origin/queue-ticket" 2>&1 \
        || [[ "$("${git_auth[@]}" git -C "$src" rev-parse -q --verify 'refs/remotes/origin/queue-ticket^{commit}' 2>/dev/null)" != "$head" ]]; then
       refuse stale-queue-ref "the queue ref $qref no longer names the ticketed commit" failed; return 0
+    fi
+  fi
+  if [[ -n "$qref" ]]; then
+    local bottom
+    bottom="$(cat "$WORK_DIR/queue-bottom" 2>/dev/null)" || bottom=""
+    if [[ ! "$bottom" =~ ^[0-9a-f]{40}$ ]] ||
+       ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$bottom" refs/remotes/origin/main 2>/dev/null; then
+      refuse untrusted-queue-base "the queue stack bottom is not on main" failed; return 0
+    fi
+    if ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$bottom" "$head" 2>/dev/null ||
+       { [[ "$mode" == diff ]] && ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$base" "$bottom" 2>/dev/null; }; then
+      refuse untrusted-queue-range "the audit range does not cover the queue stack" failed; return 0
     fi
   fi
   # main is admitted only when the head really is main's: reachable from the clone's own main.

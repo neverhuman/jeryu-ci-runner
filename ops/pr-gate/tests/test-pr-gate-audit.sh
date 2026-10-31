@@ -36,6 +36,7 @@ if [[ "\${1:-}" == clone ]]; then
   args=(); for a in "\$@"; do args+=("\${a/https:\/\/forge.example.test\/git\/acme\//$fx/git/}"); done
   exec "$real_git" "\${args[@]}"
 fi
+[[ " \$* " != *" checkout "* ]] || printf '%s\n' "\$*" >>"$fx/checkout.log"
 # A staged auditor that vanishes after the claim: removed when the head is checked out.
 if [[ -e "$fx/vanish-on-checkout" && " \$* " == *" checkout "* ]]; then rm -f -- "\$(cat "$fx/vanish-on-checkout")"; fi
 exec "$real_git" "\$@"
@@ -115,7 +116,8 @@ case "\$url" in
     printf '%s\n' "\${data#@}" >>"$fx/score-bodies.log"
     answer "\$(cat "$fx/forge/score.body" 2>/dev/null || echo '{"score":91}')" "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
   */merge-queue\?*)
-    answer "\$(jq -c '{entries: ., page: {has_more: false}}' "$fx/forge/queue.json")" 200;;
+    if [[ -e "$fx/forge/queue.json" ]]; then answer "\$(jq -c '{entries: ., page: {has_more: false}}' "$fx/forge/queue.json")" 200
+    else answer 'missing queue fixture' 500; fi;;
   */pulls\?state=open*)
     if [[ -e "$fx/forge/pulls-raw.json" ]]; then answer "\$(jq -c '{items: ., page: {has_more: false}}' "$fx/forge/pulls-raw.json")" 200
     elif [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"; else
@@ -595,7 +597,7 @@ qticket() { # ref sha base
 }
 qlive
 before=$(scores)
-qticket refs/queue/main/2 "$QQ2" "$QQ1"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"
 run
 must 'a stacked queue ticket is admitted and audited' grep -q "acme/qrepo@$QQ2 scored" "$fx/out"
 must 'it is submitted under its exact queue ref and sha' test "$(jq -r '[.branch, .commit_sha] | join(" ")' "$fx/forge/score-$before.json")" == "refs/queue/main/2 $QQ2"
@@ -604,7 +606,7 @@ printf 'PASS a queue commit reachable only through refs/queue is fetched, audite
 
 before=$(scores)
 git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ1"
-qticket refs/queue/main/2 "$QQ2" "$QQ1"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"
 run
 must 'a queue ref that moved since the ticket is refused' grep -q 'no longer names the ticketed commit' "$fx/out"
 must 'a moved queue ref submits nothing' test "$(scores)" == "$before"
@@ -615,28 +617,97 @@ must 'a ticket whose sha is not the live entry s is refused' grep -q 'merge queu
 qticket refs/queue/main/1 "$QQ2" "$QQ1"
 run
 must 'a ref and sha that belong to different entries are refused' grep -q 'merge queue holds no building entry refs/queue/main/1' "$fx/out"
-qticket refs/queue/main/2 "$QQ2" "$QQ1"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"
 jq 'map(if .number == 2 then .state = "landed" else . end)' "$fx/forge/queue.json" >"$fx/forge/queue.tmp"; mv "$fx/forge/queue.tmp" "$fx/forge/queue.json"
 run
 must 'an entry the queue no longer builds is refused' grep -q 'merge queue holds no building entry' "$fx/out"
 qlive
 jq 'map(select(.number != 2))' "$fx/forge/pulls-raw.json" >"$fx/forge/pulls.tmp"; mv "$fx/forge/pulls.tmp" "$fx/forge/pulls-raw.json"
-qticket refs/queue/main/2 "$QQ2" "$QQ1"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"
 run
 must 'a source pull request that is no longer open is refused' grep -q "no open pull request #2 holds the head" "$fx/out"
 printf 'PASS stale, mismatched and dequeued queue tickets are refused\n'
 
 qlive '["origin:contributed"]'
 : >"$fx/git-helper.log"; before=$(scores)
-qticket refs/queue/main/2 "$QQ2" "$QQ1"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"
 run
 must 'a stack holding a contribution is refused' grep -q 'a contribution (origin:contributed) is in the stack under refs/queue/main/2' "$fx/out"
 must 'a contributed stack is never cloned' test ! -s "$fx/git-helper.log"
 must 'a contributed stack submits nothing' test "$(scores)" == "$before"
 qlive '[]'
-qticket refs/queue/main/2 "$QQ2" "$QQ1"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"
 run
 must 'a stack source the forge does not mark internal is refused' grep -q 'is not marked origin:internal' "$fx/out"
 must 'an unmarked stack is never cloned' test ! -s "$fx/git-helper.log"
+
+# A missing/non-building parent is not evidence of a reviewed replay base. Prove the bottom on main
+# after fetch, before checkout, even when the missing ancestor's source was a contribution.
+for state in landed failed dequeued missing; do
+  qlive '["origin:contributed"]'
+  jq --arg state "$state" 'if $state == "missing" then map(select(.number != 1))
+    else map(if .number == 1 then .state = $state else . end) end' "$fx/forge/queue.json" >"$fx/forge/queue.tmp"
+  mv "$fx/forge/queue.tmp" "$fx/forge/queue.json"
+  : >"$fx/checkout.log"; : >"$fx/jankurai.log"; before=$(scores)
+  qticket refs/queue/main/2 "$QQ2" "$QBASE"
+  run
+  must "a $state ancestor outside main is refused" grep -q 'queue stack bottom is not on main' "$fx/out"
+  must "a $state ancestor outside main is never checked out" test ! -s "$fx/checkout.log"
+  must "a $state ancestor outside main is never audited" test ! -s "$fx/jankurai.log"
+  must "a $state ancestor outside main submits nothing" test "$(scores)" == "$before"
+done
+for parent in absent not-a-sha; do
+  qlive
+  jq --arg parent "$parent" 'map(if .number == 1 then
+    (if $parent == "absent" then del(.base_sha) else .base_sha = $parent end) else . end)' \
+    "$fx/forge/queue.json" >"$fx/forge/queue.tmp"
+  mv "$fx/forge/queue.tmp" "$fx/forge/queue.json"
+  : >"$fx/git-helper.log"
+  qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+  must "a $parent stack base is malformed" grep -q 'a queue entry under refs/queue/main/2 is malformed' "$fx/out"
+  must "a $parent stack base is refused before clone" test ! -s "$fx/git-helper.log"
+done
+# A genuinely landed ancestor is trusted without an open PR row: its queue commit is now on main.
+qlive
+jq 'map(select(.number != 1))' "$fx/forge/queue.json" >"$fx/forge/queue.tmp"; mv "$fx/forge/queue.tmp" "$fx/forge/queue.json"
+git -C "$fx/git/qrepo.git" update-ref refs/heads/main "$QQ1"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"; before=$(scores); run
+must 'a reviewed stack bottom already on main is admitted' test "$(scores)" == "$((before + 1))"
+git -C "$fx/git/qrepo.git" update-ref refs/heads/main "$QBASE"
+qlive
+qticket refs/queue/main/2 "$QQ2" "$QQ1"; before=$(scores); : >"$fx/checkout.log"; run
+must 'a ticket diff base must cover its entire live stack' grep -q 'audit range does not cover the queue stack' "$fx/out"
+must 'a partial stack range is never checked out' test ! -s "$fx/checkout.log"
+must 'a partial stack range submits nothing' test "$(scores)" == "$before"
+jq 'map(if .number == 2 then .number = 3 else . end)' "$fx/forge/queue.json" >"$fx/forge/queue.tmp"; mv "$fx/forge/queue.tmp" "$fx/forge/queue.json"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'a ref number must match its entry' grep -q 'does not match the ticket ref' "$fx/out"
+printf 'PASS queue stacks require a well-formed bottom on main before checkout and a range covering the whole stack\n'
+
+# The whole response must not be passed through argv, whose single-argument limit is only 128 KiB.
+qlive
+jq '. + [range(10; 3010) | {number:.,head_sha:"0000000000000000000000000000000000000000",title:("x" * 1000)}]' \
+  "$fx/forge/pulls-raw.json" >"$fx/forge/pulls.tmp"; mv "$fx/forge/pulls.tmp" "$fx/forge/pulls-raw.json"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"; before=$(scores); run
+must 'a multi-megabyte PR listing is admitted without argv overflow' test "$(scores)" == "$((before + 1))"
+printf 'PASS large forge listings do not use argv for JSON accumulation\n'
+
+# Bound queue jobs must agree with the job's authoritative origin as well as source labels.
+qlive
+SSHA=$(stage); touch "$fx/forge/bound"
+mv "$fx/install/pr-gate-ensure-jankurai.sh" "$fx/verifier.bound-off"
+bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" internal proof "$SSHA" 9.9.9 refs/queue/main/2
+before=$(scores); run
+must 'a bound internal queue job is admitted with real binding' test "$(scores)" == "$((before + 1))"
+must 'a bound queue proof names the exact queue SHA and job' test "$(last_score | jq -r '[.head_sha,.job_id] | join(" ")')" == "$QQ2 job-${QQ2:0:8}"
+# This fixture already has a sandbox configured: a contribution remains refused for the queue path.
+bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" contributed proof "$SSHA" 9.9.9 refs/queue/main/2
+: >"$fx/git-helper.log"; before=$(scores); run
+must 'a bound queue job with contributed origin is released' test "$(released | cut -d' ' -f2)" == contributed
+must 'a bound contributed queue job is never cloned' test ! -s "$fx/git-helper.log"
+must 'a bound contributed queue job submits nothing' test "$(scores)" == "$before"
+rm -f "$fx/forge/bound"; mv "$fx/verifier.bound-off" "$fx/install/pr-gate-ensure-jankurai.sh"
+printf 'PASS bound queue admission retains authoritative origin refusal even with a sandbox\n'
+
 rm -f "$fx/forge/pulls-raw.json" "$fx/forge/queue.json"
 printf 'PASS a contributed or unmarked source anywhere in the stack refuses the queue ticket\n'
