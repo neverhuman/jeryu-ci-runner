@@ -33,17 +33,23 @@ proof_require_history() {
   git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
 }
 
-# The baseline this proof judges against: protected main's tip, or -- for the supported retry of
-# main's own tip, where the tip *is* the baseline and every base-relative lane would see an empty
-# diff -- the protected commit before it. Only those two spellings are accepted, so the baseline is
-# always resolved from the protected remote-tracking ref the proof lane refreshes itself (never from
-# a commit a caller, a pull request or a branch chose), and the lane's baseline clone re-checks that
-# the commit is on protected main's own history. Anything else fails closed.
+# Normal runs judge against refreshed protected main. A prior-tip retry is valid
+# only when HEAD is that exact refreshed tip. Resolve its parent to a commit now:
+# later fetches cannot turn a moving origin/main~1 into HEAD and empty the proof.
 proof_base_ref() {
-  local ref="${JERYU_JANKURAI_BASE_REF:-origin/main}"
+  local ref="${JERYU_JANKURAI_BASE_REF:-origin/main}" head main parent
   case "$ref" in
-    origin/main|origin/main~1) printf '%s\n' "$ref" ;;
-    *) printf 'proof base must be protected origin/main, or origin/main~1 for the retry of main own tip, got %s\n' \
+    origin/main) printf '%s\n' "$ref" ;;
+    origin/main~1)
+      head=$(git rev-parse --verify 'HEAD^{commit}') || return 1
+      main=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}') || return 1
+      [[ "$head" == "$main" ]] || {
+        printf 'prior-tip proof requires HEAD to equal refreshed protected main; main moved or this is a PR\n' >&2
+        return 1
+      }
+      parent=$(git rev-parse --verify "$head^1") || return 1
+      printf '%s\n' "$parent" ;;
+    *) printf 'proof base must be protected origin/main, or origin/main~1 for an exact main-tip retry, got %s\n' \
          "$ref" >&2; return 1 ;;
   esac
 }

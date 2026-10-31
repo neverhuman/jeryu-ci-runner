@@ -50,6 +50,14 @@ cat >"$fixture/tools/git" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 args=("$@")
+# Another slot refreshes shared main after branch admission, immediately before
+# this slot reads its cache mirror. The old admitted tip must not be rebound.
+if [[ " $* " == *' fetch --quiet cache-mirror '* && -f "$FAKE_FORGE/advance-mirror-on-sync" ]]; then
+  read -r future <"$FAKE_FORGE/advance-mirror-on-sync"
+  rm -f "$FAKE_FORGE/advance-mirror-on-sync"
+  "$REAL_GIT" -C "$FAKE_FORGE/source.git" update-ref refs/heads/main "$future"
+  "$REAL_GIT" -C "$FAKE_FORGE/runner/mirror/fixture.git" fetch -q "$FAKE_FORGE/source.git" '+refs/heads/main:refs/heads/main'
+fi
 case " $* " in
   *' fetch '*|*' clone '*|*' ls-remote '*)
     for index in "${!args[@]}"; do
@@ -2163,11 +2171,19 @@ for pr_state in merged closed; do
   [[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb "a $pr_state pull request got a status"
 done
 rm -f "$fixture/pr-state"
+# Upgrading a generic host does not silently opt Jeryu into main-tip retries.
+runner_exit=0
+env -u PR_GATE_PROOF_BASE_VARS -u PR_GATE_MAIN_PROOF_BASE_VARS GATE_RUNNER_REPOS=jeryu/fixture \
+  "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --branch main --repo jeryu/fixture \
+  >"$fixture/runner.log" 2>&1 || runner_exit=$?
+[[ "$runner_exit" == 1 ]] && grep -q 'jeryu has no PR_GATE_PROOF_BASE_VARS or PR_GATE_MAIN_PROOF_BASE_VARS entry' "$fixture/runner.log" \
+  || fail_pb 'an unconfigured host implicitly opted Jeryu into main-tip gating'
+expect_count "$before_count"
 # Neither variable names this owner: there is no base its recipe could be told, so main is refused
 # like any other protected branch, and nothing is posted.
 before_statuses=$(wc -l <"$fixture/statuses.jsonl")
 PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS='' invoke --branch main --repo acme/fixture
-[[ "$runner_exit" == 1 ]] && grep -q 'refusing acme/fixture main: acme has no PR_GATE_PROOF_BASE_VARS entry' "$fixture/runner.log" \
+[[ "$runner_exit" == 1 ]] && grep -q 'refusing acme/fixture main: acme has no PR_GATE_PROOF_BASE_VARS or PR_GATE_MAIN_PROOF_BASE_VARS entry' "$fixture/runner.log" \
   || fail_pb 'main was gated for an owner whose recipe cannot be told the base'
 expect_count "$before_count"
 [[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb 'a refused main got a status'
@@ -2249,6 +2265,27 @@ expect_count "$((before_count + 2))"
 grep -q "acme/fixture main moved on from $stale; leaving it for the next tick" "$fixture/runner.log" \
   || fail_pb 'a moved main tip was not left for the next tick'
 [[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb 'a moved main tip got a status'
+# A shared mirror advances after the live tip was re-read but before sync_repo.
+# Keep the admission ref at the current tip; the fixture moves only on cache fetch.
+"$real_git" -C "$fixture/source" checkout -q main
+refs_json main release/v1
+admitted_main=$("$real_git" -C "$fixture/source.git" rev-parse refs/heads/main)
+printf 'future main\n' >>"$fixture/source/marker"
+"$real_git" -C "$fixture/source" add marker
+"$real_git" -C "$fixture/source" commit -qm future-main
+future_main=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" HEAD:refs/heads/future
+printf '%s\n' "$future_main" >"$fixture/advance-mirror-on-sync"
+jq -nc --arg s "$admitted_main" '{sha:$s,context:"fixture/required",state:"error",description:"needs retry",created_at:"2099-01-01T00:00:00Z"}' >>"$fixture/statuses.jsonl"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \
+  invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || fail_pb 'shared-main movement failed the tick'
+[[ ! -f "$fixture/advance-mirror-on-sync" ]] || fail_pb 'the shared-mirror race was not exercised'
+expect_count "$((before_count + 2))"
+grep -q 'base branch main moved .* since it was resolved' "$fixture/runner.log" \
+  || fail_pb 'the admitted main tip was rebound from the advanced mirror'
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] || fail_pb 'a rebound main published a status'
 # main must still be protected: an unprotected one is refused, as any branch is.
 refs_json release/v1
 PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \

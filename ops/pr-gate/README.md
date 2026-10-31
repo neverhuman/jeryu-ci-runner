@@ -318,14 +318,15 @@ failure. A malformed entry in
 variable that is also in `PR_GATE_WORKER_ROOT_VARS` is refused at start. Owners without an entry, and
 main-health, are unchanged.
 
-`PR_GATE_MAIN_PROOF_BASE_VARS` (`owner=VARIABLE` words, default `jeryu=JERYU_JANKURAI_BASE_REF`) is
-read for one thing only: `--branch main`, when the owner has no `PR_GATE_PROOF_BASE_VARS` entry. It
-exists because that mode passes exactly one value, `origin/main~1`, and the jeryu recipe accepts only
-protected main's tip or the commit before it (`ops/ci/proof_guards.sh`, `proof_base_ref`) -- it fails
-closed on anything else, so the default is safe without the owner declaring a base it would refuse
-elsewhere. It never reaches a pull-request, merge-queue, main-health or non-main branch gate, each of
-which still needs `PR_GATE_PROOF_BASE_VARS`. Set it empty to turn the default off. A variable in it
-that is also in `PR_GATE_WORKER_ROOT_VARS` is refused at start, as one in `PR_GATE_PROOF_BASE_VARS` is.
+`PR_GATE_MAIN_PROOF_BASE_VARS` (`owner=VARIABLE` words, empty by default) is a site opt-in
+for `--branch main` when the owner has no `PR_GATE_PROOF_BASE_VARS` entry. The recipe must
+support a checked prior-tip baseline. Jeryu's recipe refreshes protected main, requires
+HEAD to equal that refreshed tip, then resolves `origin/main~1` to the immutable parent
+commit before producing any proof. Main movement during that refresh refuses the retry;
+a later ref update cannot change the resolved baseline. Pull requests cannot opt into
+this weaker-than-tip baseline. The setting never reaches a pull request, merge queue,
+main-health or non-main branch gate. A variable also listed in `PR_GATE_WORKER_ROOT_VARS`
+is refused at start. Upgrade every host before opting in.
 
 Roll a runner with this out to every gate host before adding the setting: a host without it proves a
 release-line head against `origin/main`, its identity differs, and the two hosts would overwrite each
@@ -347,13 +348,14 @@ gates the current tip of `<name>`:
   cannot answer, an owner whose recipe cannot be told the base -- is refused and named, and with
   `--repo` the run exits 1. Nothing is posted on a refused branch;
 - `--branch main` is the supported retry of a protected main tip whose latest `<repo>/required` is an
-  error (a merged pull request's revalidation that returned `inputs_changed`, say; a merged or closed
+  error, failure, or no status (a merged pull request's revalidation that returned `inputs_changed`, say; a merged or closed
   PR is never listed, so `--pr` cannot select it). It is the same branch-tip gate as any other
   protected branch, with main's own prior tip as the proof base: the recipe variable is set to
-  `origin/main~1`, the commit main moved from, so the merge under gate is judged against the main it
-  landed on and no base-relative lane sees an empty diff. Main's tip is not re-bound from the shared
+  `origin/main~1`. Jeryu resolves that to the parent commit after refreshing protected main,
+  refusing a moved tip so the proof cannot silently take its empty-change-set pass. Main's tip is not re-bound from the shared
   mirror in this mode: the base is the tip observed and admitted, and a main that moved under the run
-  leaves the head for the next tick with nothing posted. The owner still needs a declared recipe
+  before execution leaves the head for the next tick with nothing posted. If Jeryu
+  observes movement in its final proof refresh, the recipe fails and publishes failure. The owner still needs a declared recipe
   variable, but it may come from `PR_GATE_MAIN_PROOF_BASE_VARS` (below) instead of
   `PR_GATE_PROOF_BASE_VARS`. The published context is the ordinary `<repo>/required`;
   `<repo>/main-health` stays the separate diagnostic context it is, and `--main-health` is unchanged;

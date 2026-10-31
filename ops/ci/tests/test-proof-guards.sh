@@ -53,10 +53,24 @@ git clone -q --depth 1 --branch topic "file://$fixture/forge.git" "$fixture/pr"
   fail 'the default proof base is not protected origin/main'
 [[ "$(unset JERYU_JANKURAI_BASE_REF; proof_base_ref)" == origin/main ]] ||
   fail 'an unset proof base is not protected origin/main'
-# The supported retry of main's own tip: the commit main moved from, so the
-# change set is the merge under gate and not nothing.
-[[ "$(JERYU_JANKURAI_BASE_REF=origin/main~1 proof_base_ref)" == 'origin/main~1' ]] ||
-  fail 'the retry of main own tip cannot name the commit before the tip'
+# The supported retry must be main's exact refreshed tip, and resolves its parent
+# to an immutable commit before any other fetch can move origin/main.
+git clone -q --branch main "file://$fixture/forge.git" "$fixture/retry"
+retry_base=$(cd "$fixture/retry" && proof_require_history && JERYU_JANKURAI_BASE_REF=origin/main~1 proof_base_ref)
+[[ "$retry_base" == "$fork" ]] || fail 'main retry did not bind its exact parent commit'
+if (cd "$fixture/pr" && JERYU_JANKURAI_BASE_REF=origin/main~1 proof_base_ref) 2>/dev/null; then
+  fail 'a pull request could opt into the prior-tip main baseline'
+fi
+# The real proof history fetch advances main after admission, as it can in the
+# final proof lane after a long recipe. Refuse, never take the empty-diff pass.
+commit "$fixture/work" m3
+git -C "$fixture/work" push -q "$fixture/forge.git" main
+(cd "$fixture/retry" && proof_require_history)
+if (cd "$fixture/retry" && JERYU_JANKURAI_BASE_REF=origin/main~1 proof_base_ref) 2>/dev/null; then
+  fail 'main moving during the proof history fetch allowed a vacuous retry'
+fi
+(cd "$fixture/retry" && proof_changed_paths "$retry_base" "$main_tip" "$fixture/retry-changed")
+[[ -s "$fixture/retry-changed" ]] || fail 'the resolved parent changed when main moved'
 for refused in origin/release/v1 main HEAD HEAD~1 "$fork" origin/main~2 origin/main~ \
                'origin/main^' 'origin/main~1 ' refs/remotes/origin/main; do
   if out="$(JERYU_JANKURAI_BASE_REF="$refused" proof_base_ref 2>/dev/null)"; then
@@ -330,6 +344,8 @@ grep -q '^name = "proof-evidence"$' agent/proof-lanes.toml ||
   fail 'the lane is not in the repository lane catalog'
 grep -q '^command = "bash ops/ci/proof_evidence.sh"$' agent/proof-lanes.toml ||
   fail 'the catalog does not name the command the gate runs'
+(( $(line_of '^proof_require_history$' "$lane") < $(line_of 'BASE_REF="$(proof_base_ref)"' "$lane") )) ||
+  fail 'the main retry baseline was selected before protected history was refreshed'
 printf 'proof lane wiring ok\n'
 
 # --- security lane failure evidence survives cleanup of target/ ---------------

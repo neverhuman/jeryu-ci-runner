@@ -153,12 +153,10 @@ WORKER_ROOT_VARS="${PR_GATE_WORKER_ROOT_VARS:-}"
 for var in $WORKER_ROOT_VARS; do
   [[ "$var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || { printf 'PR_GATE_WORKER_ROOT_VARS: %s is not a variable name\n' "$var" >&2; exit 2; }
 done
-# The owners whose recipe reads its proof base from a variable the family ships a known-safe value
-# for, so `--branch main` needs no site entry for them (owner=VARIABLE words, PR_GATE_PROOF_BASE_VARS
-# overrides it per owner). It is consulted for protected main and nowhere else: the value passed is
-# origin/main~1, and the jeryu recipe accepts only protected main's tip or the commit before it
-# (ops/ci/proof_evidence.sh), so a release line still needs its own declared entry.
-MAIN_PROOF_BASE_VARS="${PR_GATE_MAIN_PROOF_BASE_VARS-jeryu=JERYU_JANKURAI_BASE_REF}"
+# Optional site mapping for protected-main retries only (owner=VARIABLE words).
+# Empty by default. Install the runner on every host before opting in; recipes
+# must verify and bind the prior-tip baseline after refreshing protected main.
+MAIN_PROOF_BASE_VARS="${PR_GATE_MAIN_PROOF_BASE_VARS:-}"
 # A proof-base variable that is also a worker-root variable would silently replace the family root
 # with origin/<base> in the recipe's environment. That is a configuration error, refused at start (a
 # malformed proof-base entry, by contrast, only degrades its own owner; see owner_proof_base_var).
@@ -359,7 +357,7 @@ post_status() { # owner repo sha state description [target_url]
 # for the next tick with no status posted, at most PROOF_BASE_WAIT_CAP ticks in a row, and only then
 # is a failure posted that says why.
 #
-# One mode may take that variable from the family defaults instead of the site's list
+# One mode may take that variable from the main-only site mapping instead of the broader list
 # (MAIN_PROOF_BASE_VARS, above): the branch-tip gate of protected main, which passes exactly one
 # value, origin/main~1. A recipe listed there accepts only protected main's tip or the commit before
 # it and fails closed on anything else, so the default cannot widen what any other gate proves
@@ -380,7 +378,7 @@ owner_proof_base_var() { # owner
   return 0
 }
 # Protected main's own branch-tip gate, and only that one, may take its recipe variable from the
-# family defaults above when the site named none for the owner: it is proved against origin/main~1,
+# main-only site mapping above when the broader setting named none for the owner: it is proved against origin/main~1,
 # a commit of protected main's own history, which the owner's recipe is known to accept. A malformed
 # default is ignored exactly as a malformed site entry is.
 main_proof_base_var() { # owner branch
@@ -794,11 +792,13 @@ for qualified in $REPOS; do
     # Without the owner's proof-base variable the recipe would compare the tip against origin/main,
     # which a release line does not descend from: the run would prove nothing about the line. Nor
     # would main's own tip, which *is* origin/main: every base-relative check would see an empty
-    # diff. Protected main may take the variable from the family defaults; nothing else may.
+    # diff. Protected main may take the variable from the main-only site mapping; nothing else may.
     owner_proof_base_var "$owner"
     main_proof_base_var "$owner" "$only_branch"
     if [[ -z "$pb_var" ]]; then
-      say "refusing $owner/$repo $only_branch: $owner has no PR_GATE_PROOF_BASE_VARS entry, so its recipe cannot be told the base"
+      missing_setting=PR_GATE_PROOF_BASE_VARS
+      [[ "$only_branch" != main ]] || missing_setting='PR_GATE_PROOF_BASE_VARS or PR_GATE_MAIN_PROOF_BASE_VARS'
+      say "refusing $owner/$repo $only_branch: $owner has no $missing_setting entry, so its recipe cannot be told the base"
       branch_refused=1; continue
     fi
     # Never prove this runner's own work (see the PR listing below): a branch of its own name.
@@ -1441,7 +1441,7 @@ sync_repo "$repo" "$sha"
 [[ -z "$(git -C "$run/$repo" status --porcelain --ignored=no)" ]] || die "$repo is not clean at $sha"
 # The proof base in the tree as origin/<base>, at exactly the sha the inputs bind. A forge that will not
 # serve it now, or a base that moved since it was resolved, leaves the head for the next tick.
-if ((proof_base)) && [[ "$pb_branch" == main ]]; then
+if ((proof_base)) && [[ "$pb_branch" == main && -z "$only_branch" ]]; then
   # main is what sync_repo just put in the tree from the shared mirror, which another slot may have
   # advanced since the sha was first read: bind that commit, the one the recipe will actually see.
   # A branch-tip gate of main does not rebind: its base is the tip it observed and admitted, so the

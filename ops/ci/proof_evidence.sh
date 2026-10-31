@@ -18,7 +18,6 @@ if [[ ! -f "${candidate_policy}" || -L "${candidate_policy}" ||
   exit 1
 fi
 
-BASE_REF="$(proof_base_ref)"
 # origin must be the hosted source repository before anything is fetched from it.
 if [[ "$(git remote get-url origin)" != \
       'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' ]]; then
@@ -26,6 +25,7 @@ if [[ "$(git remote get-url origin)" != \
   exit 1
 fi
 proof_require_history
+BASE_REF="$(proof_base_ref)"
 base_commit="$(git rev-parse --verify "${BASE_REF}^{commit}")" || {
   printf 'missing proof evidence base: %s\n' "${BASE_REF}" >&2
   exit 1
@@ -39,7 +39,7 @@ current_head="$(git rev-parse --verify 'HEAD^{commit}')"
 # that scores below the tip, adds a cap or hard finding, or raises migration
 # liability fails them; the proof plan covers this head's own change. Gated
 # against protected main's tip, main's own head is a change set of nothing;
-# its supported retry is given origin/main~1 instead (proof_base_ref), so the
+# its supported retry resolves its parent SHA after the history fetch (proof_base_ref), so the
 # commit that moved main is judged against the main it moved from.
 fork_commit="$(proof_fork_point "${base_commit}" "${current_head}")"
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
