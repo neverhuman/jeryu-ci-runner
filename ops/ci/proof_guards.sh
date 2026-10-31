@@ -33,6 +33,21 @@ proof_require_history() {
   git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
 }
 
+# The baseline this proof judges against: protected main's tip, or -- for the supported retry of
+# main's own tip, where the tip *is* the baseline and every base-relative lane would see an empty
+# diff -- the protected commit before it. Only those two spellings are accepted, so the baseline is
+# always resolved from the protected remote-tracking ref the proof lane refreshes itself (never from
+# a commit a caller, a pull request or a branch chose), and the lane's baseline clone re-checks that
+# the commit is on protected main's own history. Anything else fails closed.
+proof_base_ref() {
+  local ref="${JERYU_JANKURAI_BASE_REF:-origin/main}"
+  case "$ref" in
+    origin/main|origin/main~1) printf '%s\n' "$ref" ;;
+    *) printf 'proof base must be protected origin/main, or origin/main~1 for the retry of main own tip, got %s\n' \
+         "$ref" >&2; return 1 ;;
+  esac
+}
+
 # Print the fork point of HEAD_COMMIT from protected main's tip BASE_COMMIT.
 # The change set is judged from here, so a head behind the tip is not refused,
 # and main's own head (or any ancestor of the tip) has the tip's ancestor as its

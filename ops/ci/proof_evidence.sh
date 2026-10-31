@@ -18,11 +18,7 @@ if [[ ! -f "${candidate_policy}" || -L "${candidate_policy}" ||
   exit 1
 fi
 
-BASE_REF="${JERYU_JANKURAI_BASE_REF:-origin/main}"
-if [[ "${BASE_REF}" != origin/main ]]; then
-  printf 'proof evidence base must be protected origin/main, got %s\n' "${BASE_REF}" >&2
-  exit 1
-fi
+BASE_REF="$(proof_base_ref)"
 # origin must be the hosted source repository before anything is fetched from it.
 if [[ "$(git remote get-url origin)" != \
       'https://git.neverhuman.org/git/jeryu/jeryu-ci-runner.git' ]]; then
@@ -41,7 +37,10 @@ current_head="$(git rev-parse --verify 'HEAD^{commit}')"
 # open pull request red each time main moves. The audit, migration and ratchet
 # checks below compare this head's whole tree with the tip's, so a stale head
 # that scores below the tip, adds a cap or hard finding, or raises migration
-# liability fails them; the proof plan covers this head's own change. Protected main's own head is a change set of nothing.
+# liability fails them; the proof plan covers this head's own change. Gated
+# against protected main's tip, main's own head is a change set of nothing;
+# its supported retry is given origin/main~1 instead (proof_base_ref), so the
+# commit that moved main is judged against the main it moved from.
 fork_commit="$(proof_fork_point "${base_commit}" "${current_head}")"
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
   printf 'proof evidence requires a clean exact-head checkout\n' >&2

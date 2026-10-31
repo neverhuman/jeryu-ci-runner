@@ -45,6 +45,26 @@ git clone -q --depth 1 --branch topic "file://$fixture/forge.git" "$fixture/pr"
 [[ "$(git -C "$fixture/pr" diff --name-only "origin/main...HEAD" | tr '\n' ' ')" == 't1 t2 t3 ' ]] ||
   fail 'the head diff against protected main is not answerable'
 
+# --- base ref: the protected tip, or the commit before it, and nothing else ---
+# Only two spellings are accepted, both resolved from the protected
+# remote-tracking ref the lane refreshes itself, so no caller, pull request or
+# branch can name the commit this head is judged against.
+[[ "$(JERYU_JANKURAI_BASE_REF= proof_base_ref)" == origin/main ]] ||
+  fail 'the default proof base is not protected origin/main'
+[[ "$(unset JERYU_JANKURAI_BASE_REF; proof_base_ref)" == origin/main ]] ||
+  fail 'an unset proof base is not protected origin/main'
+# The supported retry of main's own tip: the commit main moved from, so the
+# change set is the merge under gate and not nothing.
+[[ "$(JERYU_JANKURAI_BASE_REF=origin/main~1 proof_base_ref)" == 'origin/main~1' ]] ||
+  fail 'the retry of main own tip cannot name the commit before the tip'
+for refused in origin/release/v1 main HEAD HEAD~1 "$fork" origin/main~2 origin/main~ \
+               'origin/main^' 'origin/main~1 ' refs/remotes/origin/main; do
+  if out="$(JERYU_JANKURAI_BASE_REF="$refused" proof_base_ref 2>/dev/null)"; then
+    fail "proof base $refused was accepted as $out"
+  fi
+done
+printf 'proof base ref guard ok\n'
+
 # --- change set: from the fork point, never refused for being empty ----------
 # A head behind the tip is judged from its fork point: its own commits, not
 # main's newer one.
