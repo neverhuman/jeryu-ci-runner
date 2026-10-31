@@ -2831,14 +2831,6 @@ review_one() { # owner/name number dry-run force include-drafts
     upstream_evidence "$cache" "$base_sha" "$sha" "$d" "${repo%%/*}" "$up_budget" || say "$tag: upstream evidence failed; the review goes on without it"
     up_spent=$((up_budget - up_left))
   fi
-  # The governed tool version's authority is reading too, so it shares the same room: its own cap,
-  # within what the diff and the pins leave of the diff limit.
-  local gov_budget="$governed_max_bytes" gov_room=$((max_diff_bytes - diff_bytes - up_spent))
-  [ "$gov_room" -ge "$gov_budget" ] || gov_budget="$gov_room"
-  if [ "$gov_budget" -gt 0 ]; then
-    governed_version_evidence "$cache" "$base_sha" "$sha" "$d" "${repo%%/*}" "$gov_budget" \
-      || say "$tag: governed tool version evidence failed; the review goes on without it"
-  fi
   review_check_diff "$repo" "$number" "$sha" "$files_count" "$diff_bytes" "$me" "$check_publish"
   if [ "$diff_bytes" -gt "$max_diff_bytes" ]; then
     say "$tag: diff is $diff_bytes bytes (> $max_diff_bytes), too large to red-team; NOT approving, needs a human"
@@ -2881,6 +2873,18 @@ review_one() { # owner/name number dry-run force include-drafts
     return 0
   fi
   say "$tag: reviewing ${sha:0:12} ($files_count files, $diff_bytes bytes of diff)"
+
+  # The governed tool version's authority is reading too, so it shares the same room: its own cap,
+  # within what the diff and the pins leave of the diff limit. Read only once the mechanical holds
+  # above have passed: a head that is too large, outside the author domain or signed by git's
+  # placeholder identity is never shown to the agent, so fetching the authority for it would cost
+  # the forge two reads and a fetch for evidence nobody reads.
+  local gov_budget="$governed_max_bytes" gov_room=$((max_diff_bytes - diff_bytes - up_spent))
+  [ "$gov_room" -ge "$gov_budget" ] || gov_budget="$gov_room"
+  if [ "$gov_budget" -gt 0 ]; then
+    governed_version_evidence "$cache" "$base_sha" "$sha" "$d" "${repo%%/*}" "$gov_budget" \
+      || say "$tag: governed tool version evidence failed; the review goes on without it"
+  fi
 
   # A known failed proof holds before spending review budget. Pending proof admits
   # an internal review; its result cannot publish until a fresh gate read passes.

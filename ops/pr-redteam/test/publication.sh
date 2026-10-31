@@ -110,6 +110,11 @@ case "$url" in
     if [[ -e "$PUBLISH_FIXTURE/reject" ]]; then printf '{"message":"publication refused"}\n403'
     elif [[ "$(jq -r .expected_head_sha <<< "$data")" != "$(cat "$PUBLISH_FIXTURE/head")" ]]; then printf '{"message":"head changed"}\n409'
     else jq -c . <<< "$data" >> "$PUBLISH_FIXTURE/accepted"; printf '{"ok":true}\n201'; fi ;;
+  */api/v1/repos/jeryu%2Fjeryu-tool|*/api/v1/repos/jeryu%2Fjeryu-tool/refs)
+    # The governed tool authority. This fixture has no such repository: the read is recorded and
+    # answered 404, so the evidence reports it instead of fetching anything.
+    printf '%s\n' "$url" >> "$PUBLISH_FIXTURE/authority-reads"
+    printf '{"error":{"code":"not_found"}}\n404' ;;
   */heartbeat) printf '{"accepted":true}\n200' ;;
   */api/v1/events) jq -c . <<< "$data" >> "$PUBLISH_FIXTURE/events"; printf '{"ok":true,"seqs":[1],"duplicates":0}\n201' ;;
   *) printf 'forbidden API %s\n' "$url" >> "$PUBLISH_FIXTURE/danger"; exit 98 ;;
@@ -313,6 +318,12 @@ echo 'ok author domain held before the model, matching domain reviewed'
 model_calls="$(count "$t/model-calls")"; accepted_before="$(count "$t/accepted")"
 named_head="$(cat "$t/head")"
 printf 'unsigned\n' >> "$t/repo/README.md"
+# The same commit moves the generated governed tool version, so this head is one the governed
+# evidence would gather the authority for -- had it not been held first.
+mkdir -p "$t/repo/agent"
+printf '[audit]\nminimum_score = 85\nrequired_tool_version = "1.7.6"\n' > "$t/repo/agent/audit-policy.toml"
+fixture_git -C "$t/repo" add agent/audit-policy.toml
+authority_reads="$(count "$t/authority-reads")"
 fixture_git -C "$t/repo" -c 'user.name=Your Name' -c user.email=you@example.com commit -qam placeholder
 g rev-parse HEAD > "$t/head"
 review
@@ -323,13 +334,26 @@ attempts="$(find "$t/state/attempts" -type f | wc -l)"
 review
 [[ "$(find "$t/state/attempts" -type f | wc -l)" == "$attempts" ]]
 [[ "$(count "$t/model-calls")" == "$model_calls" && "$(count "$t/accepted")" == "$accepted_before" ]]
-# A head whose commits all name a person is reviewed as usual.
+# A head the controller holds mechanically is never shown to the agent, so its governed authority is
+# never read: no forge request for it, on this review or on the repeat above.
+[[ "$(count "$t/authority-reads")" == "$authority_reads" ]]
+# A head whose commits all name a person is reviewed as usual -- and then the same governed move does
+# cost the authority its reads, so the assertion above is about the hold and not about the move.
 g reset -q --hard "$named_head"; g rev-parse HEAD > "$t/head"
 advance
 review
 jq -e '.decision != "placeholder_author" and .posted == true' "$(receipt)" > /dev/null
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
+[[ "$(count "$t/authority-reads")" == "$authority_reads" ]]
+mkdir -p "$t/repo/agent"
+printf '[audit]\nminimum_score = 85\nrequired_tool_version = "1.7.6"\n' > "$t/repo/agent/audit-policy.toml"
+g add agent/audit-policy.toml; g commit -qm 'render the governed version'; g rev-parse HEAD > "$t/head"
+review
+jq -e '.posted == true' "$(receipt)" > /dev/null
+[[ "$(count "$t/authority-reads")" -gt "$authority_reads" ]]
+g rm -q agent/audit-policy.toml; g commit -qm 'drop the fixture policy'; g rev-parse HEAD > "$t/head"
 echo 'ok a placeholder commit identity holds before the model, with no domain configured'
+echo 'ok a mechanically held head costs the governed authority no read; a reviewed move does'
 
 # A new base also invalidates the previous exact-head review receipt.
 model_calls="$(count "$t/model-calls")"
