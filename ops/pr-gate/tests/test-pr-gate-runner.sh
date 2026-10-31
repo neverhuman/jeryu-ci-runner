@@ -1776,7 +1776,7 @@ printf 'PASS diagnostic update failure preserves terminal result, publication an
 printf 'PASS dirty after-run capture publishes repository and bounded paths without changing verdicts\n'
 # The recipe's PATH: the governed tool directory, then PR_GATE_RECIPE_PATH. A host whose
 # ~/.local/bin is written by software it does not schedule (an agent binary that replaces itself
-# mid-gate) points the recipes at directories it owns instead; what the recipe can execute stays
+# mid-gate) points the recipes at directories it owns instead; tools resolved through PATH remain
 # bound by content either way.
 rm -f "$fixture/mutate-tool"
 mkdir -p "$fixture/home/.local/bin" "$fixture/recipe-tools"
@@ -1810,14 +1810,14 @@ PR_GATE_RECIPE_PATH="$fixture/recipe-tools:/usr/bin:/bin" invoke --repo acme/fix
 jq -e '.outcome == "success"' "$receipt" >/dev/null \
   || { printf 'a tool outside the configured recipe PATH still invalidated a gate\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 rm -f "$fixture/recipe-tools/just" "$fixture/home/.local/bin/stray"
-# A PATH that is not absolute directories is refused before anything is gated.
-for bad in "/usr/bin::/bin" "/usr/../bin"; do
+# Empty entries and traversal are refused before anything is gated.
+for bad in "/usr/bin::/bin" "/usr/../bin" "/usr/bin:" ":/bin"; do
   runner_exit=0
   PR_GATE_RECIPE_PATH="$bad" invoke --list
   [[ "$runner_exit" == 2 ]] && grep -q 'PR_GATE_RECIPE_PATH is not usable' "$fixture/runner.log" \
     || { printf 'PR_GATE_RECIPE_PATH %s was accepted (exit %s)\n' "$bad" "$runner_exit" >&2; cat "$fixture/runner.log" >&2; exit 1; }
 done
-printf 'PASS the recipe PATH is the governed tools then PR_GATE_RECIPE_PATH, bound by content, unshadowable, and refused unless absolute\n'
+printf 'PASS the recipe PATH is the governed tools then PR_GATE_RECIPE_PATH, bound by content, unshadowable, and refuses empty entries and traversal\n'
 
 # Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.
 rm -f "$fixture/mutate-tool"

@@ -698,13 +698,18 @@ score 94 and ended `inputs_changed` because the only input that had moved was th
 `~/.local/bin/claude`, which had replaced itself while the gate ran. Two ways out, and nothing is
 frozen either way:
 
-- update it inside a drain: `bin/pr-gate-tool-update.sh [--timeout SECONDS] -- <command...>` takes the
-  installer's lock, pauses active slot, main-health, wake and audit timers, waits until no runner process is left (at most
-  `GATE_INSTALL_DRAIN_SECONDS`), runs the command once, then restores those timers and records
-  `{command, exit_code, finished_at, drained_slots}` in `tool-update.json`. It exits the command's
-  status, or 75 when nothing ran (an install holds the lock, or the slots did not drain in time), so
+- update it inside a drain: `bin/pr-gate-tool-update.sh [--timeout SECONDS] [--update-timeout SECONDS] -- <command...>` takes the
+  installer's lock, pauses active slot, main-health, wake and audit timers, waits until no runner, wake or audit process is left (at most
+  `GATE_INSTALL_DRAIN_SECONDS`), runs the command once with a separate positive
+  `GATE_INSTALL_UPDATE_SECONDS` bound (default 600 seconds; `--update-timeout` overrides it),
+  then restores those timers and records `{command, exit_code, finished_at, drained_slots,
+  update_timeout_seconds, resume_failures}` in `tool-update.json`. Empty/failed slot enumeration or
+  failed process inspection refuses the update. GNU timeout sends TERM at the command deadline and
+  KILL to its process group after another 10 seconds; timeout exits 124, or 137 when KILL was needed.
+  A timer restoration failure is named in the receipt and makes an otherwise successful invocation
+  fail. It exits the command's status, or 75 when nothing ran (an install holds the lock, or the slots did not drain in time), so
   the gate user's own timer can try again. An update command may also exit 75; the receipt tells
-  whether it ran. INT/TERM restore the prior active timers; SIGKILL or host loss requires operator
+  whether it ran. INT/TERM stop the update group before restoring the prior active timers; SIGKILL or host loss requires operator
   recovery of paused timers. Point the tool's updater at it instead of letting
   the tool update itself whenever it happens to run.
 - keep it off the recipe's PATH: `PR_GATE_RECIPE_PATH` replaces everything after the governed tool
