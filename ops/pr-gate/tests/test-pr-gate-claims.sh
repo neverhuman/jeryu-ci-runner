@@ -26,8 +26,15 @@ source "$here/pr-gate-state.sh"
 source "$here/pr-gate-progress.sh"
 source "$here/pr-gate-claims.sh"
 # Load the production transport and early-publication functions, without running the dispatcher.
+# A rename or reflow that makes the extraction empty or partial must fail here, not leave the
+# coverage below silently testing nothing.
 for fn in api post_status proof_base_wait retire_stale_base_green; do
-  eval "$(sed -n "/^$fn() {/,/^}/p" "$here/pr-gate-runner.sh")"
+  extracted=$(sed -n "/^$fn() {/,/^}/p" "$here/pr-gate-runner.sh")
+  if [[ "$(head -n1 <<<"$extracted")" != "$fn() {"* || "$(tail -n1 <<<"$extracted")" != "}" || "$(wc -l <<<"$extracted")" -lt 3 ]]; then
+    printf 'cannot extract %s() from pr-gate-runner.sh\n' "$fn" >&2; exit 1
+  fi
+  eval "$extracted"
+  declare -F "$fn" >/dev/null || { printf '%s() was not defined by the extraction\n' "$fn" >&2; exit 1; }
 done
 say() { printf '%s\n' "$*" >>"$scratch/operator.log"; }
 die() { say "$*"; exit 1; }

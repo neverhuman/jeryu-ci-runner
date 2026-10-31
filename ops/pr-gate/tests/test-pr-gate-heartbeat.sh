@@ -33,6 +33,9 @@ fi
 if [[ -n "${HEARTBEAT_TEST_REJECT_CAPABILITIES:-}" ]] && jq -e 'has("capabilities")' <<<"$data" >/dev/null; then
   printf 'unknown field capabilities\n422'; exit 0
 fi
+if [[ -n "${HEARTBEAT_TEST_MALFORMED_CAPABILITIES:-}" ]] && jq -e 'has("capabilities")' <<<"$data" >/dev/null; then
+  printf '{"message":"invalid capabilities: host-ci is not permitted for this runner"}\n422'; exit 0
+fi
 if [[ -n "${HEARTBEAT_TEST_REJECT_TOOLS:-}" ]] && jq -e 'has("tools")' <<<"$data" >/dev/null; then
   printf 'Failed to deserialize the JSON body: unknown field `tools`\n422'; exit 0
 fi
@@ -347,6 +350,15 @@ touch -d '-31 minutes' "$fixture/home/cache/heartbeat-no-capabilities"
 GATE_RUNNER_CAPABILITIES=host-ci bash "$source_file"
 tail -1 "$HEARTBEAT_TEST_CAPTURE" | jq -e '.body.capabilities == ["host-ci"]' >/dev/null
 rm -f "$fixture/home/cache/heartbeat-no-capabilities"
+# A 422 that is not an unknown-field refusal is a configuration fault: the beat still arrives with
+# its task evidence and no capability claim, the fault is named, and nothing is remembered.
+rm -f "$fixture/home/cache/heartbeat-no-capabilities"
+GATE_RUNNER_CAPABILITIES=host-ci HEARTBEAT_TEST_MALFORMED_CAPABILITIES=1 bash "$source_file" 2>"$fixture/capabilities.log"
+grep -q 'rejected by the forge (422' "$fixture/capabilities.log"
+grep -q 'GATE_RUNNER_CAPABILITIES' "$fixture/capabilities.log"
+! grep -q 'capabilities refused' "$fixture/capabilities.log"
+tail -1 "$HEARTBEAT_TEST_CAPTURE" | jq -e '(.body | has("capabilities") | not) and (.body.last | has("recipe"))' >/dev/null
+[[ ! -e "$fixture/home/cache/heartbeat-no-capabilities" ]]
 refuse env GATE_RUNNER_CAPABILITIES='host-ci host-ci' bash "$source_file"
 refuse env GATE_RUNNER_CAPABILITIES=host_ci bash "$source_file"
 printf 'PASS capabilities reach the forge; older forges retain task evidence; invalid configuration sends nothing\n'

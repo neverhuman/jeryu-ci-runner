@@ -1095,9 +1095,14 @@ no special capability. Names are space-separated; the runner rejects unknown
 and duplicate names before making requests. Both the slot runner and heartbeat
 timer send the setting in the heartbeat's `capabilities` array, and
 `/api/v1/control-plane/runners` shows it per node. A heartbeat without the
-field clears a previous advertisement; a forge that refuses the field gets a
-retry without it (in the same shape the beat was sent in), and cannot match on
-capabilities at all. The heartbeat timer remembers that refusal for 30 minutes
+field clears a previous advertisement; a forge that names the field as unknown (a
+`422` saying `unknown field capabilities`) gets a retry without it (in the same
+shape the beat was sent in), and cannot match on capabilities at all. Any other
+`422` that mentions capabilities is a configuration fault, not an older forge:
+the beat is sent without a capability claim so liveness stays truthful, the
+rejected value and the forge's reason are logged against
+`GATE_RUNNER_CAPABILITIES`, and nothing is remembered, so a corrected setting is
+tried on the next beat. The heartbeat timer remembers an unknown-field refusal for 30 minutes
 (`cache/heartbeat-no-capabilities`), as it remembers refused tools and code; the
 slot runner drops the field for the rest of its run.
 
@@ -1117,8 +1122,11 @@ claim rather than quietly requiring nothing.
 
 `GATE_RUNNER_OWNERS`/`GATE_RUNNER_REPOS` still say which repositories a host
 discovers and gates, and remain how a host is given a smaller share of the
-work. They are no longer a failover mechanism: there is nothing to move when a
-host dies, and no need to keep two hosts off each other's owners.
+work. Once every gate host runs this version they are no longer a failover
+mechanism: there is nothing to move when a host dies, and no need to keep two
+hosts off each other's owners. Until then (see the rollout order above) they
+stay disjoint: an older runner ignores the lease, and overlapping assignments
+would let it publish for a head another host holds.
 
 ### When it needs a person
 

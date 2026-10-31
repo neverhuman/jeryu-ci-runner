@@ -171,10 +171,20 @@ for slot in $SLOTS; do
   else
     post_heartbeat "$body"
   fi
+  # Only a forge that names `capabilities` as an unknown field predates it; that is remembered. Any
+  # other 422 that mentions them (a value the forge rejects) is a configuration fault: say so, send
+  # the beat without a claim so liveness stays truthful, and remember nothing, so a corrected
+  # setting is tried on the next beat.
   if [[ "$code" == 422 && "$CAPABILITIES" != '[]' && "$out" == *capabilities* ]]; then
-    printf 'heartbeat capabilities refused (422); retrying without them\n' >&2
+    if [[ "$out" =~ unknown\ field\ [\`\'\"]?capabilities ]]; then
+      printf 'heartbeat capabilities refused (422); retrying without them\n' >&2
+      caps_refused=1
+    else
+      printf 'heartbeat capabilities %s rejected by the forge (422: %s); check GATE_RUNNER_CAPABILITIES; beating without them\n' \
+        "$CAPABILITIES" "${out%$'\n'*}" >&2
+    fi
     body=$(jq -c 'del(.capabilities)' <<<"$body")
-    CAPABILITIES='[]' caps_refused=1
+    CAPABILITIES='[]'
     if ((minimal)); then
       post_heartbeat "$(gate_heartbeat_minimal "$body")"
     elif [[ -n "$runner_code$runner_tools" ]]; then

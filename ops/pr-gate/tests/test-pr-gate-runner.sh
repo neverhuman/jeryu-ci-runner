@@ -138,6 +138,18 @@ fi
 [[ ! -f "$fixture_root/recipe-sleep" ]] || sleep "$(cat "$fixture_root/recipe-sleep")"
 # The one PATH the recipe got, for the PR_GATE_RECIPE_PATH assertions.
 printf '%s\n' "$PATH" >"$fixture_root/recipe-path"
+# recipe-hold: a recipe that stays running until recipe-release appears (bounded at a minute), for
+# the lease renewal cases. recipe-started says it began, recipe-ticks grows while it waits, and
+# recipe-finished exists only if it ran to the end -- which a stopped recipe never does.
+if [[ -f "$fixture_root/recipe-hold" ]]; then
+  : >"$fixture_root/recipe-started"
+  for _ in $(seq 600); do
+    [[ ! -f "$fixture_root/recipe-release" ]] || break
+    printf x >>"$fixture_root/recipe-ticks"; sleep 0.1
+  done
+  : >"$fixture_root/recipe-finished"
+fi
+
 if [[ "$1" == required-fast && "$(cat mode)" == fast-fail ]]; then exit 8; fi
 if [[ "$1" == required && -f "$fixture_root/full-fail" ]]; then exit 9; fi
 if [[ -f "$fixture_root/require-sibling" ]]; then
@@ -301,9 +313,10 @@ case "$method $url" in
     else printf '{"statuses":[]}'; fi
     printf '\n200';;
   'POST '*'/statuses/'*)
+    # A publication needs a lease on exactly this repository (read from the URL) and this head.
     publish_sha=${url##*/statuses/}
-    lease="$FAKE_FORGE/claims/acme-fixture-$publish_sha"
-    [[ "$url" != */gate-a/hubDB/* ]] || lease="$FAKE_FORGE/claims/gate-a-hubDB-$publish_sha"
+    route=${url#*/repos/}; lease_owner=${route%%/*}; route=${route#*/}; lease_repo=${route%%/*}
+    lease="$FAKE_FORGE/claims/$lease_owner-$lease_repo-$publish_sha"
     [[ -f "$lease" ]] || { printf 'UNLEASED status %s\n' "$url" >>"$FAKE_FORGE/unleased"; printf '{}\n409'; exit; }
     # A forge that predates the status link refuses the field.
     if [[ -f "$FAKE_FORGE/reject-target-url" ]] && jq -e 'has("target_url")' <<<"$payload" >/dev/null; then
@@ -345,9 +358,15 @@ case "$method $url" in
       fi
     fi
     if [[ "$(jq -r '.state' <<<"$payload")" == pending ]]; then touch "$FAKE_FORGE/pending-$publish_sha"; fi
-    # pending-sleep: a forge slow to take `pending`, which keeps a slot in preparation that long.
-    if [[ -f "$FAKE_FORGE/pending-sleep" && "$(jq -r '.state' <<<"$payload")" == pending ]]; then
-      sleep "$(cat "$FAKE_FORGE/pending-sleep")"
+    # pending-hold: a forge slow to take `pending`: it answers once the lease on this head has been
+    # asked for three times (the grant, the check before `pending`, and a background renewal,
+    # granted or refused), bounded at a minute.
+    if [[ -f "$FAKE_FORGE/pending-hold" && "$(jq -r '.state' <<<"$payload")" == pending ]]; then
+      for _ in $(seq 600); do
+        asks=$(cat "$FAKE_FORGE/claims-granted.log" "$FAKE_FORGE/claims-refused.log" 2>/dev/null | grep -c " $publish_sha " || true)
+        ((asks < 3)) || break
+        sleep 0.1
+      done
     fi
     count=0
     [[ ! -f "$FAKE_FORGE/statuses.jsonl" ]] || count=$(wc -l <"$FAKE_FORGE/statuses.jsonl")
@@ -483,6 +502,14 @@ export PATH="$fixture/tools:$fixture/toolchain/bin:/usr/bin:/bin"
 invoke() {
   runner_exit=0
   "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" "$@" >"$fixture/runner.log" 2>&1 || runner_exit=$?
+  no_unleased
+}
+# The forge refuses a status without a live lease on its repository and head and logs the attempt:
+# no case of this suite may have made one.
+no_unleased() {
+  [[ ! -s "$fixture/unleased" ]] && return 0
+  printf 'a publication was attempted without a lease:\n' >&2; cat "$fixture/unleased" >&2
+  printf -- '--- runner.log\n' >&2; cat "$fixture/runner.log" >&2; exit 1
 }
 count() { cat "$fixture/executions" 2>/dev/null || printf 'none\n'; }
 # Every count assertion says what actually happened; a bare [[ ]] left no trace of the runner's own

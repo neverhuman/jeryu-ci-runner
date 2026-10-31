@@ -14,8 +14,25 @@ claim="$fixture/claims/acme-fixture-$head"
 claims_count=$(count)
 fail_claims() { printf '%s\n--- runner.log\n' "$1" >&2; cat "$fixture/runner.log" >&2; exit 1; }
 
-# A live lease held by the other host: this host posts nothing at all for that head.
+# The fixture forge accepts a status only under a lease on that URL's own repository and head: a
+# lease on another repository, or on another head, authorizes nothing.
 mkdir -p "$fixture/claims"
+status_post() { # repo-path sha -> the forge's HTTP code
+  "$fixture/tools/curl" -X POST --data '{"state":"pending","context":"x"}' \
+    "https://forge.invalid/api/v1/repos/$1/statuses/$2" | tail -n1
+}
+other_head=0000000000000000000000000000000000000001
+for held in "acme-other-$head" "gate-a-hubDB-$head" "acme-fixture-$other_head"; do
+  printf 'gate-a/slot0 gate-a %s\n' "$(( $(date +%s) + 3600 ))" >"$fixture/claims/$held"
+done
+[[ "$(status_post acme/fixture "$head")" == 409 ]] || fail_claims 'a lease on other repositories or heads authorized a status'
+[[ "$(status_post gate-a/hubDB "$other_head")" == 409 ]] || fail_claims 'a lease on another head authorized a status'
+[[ "$(wc -l <"$fixture/unleased")" == 2 ]] || fail_claims 'the fixture did not log the unleased attempts'
+rm -f "$fixture/unleased" "$fixture/claims/acme-other-$head" "$fixture/claims/gate-a-hubDB-$head" \
+  "$fixture/claims/acme-fixture-$other_head"
+printf 'PASS gate claims: the fixture binds a publication to its own repository and head\n'
+
+# A live lease held by the other host: this host posts nothing at all for that head.
 printf 'gate-b/slot0 gate-b %s\n' "$(( $(date +%s) + 3600 ))" >"$claim"
 statuses=$(wc -l <"$fixture/statuses.jsonl")
 invoke --repo acme/fixture --pr 1
@@ -98,7 +115,7 @@ claims_head() {
 non_pending() { jq -s '[.[] | select(.state != "pending")] | length' "$fixture/statuses.jsonl"; }
 claims_head
 printf '30\n' >"$fixture/claim-ttl"
-printf '12\n' >"$fixture/pending-sleep"
+touch "$fixture/pending-hold"
 grants=$(grep -c "acme/fixture $head " "$fixture/claims-granted.log" || true)
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || fail_claims 'the slow-preparation gate failed'
@@ -122,7 +139,7 @@ grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'the lost leas
 jq -se 'map(select(.outcome == "claim_lost" and .publication.superseded_by != null)) | length >= 1' \
   "$fixture"/runner/attempts/acme-fixture-"$head"*/*/receipt.json >/dev/null \
   || fail_claims 'the abandoned attempt is not recorded as superseded'
-rm -f "$fixture/pending-sleep" "$claim"
+rm -f "$fixture/pending-hold" "$claim"
 printf 'PASS gate claims: a lease lost during preparation stops the gate before its recipe\n'
 
 # A completed result whose publication lease is refused stays in the outbox. The
@@ -226,7 +243,8 @@ rm -f "$fixture/deny-claims-after-recipe" "$fixture/claims-denied" "$claim"
 printf 'PASS gate claims: an ownership that stays unknown is deferred after a bounded recovery\n'
 
 # A lease lost while the recipe runs stops the recipe: the slot does not spend the rest of a gate on
-# a head another host now gates, and publishes nothing for it.
+# a head another host now gates, and publishes nothing for it. The recipe holds until released, so
+# a runner that left it running would finish its sleep and mark recipe-slept.
 claims_head
 printf '30\n' >"$fixture/claim-ttl"
 printf '25\n' >"$fixture/recipe-sleep"
@@ -242,6 +260,7 @@ expect_count "$((started + 1))"
 # The recipe marks the end of its sleep; a stopped recipe never reaches it, however long the host's
 # preparation took.
 [[ ! -e "$fixture/recipe-slept" ]] || fail_claims 'the recipe ran on after its lease was lost'
+
 [[ "$(non_pending)" == "$results" ]] || fail_claims 'a result was published after the lease was lost mid-recipe'
 grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'the mid-recipe loss was not reported'
 grep -qE 'renewal answered|publication renewal refused' "$fixture/runner/cache/gate-claim-slot0/lost" \
@@ -251,19 +270,40 @@ printf 'PASS gate claims: a lease lost mid-recipe stops the recipe and publishes
 
 
 # A slot killed outright (kill -9) leaves no process renewing its head: the renewer ends with the
-# runner, so the lease lapses within one TTL and another host can take the head.
-printf '20\n' >"$fixture/recipe-sleep"
+# runner, so the lease lapses within one TTL and another host can take the head. A renewal request
+# may still be in flight at the kill, so the grants are counted only once the slot's own processes
+# and every fixture request are gone. The observation window is then the lease itself: it must run
+# out at the expiry the forge recorded, with no further grant, and a second runner is granted the head.
+renewer_gone() {
+  ! pgrep -f "$script_dir/pr-gate-runner.sh --repo acme/fixture --pr 1" >/dev/null \
+    && ! pgrep -f "$fixture/tools/curl" >/dev/null
+}
+rm -f "$fixture/recipe-started" "$fixture/recipe-finished" "$fixture/recipe-release" "$fixture/recipe-ticks"
+touch "$fixture/recipe-hold"
+printf '3\n' >"$fixture/claim-ttl"
 "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --repo acme/fixture --pr 1 >"$fixture/runner.log" 2>&1 &
 killed=$!
-for _ in $(seq 100); do grep -q 'gate claim held for' "$fixture/runner.log" && break; sleep 0.2; done
+for _ in $(seq 300); do [[ -e "$fixture/recipe-started" ]] && break; sleep 0.1; done
+[[ -e "$fixture/recipe-started" ]] || fail_claims 'the killed slot never reached its recipe'
 grep -q 'gate claim held for' "$fixture/runner.log" || fail_claims 'the killed slot never took the lease'
 kill -9 "$killed"; wait "$killed" 2>/dev/null || true
+# The recipe is a fork of the runner and shares its command line: let it end so that what remains
+# under that command line can only be a renewer.
+touch "$fixture/recipe-release"
+for _ in $(seq 300); do [[ -e "$fixture/recipe-finished" ]] && break; sleep 0.1; done
+[[ -e "$fixture/recipe-finished" ]] || fail_claims 'the orphaned recipe did not end'
+for _ in $(seq 300); do renewer_gone && break; sleep 0.1; done
+renewer_gone || fail_claims "a renewer or request outlived its killed runner: $(cat "$fixture/runner/cache/gate-claim-slot0/renewer.log" 2>/dev/null)"
 grants=$(grep -c "acme/fixture $head " "$fixture/claims-granted.log")
-sleep 15
+read -r _ _ expiry <"$claim" || fail_claims 'the killed slot left no lease record'
+while (( $(date +%s) <= expiry )); do sleep 0.2; done
 [[ "$(grep -c "acme/fixture $head " "$fixture/claims-granted.log")" == "$grants" ]] \
-  || fail_claims 'a renewer outlived its killed runner'
-sleep 8   # the orphaned recipe finishes; nothing of the slot renews its lease
-rm -f "$fixture/recipe-sleep" "$fixture/claim-ttl"
+  || fail_claims 'the lease was renewed after its runner was killed'
+took=$("$fixture/tools/curl" -X POST --data "$(jq -nc --arg s "$head" \
+  '{repo:"acme/fixture",head_sha:$s,runner_id:"gate-b/slot0",host:"gate-b"}')" \
+  https://forge.invalid/api/v1/gate-claims | tail -n1)
+[[ "$took" == 201 ]] || fail_claims "another host could not take the head after the killed slot's lease lapsed (HTTP $took)"
+rm -f "$fixture/recipe-hold" "$fixture/claim-ttl" "$claim"
 printf 'PASS gate claims: a killed slot leaves no renewer behind\n'
 
 # A handover after the first recipe must leave later candidates eligible in this tick.
