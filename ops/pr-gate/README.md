@@ -328,6 +328,17 @@ this weaker-than-tip baseline. The setting never reaches a pull request, merge q
 main-health or non-main branch gate. A variable also listed in `PR_GATE_WORKER_ROOT_VARS`
 is refused at start. Upgrade every host before opting in.
 
+For Jeryu, after this runner is installed on every gate host and the matching recipe is
+on protected main, the site setting is:
+
+```sh
+PR_GATE_MAIN_PROOF_BASE_VARS=jeryu=JERYU_JANKURAI_BASE_REF
+```
+
+Set it in each host's `pr-gate.env`. On an idle slot, inspect candidate selection with
+`pr-gate-runner.sh --list --branch main --repo jeryu/jeryu-ci-runner` before running the
+retry. The list reads the forge and executes no recipe or status publication.
+
 Roll a runner with this out to every gate host before adding the setting: a host without it proves a
 release-line head against `origin/main`, its identity differs, and the two hosts would overwrite each
 other's verdict on that head every tick.
