@@ -283,12 +283,20 @@ proof_report_security_failure() {
 # to DIGEST. Run after the baseline audit, which leaves untracked .jankurai
 # output behind -- that output is this run's, the tracked tree is main's.
 proof_require_protected_baseline() {
-  local repo="$1" base="$2" digest="$3" now
-  if [[ "$(git -C "$repo" rev-parse 'HEAD^{commit}')" != "$base" ]]; then
+  local repo="$1" base="$2" digest="$3" now head tracked
+  head="$(git -C "$repo" rev-parse 'HEAD^{commit}')" || {
+    printf 'cannot read protected-main baseline HEAD\n' >&2
+    return 1
+  }
+  if [[ "$head" != "$base" ]]; then
     printf 'protected-main baseline moved off %s during the gate\n' "$base" >&2
     return 1
   fi
-  if [[ -n "$(git -C "$repo" status --porcelain=v1 --untracked-files=no)" ]]; then
+  tracked="$(git -C "$repo" status --porcelain=v1 --untracked-files=no)" || {
+    printf 'cannot inspect protected-main baseline tracked files\n' >&2
+    return 1
+  }
+  if [[ -n "$tracked" ]]; then
     printf 'protected-main baseline has modified tracked files\n' >&2
     return 1
   fi

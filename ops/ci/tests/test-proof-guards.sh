@@ -230,6 +230,8 @@ printf 'candidate source\n' > "$fixture/protected/source.txt"
 if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'edited non-policy baseline input accepted'; fi
 git -C "$fixture/protected" restore source.txt
 if $b "$fixture/protected" "$pbase" "$zero" 2>/dev/null; then fail 'wrong baseline policy digest accepted'; fi
+printf 'invalid index\n' > "$fixture/protected/.git/index"
+if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'failed baseline status read accepted'; fi
 printf 'proof protected baseline guard ok\n'
 
 # --- the authorization file the lane really reads ----------------------------
