@@ -339,6 +339,7 @@ STATUS_ATTEMPTS="${PR_GATE_STATUS_ATTEMPTS:-4}"
 STATUS_RETRY_SLEEP="${PR_GATE_STATUS_RETRY_SLEEP:-5}"
 [[ "$STATUS_RETRY_SLEEP" =~ ^[0-9]+$ ]] && ((STATUS_RETRY_SLEEP <= 60)) || STATUS_RETRY_SLEEP=5
 post_status() { # owner repo sha state description [target_url]
+  POST_STATUS_POSTED=0
   local url=${6:-} attempt=1 failed_code failed_body
   while :; do
     api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg s "$4" --arg c "$(gate_status_context "$1" "$2")" \
@@ -356,14 +357,15 @@ post_status() { # owner repo sha state description [target_url]
     fi
     break
   done
-  [[ "$code" == 201 ]] && return 0
-  [[ "$code" != lease_unavailable ]] || return 0
+  if [[ "$code" == 201 ]]; then POST_STATUS_POSTED=1; return 0; fi
+  [[ "$code" != lease_unavailable && "$body" != "publication lease renewal unavailable; retain result for recovery" ]] || return 0
   failed_code=$code failed_body=$body
   if [[ "$code" =~ ^(5[0-9][0-9]|000)$ && "$4" != error ]]; then
     api POST "/repos/$1/$2/statuses/$3" "$(jq -n --arg c "$(gate_status_context "$1" "$2")" \
       --arg d "$MARKER: the forge answered $failed_code posting $4; the gate retries on the next tick" \
       '{state: "error", context: $c, description: $d}')"
   fi
+  [[ ! "$failed_code" =~ ^(5[0-9][0-9]|000|429)$ ]] || return 0
   die "posting $1/$2 $(gate_status_context "$1" "$2")=$4 on $3 answered $failed_code: $failed_body"
 }
 
@@ -503,7 +505,7 @@ proof_base_wait() { # owner repo sha stage reason
     post_status "$1" "$2" "$3" failure "no gate: proof base unavailable for $n ticks: ${reason:0:100} ($MARKER)"
     # A denied lease published nothing: start another bounded wait instead of claiming
     # a failure stands forever when it never reached the forge.
-    [[ "$code" != lease_unavailable ]] || proof_base_count "$1" "$2" "$3" clear >/dev/null
+    ((POST_STATUS_POSTED)) || proof_base_count "$1" "$2" "$3" clear >/dev/null
   else
     say "$1/$2@$3: proof base still not available after $n ticks ($reason); its failure status stands"
   fi
@@ -1747,7 +1749,10 @@ case "${gate_action:?}" in
   republish)
     id=$(jq -r '.id' "$gate_key_dir/last-result.json")
     gate_receipt="$gate_key_dir/$id/receipt.json"
-    gate_publish || die "publication recovery still rejected; retained $gate_receipt"
+    if ! gate_publish; then
+      ((GATE_PUBLICATION_DEFERRED)) || die "publication recovery fault; retained $gate_receipt"
+      say "publication recovery deferred; retained $gate_receipt"
+    fi
     gate_receipt=""
     rm -f -- "$identity" "$status_snapshot"
     break;;
@@ -1928,11 +1933,23 @@ if ((keep_green)); then
 else
   pending_base=$(gate_proof_base_field "$gate_receipt") || pending_base=""
   post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")${pending_base:+; $pending_base}" "$checks_url"
+  if ((POST_STATUS_POSTED == 0)); then
+    gate_finish interrupted null "" 'pending publication deferred; recipe not started'
+    gate_receipt=""
+    ran_tier=0
+    break
+  fi
 fi
 if ((full_pending)); then
   say "$owner/$repo@$sha: its newest full success is not this runner's for this base; posting full pending before the fast tier"
   pending_base=$(gate_proof_base_field "$gate_receipt") || pending_base=""
   GATE_CONTEXT_KIND=required post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running first on $MARKER, then $full_recipe_name; attempt $(jq -r '.id' "$gate_receipt")${pending_base:+; $pending_base}" "$checks_url"
+  if ((POST_STATUS_POSTED == 0)); then
+    gate_finish interrupted null "" 'pending publication deferred; recipe not started'
+    gate_receipt=""
+    ran_tier=0
+    break
+  fi
 fi
 # shellcheck disable=SC2016  # a jq program: $url is jq's
 gate_update --arg url "$checks_url" '.phase="running" | .checks_url=$url'
@@ -2140,6 +2157,10 @@ if claim_lost_why=$(gate_claim_lost); then
 fi
 # Save the finished verdict before attempting publication. A renewal outage leaves a
 # recoverable outbox item; every actual status/check write verifies the lease in api().
+if [[ "$tier" == fast && "$state" != success && "$selected_tier" == full ]]; then
+  final_context=$(GATE_CONTEXT_KIND=required gate_status_context "$owner" "$repo")
+  gate_update --arg context "$final_context" '.final_required_context=$context'
+fi
 gate_finish "$state" "$worker_exit" "$log"
 # Only an approved commit on its way to main feeds the shared cache: a green merge-queue replay or a
 # green main-health gate. A pull-request head is unreviewed until it is queued, so its outputs are
@@ -2168,7 +2189,13 @@ fi
 # nothing without the lease (gate_claim_authorize_path refuses on the marker) and retains the result
 # with recovery_required, so recovery publishes it only under a fresh lease and never restores a green.
 gate_claim_recheck
-gate_publish || die "terminal $state saved; publication recovery required in $gate_receipt"
+if ! gate_publish; then
+  ((GATE_PUBLICATION_DEFERRED)) || die "terminal $state saved; publication recovery required in $gate_receipt"
+  say "terminal $state saved; publication deferred in $gate_receipt"
+  gate_receipt=""
+  ran_tier=0
+  break
+fi
 # Published. The head is given back once this host is done with it: a passing fast tier keeps the
 # lease for the full tier that follows, so no other host can start on the head in between.
 if [[ "$tier" == "${tiers[-1]}" || "$state" != success ]]; then
@@ -2184,9 +2211,6 @@ heartbeat
 say "recorded $owner/$repo $(gate_status_context "$owner" "$repo")=$state; exit $worker_exit; evidence $gate_receipt"
 gate_receipt=""
 if [[ "$tier" == fast && "$state" != success ]]; then
-  if [[ "$selected_tier" == full ]]; then
-    GATE_CONTEXT_KIND=required post_status "$owner" "$repo" "$sha" failure "fast prerequisite did not pass; full validation not started ($MARKER)"
-  fi
   break
 fi
 done

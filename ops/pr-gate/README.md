@@ -1069,3 +1069,15 @@ a row: that is the design working.
 
 `veox/jain`, whose gate needs the host-ci sandbox, is outside these
 repositories; its `.jeryu/repo.toml` has to be committed there.
+
+Publication lease refusal and temporary renewal outages leave a completed verdict in
+its attempt outbox. The slot continues to other candidates and exits successfully;
+a later tick recovers the verdict only after obtaining live authority. Local journal
+errors and permanent publication errors still fail the service. `post_status` sets
+`POST_STATUS_POSTED=1` only when the requested status was acknowledged; a recoverable
+refusal returns with that flag at zero. Pending publication that exhausts transient
+retries defers the recipe to a later tick. Failed fast tiers retain their lease
+through the final required-context failure, which is also retained for recovery.
+Renewal treats only typed claim refusal or a typed missing route as definitive
+loss. Other unsuccessful answers provide unknown authority, authorize no writes,
+and are retried only within the last known grant's bounded TTL (30–3600 seconds).

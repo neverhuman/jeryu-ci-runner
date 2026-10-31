@@ -76,11 +76,13 @@ printf 'fast-fail\n' >"$fixture/source/mode"
 "$real_git" -C "$fixture/source" rev-parse HEAD >"$fixture/head"
 printf 'main\n' >"$fixture/pr-base-ref"
 rm "$fixture/protection.json"
+touch "$fixture/require-continuous-lease"
 run_tier
 expect_count 7
 [[ "$(tail -1 "$fixture/recipes")" == required-fast ]] || fail_tier 'full ran after fast failed'
 jq -se 'map(select(.context == "fixture/fast")) | last | .state == "failure"' "$fixture/statuses.jsonl" >/dev/null
 last_tier | jq -e '.context == "fixture/required" and .state == "failure" and (.description | contains("full validation not started"))' >/dev/null
+rm "$fixture/require-continuous-lease"
 run_tier
 expect_count 7
 printf 'PASS fast failure publishes immediately, skips full and holds on rerun\n'

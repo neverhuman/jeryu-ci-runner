@@ -1025,6 +1025,7 @@ gate_publication_ownership() {
 }
 
 gate_publish() {
+  GATE_PUBLICATION_DEFERRED=0
   local state outcome id digest exit_code context cause="" log note="" kind review="" inputs checks_url steps
   local ownership
   local steps_dir="" steps_end="" status_payload check_payload proof_base
@@ -1115,6 +1116,7 @@ gate_publish() {
          | .publication.ownership=(if $ownership == "" then null else $ownership end)' || return
       cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
       printf 'required-status publication unacknowledged for %s/%s@%s (HTTP %s, %s); retained for recovery\n' "$owner" "$repo" "$sha" "$code" "$fault" >&2
+      [[ ! "$code" =~ ^(lease_unavailable|5[0-9][0-9]|000|429)$ ]] || GATE_PUBLICATION_DEFERRED=1
       return 1
     fi
     gate_update --argjson response "$body" '.publication.required_status=true | .publication.status_id=$response.id | .publication.http_status=201' || return
@@ -1124,6 +1126,21 @@ gate_publish() {
         && ! jq -e --arg field "; inputs $inputs" '(.description + ";") | contains($field + ";")' <<<"$body" >/dev/null; then
       printf 'the forge did not keep the inputs digest in %s/%s@%s'"'"'s status; other hosts will re-gate it\n' "$owner" "$repo" "$sha" >&2
     fi
+  fi
+  # A failed fast tier also owes the final required context. Keep that obligation
+  # in the same outbox so lease loss cannot strand the full context at pending.
+  if jq -e '.final_required_context != null and (.publication.final_required_status | not)' "$gate_receipt" >/dev/null; then
+    status_payload=$(jq -nc --arg context "$(jq -r '.final_required_context' "$gate_receipt")" \
+      --arg description "fast prerequisite did not pass; full validation not started ($MARKER)" \
+      '{state:"failure",context:$context,description:$description}')
+    gate_api_retry POST "/repos/$owner/$repo/statuses/$sha" "$status_payload"
+    if [[ "$code" != 201 ]] || ! jq -se 'length == 1 and .[0].id != null' <<<"$body" >/dev/null 2>&1; then
+      gate_update '.recovery_required="final required-context publication unacknowledged"' || return
+      cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
+      [[ ! "$code" =~ ^(lease_unavailable|5[0-9][0-9]|000|429)$ ]] || GATE_PUBLICATION_DEFERRED=1
+      return 1
+    fi
+    gate_update '.publication.final_required_status=true | .recovery_required=null' || return
   fi
   if ! jq -e '.publication.check_run' "$gate_receipt" >/dev/null; then
     # A head that changes its own gate is annotated here, on the check run, and never on the required
@@ -1233,7 +1250,7 @@ gate_recover() {
     if ! jq -e '.terminal' "$receipt" >/dev/null; then
       gate_finish interrupted null "" 'exclusive descendant lock recovered without a process-exit receipt' || return
     fi
-    if ! jq -e '.publication.required_status and .publication.check_run' "$receipt" >/dev/null; then
+    if ! jq -e '.publication.required_status and .publication.check_run and (.final_required_context == null or .publication.final_required_status)' "$receipt" >/dev/null; then
       # A receipt owed after its lease was lost is published only once this host holds the head
       # again (gate_publish takes the lease) and only while no newer verdict of the required context
       # stands: whoever took the head meanwhile has already spoken for it.

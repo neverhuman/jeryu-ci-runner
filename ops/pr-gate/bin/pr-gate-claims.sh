@@ -41,6 +41,13 @@ gate_claim_payload() {
     --arg id "$RUNNER_HOST/slot$SLOT" --arg host "$RUNNER_HOST" \
     '{repo:$repo,number:$number,runner_id:$id,host:$host} + {($field):$sha}'
 }
+# Accept only a bounded, explicit TTL from a grant. Unknown grants authorize no writes.
+gate_claim_grant_ttl() {
+  local ttl
+  ttl=$(jq -er '.ttl_seconds | numbers | select(. == floor) | tostring' <<<"$body" 2>/dev/null) || return 1
+  [[ "$ttl" =~ ^[0-9]{1,4}$ ]] && ((10#$ttl >= 30 && 10#$ttl <= 3600)) || return 1
+  GATE_CLAIM_TTL=$((10#$ttl))
+}
 # gate_claim_take OWNER REPO NUMBER SHA FIELD -- 0: this slot holds the head (granted or renewed);
 # 1: it does not, and must not gate it now. A lease this slot holds on another head is given back
 # first, and every answer that grants nothing leaves GATE_CLAIM_HELD at 0, so the exit handler never
@@ -55,9 +62,9 @@ gate_claim_take() {
   case "$code" in
     200|201)
       gate_claim_stop_renewer
+      GATE_CLAIM_HELD=0
+      gate_claim_grant_ttl || { say "gate claim grant has no bounded TTL; leaving the head for this tick"; return 1; }
       GATE_CLAIM_HELD=1
-      GATE_CLAIM_TTL=$(jq -r '.ttl_seconds // empty' <<<"$body" 2>/dev/null || true)
-      [[ "$GATE_CLAIM_TTL" =~ ^[0-9]+$ ]] && ((GATE_CLAIM_TTL >= 30)) || GATE_CLAIM_TTL=180
       say "$1/$2@$4: gate claim held for ${GATE_CLAIM_TTL}s"
       gate_claim_renewer_start
       return 0;;
@@ -71,10 +78,10 @@ gate_claim_take() {
         GATE_CLAIM_ROUTE=0
         return 1
       fi
-      say "$1/$2@$4: asking for its gate claim answered 404 ($(jq -r '.message // .code // empty' <<<"$body" 2>/dev/null || echo 'not a forge answer')); leaving the head for this tick"
+      say "$1/$2@$4: asking for its gate claim answered 404 (untyped response); leaving the head for this tick"
       return 1;;
     409)
-      say "$1/$2@$4: $(jq -r '.message // "another host holds its gate claim"' <<<"$body" 2>/dev/null || true)"
+      say "$1/$2@$4: gate claim refused; leaving the head for this tick"
       return 1;;
     *)
       say "$1/$2@$4: asking for its gate claim answered $code; leaving the head for this tick"
@@ -82,13 +89,20 @@ gate_claim_take() {
   esac
 }
 # gate_claim_renew -- ask for the held lease again, which is the renewal. 0: renewed; 1: refused
-# (the lease is lost); 2: no answer that says either (5xx, 000, 429), so the lease may still be held.
+# (the lease is lost); 2: unknown authority, retried only within the last grant TTL.
 gate_claim_renew() {
   ((GATE_CLAIM_HELD)) || return 0
   api POST "/api/v1/gate-claims" "$(gate_claim_payload)"
-  [[ ! "$code" =~ ^2 ]] || return 0
-  [[ ! "$code" =~ ^(5[0-9][0-9]|000|429)$ ]] || return 2
-  return 1
+  case "$code" in
+    200|201) gate_claim_grant_ttl && return 0; return 2;;
+    409)
+      case "$(jq -r '.code? // empty' <<<"$body" 2>/dev/null || true)" in
+        claim_held|capability_missing) return 1;;
+      esac;;
+    404)
+      [[ "$(jq -r '.code? // empty' <<<"$body" 2>/dev/null || true)" != api_route_not_found ]] || return 1;;
+  esac
+  return 2
 }
 # gate_claim_release -- give the head back once its result is published, so the next host does not
 # wait out the TTL. Releasing a lease the forge has already forgotten is not an error.
@@ -105,9 +119,16 @@ gate_claim_release() {
 # Registration checks the marker too: loss can occur after the pre-spawn check
 # but before the parent writes the worker PID, when the renewer sees no worker yet.
 gate_claim_stop_worker() {
-  local worker=""
-  [[ ! -f "$GATE_CLAIM_STATE/worker" ]] || read -r worker <"$GATE_CLAIM_STATE/worker" || true
-  [[ ! "$worker" =~ ^[0-9]+$ ]] || kill -TERM -- "-$worker" 2>/dev/null || true
+  local worker="" receipt="" parent group
+  [[ -f "$GATE_CLAIM_STATE/worker" && ! -L "$GATE_CLAIM_STATE/worker" ]] || return 0
+  read -r worker receipt <"$GATE_CLAIM_STATE/worker" || return 0
+  [[ "$worker" =~ ^[0-9]+$ && "$receipt" == "$HOME_DIR/attempts/"* && ! -L "$receipt" ]] || return 0
+  jq -e --argjson pid "$worker" --arg owner "$GATE_CLAIM_OWNER" --arg repo "$GATE_CLAIM_REPO" \
+    --arg sha "$GATE_CLAIM_SHA" '.worker_pid==$pid and .phase=="running" and (.terminal|not)
+      and .owner==$owner and .repo==$repo and .sha==$sha' "$receipt" >/dev/null 2>&1 || return 0
+  read -r parent group < <(ps -o ppid=,pgid= -p "$worker") || return 0
+  [[ "$parent" == "$$" && "$group" == "$worker" ]] || return 0
+  kill -TERM -- "-$worker" 2>/dev/null || true
 }
 # gate_claim_mark_lost KIND WHY -- record that this slot no longer holds the lease. KIND is the
 # ownership this answer proves, as its own state and not as text inside WHY: `refused` (the forge
@@ -124,7 +145,7 @@ gate_claim_mark_lost() {
   gate_claim_stop_worker
 }
 gate_claim_track_worker() {
-  printf '%s\n' "$1" | gate_atomic "$GATE_CLAIM_STATE/worker" || return 1
+  printf '%s %s\n' "$1" "${gate_receipt:?}" | gate_atomic "$GATE_CLAIM_STATE/worker" || return 1
   [[ ! -f "$GATE_CLAIM_STATE/lost" ]] || gate_claim_stop_worker
 }
 
@@ -143,7 +164,7 @@ gate_claim_renew_loop() {
     kill -0 "$runner" 2>/dev/null || break
     rc=0; gate_claim_renew || rc=$?
     now=$(date +%s)
-    if ((rc == 0)); then last_ok=$now; continue; fi
+    if ((rc == 0)); then last_ok=$now; every=$((GATE_CLAIM_TTL / 3)); continue; fi
     if ((rc == 2 && now - last_ok < GATE_CLAIM_TTL)); then
       say "renewing the gate claim on $GATE_CLAIM_SHA answered $code; retrying"
       continue
@@ -173,7 +194,7 @@ gate_claim_stop_renewer() {
 gate_claim_lost() {
   ((GATE_CLAIM_HELD)) || return 1
   [[ -f "$GATE_CLAIM_STATE/lost" ]] || return 1
-  cat "$GATE_CLAIM_STATE/lost"
+  printf 'lease renewal no longer grants authority\n'
 }
 # gate_claim_lost_kind -- the ownership this slot's loss proves: `refused` or `unknown`. Read from
 # the state the renewer wrote. A marker left by a runner that recorded no kind is classified from its

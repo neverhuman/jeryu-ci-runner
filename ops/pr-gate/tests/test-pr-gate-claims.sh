@@ -44,9 +44,10 @@ curl() {
   if [[ "$path" == /api/v1/gate-claims ]]; then
     count=$(cat "$scratch/asks" 2>/dev/null || echo 0)
     echo "$((count + 1))" >"$scratch/asks"
+    if [[ -f "$scratch/response" ]]; then cat "$scratch/response"; return; fi
     case "$(cat "$scratch/mode")" in
-      denied) printf '{}\n409'; return;;
-      lost) if ((count > 0)); then printf '{}\n409'; return; fi;;
+      denied) printf '{"code":"claim_held"}\n409'; return;;
+      lost) if ((count > 0)); then printf '{"code":"claim_held"}\n409'; return; fi;;
       outage) printf '{}\n503'; return;;
       forbidden) printf '{}\n403'; return;;
       missing) printf '{"code":"api_route_not_found"}\n404'; return;;
@@ -85,6 +86,7 @@ for mode in denied lost missing; do
       missing-recipe) post_status "$owner" "$repo" "$sha" failure 'no gate recipe';;
     esac
     no_writes
+    [[ "${POST_STATUS_POSTED:-0}" == 0 ]]
     printf 'PASS %s %s publishes nothing\n' "$route" "$mode"
   done
   for route in head-recovery tier-recovery republish; do
@@ -170,18 +172,37 @@ printf 'PASS a regrant removes the old lost marker\n'
 # than using wall-clock deadlines or leaving test processes behind.
 reset_claim granted
 gate_claim_take "$owner" "$repo" "$number" "$sha"
-printf '1234\n' >"$GATE_CLAIM_STATE/worker"
+gate_begin "$identity"
+setsid sleep 60 &
+worker=$!
+gate_update --argjson pid "$worker" '.phase="running" | .worker_pid=$pid'
+# Wait until setsid has established the worker's process group.
+for _ in {1..100}; do
+  [[ "$(ps -o pgid= -p "$worker" | tr -d ' ')" != "$worker" ]] || break
+  sleep 0.01
+done
+gate_claim_track_worker "$worker"
 printf 'denied\n' >"$scratch/mode"
 kill() { printf '%s\n' "$*" >>"$scratch/signals"; }
 api POST "/repos/$owner/$repo/statuses/$sha" '{"state":"success"}'
 no_writes
-grep -qx -- '-TERM -- -1234' "$scratch/signals"
+grep -qx -- "-TERM -- -$worker" "$scratch/signals"
 # If the background renewer lost the lease before the parent could register
 # the process group, registration must notice the existing loss and stop it.
 rm -f "$GATE_CLAIM_STATE/worker" "$scratch/signals"
-gate_claim_track_worker 5678
-grep -qx -- '-TERM -- -5678' "$scratch/signals"
+gate_claim_track_worker "$worker"
+grep -qx -- "-TERM -- -$worker" "$scratch/signals"
+# A forged registration cannot signal an unrelated group or a completed receipt.
+rm -f "$scratch/signals"
+printf '1 %s\n' "$gate_receipt" >"$GATE_CLAIM_STATE/worker"
+gate_claim_stop_worker
+[[ ! -f "$scratch/signals" ]]
+gate_update '.terminal=true'
+gate_claim_track_worker "$worker"
+[[ ! -f "$scratch/signals" ]]
 unset -f kill
+kill -TERM -- "-$worker"
+wait "$worker" || true
 rm -f "$GATE_CLAIM_STATE/worker"
 printf 'PASS publication renewal loss and pre-registration loss stop the worker immediately\n'
 # queue_sha is reserved for actual queue refs; main/branch health is a head claim.
@@ -320,3 +341,70 @@ unset IDENTITY
 GATE_RECOVERY_ATTEMPTS=10
 gate_claim_release
 gate_receipt=''
+
+# Real api/curl framing for typed losses, uncertain responses, and malformed grants.
+reset_claim granted
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+for http in 401 403 404 422 429 500 000; do
+  printf '{}\n%s' "$http" >"$scratch/response"
+  rc=0; gate_claim_renew || rc=$?
+  [[ "$rc" == 2 ]]
+  post_status "$owner" "$repo" "$sha" pending test
+  [[ "$POST_STATUS_POSTED" == 0 ]]
+  no_writes
+done
+for typed in claim_held capability_missing; do
+  printf '{"code":"%s","message":"untrusted\\nmessage"}\n409' "$typed" >"$scratch/response"
+  rc=0; gate_claim_renew || rc=$?
+  [[ "$rc" == 1 ]]
+done
+for ttl in null 0 29 3601 999999999999999999999 30.5 '"180"'; do
+  printf '{"ttl_seconds":%s}\n201' "$ttl" >"$scratch/response"
+  rc=0; gate_claim_renew || rc=$?
+  [[ "$rc" == 2 ]]
+  if gate_claim_take "$owner" "$repo" "$number" "$sha"; then exit 1; fi
+  [[ "$GATE_CLAIM_HELD" == 0 ]]
+  GATE_CLAIM_HELD=1
+done
+rm -f "$scratch/response"
+reset_claim granted
+post_status "$owner" "$repo" "$sha" pending test
+[[ "$POST_STATUS_POSTED" == 1 ]]
+gate_claim_release
+printf 'PASS typed renewal, uncertain transport, bounded TTL and posted flag contracts\n'
+
+# Final full-context failure is part of the fast receipt's recovery obligation.
+reset_claim granted
+gate_begin "$identity"
+gate_update '.final_required_context="fixture/required" | .publication.required_status=true'
+gate_finish failure 7 ''
+receipt=$gate_receipt
+printf 'denied\n' >"$scratch/mode"
+if gate_publish; then exit 1; fi
+[[ "$GATE_PUBLICATION_DEFERRED" == 1 ]]
+no_writes
+jq -e '.outcome=="failure" and .recovery_required!=null and (.publication.final_required_status|not)' "$receipt" >/dev/null
+printf 'granted\n' >"$scratch/mode"
+gate_recover
+jq -e '.publication.final_required_status and .publication.check_run and .recovery_required==null' "$receipt" >/dev/null
+gate_claim_release
+printf 'PASS failed-fast final required context recovers under a live lease\n'
+
+# Uncertain renewal answers are bounded by the last known grant's TTL.
+reset_claim granted
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+printf '{}\n401' >"$scratch/response"
+eval "$(sed -n '/^gate_claim_renew_loop() {/,/^}/p' "$here/pr-gate-claims.sh")"
+printf '0\n' >"$scratch/clock"
+date() { local now; read -r now <"$scratch/clock"; echo "$now"; echo "$((now+10))" >"$scratch/clock"; }
+sleep() { :; }
+kill() { [[ "$1" == -0 ]]; }
+GATE_CLAIM_TTL=30
+gate_claim_renew_loop 10 "$$"
+[[ "$(cat "$scratch/clock")" == 40 ]]
+[[ -f "$GATE_CLAIM_STATE/lost" ]]
+no_writes
+unset -f date sleep kill
+rm -f "$scratch/response"
+gate_claim_release
+printf 'PASS unknown renewal authority expires at the bounded TTL without publication\n'
