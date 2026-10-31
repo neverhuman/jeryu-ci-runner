@@ -284,6 +284,17 @@ mkdir -p "$fixture/protected/jankurai"
 printf '{}\n' > "$fixture/protected/jankurai/not-audit-output.json"
 if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'an untracked path merely resembling the audit output accepted'; fi
 rm -rf -- "$fixture/protected/jankurai"
+# Ignored paths are inputs too: git status hides them unless asked, and the
+# audit reads a file whatever .gitignore says. The exclude rules stand in for
+# this repository's .gitignore (/target/, /.jankurai/, dist, *.receipt.json).
+printf '%s\n' '/.jankurai/' 'target/' 'dist/' '*.receipt.json' >> "$fixture/protected/.git/info/exclude"
+$b "$fixture/protected" "$pbase" "$pdigest" || fail 'ignored baseline audit output refused'
+for ignored in target/x.rs sub/target/x.rs dist/x.rs x.receipt.json; do
+  mkdir -p "$fixture/protected/$(dirname "$ignored")"
+  printf 'fn planted() {}\n' > "$fixture/protected/$ignored"
+  if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail "an ignored input in the baseline tree accepted: $ignored"; fi
+  rm -rf -- "$fixture/protected/target" "$fixture/protected/sub" "$fixture/protected/dist" "$fixture/protected/x.receipt.json"
+done
 $b "$fixture/protected" "$pbase" "$pdigest" || fail 'baseline refused after the stray inputs were removed'
 if $b "$fixture/protected" "$pbase" "$zero" 2>/dev/null; then fail 'wrong baseline policy digest accepted'; fi
 printf 'invalid index\n' > "$fixture/protected/.git/index"
@@ -305,41 +316,45 @@ proof_require_governed_policy agent/audit-policy.toml agent/audit-policy.toml "$
   fail 'the real transition file refuses an unchanged policy'
 printf 'proof policy transition file ok\n'
 
-# --- the historical 1.7.5 -> 1.7.6 pin: full preimages, and inert -------------
-# The pin's two digests are claims about two exact files. Both preimages are
-# kept, so both can be hashed here: the protected side as a fixture, the
-# candidate side as main's own policy. The pair must differ only in the pinned
-# auditor version, and main must already carry the candidate bytes -- then
-# main's policy is never this pin's protected side and the pin authorizes no
-# change to today's main.
-historical=ops/ci/tests/fixtures/audit-policy-1.7.5-preimage.toml
-[[ -f "$historical" && ! -L "$historical" ]] ||
-  fail 'the historical 1.7.5 policy preimage is missing'
-hist_protected="$(sha256sum "$historical" | cut -d' ' -f1)"
-main_policy="$(sha256sum agent/audit-policy.toml | cut -d' ' -f1)"
+# --- the historical 1.7.5 -> 1.7.6 pin: two immutable preimages, and inert ----
+# The pin's two digests are claims about two exact files, and both are kept as
+# fixtures. Nothing here reads agent/audit-policy.toml, so a reviewed change to
+# the live policy never touches this test; the live policy is covered by the
+# guard test above and by the lane itself. The pair must differ only in the
+# pinned auditor version, and the pin must be inert: it cannot carry the later
+# bytes back to the earlier ones.
+hist_from=ops/ci/tests/fixtures/audit-policy-1.7.5-preimage.toml
+hist_to=ops/ci/tests/fixtures/audit-policy-1.7.6-preimage.toml
+for f in "$hist_from" "$hist_to"; do
+  [[ -f "$f" && ! -L "$f" ]] || fail "the historical policy preimage is missing: $f"
+done
+hist_from_sha="$(sha256sum "$hist_from" | cut -d' ' -f1)"
+hist_to_sha="$(sha256sum "$hist_to" | cut -d' ' -f1)"
 historical_pinned=
 while IFS= read -r line || [[ -n "$line" ]]; do
   case "$line" in ''|'#'*) continue ;; esac
   read -r pin_protected pin_candidate <<<"$line"
-  [[ "$pin_protected" == "$hist_protected" && "$pin_candidate" == "$main_policy" ]] &&
+  [[ "$pin_protected" == "$hist_from_sha" && "$pin_candidate" == "$hist_to_sha" ]] &&
     historical_pinned=1
 done < "$authz_path"
 [[ -n "$historical_pinned" ]] ||
-  fail 'the historical pin does not name the preimage digest and main policy digest'
-[[ "$hist_protected" != "$main_policy" ]] ||
+  fail 'the historical pin does not name the two preimage digests'
+[[ "$hist_from_sha" != "$hist_to_sha" ]] ||
   fail 'the historical pin preimages are the same bytes'
 pinned_version() { sed -n 's/^required_tool_version = "\(.*\)"$/\1/p' "$1"; }
-[[ "$(pinned_version "$historical")" == 1.7.5 ]] ||
+[[ "$(pinned_version "$hist_from")" == 1.7.5 ]] ||
   fail 'the protected-side preimage does not pin auditor 1.7.5'
-[[ "$(pinned_version agent/audit-policy.toml)" == 1.7.6 ]] ||
-  fail 'the candidate-side policy does not pin auditor 1.7.6'
+[[ "$(pinned_version "$hist_to")" == 1.7.6 ]] ||
+  fail 'the candidate-side preimage does not pin auditor 1.7.6'
 blind_version() { sed 's/^required_tool_version = ".*"$/required_tool_version = "pinned"/' "$1"; }
-diff <(blind_version "$historical") <(blind_version agent/audit-policy.toml) >/dev/null ||
+diff <(blind_version "$hist_from") <(blind_version "$hist_to") >/dev/null ||
   fail 'the historical pin pair differs by more than the pinned auditor version'
-# Inert in the direction that matters: the pin cannot carry main's policy back
-# to its 1.7.5 preimage, because that pair is the reverse of what is pinned.
-if proof_require_governed_policy "$historical" agent/audit-policy.toml "$authz_path" 2>/dev/null; then
-  fail "the historical pin authorizes reverting main's policy to its 1.7.5 preimage"
+# The recorded transition is accepted as recorded, with the fixtures alone.
+proof_require_governed_policy "$hist_to" "$hist_from" "$PWD/$authz_path" ||
+  fail 'the recorded historical transition is refused'
+# Inert in the direction that matters: the reverse pair is not pinned.
+if proof_require_governed_policy "$hist_from" "$hist_to" "$PWD/$authz_path" 2>/dev/null; then
+  fail 'the historical pin authorizes reverting the policy to its 1.7.5 preimage'
 fi
 printf 'historical policy pin preimages ok\n'
 
@@ -353,23 +368,46 @@ lane=ops/ci/proof_evidence.sh
 # file, a pattern this grep rejects) passes, and so does a pipeline whose
 # writing grep was killed by SIGPIPE once the reading `grep -q` stopped at its
 # first match, which `set -o pipefail` surfaces as the pipeline's status.
+# scan_hits runs grep with the given arguments and leaves what matched in
+# $HITS. Status 0 is hits and 1 is a clean scan; anything else is a scan that
+# did not run and fails the test, so an unreadable file never reads as "nothing
+# matched". It runs in the current shell, never inside `$(...)`, because an
+# exit in a command substitution would end only the substitution.
+HITS=
+scan_hits() {
+  local rc=0
+  HITS="$(grep "$@")" || rc=$?
+  case "$rc" in
+    0|1) ;;
+    *) fail "a lane scan did not run (grep status $rc)" ;;
+  esac
+}
+# A scan that cannot run must fail the test, not read as a clean scan.
+if (scan_hits -n x "$fixture/no-such-lane-file") 2>/dev/null; then
+  fail 'a scan of an unreadable file passed as clean'
+fi
+(scan_hits -n x /dev/null) || fail 'a clean scan was refused'
+
+scan_hits -n '|| true' "$lane"
 while IFS= read -r line; do
   [[ -n "$line" ]] || continue
   [[ "$line" == *'cleanup_baseline || true' ]] ||
     fail 'a literal `|| true` discards a tool failure in the lane'
-done <<<"$(grep -n '|| true' "$lane" || :)"
+done <<<"$HITS"
 grep -q 'git clone --quiet --no-local' "$lane" ||
   fail 'the ratchet baseline is not cloned from protected main'
-grep -q 'agent/baselines' "$lane" &&
-  fail 'the lane names agent/baselines, an in-tree baseline' || :
+scan_hits -n 'agent/baselines' "$lane"
+[[ -z "$HITS" ]] ||
+  fail 'the lane names agent/baselines, an in-tree baseline'
 grep -q 'proof_require_governed_policy "$candidate_policy" "$baseline_policy"' "$lane" ||
   fail 'the lane does not check that main policy judges this head'
 grep -q 'ops/ci/policy-transitions.txt' "$lane" ||
   fail 'the lane does not read transitions from the protected-main tree'
 # Any write whose target is the baseline policy or the baseline tree's policy
 # path, however it is spelled, puts the candidate's bytes in main's place.
-grep -nE '(cp|mv|install|tee|ln|printf|cat|sed)[^|&;]*\$\{?baseline_policy|> *"?\$\{?baseline_policy' "$lane" &&
-  fail 'the lane writes to the protected-main baseline policy' || :
+scan_hits -nE '(cp|mv|install|tee|ln|printf|cat|sed)[^|&;]*\$\{?baseline_policy|> *"?\$\{?baseline_policy' "$lane"
+[[ -z "$HITS" ]] ||
+  fail 'the lane writes to the protected-main baseline policy'
 # The lane reads history and never writes it. `HEAD^{commit}` and
 # `${base_commit}` are reads, so only `commit` in git's subcommand position
 # counts -- it is the shape the baseline mutation took. A subcommand ends the
@@ -379,14 +417,21 @@ grep -nE '(cp|mv|install|tee|ln|printf|cat|sed)[^|&;]*\$\{?baseline_policy|> *"?
 # scan that did not run and is never read as a clean one.
 text_runs_commit() {
   local body rc=0
-  body="$(grep -vE '^[[:space:]]*#' <<<"$1" || :)"
-  grep -qE '(^|[^_{[:alnum:]])commit([[:space:]]|$)' <<<"$body" || rc=$?
+  scan_hits -vE '^[[:space:]]*#' <<<"$1"
+  body="$HITS"
+  grep -qE '(^|[^_{[:alnum:]])commit([[:space:];&|)]|$)' <<<"$body" || rc=$?
   case "$rc" in
     0) return 0 ;;
     1) return 1 ;;
     *) fail "the commit scan did not run (status $rc)" ;;
   esac
 }
+# The static tripwire is a line regex, not a shell parser. It catches `commit`
+# as a bare word after whitespace, a line start, `(` or `;`-style separators, and
+# across a `git \` continuation. It does not see a quoted subcommand
+# (`git "commit"`), a variable holding it, or an alias; those are covered only
+# by the runtime guards, proof_require_protected_baseline's HEAD, tracked-file
+# and untracked/ignored-path checks, which the lane runs three times.
 ! text_runs_commit "$(cat "$lane")" || fail 'the lane runs git commit'
 # The tripwire itself, against the forms it must catch and the reads it must not.
 while IFS= read -r form; do
@@ -397,6 +442,10 @@ git commit
 git -C "${baseline_parent}/repo" -c user.name=t commit
 	commit --allow-empty -m x
 commit -am x
+(cd "$repo" && git commit)
+git commit;
+git commit&
+git -C "$repo" commit|cat
 COMMIT_FORMS
 # A `git \` continuation whose subcommand lands on the next line.
 continued='git -C "${baseline_parent}/repo" \
@@ -430,8 +479,9 @@ line_of() {
   fail 'the lane fetches from origin before checking it is the hosted repository'
 (( $(line_of '^proof_require_history$' "$lane") < $(line_of 'proof_fork_point' "$lane") )) ||
   fail 'ancestry is asked before the checkout has its history'
-grep -qE "mapfile .*< <\(" "$lane" &&
-  fail 'the lane reads its change set through a process substitution set -e cannot see' || :
+scan_hits -nE "mapfile .*< <\(" "$lane"
+[[ -z "$HITS" ]] ||
+  fail 'the lane reads its change set through a process substitution set -e cannot see'
 grep -q 'was not read in full' "$lane" ||
   fail 'the lane does not check that its whole change set was read'
 (( $(line_of '^rm -rf -- \\$' "$lane") < $(line_of '^ *jankurai proof \.' "$lane") )) ||
@@ -502,11 +552,14 @@ lane_folded="$(sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' "$lane" | tr -s ' ')
 grep -Fq 'git -C "${baseline_parent}/repo" status --porcelain=v1 --untracked-files=all' \
   <<<"$lane_folded" ||
   fail 'the baseline clone is not checked for modified and untracked files'
+scan_hits -nE '> *"?\$\{baseline_parent\}' "$lane"
 while IFS= read -r line; do
   [[ -n "$line" ]] || continue
   fail "the lane redirects into the protected-main baseline clone: $line"
-done <<<"$(grep -nE '> *"?\$\{baseline_parent\}' "$lane" || :)"
+done <<<"$HITS"
 printf 'proof pre-digest window ok\n'
 grep -Fqx 'effective_floor="$(audit_effective_floor "${baseline_policy}")"' "$lane" ||
   fail 'the proof floor is not derived from protected-main policy'
-grep -q 'audit_base_commit' "$lane" && fail 'the baseline binding can name a synthetic commit' || :
+scan_hits -n 'audit_base_commit' "$lane"
+[[ -z "$HITS" ]] ||
+  fail 'the baseline binding can name a synthetic commit'

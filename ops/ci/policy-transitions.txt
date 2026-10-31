@@ -27,12 +27,13 @@
 # whole file: a pin nobody can parse must not become a pin nobody checks.
 #
 # Historical 1.7.5 -> 1.7.6 version-only transition, already completed by PR171
-# (ad7191181360eb418c6a1af4e501eba663c7ff83). Both sides are kept as full
-# preimages so the pin is not a claim but a checkable fact: the protected side
-# is ops/ci/tests/fixtures/audit-policy-1.7.5-preimage.toml (protected d19269ff)
-# and the candidate side is agent/audit-policy.toml itself (ad719118).
-# ops/ci/tests/test-proof-guards.sh hashes both, holds them to a version-only
-# difference, and proves the pin is inert: main already carries the candidate
-# bytes, so main's policy is never this pin's protected side and the pin
-# authorizes no change to today's main.
+# (ad7191181360eb418c6a1af4e501eba663c7ff83). Both sides are kept as immutable
+# full preimages so the pin is a checkable fact, not a claim:
+# ops/ci/tests/fixtures/audit-policy-1.7.5-preimage.toml (protected, d19269ff)
+# and ops/ci/tests/fixtures/audit-policy-1.7.6-preimage.toml (candidate, ad719118).
+# ops/ci/tests/test-proof-guards.sh hashes both against this line, holds them to
+# a version-only difference, accepts the pair through the guard and refuses the
+# reverse pair. It never reads the live agent/audit-policy.toml, so a reviewed
+# change to the live policy does not touch it, and the pin authorizes nothing
+# about today's main: main's policy is not this pin's protected side.
 da5cb2572abca03ae5777f570208e5bb73c2e6e2d8f3fb94b94ca96e57cb5771 77cc588348ad42861cf52ff266fc685feff56bead9a21a57d3c79f43f404971d

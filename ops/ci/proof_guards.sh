@@ -306,24 +306,26 @@ proof_report_security_failure() {
   } >&2
 }
 
-# The untracked paths a protected-main baseline tree may hold while this gate
-# runs: the audit's own report directory, and nothing else. The lane verifies
-# the fresh clone has no untracked file at all; from then on the only writer
-# into that tree is the baseline audit, which writes .jankurai/. Any other
-# untracked path is an input the audit or the migration analysis would read as
-# if protected main carried it. A path git reports in quoted form, because its
-# name needs escaping, never matches and so refuses.
+# The untracked or ignored paths a protected-main baseline tree may hold while
+# this gate runs: the audit's own report directory, and nothing else. The lane
+# verifies the fresh clone has no untracked and no ignored path at all; from
+# then on the only writer into that tree is the baseline audit, which writes
+# .jankurai/. Ignored paths count: the audit may read a file whatever
+# .gitignore says (the policy's [scan] excluded_paths names only .jankurai/), so
+# an ignored path is an input like any other. The entry is git's status line
+# for it, `?? path` for untracked and `!! path` for ignored. A path git reports
+# in quoted form, because its name needs escaping, never matches and so refuses.
 proof_baseline_untracked_allowed() {
   case "$1" in
-    '?? .jankurai/'*) return 0 ;;
+    '?? .jankurai/'*|'!! .jankurai/'*) return 0 ;;
     *) return 1 ;;
   esac
 }
 
 # Refuse a protected-main baseline clone that this gate changed. The baseline is
 # main's bytes: its HEAD must still be the commit the lane checked out, no
-# tracked file may be modified, every untracked path must be the baseline
-# audit's own output (proof_baseline_untracked_allowed), and the policy that
+# tracked file may be modified, every untracked or ignored path must be the
+# baseline audit's own output (proof_baseline_untracked_allowed), and the policy that
 # judged this head must hash to DIGEST.
 #
 # Run after the baseline audit: that audit's .jankurai output is this run's, and
@@ -346,12 +348,13 @@ proof_require_protected_baseline() {
     printf 'protected-main baseline has modified tracked files\n' >&2
     return 1
   fi
-  untracked="$(git -C "$repo" status --porcelain=v1 --untracked-files=all)" || {
+  untracked="$(git -C "$repo" status --porcelain=v1 --untracked-files=all \
+    --ignored=matching)" || {
     printf 'cannot inspect protected-main baseline untracked files\n' >&2
     return 1
   }
   while IFS= read -r entry; do
-    case "$entry" in '?? '*) ;; *) continue ;; esac
+    case "$entry" in '?? '*|'!! '*) ;; *) continue ;; esac
     proof_baseline_untracked_allowed "$entry" || {
       printf 'protected-main baseline holds an untracked input: %s\n' \
         "${entry#?? }" >&2

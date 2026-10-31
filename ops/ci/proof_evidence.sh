@@ -230,7 +230,7 @@ git -C "${baseline_parent}/repo" -c advice.detachedHead=false checkout --quiet -
 if [[ "$(git -C "${baseline_parent}/repo" rev-parse 'HEAD^{commit}')" != \
       "${base_commit}" ||
       -n "$(git -C "${baseline_parent}/repo" status --porcelain=v1 \
-        --untracked-files=all)" ]]; then
+        --untracked-files=all --ignored=matching)" ]]; then
   printf 'protected-main baseline clone drifted or is dirty\n' >&2
   exit 1
 fi
@@ -253,7 +253,7 @@ effective_floor="$(audit_effective_floor "${baseline_policy}")"
 # Everything between the clone's clean check above and this digest is the
 # pre-digest window, and it is covered by that check rather than by the digest:
 # the clone was verified to be the exact base commit with no modified tracked
-# file and no untracked path at all, and from there to here the lane only reads
+# file and no untracked or ignored path at all, and from there to here the lane only reads
 # -- the canonical-file test, the governed-policy comparison and the floor
 # derivation. So the bytes hashed here are the bytes the comparison accepted,
 # and proof_require_protected_baseline binds them for the rest of the gate: the
