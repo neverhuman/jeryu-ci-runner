@@ -1031,12 +1031,16 @@ gate_publication_fault() {
 # a failure like "000" keeps its leading zeros. publication.fault names the failure class.
 
 # The ownership of the head recorded on a receipt a publication could not write: `refused` or
-# `unknown` when the slot observed its lease lost (gate_claim_lost_kind), and nothing when no loss was
-# observed, which is every other reason a write was refused. Recovery reads it to decide what it must
-# prove before publishing the retained verdict (gate_recover).
+# `unknown` when the slot observed its lease lost (gate_claim_lost_kind), `unknown` when the write was
+# refused because this slot's authority over the head was not current (GATE_CLAIM_UNCERTAIN: a lease
+# it could not take, or a renewal that answered neither way), and nothing when the lease was held and
+# the forge simply did not accept the write. Recovery reads it to decide what it must prove before
+# publishing the retained verdict (gate_recover).
 gate_publication_ownership() {
-  declare -F gate_claim_lost_kind >/dev/null && [[ -f "${GATE_CLAIM_STATE:-}/lost" ]] || return 1
-  gate_claim_lost_kind
+  declare -F gate_claim_lost_kind >/dev/null || return 1
+  if [[ -f "${GATE_CLAIM_STATE:-}/lost" ]]; then gate_claim_lost_kind; return 0; fi
+  ((${GATE_CLAIM_UNCERTAIN:-0})) || return 1
+  printf 'unknown\n'
 }
 
 gate_publish() {

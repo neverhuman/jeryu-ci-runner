@@ -161,7 +161,9 @@ claims_head
 touch "$fixture/deny-claims-after-recipe"
 results=$(non_pending)
 invoke --repo acme/fixture --pr 1
-[[ "$runner_exit" != 0 ]] || fail_claims 'an unproven loss did not retain the verdict for recovery'
+# Losing the lease is an ordinary handover, so the slot exits successfully with the verdict owed;
+# what must not happen is a publication, which the assertions below check.
+[[ "$runner_exit" == 0 ]] || fail_claims 'an unproven loss failed the slot instead of owing its verdict'
 expect_count "$((claims_count + 5))"
 [[ "$(non_pending)" == "$results" ]] || fail_claims 'a result was published after an unproven loss'
 ! grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'a finished verdict was abandoned on an unproven loss'
@@ -201,7 +203,7 @@ claims_head
 touch "$fixture/deny-claims-after-recipe"
 results=$(non_pending)
 PR_GATE_RECOVERY_ATTEMPTS=2 invoke --repo acme/fixture --pr 1
-[[ "$runner_exit" != 0 ]] || fail_claims 'the bounded-recovery gate published without a lease'
+[[ "$runner_exit" == 0 ]] || fail_claims 'the bounded-recovery gate failed the slot instead of owing its verdict'
 expect_count "$((claims_count + 7))"
 owed_attempt=$(jq -r '.id' "$fixture/runner/attempts/acme-fixture-$head/last-result.json")
 receipt="$fixture/runner/attempts/acme-fixture-$head/$owed_attempt/receipt.json"

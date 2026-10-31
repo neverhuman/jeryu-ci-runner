@@ -31,6 +31,11 @@ GATE_CLAIM_OWNER="" GATE_CLAIM_REPO="" GATE_CLAIM_NUMBER=0 GATE_CLAIM_SHA=""
 # Which field names the head: a queue entry is claimed by its queue sha, a pull request by its head.
 GATE_CLAIM_FIELD=head_sha
 GATE_CLAIM_TTL=180
+# 1 once a per-head write was refused because this slot's authority over the head was not current:
+# the lease was lost, could not be taken, or renewal did not answer either way. The head may be held
+# by another host, so what a retained verdict owes afterwards is decided from this and not from the
+# refusal's text (gate_publication_ownership, gate_recover).
+GATE_CLAIM_UNCERTAIN=0
 # The renewer's state: `lost` (why the lease was lost) and `worker` (the recipe's process group, which
 # a lost lease stops). One directory per slot; the slot lock makes it this run's.
 GATE_CLAIM_STATE="$HOME_DIR/cache/gate-claim-slot$SLOT"
@@ -65,6 +70,7 @@ gate_claim_take() {
       GATE_CLAIM_HELD=0
       gate_claim_grant_ttl || { say "gate claim grant has no bounded TTL; leaving the head for this tick"; return 1; }
       GATE_CLAIM_HELD=1
+      GATE_CLAIM_UNCERTAIN=0
       say "$1/$2@$4: gate claim held for ${GATE_CLAIM_TTL}s"
       gate_claim_renewer_start
       return 0;;
@@ -284,17 +290,20 @@ gate_claim_authorize_path() { # method path payload
     fi
     heartbeat
     if ! gate_claim_take "$target_owner" "$target_repo" "$target_number" "$target_sha" "$field"; then
+      GATE_CLAIM_UNCERTAIN=1
       code=lease_unavailable body='publication needs a granted lease'; return 1
     fi
   fi
   # The background renewer may have detected a definitive loss since the last write.
   if [[ -f "$GATE_CLAIM_STATE/lost" ]]; then
+    GATE_CLAIM_UNCERTAIN=1
     code=lease_unavailable body='publication lease was lost'
     say "$target_owner/$target_repo@$target_sha: $body; posting nothing"
     return 1
   fi
   gate_claim_renew || rc=$?
-  if ((rc == 0 && GATE_CLAIM_HELD)); then return 0; fi
+  if ((rc == 0 && GATE_CLAIM_HELD)); then GATE_CLAIM_UNCERTAIN=0; return 0; fi
+  GATE_CLAIM_UNCERTAIN=1
   if ((rc == 2)); then
     # Nothing is published while authority is uncertain. gate_publish retains recovery_required.
     code=503 body='publication lease renewal unavailable; retain result for recovery'
