@@ -173,6 +173,28 @@ o="$(evidence "$b" "$(snap malformed)")"
   || fail "malformed rows: $(jq -c .consumers "$o/governance/authority.json")"
 ok 'a value that is not a version, and a policy that declares none, are reported'
 
+# A key outside [audit] cannot choose the consumer value. Duplicate assignments
+# anywhere are invalid, including an authority-looking decoy before the real key.
+dep decoy; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
+printf '[decoy]\nrequired_tool_version = "1.7.6"\n[audit]\nrequired_tool_version = "9.9.9"\n' | put agent/audit-policy.toml
+o="$(evidence "$b" "$(snap duplicate-decoy)")"
+[ "$(jq -r '.consumers[0].head_value' "$o/governance/authority.json")" = '!invalid' ] \
+  && [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = DIFFERS-FROM-AUTHORITY ] \
+  || fail "duplicate table decoy: $(jq -c .consumers "$o/governance/authority.json")"
+printf '[decoy]\nrequired_tool_version = "1.7.6"\n[audit]\nminimum_score = 85\n' | put agent/audit-policy.toml
+o="$(evidence "$b" "$(snap outside-only)")"
+[ "$(jq -r '.consumers[0].head_value' "$o/governance/authority.json")" = '!none' ] \
+  || fail "a key outside audit supplied the consumer value"
+printf '[ audit ] # generated\nrequired_tool_version = "1.7.6"\n' | put agent/audit-policy.toml
+o="$(evidence "$b" "$(snap audit-header)")"
+[ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = matches-authority ] \
+  || fail "a valid spaced audit header was not read"
+printf '[audit]\nrequired_tool_version = "1.7.6"\nrequired_tool_version = "1.7.6"\n' | put agent/audit-policy.toml
+o="$(evidence "$b" "$(snap repeated-key)")"
+[ "$(jq -r '.consumers[0].head_value' "$o/governance/authority.json")" = '!invalid' ] \
+  || fail "duplicate identical keys were accepted"
+ok 'only the audit table supplies a scalar, and duplicate assignments never verify'
+
 # 6. Nothing is written for a change that does not move the scalar.
 dep quiet; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
 printf '[audit]\nminimum_score = 90\nrequired_tool_version = "1.7.5"\n' | put agent/audit-policy.toml
@@ -259,6 +281,23 @@ o="$(budget=80 evidence "$b" "$h")"
   && [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = matches-authority-partial ] \
   || fail "a packet with no renderer and a cut manifest: $(jq -c '.status, .verified, .consumers' "$o/governance/authority.json")"
 ok 'a cut copy is still identified by the blob the authority commit holds, and is reported partial'
+
+# A complete manifest and present-but-truncated renderer are still partial:
+# the bounded copy may end before the rule that owns the consumer scalar.
+{ printf '# renderer rules\n'; head -c 32768 /dev/zero | tr '\000' '#'; } \
+  >"$t/authority/crates/jeryu-tool-control/src/render_rules.rs"
+a add -A; a commit -qm 'large renderer'
+rm -rf "$t/forge/git/acme/jeryu-tool.git"; git clone -q --bare "$t/authority" "$t/forge/git/acme/jeryu-tool.git"
+dep cut-renderer; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
+policy 1.7.6 | put agent/audit-policy.toml; h="$(snap bump)"
+o="$(budget=8192 evidence "$b" "$h")"
+[ "$(field "$o" manifest_truncated)" = false ] \
+  && jq -e 'any(.renderers[]; .truncated)' "$o/governance/authority.json" >/dev/null \
+  || fail 'fixture did not isolate a truncated renderer with a complete manifest'
+[ "$(field "$o" status)" = authority-partial ] && [ "$(field "$o" verified)" = false ] \
+  && [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = matches-authority-partial ] \
+  || fail "a truncated renderer was reported verified: $(cat "$o/governance/authority.json")"
+ok 'a truncated renderer cannot report the full authority was shown'
 
 [ ! -e "$t/api.unexpected" ] || fail "unexpected forge API paths: $(sort -u "$t/api.unexpected")"
 [ ! -e "$t/ambient-called" ] || fail "an ambient credential helper was called"
