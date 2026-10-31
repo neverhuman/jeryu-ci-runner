@@ -140,6 +140,25 @@ printf 'old loss\n' >"$GATE_CLAIM_STATE/lost"
 gate_claim_take "$owner" "$repo" "$number" "$sha"
 [[ ! -f "$GATE_CLAIM_STATE/lost" ]]
 printf 'PASS a regrant removes the old lost marker\n'
+# A publication-time refusal stops an already registered recipe immediately,
+# without waiting for the background renewal interval. Record the signal rather
+# than using wall-clock deadlines or leaving test processes behind.
+reset_claim granted
+gate_claim_take "$owner" "$repo" "$number" "$sha"
+printf '1234\n' >"$GATE_CLAIM_STATE/worker"
+printf 'denied\n' >"$scratch/mode"
+kill() { printf '%s\n' "$*" >>"$scratch/signals"; }
+api POST "/repos/$owner/$repo/statuses/$sha" '{"state":"success"}'
+no_writes
+grep -qx -- '-TERM -- -1234' "$scratch/signals"
+# If the background renewer lost the lease before the parent could register
+# the process group, registration must notice the existing loss and stop it.
+rm -f "$GATE_CLAIM_STATE/worker" "$scratch/signals"
+gate_claim_track_worker 5678
+grep -qx -- '-TERM -- -5678' "$scratch/signals"
+unset -f kill
+rm -f "$GATE_CLAIM_STATE/worker"
+printf 'PASS publication renewal loss and pre-registration loss stop the worker immediately\n'
 # queue_sha is reserved for actual queue refs; main/branch health is a head claim.
 for qref in refs/heads/main refs/heads/release refs/queue/main/12; do
   reset_claim granted

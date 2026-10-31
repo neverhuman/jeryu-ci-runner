@@ -101,6 +101,25 @@ gate_claim_release() {
   GATE_CLAIM_HELD=0
   return 0
 }
+# Stop a registered recipe for either background or publication-time lease loss.
+# Registration checks the marker too: loss can occur after the pre-spawn check
+# but before the parent writes the worker PID, when the renewer sees no worker yet.
+gate_claim_stop_worker() {
+  local worker=""
+  [[ ! -f "$GATE_CLAIM_STATE/worker" ]] || read -r worker <"$GATE_CLAIM_STATE/worker" || true
+  [[ ! "$worker" =~ ^[0-9]+$ ]] || kill -TERM -- "-$worker" 2>/dev/null || true
+}
+gate_claim_mark_lost() {
+  printf '%s\n' "$1" | gate_atomic "$GATE_CLAIM_STATE/lost" \
+    || say "could not persist the lost-lease marker; stopping its worker anyway"
+  say "lost the gate claim on $GATE_CLAIM_OWNER/$GATE_CLAIM_REPO@$GATE_CLAIM_SHA ($1); stopping its gate"
+  gate_claim_stop_worker
+}
+gate_claim_track_worker() {
+  printf '%s\n' "$1" | gate_atomic "$GATE_CLAIM_STATE/worker" || return 1
+  [[ ! -f "$GATE_CLAIM_STATE/lost" ]] || gate_claim_stop_worker
+}
+
 # gate_claim_renew_loop SECONDS RUNNER-PID -- renew every SECONDS while the runner lives. It ends on
 # its own when the runner is gone (a `kill -9` of the slot must not leave a process renewing a head
 # nobody gates), and when the lease is lost: refused on renewal, or no renewal answered within one
@@ -108,7 +127,7 @@ gate_claim_release() {
 # recorded in $GATE_CLAIM_STATE/lost and stops the recipe's process group, so the runner abandons the
 # attempt and posts nothing more for the head.
 gate_claim_renew_loop() {
-  local every=$1 runner=$2 last_ok now rc worker=""
+  local every=$1 runner=$2 last_ok now rc
   ((every >= 10)) || every=10
   last_ok=$(date +%s)
   while kill -0 "$runner" 2>/dev/null; do
@@ -121,11 +140,7 @@ gate_claim_renew_loop() {
       say "renewing the gate claim on $GATE_CLAIM_SHA answered $code; retrying"
       continue
     fi
-    printf 'renewal answered %s, %ss after the last renewal\n' "$code" "$((now - last_ok))" \
-      | gate_atomic "$GATE_CLAIM_STATE/lost"
-    say "lost the gate claim on $GATE_CLAIM_OWNER/$GATE_CLAIM_REPO@$GATE_CLAIM_SHA (renewal answered $code); stopping its gate"
-    [[ ! -f "$GATE_CLAIM_STATE/worker" ]] || read -r worker <"$GATE_CLAIM_STATE/worker" || true
-    [[ ! "$worker" =~ ^[0-9]+$ ]] || kill -TERM -- "-$worker" 2>/dev/null || true
+    gate_claim_mark_lost "renewal answered $code, $((now - last_ok))s after the last renewal"
     break
   done
 }
@@ -209,7 +224,7 @@ gate_claim_authorize_path() { # method path payload
     # Nothing is published while authority is uncertain. gate_publish retains recovery_required.
     code=503 body='publication lease renewal unavailable; retain result for recovery'
   else
-    printf '%s\n' 'publication renewal refused' | gate_atomic "$GATE_CLAIM_STATE/lost"
+    gate_claim_mark_lost "publication renewal refused (HTTP $code)"
     code=lease_unavailable body='publication lease renewal refused'
   fi
   say "$target_owner/$target_repo@$target_sha: $body; posting nothing"

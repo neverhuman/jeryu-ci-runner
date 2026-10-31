@@ -2559,8 +2559,8 @@ invoke --repo acme/fixture --pr 1
 (( $(date +%s) - started < 24 )) || fail_claims 'the recipe ran on after its lease was lost'
 [[ "$(non_pending)" == "$results" ]] || fail_claims 'a result was published after the lease was lost mid-recipe'
 grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'the mid-recipe loss was not reported'
-grep -q 'stopping its gate' "$fixture/runner/cache/gate-claim-slot0/renewer.log" \
-  || fail_claims 'the renewer did not stop the recipe'
+grep -qE 'renewal answered|publication renewal refused' "$fixture/runner/cache/gate-claim-slot0/lost" \
+  || fail_claims 'the renewal loss that stopped the recipe was not recorded'
 rm -f "$fixture/steal-on-renew" "$claim"
 printf 'PASS gate claims: a lease lost mid-recipe stops the recipe and publishes nothing\n'
 

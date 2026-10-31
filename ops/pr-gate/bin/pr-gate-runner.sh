@@ -2077,18 +2077,19 @@ fi
 gate_worker=$!
 ran_tier=1
 gate_update --argjson worker "$gate_worker" '.worker_pid=$worker'
+# Register before the progress watcher can discover a refusal of its own renewal.
+# A loss between the pre-spawn check and registration stops this worker too.
+((GATE_CLAIM_HELD == 0)) || gate_claim_track_worker "$gate_worker"
 # What the gate is checking, step by step, while it runs (pr-gate-progress.sh). Best effort.
 gate_progress_watch "$log" "$steps_tsv" "$gate_worker" "$owner" "$repo" "$sha" \
   "$(gate_planned_path "$owner" "$repo")" "$step_sources" "$checks_url" >/dev/null 2>&1 &
 progress_watcher=$!
-# The lease's renewer (started when it was granted) stops this process group if the lease is lost.
-((GATE_CLAIM_HELD == 0)) || printf '%s\n' "$gate_worker" | gate_atomic "$GATE_CLAIM_STATE/worker"
 worker_exit=0
 wait "$gate_worker" || worker_exit=$?
+rm -f -- "$GATE_CLAIM_STATE/worker"
 gate_worker=""
 kill "$progress_watcher" 2>/dev/null || true
 wait "$progress_watcher" 2>/dev/null || true
-rm -f -- "$GATE_CLAIM_STATE/worker"
 gate_steps_record "$log" "$steps_tsv" || true
 date +%s >"$gate_attempt_dir/steps.end"
 state=success
