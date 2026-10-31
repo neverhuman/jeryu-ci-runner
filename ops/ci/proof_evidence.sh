@@ -304,13 +304,15 @@ jankurai audit . --mode ratchet --baseline target/jankurai/accepted-baseline.jso
 
 short_head="${current_head:0:7}"
 if [[ "${#changed_paths[@]}" -gt 0 ]]; then
-  jq -e --arg head "${short_head}" --argjson changed "${expected_changed}" \
-    '.schema_version == "1.0.0" and .git_head == $head and
+  proof_require_report_head "$ROOT" "$current_head" target/jankurai/proofbind/surface-witness.json
+  jq -e --argjson changed "${expected_changed}" \
+    '.schema_version == "1.0.0" and
      (.changed_paths | sort | unique) == $changed and
      (.summary.changed_surface_count | type == "number")' \
     target/jankurai/proofbind/surface-witness.json >/dev/null
-  jq -e --arg head "${short_head}" \
-    '.schema_version == "1.0.0" and .git_head == $head and
+  proof_require_report_head "$ROOT" "$current_head" target/jankurai/proofmark/proofmark-receipt.json
+  jq -e \
+    '.schema_version == "1.0.0" and
      (.summary.total_obligations | type == "number") and
      (.summary.satisfied_obligations | type == "number") and
      (.summary.review_obligations | type == "number") and

@@ -37,6 +37,11 @@ directory and proofmark count are null and `proof_verification` is
 is deepened from the forge first. Run the narrower `just` lanes above on a tree
 that is not yet a pushed, rebased head.
 
+Advisory proofbind and proofmark reports may use Git's variable-length head
+abbreviation. The lane accepts only a hexadecimal prefix resolving to the
+single exact candidate Git object; wrong or ambiguous prefixes refuse, even
+when a branch has the same name. Full heads remain valid.
+
 The baseline audit and migration analysis run on the unchanged protected-main
 commit. The lane checks its HEAD, tracked files, untracked paths and policy
 digest before and after auditing and after migration; the baseline report and

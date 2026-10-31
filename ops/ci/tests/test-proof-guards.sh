@@ -322,6 +322,31 @@ if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'failed ba
 if $c "$fixture/protected" "$pbase" 2>/dev/null; then fail 'failed fresh clone status read accepted'; fi
 printf 'proof protected baseline guard ok\n'
 
+# --- report abbreviations must identify one exact object, not seven fixed bytes ---
+head_repo="$fixture/report-head"
+git init -q --object-format=sha1 -b main "$head_repo"
+git -C "$head_repo" mktree </dev/null >/dev/null
+ca="$(git -C "$head_repo" hash-object -w -t commit --stdin < ops/ci/tests/fixtures/report-head-collision-a.commit)"
+cb="$(git -C "$head_repo" hash-object -w -t commit --stdin < ops/ci/tests/fixtures/report-head-collision-b.commit)"
+[[ "$ca" != "$cb" && "${ca:0:7}" == "${cb:0:7}" && "${ca:0:8}" != "${cb:0:8}" ]] || fail 'report head collision fixtures drifted'
+head_report="$fixture/report.json"
+for prefix in "$ca" "${ca:0:8}"; do
+  jq -n --arg h "$prefix" '{git_head:$h}' > "$head_report"
+  proof_require_report_head "$head_repo" "$ca" "$head_report" || fail 'valid full or eight-character head refused'
+done
+# Even an all-hex branch with that name cannot make an ambiguous object prefix valid.
+git -C "$head_repo" update-ref "refs/heads/${ca:0:7}" "$ca"
+for prefix in "${ca:0:7}" "${ca:0:6}" "$cb" HEAD ''; do
+  jq -n --arg h "$prefix" '{git_head:$h}' > "$head_report"
+  if proof_require_report_head "$head_repo" "$ca" "$head_report" 2>/dev/null; then fail "invalid or ambiguous report head accepted: $prefix"; fi
+done
+unique="$(printf 'unique head\n' | git -C "$head_repo" commit-tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904)"
+jq -n --arg h "${unique:0:7}" '{git_head:$h}' > "$head_report"
+proof_require_report_head "$head_repo" "$unique" "$head_report" || fail 'valid seven-character head refused'
+printf '{"git_head":12345678}\n' > "$head_report"
+if proof_require_report_head "$head_repo" "$unique" "$head_report" 2>/dev/null; then fail 'numeric report head accepted'; fi
+printf 'proof report exact-head abbreviation guard ok\n'
+
 # --- the authorization file the lane really reads ----------------------------
 authz_path=ops/ci/policy-transitions.txt
 [[ -f "$authz_path" && ! -L "$authz_path" ]] ||

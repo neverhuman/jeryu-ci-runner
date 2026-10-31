@@ -87,6 +87,26 @@ proof_json_digest() {
   printf '"%s"\n' "${sum%% *}"
 }
 
+# Advisory proof reports use Git's variable-length abbreviation. Bind only a
+# hexadecimal prefix that resolves to exactly this commit, never a named ref
+# or a prefix ambiguous with another Git object.
+proof_require_report_head() {
+  local repo="$1" expected="$2" report="$3" reported objects
+  reported="$(jq -er '.git_head | strings' "$report")" || {
+    printf 'cannot read proof report head: %s\n' "$report" >&2
+    return 1
+  }
+  if [[ ! "$reported" =~ ^[0-9a-f]{7,40}$ || "$expected" != "$reported"* ]]; then
+    printf 'proof report does not name the exact head: %s\n' "$report" >&2
+    return 1
+  fi
+  objects="$(git -C "$repo" rev-parse --disambiguate="$reported")" || return 1
+  [[ "$objects" == "$expected" ]] || {
+    printf 'proof report head is missing or ambiguous: %s\n' "$report" >&2
+    return 1
+  }
+}
+
 # Print the lane's summary, jeryu.ci-runner.proof-evidence/v2, from the
 # artifacts under ./target this run wrote.
 #
