@@ -1076,7 +1076,12 @@ a later tick recovers the verdict only after obtaining live authority. Local jou
 errors and permanent publication errors still fail the service. `post_status` sets
 `POST_STATUS_POSTED=1` only when the requested status was acknowledged; a recoverable
 refusal returns with that flag at zero. Pending publication that exhausts transient
-retries defers the recipe to a later tick. Failed fast tiers retain their lease
+retries defers the recipe to a later tick: that attempt never ran its recipe, so its
+journal is kept as superseded evidence and owes no publication, and the next tick
+gates the head afresh rather than recovering a verdict for a recipe that never ran.
+Every publication a result still owes -- the required status, the check run and a
+failed fast tier's final required context -- keeps it an outbox item, so it is never
+reused or held on until all three are acknowledged. Failed fast tiers retain their lease
 through the final required-context failure, which is also retained for recovery.
 Renewal treats only typed claim refusal or a typed missing route as definitive
 loss. Other unsuccessful answers provide unknown authority, authorize no writes,

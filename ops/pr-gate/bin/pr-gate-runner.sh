@@ -1934,7 +1934,8 @@ else
   pending_base=$(gate_proof_base_field "$gate_receipt") || pending_base=""
   post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running on $MARKER; attempt $(jq -r '.id' "$gate_receipt")${pending_base:+; $pending_base}" "$checks_url"
   if ((POST_STATUS_POSTED == 0)); then
-    gate_finish interrupted null "" 'pending publication deferred; recipe not started'
+    say "$owner/$repo@$sha: its pending was not acknowledged; the recipe does not start, and the head is left for the next tick"
+    gate_defer_attempt 'pending publication not acknowledged; recipe not started'
     gate_receipt=""
     ran_tier=0
     break
@@ -1945,7 +1946,8 @@ if ((full_pending)); then
   pending_base=$(gate_proof_base_field "$gate_receipt") || pending_base=""
   GATE_CONTEXT_KIND=required post_status "$owner" "$repo" "$sha" pending "$(gate_execution_kind) $recipe_name running first on $MARKER, then $full_recipe_name; attempt $(jq -r '.id' "$gate_receipt")${pending_base:+; $pending_base}" "$checks_url"
   if ((POST_STATUS_POSTED == 0)); then
-    gate_finish interrupted null "" 'pending publication deferred; recipe not started'
+    say "$owner/$repo@$sha: its pending was not acknowledged; the recipe does not start, and the head is left for the next tick"
+    gate_defer_attempt 'pending publication not acknowledged; recipe not started'
     gate_receipt=""
     ran_tier=0
     break

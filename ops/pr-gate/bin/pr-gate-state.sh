@@ -878,7 +878,10 @@ gate_decision_local() {
   actual=$(sha256sum "$gate_result_log" | cut -c1-64)
   [[ "$actual" == "$(jq -r '.log_sha256' "$previous")" ]] || return 0
   [[ "$retry" == 0 ]] || return 0
-  if ! jq -e '.publication.required_status and .publication.check_run' "$previous" >/dev/null; then
+  # Every publication this result owes, including a failed fast tier's final required context: a
+  # single outstanding write is still an outbox item, never a result to reuse or hold on.
+  if ! jq -e '.publication.required_status and .publication.check_run
+      and (.final_required_context == null or .publication.final_required_status)' "$previous" >/dev/null; then
     # A result discharged under another proof base is never published: gate it again instead.
     jq -e '.publication.superseded_by != null' "$previous" >/dev/null && return 0
     gate_action=republish
@@ -908,6 +911,18 @@ gate_finish() {
       .terminal=true | .outcome=$outcome | .exit_code=$exit_code | .finished_at=$at |
       .log=(if $log=="" then null else $log end) | .log_sha256=(if $digest=="" then null else $digest end) |
       .recovery_required=(if $recovery=="" then null else $recovery end) end' || return
+  cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json"
+}
+
+# gate_defer_attempt WHY -- an attempt whose recipe never started, because the `pending` that
+# announces it was not acknowledged (a lease handover, or a forge that could not take it). Nothing
+# reached the forge, so nothing is owed: the journal is kept as evidence and recorded as superseded,
+# which is what keeps a later tick from publishing a verdict for a recipe that never ran. The head is
+# gated again on the next tick (gate_decision_local treats a superseded result as no result).
+gate_defer_attempt() {
+  gate_update --arg why "$1" --arg at "$(date -u +%FT%TZ)" \
+    'if .terminal then . else .terminal=true | .outcome="not_started" | .exit_code=null | .finished_at=$at end
+     | .publication.superseded_by=$why | .recovery_required=null' || return
   cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json"
 }
 
@@ -1135,8 +1150,11 @@ gate_publish() {
       '{state:"failure",context:$context,description:$description}')
     gate_api_retry POST "/repos/$owner/$repo/statuses/$sha" "$status_payload"
     if [[ "$code" != 201 ]] || ! jq -se 'length == 1 and .[0].id != null' <<<"$body" >/dev/null 2>&1; then
-      gate_update '.recovery_required="final required-context publication unacknowledged"' || return
+      fault=$(gate_publication_fault)
+      gate_update --arg code "$code" --arg fault "$fault" '.recovery_required="final required-context publication unacknowledged"
+        | .publication.final_http_status=$code | .publication.final_fault=$fault' || return
       cat "$gate_receipt" | gate_atomic "$gate_key_dir/last-result.json" || return
+      printf 'final required-context publication unacknowledged for %s/%s@%s (HTTP %s, %s); retained for recovery\n' "$owner" "$repo" "$sha" "$code" "$fault" >&2
       [[ ! "$code" =~ ^(lease_unavailable|5[0-9][0-9]|000|429)$ ]] || GATE_PUBLICATION_DEFERRED=1
       return 1
     fi

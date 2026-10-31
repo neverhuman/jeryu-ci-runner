@@ -200,6 +200,17 @@ gate_claim_stop_worker
 gate_update '.terminal=true'
 gate_claim_track_worker "$worker"
 [[ ! -f "$scratch/signals" ]]
+# Nor may a registration, or the receipt it names, be a symlink planted beside this slot's state.
+gate_update '.terminal=false'
+printf '%s %s\n' "$worker" "$gate_receipt" >"$scratch/forged-worker"
+ln -sf "$scratch/forged-worker" "$GATE_CLAIM_STATE/worker"
+gate_claim_stop_worker
+[[ ! -f "$scratch/signals" ]]
+rm -f "$GATE_CLAIM_STATE/worker"
+ln -sf "$gate_receipt" "$scratch/forged-receipt"
+printf '%s %s\n' "$worker" "$HOME_DIR/attempts/../../forged-receipt" >"$GATE_CLAIM_STATE/worker"
+gate_claim_stop_worker
+[[ ! -f "$scratch/signals" ]]
 unset -f kill
 kill -TERM -- "-$worker"
 wait "$worker" || true
@@ -408,3 +419,49 @@ unset -f date sleep kill
 rm -f "$scratch/response"
 gate_claim_release
 printf 'PASS unknown renewal authority expires at the bounded TTL without publication\n'
+
+statuses_file="$scratch/statuses.json"
+printf '{"statuses":[]}\n' >"$statuses_file"
+
+# A `pending` that the forge never acknowledged starts no recipe, and leaves no verdict to publish:
+# an attempt recorded as owed here would post `error` for a recipe that never ran.
+reset_claim denied
+gate_receipt=''
+gate_begin "$identity"
+receipt=$gate_receipt
+post_status "$owner" "$repo" "$sha" pending 'fixture recipe running'
+[[ "$POST_STATUS_POSTED" == 0 ]]
+gate_defer_attempt 'pending publication not acknowledged; recipe not started'
+no_writes
+jq -e '.terminal and .outcome=="not_started" and .exit_code==null and .recovery_required==null
+  and .publication.superseded_by!=null and (.publication.required_status|not)' "$receipt" >/dev/null
+gate_receipt=''
+printf 'granted\n' >"$scratch/mode"
+gate_recover
+no_writes
+gate_decision_local "$identity" 0 "$statuses_file"
+[[ "$gate_action" == run ]]
+gate_claim_release
+printf 'PASS a deferred pending owes no publication and the head is gated again\n'
+
+# The final required context a failed fast tier owes is part of the outbox the next tick inspects,
+# not only of gate_recover: a result still owing it is never reused or held on.
+reset_claim granted
+gate_receipt=''
+gate_begin "$identity"
+receipt=$gate_receipt
+log="$(dirname "$receipt")/build.log"
+printf 'fixture output\n' >"$log"
+gate_update '.final_required_context="fixture/required"
+  | .publication.required_status=true | .publication.check_run=true'
+gate_finish failure 7 "$log"
+gate_decision_local "$identity" 0 "$statuses_file"
+[[ "$gate_action" == republish ]]
+gate_update '.publication.final_required_status=true'
+cat "$receipt" | gate_atomic "$gate_key_dir/last-result.json"
+gate_decision_local "$identity" 0 "$statuses_file"
+[[ "$gate_action" == hold ]]
+no_writes
+gate_receipt=''
+gate_claim_release
+printf 'PASS an owed final required context keeps the result an outbox item\n'

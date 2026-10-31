@@ -120,9 +120,11 @@ gate_claim_release() {
 # but before the parent writes the worker PID, when the renewer sees no worker yet.
 gate_claim_stop_worker() {
   local worker="" receipt="" parent group
-  [[ -f "$GATE_CLAIM_STATE/worker" && ! -L "$GATE_CLAIM_STATE/worker" ]] || return 0
+  # Both the registration and the receipt it names must be this user's own plain files: a process
+  # group is only stopped on evidence this slot wrote.
+  [[ -f "$GATE_CLAIM_STATE/worker" && ! -L "$GATE_CLAIM_STATE/worker" && -O "$GATE_CLAIM_STATE/worker" ]] || return 0
   read -r worker receipt <"$GATE_CLAIM_STATE/worker" || return 0
-  [[ "$worker" =~ ^[0-9]+$ && "$receipt" == "$HOME_DIR/attempts/"* && ! -L "$receipt" ]] || return 0
+  [[ "$worker" =~ ^[0-9]+$ && "$receipt" == "$HOME_DIR/attempts/"* && -f "$receipt" && ! -L "$receipt" && -O "$receipt" ]] || return 0
   jq -e --argjson pid "$worker" --arg owner "$GATE_CLAIM_OWNER" --arg repo "$GATE_CLAIM_REPO" \
     --arg sha "$GATE_CLAIM_SHA" '.worker_pid==$pid and .phase=="running" and (.terminal|not)
       and .owner==$owner and .repo==$repo and .sha==$sha' "$receipt" >/dev/null 2>&1 || return 0

@@ -1934,11 +1934,33 @@ invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 jq -se '[.[-3:][] | select(.state == "error" and (.description | test("forge answered 503 posting pending")))] | length == 1' \
   "$fixture/statuses.jsonl" >/dev/null || { tail -3 "$fixture/statuses.jsonl" >&2; exit 1; }
+deferred_head=$(sed -n 's/^.*acme\/fixture@\([0-9a-f]\{40\}\): its pending was not acknowledged.*$/\1/p' \
+  "$fixture/runner.log" | head -1)
+[[ -n "$deferred_head" ]] \
+  || { printf 'the deferred pending was not reported\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+# The recipe never started, so the attempt is evidence of nothing and owes no publication: an
+# attempt left owed here would have the next tick post a verdict for a recipe that never ran.
+mapfile -t deferred_results < <(printf '%s\n' "$fixture/runner/attempts/acme-fixture-$deferred_head"*/last-result.json)
+jq -se 'length > 0 and all(.[]; .outcome == "not_started" and .exit_code == null and .recovery_required == null
+  and .publication.superseded_by != null and (.publication.required_status | not))' \
+  "${deferred_results[@]}" >/dev/null \
+  || { ls -la "$fixture/runner/attempts" >&2; cat "${deferred_results[@]}" >&2; exit 1; }
 rm -f "$fixture/forge-5xx"
+verdicts=$(jq -s --arg sha "$deferred_head" '[.[] | select(.sha == $sha and .state != "pending"
+  and ((.description // "") | test("forge answered 503 posting pending") | not))] | length' "$fixture/statuses.jsonl")
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
 expect_count "$((before_count + 1))"
-printf 'PASS an exhausted forge 5xx leaves a visible error status and the next tick gates the head\n'
+# One new verdict for the head: the gate that actually ran, naming its own attempt and log. Not
+# two, and never the `interrupted` error the attempt whose pending was refused would have recovered.
+jq -se --arg sha "$deferred_head" --argjson before "$verdicts" '[.[] | select(.sha == $sha and .state != "pending"
+  and ((.description // "") | test("forge answered 503 posting pending") | not))] as $v
+  | ($v | length) == $before + 1
+  and ($v[-1] | .state != "error" and ((.description // "") | test("; log [0-9a-f]{64}")))
+  and ([.[] | select(.sha == $sha and ((.description // "") | test("interrupted")))] | length) == 0' \
+  "$fixture/statuses.jsonl" >/dev/null \
+  || { jq -sc --arg sha "$deferred_head" '[.[] | select(.sha == $sha) | {state,description}]' "$fixture/statuses.jsonl" >&2; exit 1; }
+printf 'PASS an exhausted forge 5xx leaves a visible error status, owes no verdict, and the next tick gates the head\n'
 
 # ---- proof base (PR_GATE_PROOF_BASE_VARS) ----
 # The recipe is told which base to prove against: origin/main for a main-bound PR, origin/<base> for a
