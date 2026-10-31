@@ -40,11 +40,16 @@ that is not yet a pushed, rebased head.
 The baseline audit and migration analysis run on the unchanged protected-main
 commit. The lane checks its HEAD, tracked files, untracked paths and policy
 digest before and after auditing and after migration; the baseline report and
-summary name that same commit. The only untracked or gitignored paths the baseline tree
-may hold are the baseline audit's own report directory, `.jankurai/`; any other
-untracked or ignored path refuses (the check lists ignored paths too, because
-the auditor reads files whatever `.gitignore` says), because the audit and the migration analysis would read
-it as bytes protected main carried. Before the policy digest pins that tree --
+summary name that same commit. After the full audit, the only permitted
+untracked or ignored outputs are `.jankurai/` (excluded by main's policy) and
+`target/jankurai/audit-state.json`, the smart-scan state Jankurai 1.7.6 writes
+after every full audit even with `--no-score-history`. The lane always uses
+`--full`, so it does not reuse that state to skip scanning. The state must be
+a canonical one-link regular file, with no symlinked parent. The inventory
+uses `--ignored=traditional --untracked-files=all` to list individual files;
+allowing the state file never allows a sibling under `target/`. All other
+untracked and ignored paths refuse conservatively, without assuming that
+`.gitignore` defines what the auditor or migration analysis reads. Before the policy digest pins that tree --
 the pre-digest window -- the lane has already required the fresh clone to be the
 exact base commit with no modified tracked file and no untracked or ignored path at all,
 and between that check and the digest it only reads, so the bytes it hashes are
@@ -67,17 +72,18 @@ rather than asserted: `ops/ci/tests/fixtures/audit-policy-1.7.5-preimage.toml`
 (protected side) and `ops/ci/tests/fixtures/audit-policy-1.7.6-preimage.toml`
 (candidate side). `ops/ci/tests/test-proof-guards.sh` hashes both against the
 pinned pair, holds them to a difference of only the pinned auditor version,
-accepts the pair through the guard and refuses the reverse pair. It does not
-read the live `agent/audit-policy.toml`, so a reviewed change to the live policy
-leaves this test meaningful; the pin authorizes no change to today's main.
+accepts the pair through the guard and refuses the reverse pair. A separate
+assertion requires the live policy digest to differ from the historical
+protected-side digest. Future reviewed policy evolution remains possible,
+while reactivating this historical pin fails the test.
 Jankurai 1.7.6 rejects changed fingerprints, so a future migration also needs
 reviewed auditor support for evaluating candidate code under main's policy; a
 digest entry alone is insufficient.
 
 The static `git commit` tripwire in `ops/ci/tests/test-proof-guards.sh` is a
-line regex, not a shell parser. It catches `commit` as a bare word after
-whitespace, `(`, `;`, `&` or `|`, at a line end, and across a `git \`
-continuation. It does not see a quoted subcommand, a variable holding it, or an
+line regex, not a shell parser. It catches `commit` at line start or after
+any character except alphanumeric, `_` or `{`, followed by whitespace,
+`;`, `&`, `|`, `)` or line end, including across a `git \` continuation. It does not see a quoted subcommand, a variable holding it, or an
 alias; the runtime baseline guards are what cover those. Its scans of the lane
 fail the test when grep cannot run, instead of reading that as a clean scan.
 

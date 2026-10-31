@@ -33,7 +33,7 @@
 # and ops/ci/tests/fixtures/audit-policy-1.7.6-preimage.toml (candidate, ad719118).
 # ops/ci/tests/test-proof-guards.sh hashes both against this line, holds them to
 # a version-only difference, accepts the pair through the guard and refuses the
-# reverse pair. It never reads the live agent/audit-policy.toml, so a reviewed
-# change to the live policy does not touch it, and the pin authorizes nothing
-# about today's main: main's policy is not this pin's protected side.
+# reverse pair. A separate assertion checks that live agent/audit-policy.toml
+# is not the historical protected-side preimage. It permits future reviewed
+# policy evolution while refusing reactivation of this historical pin.
 da5cb2572abca03ae5777f570208e5bb73c2e6e2d8f3fb94b94ca96e57cb5771 77cc588348ad42861cf52ff266fc685feff56bead9a21a57d3c79f43f404971d

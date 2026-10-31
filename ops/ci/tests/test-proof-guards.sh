@@ -248,6 +248,7 @@ printf 'proof governed policy guard ok\n'
 
 # --- the baseline clone this gate scored against must still be main's bytes ---
 git init -q -b main "$fixture/protected"
+cp .gitignore "$fixture/protected/.gitignore"
 mkdir -p "$fixture/protected/agent"
 printf '%s\n' 'minimum_score = 80' > "$fixture/protected/agent/audit-policy.toml"
 printf 'protected source\n' > "$fixture/protected/source.txt"
@@ -257,10 +258,14 @@ pbase="$(git -C "$fixture/protected" rev-parse HEAD)"
 pdigest="$(sha256sum "$fixture/protected/agent/audit-policy.toml" | cut -d' ' -f1)"
 b=proof_require_protected_baseline
 $b "$fixture/protected" "$pbase" "$pdigest" || fail 'untouched baseline refused'
+c=proof_require_clean_baseline_clone
+$c "$fixture/protected" "$pbase" || fail 'untouched fresh clone refused'
+if $c "$fixture/protected" "$zero" 2>/dev/null; then fail 'fresh clone at wrong head accepted'; fi
 # The audit's own untracked output does not count as a change.
 mkdir -p "$fixture/protected/.jankurai"
 printf '{}\n' > "$fixture/protected/.jankurai/repo-score.json"
 $b "$fixture/protected" "$pbase" "$pdigest" || fail 'baseline audit output counted as a change'
+if $c "$fixture/protected" "$pbase" 2>/dev/null; then fail 'fresh clone with audit output accepted'; fi
 # Editing the policy in the baseline tree is caught, and so is committing it.
 printf '%s\n' 'minimum_score = 70' > "$fixture/protected/agent/audit-policy.toml"
 if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'edited baseline policy accepted'; fi
@@ -284,21 +289,37 @@ mkdir -p "$fixture/protected/jankurai"
 printf '{}\n' > "$fixture/protected/jankurai/not-audit-output.json"
 if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'an untracked path merely resembling the audit output accepted'; fi
 rm -rf -- "$fixture/protected/jankurai"
-# Ignored paths are inputs too: git status hides them unless asked, and the
-# audit reads a file whatever .gitignore says. The exclude rules stand in for
-# this repository's .gitignore (/target/, /.jankurai/, dist, *.receipt.json).
-printf '%s\n' '/.jankurai/' 'target/' 'dist/' '*.receipt.json' >> "$fixture/protected/.git/info/exclude"
+# Use the repository's real .gitignore, not synthetic exclude rules. Output
+# allowance must never hide a sibling ignored input in the same directory.
 $b "$fixture/protected" "$pbase" "$pdigest" || fail 'ignored baseline audit output refused'
-for ignored in target/x.rs sub/target/x.rs dist/x.rs x.receipt.json; do
+# Jankurai's exact state output is permitted after auditing, never before it.
+mkdir -p "$fixture/protected/target/jankurai"
+printf '{}\n' > "$fixture/protected/target/jankurai/audit-state.json"
+$b "$fixture/protected" "$pbase" "$pdigest" || fail 'real audit state output refused'
+if $c "$fixture/protected" "$pbase" 2>/dev/null; then fail 'fresh clone with ignored output accepted'; fi
+for ignored in target/x.rs target/jankurai/extra.rs sub/target/x.rs dist/x.rs x.receipt.json; do
   mkdir -p "$fixture/protected/$(dirname "$ignored")"
   printf 'fn planted() {}\n' > "$fixture/protected/$ignored"
   if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail "an ignored input in the baseline tree accepted: $ignored"; fi
-  rm -rf -- "$fixture/protected/target" "$fixture/protected/sub" "$fixture/protected/dist" "$fixture/protected/x.receipt.json"
+  rm -f -- "$fixture/protected/$ignored"
+  rm -rf -- "$fixture/protected/sub" "$fixture/protected/dist" "$fixture/protected/x.receipt.json"
 done
 $b "$fixture/protected" "$pbase" "$pdigest" || fail 'baseline refused after the stray inputs were removed'
+# Exact-name allowance never follows a symlink or shared inode.
+state="$fixture/protected/target/jankurai/audit-state.json"
+rm -- "$state"
+ln -s /dev/null "$state"
+if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'symlink audit state accepted'; fi
+rm -- "$state"
+printf '{}\n' > "$fixture/shared-state"
+ln "$fixture/shared-state" "$state"
+if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'hardlinked audit state accepted'; fi
+rm -- "$state"
+
 if $b "$fixture/protected" "$pbase" "$zero" 2>/dev/null; then fail 'wrong baseline policy digest accepted'; fi
 printf 'invalid index\n' > "$fixture/protected/.git/index"
 if $b "$fixture/protected" "$pbase" "$pdigest" 2>/dev/null; then fail 'failed baseline status read accepted'; fi
+if $c "$fixture/protected" "$pbase" 2>/dev/null; then fail 'failed fresh clone status read accepted'; fi
 printf 'proof protected baseline guard ok\n'
 
 # --- the authorization file the lane really reads ----------------------------
@@ -318,9 +339,9 @@ printf 'proof policy transition file ok\n'
 
 # --- the historical 1.7.5 -> 1.7.6 pin: two immutable preimages, and inert ----
 # The pin's two digests are claims about two exact files, and both are kept as
-# fixtures. Nothing here reads agent/audit-policy.toml, so a reviewed change to
-# the live policy never touches this test; the live policy is covered by the
-# guard test above and by the lane itself. The pair must differ only in the
+# fixtures. The live policy may evolve, but must not become the historical
+# protected preimage again; otherwise this entry could authorize it. The
+# lane still checks live policy authority. The pair must differ only in the
 # pinned auditor version, and the pin must be inert: it cannot carry the later
 # bytes back to the earlier ones.
 hist_from=ops/ci/tests/fixtures/audit-policy-1.7.5-preimage.toml
@@ -330,6 +351,10 @@ for f in "$hist_from" "$hist_to"; do
 done
 hist_from_sha="$(sha256sum "$hist_from" | cut -d' ' -f1)"
 hist_to_sha="$(sha256sum "$hist_to" | cut -d' ' -f1)"
+live_policy_sha="$(sha256sum agent/audit-policy.toml | cut -d' ' -f1)" ||
+  fail 'cannot hash live audit policy'
+[[ "$live_policy_sha" != "$hist_from_sha" ]] ||
+  fail 'live policy reactivates the historical protected-side pin'
 historical_pinned=
 while IFS= read -r line || [[ -n "$line" ]]; do
   case "$line" in ''|'#'*) continue ;; esac
@@ -427,7 +452,7 @@ text_runs_commit() {
   esac
 }
 # The static tripwire is a line regex, not a shell parser. It catches `commit`
-# as a bare word after whitespace, a line start, `(` or `;`-style separators, and
+# at line start or after any character except alphanumeric, `_` or `{`, and
 # across a `git \` continuation. It does not see a quoted subcommand
 # (`git "commit"`), a variable holding it, or an alias; those are covered only
 # by the runtime guards, proof_require_protected_baseline's HEAD, tracked-file
@@ -464,10 +489,14 @@ grep -q 'proof_require_protected_baseline' "$lane" ||
   fail 'the lane does not verify the baseline stayed protected-main bytes'
 # Every `>` redirect into target/ is this run's summary; a `printf > target/...`
 # fallback would be a result nobody produced. (cp and tee are not covered.)
+scan_hits -E '> *target/' "$lane"
+redirects="$HITS"
+scan_hits -v '^[[:space:]]*#' <<<"$redirects"
 while IFS= read -r line; do
+  [[ -n "$line" ]] || continue
   [[ "$line" == '  > target/jankurai/proof-evidence-summary.json' ]] ||
     fail "the lane redirects into target/: $line"
-done < <(grep -E '> *target/' "$lane" | grep -v '^[[:space:]]*#')
+done <<<"$HITS"
 
 line_of() {
   local n
@@ -542,14 +571,14 @@ printf 'security failure evidence ok\n'
 # The pre-digest window: before the policy digest pins the baseline tree, the
 # clone must already be known to be the exact base commit with nothing modified
 # and nothing untracked, and the lane must not redirect into that tree at all.
-(( $(line_of 'baseline clone drifted or is dirty' "$lane") < $(line_of 'proof_require_governed_policy' "$lane") )) ||
+(( $(line_of '^proof_require_clean_baseline_clone' "$lane") < $(line_of 'proof_require_governed_policy' "$lane") )) ||
   fail 'the baseline clone is read as main bytes before it is known clean'
-(( $(line_of 'baseline clone drifted or is dirty' "$lane") < $(line_of 'baseline_policy_sha256=' "$lane") )) ||
+(( $(line_of '^proof_require_clean_baseline_clone' "$lane") < $(line_of 'baseline_policy_sha256=' "$lane") )) ||
   fail 'the baseline policy digest is recorded before the clone is known clean'
 # Fold the lane's line continuations so a check written across lines reads as
 # the single command it is.
 lane_folded="$(sed -e ':a' -e '/\\$/{N;s/\\\n/ /;ba' -e '}' "$lane" | tr -s ' ')"
-grep -Fq 'git -C "${baseline_parent}/repo" status --porcelain=v1 --untracked-files=all' \
+grep -Fq 'proof_require_clean_baseline_clone "${baseline_parent}/repo" "$base_commit"' \
   <<<"$lane_folded" ||
   fail 'the baseline clone is not checked for modified and untracked files'
 scan_hits -nE '> *"?\$\{baseline_parent\}' "$lane"

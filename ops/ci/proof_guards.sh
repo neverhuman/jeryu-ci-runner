@@ -306,18 +306,32 @@ proof_report_security_failure() {
   } >&2
 }
 
-# The untracked or ignored paths a protected-main baseline tree may hold while
-# this gate runs: the audit's own report directory, and nothing else. The lane
-# verifies the fresh clone has no untracked and no ignored path at all; from
-# then on the only writer into that tree is the baseline audit, which writes
-# .jankurai/. Ignored paths count: the audit may read a file whatever
-# .gitignore says (the policy's [scan] excluded_paths names only .jankurai/), so
-# an ignored path is an input like any other. The entry is git's status line
-# for it, `?? path` for untracked and `!! path` for ignored. A path git reports
-# in quoted form, because its name needs escaping, never matches and so refuses.
+# A fresh protected-main clone must contain no generated output or other input.
+# Keep this pre-digest check separate from the post-audit output allowance.
+proof_require_clean_baseline_clone() {
+  local repo="$1" base="$2" head inventory
+  head="$(git -C "$repo" rev-parse 'HEAD^{commit}')" || return 1
+  inventory="$(git -C "$repo" status --porcelain=v1 --untracked-files=all \
+    --ignored=traditional)" || return 1
+  if [[ "$head" != "$base" || -n "$inventory" ]]; then
+    printf 'protected-main baseline clone drifted or is dirty\n' >&2
+    return 1
+  fi
+}
+
+# The baseline full audit writes .jankurai reports (excluded by main's policy)
+# and, even with --full --no-score-history, target/jankurai/audit-state.json.
+# Enumerate ignored FILES, never collapsed directories, so allowing this one
+# state output cannot hide another file under target/. A quoted path refuses.
 proof_baseline_untracked_allowed() {
   case "$1" in
     '?? .jankurai/'*|'!! .jankurai/'*) return 0 ;;
+    '?? target/jankurai/audit-state.json'|'!! target/jankurai/audit-state.json')
+      local repo="$2" path="$2/target/jankurai/audit-state.json"
+      [[ -f "$path" && ! -L "$path" &&
+         ! -L "$repo/target" && ! -L "$repo/target/jankurai" &&
+         "$(stat -c '%h' -- "$path")" == 1 &&
+         "$(realpath -- "$path")" == "$path" ]] ;;
     *) return 1 ;;
   esac
 }
@@ -328,8 +342,8 @@ proof_baseline_untracked_allowed() {
 # baseline audit's own output (proof_baseline_untracked_allowed), and the policy that
 # judged this head must hash to DIGEST.
 #
-# Run after the baseline audit: that audit's .jankurai output is this run's, and
-# the tracked tree plus the absence of any other untracked path is main's.
+# Run before and after audit and after migration: only the named outputs may
+# be added to the unchanged tracked tree.
 proof_require_protected_baseline() {
   local repo="$1" base="$2" digest="$3" now head tracked untracked entry
   head="$(git -C "$repo" rev-parse 'HEAD^{commit}')" || {
@@ -349,15 +363,15 @@ proof_require_protected_baseline() {
     return 1
   fi
   untracked="$(git -C "$repo" status --porcelain=v1 --untracked-files=all \
-    --ignored=matching)" || {
+    --ignored=traditional)" || {
     printf 'cannot inspect protected-main baseline untracked files\n' >&2
     return 1
   }
   while IFS= read -r entry; do
     case "$entry" in '?? '*|'!! '*) ;; *) continue ;; esac
-    proof_baseline_untracked_allowed "$entry" || {
-      printf 'protected-main baseline holds an untracked input: %s\n' \
-        "${entry#?? }" >&2
+    proof_baseline_untracked_allowed "$entry" "$repo" || {
+      printf 'protected-main baseline holds an unexpected untracked/ignored input: %s\n' \
+        "${entry:3}" >&2
       return 1
     }
   done <<<"$untracked"

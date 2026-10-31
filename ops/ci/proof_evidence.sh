@@ -227,13 +227,7 @@ if ! git -C "${baseline_parent}/repo" merge-base --is-ancestor "${base_commit}" 
   exit 1
 fi
 git -C "${baseline_parent}/repo" -c advice.detachedHead=false checkout --quiet --detach "${base_commit}"
-if [[ "$(git -C "${baseline_parent}/repo" rev-parse 'HEAD^{commit}')" != \
-      "${base_commit}" ||
-      -n "$(git -C "${baseline_parent}/repo" status --porcelain=v1 \
-        --untracked-files=all --ignored=matching)" ]]; then
-  printf 'protected-main baseline clone drifted or is dirty\n' >&2
-  exit 1
-fi
+proof_require_clean_baseline_clone "${baseline_parent}/repo" "$base_commit"
 baseline_policy="${baseline_parent}/repo/agent/audit-policy.toml"
 if [[ ! -f "${baseline_policy}" || -L "${baseline_policy}" ||
       "$(stat -c '%h' -- "${baseline_policy}")" != 1 ||
@@ -257,7 +251,7 @@ effective_floor="$(audit_effective_floor "${baseline_policy}")"
 # -- the canonical-file test, the governed-policy comparison and the floor
 # derivation. So the bytes hashed here are the bytes the comparison accepted,
 # and proof_require_protected_baseline binds them for the rest of the gate: the
-# baseline audit may add its own .jankurai output and nothing else.
+# baseline audit may add .jankurai reports and its exact audit-state.json output.
 baseline_policy_sha256="$(sha256sum -- "${baseline_policy}")"
 baseline_policy_sha256="${baseline_policy_sha256%% *}"
 proof_require_protected_baseline "${baseline_parent}/repo" "$base_commit" \
