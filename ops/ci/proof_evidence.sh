@@ -249,6 +249,15 @@ proof_require_governed_policy "$candidate_policy" "$baseline_policy" \
 effective_floor="$(audit_effective_floor "${baseline_policy}")"
 # Record the policy that was just accepted as main's, so the checks below can
 # prove the tree that produced the baseline score is still that tree.
+#
+# Everything between the clone's clean check above and this digest is the
+# pre-digest window, and it is covered by that check rather than by the digest:
+# the clone was verified to be the exact base commit with no modified tracked
+# file and no untracked path at all, and from there to here the lane only reads
+# -- the canonical-file test, the governed-policy comparison and the floor
+# derivation. So the bytes hashed here are the bytes the comparison accepted,
+# and proof_require_protected_baseline binds them for the rest of the gate: the
+# baseline audit may add its own .jankurai output and nothing else.
 baseline_policy_sha256="$(sha256sum -- "${baseline_policy}")"
 baseline_policy_sha256="${baseline_policy_sha256%% *}"
 proof_require_protected_baseline "${baseline_parent}/repo" "$base_commit" \

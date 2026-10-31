@@ -38,17 +38,40 @@ is deepened from the forge first. Run the narrower `just` lanes above on a tree
 that is not yet a pushed, rebased head.
 
 The baseline audit and migration analysis run on the unchanged protected-main
-commit. The lane checks its HEAD, tracked files and policy digest before and
-after auditing and after migration; the baseline report and summary name that
-same commit. Both audits receive the floor derived from protected main's policy.
+commit. The lane checks its HEAD, tracked files, untracked paths and policy
+digest before and after auditing and after migration; the baseline report and
+summary name that same commit. The only untracked paths the baseline tree may
+hold are the baseline audit's own report directory, `.jankurai/`; any other
+untracked path refuses, because the audit and the migration analysis would read
+it as bytes protected main carried. Before the policy digest pins that tree --
+the pre-digest window -- the lane has already required the fresh clone to be the
+exact base commit with no modified tracked file and no untracked path at all,
+and between that check and the digest it only reads, so the bytes it hashes are
+the bytes it compared.
+
+Both audits receive the floor derived from protected main's policy.
 Candidate policy bytes must match main unless their exact digest pair was
 previously reviewed into main's `ops/ci/policy-transitions.txt`. A candidate
-cannot authorize itself by editing that file. The recorded 1.7.5 to 1.7.6 entry
-names the completed historical transition; main already has its target bytes.
-An authorization never rewrites the baseline or overrides the auditor's
-`policy_changed == false` ratchet. Jankurai 1.7.6 rejects changed fingerprints,
-so a future migration also needs reviewed auditor support for evaluating
-candidate code under main's policy; a digest entry alone is insufficient.
+cannot authorize itself by editing that file. Beyond the digest pair a matched
+pin re-checks exactly one field, the numeric `minimum_score`, and only that it
+did not go down; `hard_findings_allowed`, `[scan] excluded_paths`,
+`[dead_language] allow_terms` and the required auditor version are authorized by
+the digests alone and rest on the review that landed the pin. An authorization
+never rewrites the baseline, never moves the merge floor, and never overrides
+the auditor's strict `policy_changed == false` ratchet.
+
+The recorded 1.7.5 to 1.7.6 entry names the completed historical transition, and
+both of its preimages are kept so the entry is checkable rather than asserted:
+the protected side is `ops/ci/tests/fixtures/audit-policy-1.7.5-preimage.toml`
+and the candidate side is `agent/audit-policy.toml` itself.
+`ops/ci/tests/test-proof-guards.sh` hashes both against the pinned pair, holds
+them to a difference of only the pinned auditor version, and proves the entry
+inert: main already carries the candidate bytes, so main's policy is never that
+pin's protected side and the pin authorizes no change to today's main -- it will
+not even carry main's policy back to the 1.7.5 preimage. Jankurai 1.7.6 rejects
+changed fingerprints, so a future migration also needs reviewed auditor support
+for evaluating candidate code under main's policy; a digest entry alone is
+insufficient.
 
 The security lane runs networked dependency checks by default through
 `just security`. It preserves Cargo's immutable source identity while

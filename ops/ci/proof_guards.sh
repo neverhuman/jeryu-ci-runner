@@ -217,6 +217,14 @@ proof_policy_minimum_score() {
 # A pin authorizes those exact bytes, not a weaker gate: a pinned transition
 # that lowers minimum_score is still refused, so a pin landed for one reason
 # cannot be spent on dropping the merge floor.
+#
+# That numeric floor is the only field this guard compares between the pair.
+# hard_findings_allowed, [scan] excluded_paths, [dead_language] allow_terms and
+# the required auditor version are authorized by the digests alone, so the
+# review that landed the pin is what stands behind them. The rest of the gate is
+# unchanged by a pin: both audits still run at main's effective floor, the
+# baseline is still protected main's own tree, and the caller still holds this
+# head to the auditor's strict ratchet, policy_changed == false included.
 proof_require_governed_policy() {
   local candidate="$1" protected="$2" authz="${3:-}" cd_ pd_ line a b cf pf matched
   cmp -s "$candidate" "$protected" && return 0
@@ -298,13 +306,30 @@ proof_report_security_failure() {
   } >&2
 }
 
+# The untracked paths a protected-main baseline tree may hold while this gate
+# runs: the audit's own report directory, and nothing else. The lane verifies
+# the fresh clone has no untracked file at all; from then on the only writer
+# into that tree is the baseline audit, which writes .jankurai/. Any other
+# untracked path is an input the audit or the migration analysis would read as
+# if protected main carried it. A path git reports in quoted form, because its
+# name needs escaping, never matches and so refuses.
+proof_baseline_untracked_allowed() {
+  case "$1" in
+    '?? .jankurai/'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # Refuse a protected-main baseline clone that this gate changed. The baseline is
 # main's bytes: its HEAD must still be the commit the lane checked out, no
-# tracked file may be modified, and the policy that judged this head must hash
-# to DIGEST. Run after the baseline audit, which leaves untracked .jankurai
-# output behind -- that output is this run's, the tracked tree is main's.
+# tracked file may be modified, every untracked path must be the baseline
+# audit's own output (proof_baseline_untracked_allowed), and the policy that
+# judged this head must hash to DIGEST.
+#
+# Run after the baseline audit: that audit's .jankurai output is this run's, and
+# the tracked tree plus the absence of any other untracked path is main's.
 proof_require_protected_baseline() {
-  local repo="$1" base="$2" digest="$3" now head tracked
+  local repo="$1" base="$2" digest="$3" now head tracked untracked entry
   head="$(git -C "$repo" rev-parse 'HEAD^{commit}')" || {
     printf 'cannot read protected-main baseline HEAD\n' >&2
     return 1
@@ -321,6 +346,18 @@ proof_require_protected_baseline() {
     printf 'protected-main baseline has modified tracked files\n' >&2
     return 1
   fi
+  untracked="$(git -C "$repo" status --porcelain=v1 --untracked-files=all)" || {
+    printf 'cannot inspect protected-main baseline untracked files\n' >&2
+    return 1
+  }
+  while IFS= read -r entry; do
+    case "$entry" in '?? '*) ;; *) continue ;; esac
+    proof_baseline_untracked_allowed "$entry" || {
+      printf 'protected-main baseline holds an untracked input: %s\n' \
+        "${entry#?? }" >&2
+      return 1
+    }
+  done <<<"$untracked"
   now="$(sha256sum -- "$repo/agent/audit-policy.toml")" && now="${now%% *}" || return 1
   if [[ "$now" != "$digest" ]]; then
     printf 'protected-main baseline policy changed during the gate (%s -> %s)\n' \
