@@ -71,6 +71,33 @@ if (cd "$fixture/retry" && JERYU_JANKURAI_BASE_REF=origin/main~1 proof_base_ref)
 fi
 (cd "$fixture/retry" && proof_changed_paths "$retry_base" "$main_tip" "$fixture/retry-changed")
 [[ -s "$fixture/retry-changed" ]] || fail 'the resolved parent changed when main moved'
+# A landing of several commits: main is at m3, and its first parent m2 landed
+# unproved with it. The gate runner resolves the verified ancestor itself and
+# names that exact commit, which the lane accepts only as a commit of this
+# head's own history -- and then every commit the landing added is in the
+# change set, m2's file among them.
+landing_tip="$(git -C "$fixture/work" rev-parse main)"
+git clone -q --branch main "file://$fixture/forge.git" "$fixture/landing"
+(cd "$fixture/landing" && proof_require_history)
+[[ "$(cd "$fixture/landing" && JERYU_JANKURAI_BASE_REF="$fork" proof_base_ref)" == "$fork" ]] ||
+  fail 'the lane refused the verified ancestor the gate resolved'
+[[ "$(cd "$fixture/landing" && JERYU_JANKURAI_BASE_REF="$main_tip" proof_base_ref)" == "$main_tip" ]] ||
+  fail 'the lane refused main'"'"'s immediate parent as a baseline commit'
+(cd "$fixture/landing" && proof_changed_paths "$fork" "$landing_tip" "$fixture/landing-changed")
+[[ "$(tr '\0' ' ' < "$fixture/landing-changed")" == 'm2 m3 ' ]] ||
+  fail 'a multi-commit landing judged from the verified ancestor excludes an earlier commit'
+# What the lane will not take as a baseline commit: this head itself (an empty
+# proof), a commit off this history, and a commit this checkout does not have.
+for refused_commit in "$landing_tip" "$topic" 0000000000000000000000000000000000000000; do
+  if out="$(cd "$fixture/landing" && JERYU_JANKURAI_BASE_REF="$refused_commit" proof_base_ref 2>/dev/null)"; then
+    fail "baseline commit $refused_commit was accepted as $out"
+  fi
+done
+# A pull request cannot opt into a baseline commit either: its HEAD is not the
+# refreshed protected tip.
+if (cd "$fixture/pr" && JERYU_JANKURAI_BASE_REF="$fork" proof_base_ref) 2>/dev/null; then
+  fail 'a pull request could opt into a baseline commit'
+fi
 for refused in origin/release/v1 main HEAD HEAD~1 "$fork" origin/main~2 origin/main~ \
                'origin/main^' 'origin/main~1 ' refs/remotes/origin/main; do
   if out="$(JERYU_JANKURAI_BASE_REF="$refused" proof_base_ref 2>/dev/null)"; then

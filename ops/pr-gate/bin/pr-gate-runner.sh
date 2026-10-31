@@ -60,8 +60,11 @@
 # Usage: pr-gate-runner.sh [--repo [OWNER/]R --pr N] [--main-health] [--branch B [--repo R]] [--list]
 #   --repo/--pr  gate this PR now, even if it already has a runner status
 #   --main-health  gate protected main and post <repo>/main-health
-#   --branch B   gate the tip of protected branch B (a release line) and post <repo>/required on it,
-#                proved against B itself; refused for a branch the forge does not report as protected
+#   --branch B   gate the tip of protected branch B (a release line, or main) and post
+#                <repo>/required on it, proved against B as it stood before the tip: its first
+#                parent, or, for main, the nearest ancestor this gate identity has already proved
+#                (refused when there is none); refused for a branch the forge does not report as
+#                protected
 #   --list       print what the next tick would gate and exit
 #   --preflight  (alone) read-only release check: stale slot index locks, pinned-tool drift, each
 #                family main's latest <repo>/required; exit 1 on a finding (pr-gate-preflight.sh)
@@ -179,8 +182,18 @@ for var in $WORKER_ROOT_VARS; do
 done
 # Optional site mapping for protected-main retries only (owner=VARIABLE words).
 # Empty by default. Install the runner on every host before opting in; recipes
-# must verify and bind the prior-tip baseline after refreshing protected main.
+# must verify and bind the baseline commit after refreshing protected main.
 MAIN_PROOF_BASE_VARS="${PR_GATE_MAIN_PROOF_BASE_VARS:-}"
+# How far back along main's first-parent history a main retry looks for its baseline: the nearest
+# ancestor that already carries this gate identity's own <repo>/required success (main_retry_baseline).
+# Protected main can advance by more than one commit at once -- a merge queue landing several
+# entries, a fast-forward push of a reviewed series -- and then the tip's own parent is unproved
+# too; the deepest landing this will bind across is this many commits. One forge read per step, and
+# a landing deeper than that is refused rather than proved against an unverified commit.
+MAIN_RETRY_BASELINE_DEPTH="${PR_GATE_MAIN_RETRY_BASELINE_DEPTH:-25}"
+[[ "$MAIN_RETRY_BASELINE_DEPTH" =~ ^[1-9][0-9]{0,2}$ ]] \
+  || { printf 'PR_GATE_MAIN_RETRY_BASELINE_DEPTH: %s is not a commit count between 1 and 999\n' \
+       "$MAIN_RETRY_BASELINE_DEPTH" >&2; exit 2; }
 # A proof-base variable that is also a worker-root variable would silently replace the family root
 # with origin/<base> in the recipe's environment. That is a configuration error, refused at start (a
 # malformed proof-base entry, by contrast, only degrades its own owner; see owner_proof_base_var).
@@ -398,8 +411,9 @@ post_status() { # owner repo sha state description [target_url]
 #
 # One mode may take that variable from the main-only site mapping instead of the broader list
 # (MAIN_PROOF_BASE_VARS, above): the branch-tip gate of protected main, which passes exactly one
-# value, origin/main~1. A recipe listed there accepts only protected main's tip or the commit before
-# it and fails closed on anything else, so the default cannot widen what any other gate proves
+# value, the commit of main's own history this runner verified as already proved
+# (main_retry_baseline). A recipe listed there accepts only protected main's tip or an ancestor of
+# that tip and fails closed on anything else, so the default cannot widen what any other gate proves
 # against -- and main's tip has to be proved against something other than itself.
 # ---------------------------------------------------------------------------
 PROOF_BASE_WAIT_CAP=6
@@ -417,14 +431,54 @@ owner_proof_base_var() { # owner
   return 0
 }
 # Protected main's own branch-tip gate, and only that one, may take its recipe variable from the
-# main-only site mapping above when the broader setting named none for the owner: it is proved against origin/main~1,
-# a commit of protected main's own history, which the owner's recipe is known to accept. A malformed
+# main-only site mapping above when the broader setting named none for the owner: it is proved against a
+# commit of protected main's own history, which the owner's recipe is known to accept. A malformed
 # default is ignored exactly as a malformed site entry is.
 main_proof_base_var() { # owner branch
   [[ -z "$pb_var" && "$2" == main ]] || return 0
   pb_var="$(pr_gate_lookup "$MAIN_PROOF_BASE_VARS" "$1")" || pb_var=""
   [[ "$pb_var" =~ ^[A-Z_][A-Z0-9_]*$ ]] || pb_var=""
   return 0
+}
+
+# The baseline a protected-main retry of TIP in TREE is proved against: the nearest first-parent
+# ancestor of TIP that already carries this gate identity's own <repo>/required success, read from
+# the forge under this runner's credential (never from the tree, which says nothing about what was
+# proved). Sets baseline_sha, or baseline_refusal and returns 1.
+#
+# Walking back past an unproved commit only widens the change set, so every commit a landing added
+# is judged; stopping at the first proved ancestor keeps it the narrowest such set. The walk is
+# bounded by MAIN_RETRY_BASELINE_DEPTH and asks the forge once per step. A root commit, a landing
+# deeper than the bound, and a forge that will not answer are all refusals: nothing is published, and
+# the tip is left as it was.
+main_retry_baseline() { # tree tip
+  # Only the required context answers for an ancestor: a fast tier's green proves a cheaper recipe.
+  local tree=$1 walk=$2 step=0 snapshot proved GATE_CONTEXT_KIND=required
+  baseline_sha="" baseline_refusal=""
+  while ((step < MAIN_RETRY_BASELINE_DEPTH)); do
+    if ! walk=$(git -C "$tree" rev-parse --verify --quiet "$walk^1"); then
+      baseline_refusal="its history reaches a root commit with no ancestor this runner has proved"
+      return 1
+    fi
+    step=$((step + 1))
+    api GET "/repos/$owner/$repo/commits/$walk/status"
+    if [[ "$code" != 200 ]]; then
+      baseline_refusal="the forge answered $code reading the statuses of ${walk:0:12}"
+      return 1
+    fi
+    snapshot=$(mktemp "$HOME_DIR/cache/retry-baseline-status-$SLOT.XXXXXXXX") || {
+      baseline_refusal="cannot record the statuses of ${walk:0:12}"
+      return 1
+    }
+    printf '%s\n' "$body" >"$snapshot"
+    proved=0
+    ! gate_authenticated_runner_success "$snapshot" || proved=1
+    rm -f -- "$snapshot"
+    if ((proved)); then baseline_sha=$walk; return 0; fi
+    say "$owner/$repo main baseline: ${walk:0:12} carries no $(gate_status_context "$owner" "$repo") success from $IDENTITY; looking further back"
+  done
+  baseline_refusal="no ancestor within $MAIN_RETRY_BASELINE_DEPTH commits carries a $(gate_status_context "$owner" "$repo") success from $IDENTITY"
+  return 1
 }
 
 # A candidate's base field: "-" when the forge named none, "!" for a name the runner will not use,
@@ -1525,9 +1579,6 @@ if ((proof_base)); then
     # Proved against the tip itself, every base-relative check would see an empty diff. The tip is
     # proved as the pull request that made it would have been: against the branch before it, its
     # first parent, which is on the protected branch's own history. A root commit has none.
-    # This is protected main's rule too: its retry is proved against origin/main~1, never against
-    # itself, and the parent sha is in the inputs, the receipt and the status description, so a
-    # main-bound pull request gated at the same commit (base: main's tip) is a different input.
     if ! tip_parent=$(git -C "$run/$repo" rev-parse --verify --quiet "$sha^1"); then
       say "refusing $owner/$repo $only_branch at $sha: a root commit has no base to be proved against"
       exec 6>&-; exec 7>&-
@@ -1541,9 +1592,30 @@ if ((proof_base)); then
       continue
     fi
     pb_sha=$tip_parent
+    if [[ "$only_branch" == main ]]; then
+      # Protected main's retry is never proved against itself either, but its parent is the main
+      # this tip landed on only when main advanced by exactly one commit. A queue or fast-forward
+      # landing of several commits leaves that parent unproved as well, and a proof from there would
+      # keep the earlier commits out of the diff, the proof plan and the ratchet baseline while
+      # publishing the ordinary required success. So the baseline is the nearest first-parent
+      # ancestor the forge says this gate identity has already proved, or the retry is refused.
+      if ! main_retry_baseline "$run/$repo" "$sha"; then
+        say "refusing $owner/$repo main at $sha: $baseline_refusal"
+        exec 6>&-; exec 7>&-
+        continue
+      fi
+      pb_sha=$baseline_sha
+      # The recipe is handed that exact commit, not a relative ref it would resolve again in its own
+      # tree: the receipt, the status description and every lane of the run name one immutable
+      # baseline. A main-bound pull request gated at the same commit (base: main's tip) stays a
+      # different input, as a retry bound to another ancestor does.
+      proof_base_env=("$pb_var=$pb_sha")
+      pb_note="proof base origin/$pb_branch at its proved ancestor (${pb_sha:0:12})"
+    else
+      pb_note="proof base origin/$pb_branch before this commit (${pb_sha:0:12})"
+      proof_base_env=("$pb_var=origin/$pb_branch~1")
+    fi
     GATE_PROOF_BASE=$(gate_proof_base_json "$pb_var" "$pb_branch" "$pb_sha")
-    pb_note="proof base origin/$pb_branch before this commit (${pb_sha:0:12})"
-    proof_base_env=("$pb_var=origin/$pb_branch~1")
   fi
   say "$owner/$repo@$sha is proved against origin/$pb_branch at ${pb_sha:0:12}${pb_note:+ -- $pb_note}"
 fi

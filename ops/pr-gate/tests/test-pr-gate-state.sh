@@ -1118,6 +1118,33 @@ own_success '{"context":"jeryu-web/required","state":"success","description":"pr
   || { printf 'own marker lost keep-green after identity rename\n' >&2; exit 1; }
 printf 'PASS keep green without a creator: this host'"'"'s own marker only\n'
 
+# The baseline a protected-main retry is proved against must be a commit this gate identity really
+# proved, so gate_authenticated_runner_success takes the forge's own record of the poster and has no
+# description-only fallback: a creator-less row, another identity's row, another context, a
+# non-success, and an older success under a newer pending are all "not proved".
+owner=jeryu repo=jeryu-web IDENTITY=runner-bot MARKER=pr-gate-runner@node-a
+proved() { printf '{"statuses":[%s]}' "$1" >"$snap"; gate_authenticated_runner_success "$snap"; }
+proved '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-b operator-unsealed success","creator":{"login":"runner-bot"},"created_at":"2026-09-18T14:00:00Z"}' \
+  || { printf 'a success this identity posted from another host is not a proved ancestor\n' >&2; exit 1; }
+for not_proved in \
+  '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-a operator-unsealed success","created_at":"2026-09-18T14:00:00Z"}' \
+  '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-b operator-unsealed success","creator":{"login":"mallory"},"created_at":"2026-09-18T14:00:00Z"}' \
+  '{"context":"jeryu-web/required","state":"success","description":"manual green","creator":{"login":"runner-bot"},"created_at":"2026-09-18T14:00:00Z"}' \
+  '{"context":"jeryu-web/main-health","state":"success","description":"pr-gate-runner@node-a operator-unsealed success","creator":{"login":"runner-bot"},"created_at":"2026-09-18T14:00:00Z"}' \
+  '{"context":"jeryu-web/required","state":"failure","description":"pr-gate-runner@node-a operator-unsealed failure","creator":{"login":"runner-bot"},"created_at":"2026-09-18T14:00:00Z"}' \
+  '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-a operator-unsealed success","creator":{"login":"runner-bot"},"created_at":"2026-09-18T14:00:00Z"},{"context":"jeryu-web/required","state":"pending","description":"pr-gate-runner@node-a running","creator":{"login":"runner-bot"},"created_at":"2026-09-18T14:01:00Z"}' \
+  '{}' ; do
+  if proved "$not_proved"; then
+    printf 'a row that is not this identity'"'"'s own required success was taken as proved: %s\n' "$not_proved" >&2
+    exit 1
+  fi
+done
+if IDENTITY='' proved '{"context":"jeryu-web/required","state":"success","description":"pr-gate-runner@node-a operator-unsealed success","creator":{"login":""},"created_at":"2026-09-18T14:00:00Z"}'; then
+  printf 'an unset gate identity matched a creator-less row\n' >&2; exit 1; fi
+unset IDENTITY
+owner=acme repo=fixture MARKER=pr-gate-runner@test
+printf 'PASS proved ancestor: only a required success the forge records this gate identity as posting\n'
+
 # A forge that shortens the description drops the digest; the runner says so instead of failing silently.
 owner=acme repo=fixture
 gate_lock "acme-fixture-3333333333333333333333333333333333333333"

@@ -33,25 +33,73 @@ proof_require_history() {
   git fetch --quiet --no-tags origin '+refs/heads/main:refs/remotes/origin/main'
 }
 
-# Normal runs judge against refreshed protected main. A prior-tip retry is valid
-# only when HEAD is that exact refreshed tip. Resolve its parent to a commit now:
-# later fetches cannot turn a moving origin/main~1 into HEAD and empty the proof.
+# Normal runs judge against refreshed protected main. A main-tip retry is valid
+# only when HEAD is that exact refreshed tip, and its baseline is a commit of
+# protected main's own history before HEAD. Two spellings are accepted:
+#
+#   origin/main~1  HEAD's first parent, resolved to a commit now: later fetches
+#                  cannot turn a moving origin/main~1 into HEAD and empty the
+#                  proof. It is the pre-landing main only when main advanced by
+#                  one commit.
+#   <40-hex>       the exact baseline commit the caller resolved and verified --
+#                  for the gate runner, the nearest ancestor that already
+#                  carries its own required success, so a landing of several
+#                  commits is judged from before the first of them. Checked
+#                  here as well: the commit must be in this checkout, must be an
+#                  ancestor of HEAD, and must not be HEAD, so a baseline off
+#                  this history, or one that would empty the proof, fails the
+#                  recipe before any lane runs.
+#
+# Either way the answer is one immutable commit, and every lane of the run is
+# judged against that commit.
 proof_base_ref() {
-  local ref="${JERYU_JANKURAI_BASE_REF:-origin/main}" head main parent
+  local ref="${JERYU_JANKURAI_BASE_REF:-origin/main}" head parent commit
   case "$ref" in
     origin/main) printf '%s\n' "$ref" ;;
     origin/main~1)
+      proof_base_retry_head || return 1
       head=$(git rev-parse --verify 'HEAD^{commit}') || return 1
-      main=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}') || return 1
-      [[ "$head" == "$main" ]] || {
-        printf 'prior-tip proof requires HEAD to equal refreshed protected main; main moved or this is a PR\n' >&2
-        return 1
-      }
       parent=$(git rev-parse --verify "$head^1") || return 1
       printf '%s\n' "$parent" ;;
-    *) printf 'proof base must be protected origin/main, or origin/main~1 for an exact main-tip retry, got %s\n' \
-         "$ref" >&2; return 1 ;;
+    *)
+      if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+        printf 'proof base must be protected origin/main, origin/main~1, or a baseline commit sha for an exact main-tip retry, got %s\n' \
+          "$ref" >&2
+        return 1
+      fi
+      proof_base_retry_head || return 1
+      head=$(git rev-parse --verify 'HEAD^{commit}') || return 1
+      commit=$(git rev-parse --verify --quiet "$ref^{commit}") || {
+        printf 'baseline commit %s is not in this checkout\n' "$ref" >&2
+        return 1
+      }
+      [[ "$commit" == "$ref" ]] || {
+        printf 'baseline %s is not a commit of its own\n' "$ref" >&2
+        return 1
+      }
+      [[ "$commit" != "$head" ]] || {
+        printf 'baseline %s is this head: a proof against itself has an empty change set\n' "$ref" >&2
+        return 1
+      }
+      git merge-base --is-ancestor "$commit" "$head" || {
+        printf 'baseline %s is not an ancestor of this head\n' "$ref" >&2
+        return 1
+      }
+      printf '%s\n' "$commit" ;;
   esac
+}
+
+# A main-tip retry baseline answers for the tip of protected main and nothing
+# else: HEAD must be the refreshed protected tip. A pull request, or a main that
+# moved during the refresh, gets no retry baseline.
+proof_base_retry_head() {
+  local head main
+  head=$(git rev-parse --verify 'HEAD^{commit}') || return 1
+  main=$(git rev-parse --verify 'refs/remotes/origin/main^{commit}') || return 1
+  [[ "$head" == "$main" ]] || {
+    printf 'prior-tip proof requires HEAD to equal refreshed protected main; main moved or this is a PR\n' >&2
+    return 1
+  }
 }
 
 # Print the fork point of HEAD_COMMIT from protected main's tip BASE_COMMIT.

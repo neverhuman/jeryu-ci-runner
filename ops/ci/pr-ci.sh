@@ -21,7 +21,8 @@ source ops/ci/required-lane.sh
 source ops/ci/proof_guards.sh
 require_jankurai
 # The baseline every base-relative lane of this recipe judges against, validated once, before any
-# lane runs: protected origin/main, or origin/main~1 for the supported retry of main's own tip (see
+# lane runs: protected origin/main, or, for the supported retry of main's own tip, origin/main~1 or
+# the verified ancestor commit the gate runner resolved (see
 # proof_base_ref). An unaccepted JERYU_JANKURAI_BASE_REF fails the recipe here rather than letting a
 # lane quietly fall back to a baseline nobody checked.
 JERYU_CI_PROOF_BASE="$(proof_base_ref)"

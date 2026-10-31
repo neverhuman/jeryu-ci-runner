@@ -345,13 +345,14 @@ main-health, are unchanged.
 
 `PR_GATE_MAIN_PROOF_BASE_VARS` (`owner=VARIABLE` words, empty by default) is a site opt-in
 for `--branch main` when the owner has no `PR_GATE_PROOF_BASE_VARS` entry. The recipe must
-support a checked prior-tip baseline. Jeryu's recipe refreshes protected main, requires
-HEAD to equal that refreshed tip, then resolves `origin/main~1` to the immutable parent
-commit before producing any proof. Main movement during that refresh refuses the retry;
-a later ref update cannot change the resolved baseline. Pull requests cannot opt into
-this weaker-than-tip baseline. The setting never reaches a pull request, merge queue,
-main-health or non-main branch gate. A variable also listed in `PR_GATE_WORKER_ROOT_VARS`
-is refused at start. Upgrade every host before opting in.
+support a checked baseline commit. The runner hands it one immutable commit sha, the
+ancestor it verified (below); Jeryu's recipe refreshes protected main, requires HEAD to
+equal that refreshed tip, and accepts that sha only as a commit of this checkout that is an
+ancestor of HEAD and not HEAD itself, before producing any proof. Main movement during that
+refresh refuses the retry; a later ref update cannot change the resolved baseline. Pull
+requests cannot opt into this weaker-than-tip baseline. The setting never reaches a pull
+request, merge queue, main-health or non-main branch gate. A variable also listed in
+`PR_GATE_WORKER_ROOT_VARS` is refused at start. Upgrade every host before opting in.
 
 For Jeryu, after this runner is installed on every gate host and the matching recipe is
 on protected main, the site setting is:
@@ -386,8 +387,19 @@ gates the current tip of `<name>`:
 - `--branch main` is the supported retry of a protected main tip whose latest `<repo>/required` is an
   error, failure, or no status (a merged pull request's revalidation that returned `inputs_changed`, say; a merged or closed
   PR is never listed, so `--pr` cannot select it). It is the same branch-tip gate as any other
-  protected branch, with main's own prior tip as the proof base: the recipe variable is set to
-  `origin/main~1`. Jeryu resolves that to the parent commit after refreshing protected main,
+  protected branch, but its proof base is not simply the tip's parent: protected main can advance by
+  more than one commit at once (a merge queue draining several entries, a fast-forward push of a
+  reviewed series), and then that parent landed unproved with the tip. Proving from there would keep
+  the earlier commits out of the change set, the proof plan and the ratchet baseline while publishing
+  the ordinary required success. So the baseline is the nearest ancestor along main's first-parent
+  history that already carries this gate identity's own `<repo>/required` success, read from the
+  forge under this runner's credential (`creator.login`, never a status description, which anybody
+  allowed to post one can write). The recipe variable is set to that exact commit sha, so the
+  receipt, the status description and every lane of the run name one immutable baseline. The search
+  is bounded by `PR_GATE_MAIN_RETRY_BASELINE_DEPTH` commits (default 25), one forge read per step,
+  and the retry is **refused** -- nothing published, the tip left as it was -- when it finds no such
+  ancestor, reaches a root commit, or the forge will not answer. Jeryu's recipe re-checks the sha it
+  is handed after refreshing protected main,
   refusing a moved tip so the proof cannot silently take its empty-change-set pass. Main's tip is not re-bound from the shared
   mirror in this mode: the base is the tip observed and admitted, and a main that moved under the run
   before execution leaves the head for the next tick with nothing posted. If Jeryu
@@ -400,14 +412,18 @@ gates the current tip of `<name>`:
   is refused;
 - never over an existing green: a tip that already carries this runner's `<repo>/required` success (a
   pull-request or merge-queue gate, or an earlier pass) is skipped, because that green was proved
-  against the base its own gate used;
+  against the base its own gate used. The same greens are what a `--branch main` retry's baseline
+  search looks for on main's earlier commits, so consecutive landings chain: each retry's published
+  success is the baseline the next one binds;
 - with the repository's own recipe (`just required`, else `ops/ci/pr-ci.sh`) in the usual family tree,
-  proved against the branch as it stood before the tip: the proof-base variable is `origin/<name>~1`,
-  the tip's first parent on the protected branch's own history -- what the pull request that made the
-  tip was proved against. Proved against the tip itself, every base-relative check would see an empty
-  diff. A root commit has no base and is refused;
+  proved against the branch as it stood before the tip: for a branch other than `main` the
+  proof-base variable is `origin/<name>~1`, the tip's first parent on the protected branch's own
+  history -- what the pull request that made the tip was proved against -- and for `main` it is the
+  verified ancestor commit above. Proved against the tip itself, every base-relative check would see
+  an empty diff. A root commit has no base and is refused;
 - posting `<repo>/required` on the tip commit as the gate identity, with
-  `; proof base origin/<name> before this commit (<parent>)` in its description; the self-gate
+  `; proof base origin/<name> before this commit (<parent>)` in its description (for `main`,
+  `; proof base origin/main at its proved ancestor (<commit>)`); the self-gate
   annotation is computed against protected `main`, as for pull requests;
 - under the same evidence identity and reuse rules as pull requests: the base and its resolved sha are
   in the inputs and the attempt key, and a failure is held. `--repo` makes the run a retry, as

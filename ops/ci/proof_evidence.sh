@@ -39,8 +39,8 @@ current_head="$(git rev-parse --verify 'HEAD^{commit}')"
 # that scores below the tip, adds a cap or hard finding, or raises migration
 # liability fails them; the proof plan covers this head's own change. Gated
 # against protected main's tip, main's own head is a change set of nothing;
-# its supported retry resolves its parent SHA after the history fetch (proof_base_ref), so the
-# commit that moved main is judged against the main it moved from.
+# its supported retry binds its baseline SHA after the history fetch (proof_base_ref), so the
+# commits that moved main are judged against the main they moved from.
 fork_commit="$(proof_fork_point "${base_commit}" "${current_head}")"
 if [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
   printf 'proof evidence requires a clean exact-head checkout\n' >&2

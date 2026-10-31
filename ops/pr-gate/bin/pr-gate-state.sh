@@ -343,6 +343,22 @@ gate_newest_is_own_success() { # status-snapshot
     | . != null and .state == "success" and ((.description // "") | startswith($marker))' "$1" >/dev/null
 }
 
+# True when SNAPSHOT's newest status in this gate's required context is a success this gate identity
+# itself posted, as the forge records the poster (creator.login). Unlike keep-green above there is no
+# description-only fallback: this answers whether a commit is already proved, and the commit it
+# answers for becomes the baseline a whole retry proof is judged against, so a row anyone allowed to
+# post a status could have written is not evidence. A snapshot without a creator, or from another
+# identity, is not this gate's success.
+gate_authenticated_runner_success() { # status-snapshot
+  jq -e --arg context "$(gate_status_context "$owner" "$repo")" --arg prefix "$GATE_RUNNER_NAME@" \
+    --arg identity "${IDENTITY:-}" '
+    $identity != "" and ([.statuses[]? | select(.context == $context)]
+      | sort_by(.updated_at // .created_at) | last
+      | . != null and .state == "success"
+        and ((.description // "") | startswith($prefix))
+        and (.creator.login // "") == $identity)' "$1" >/dev/null 2>&1
+}
+
 gate_lock() {
   local key=$1
   [[ "$key" =~ ^[A-Za-z0-9._-]+-[0-9a-f]{40}$ && "$key" != *..* ]] || return 2

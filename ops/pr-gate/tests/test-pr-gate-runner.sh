@@ -168,7 +168,7 @@ if [[ -n "${ACME_PROOF_BASE_REF+set}" ]]; then
   [[ "$base_commit" != missing ]] || exit 39
   changed="$("$worker_git" diff --no-ext-diff --name-only "$base_commit" HEAD | grep -c . || true)"
   printf '%s %s %s\n' "$ACME_PROOF_BASE_REF" "$base_commit" "$changed" >>"$fixture_root/changed-surface.log"
-  if [[ "$ACME_PROOF_BASE_REF" == *'~1' && "$changed" == 0 ]]; then
+  if [[ ( "$ACME_PROOF_BASE_REF" == *'~1' || "$ACME_PROOF_BASE_REF" =~ ^[0-9a-f]{40}$ ) && "$changed" == 0 ]]; then
     printf 'recipe: the change set from %s (%s) to this head is empty\n' "$ACME_PROOF_BASE_REF" "$base_commit" >&2
     exit 40
   fi
@@ -2537,6 +2537,10 @@ grep -q "skip acme/fixture main: its tip ${mainsha:0:12} already carries a fixtu
 # The latest required status is the inputs_changed error: the retry runs the recipe fresh against
 # main's own prior tip and publishes success on the same tip.
 mainparent=$("$real_git" -C "$fixture/source.git" rev-parse "$mainsha^1")
+# main advanced by one commit, so its parent is the main this tip landed on -- and the retry binds it
+# only because that commit carries this gate identity's own required success, as the forge records
+# the poster of a status.
+jq -nc --arg s "$mainparent" --arg m "pr-gate-runner@$(hostname -s)" '{sha:$s,context:"fixture/required",state:"success",description:($m + " operator-unsealed success"),created_at:"2026-10-29T00:00:00Z",updated_at:"2026-10-29T00:00:00Z",creator:{login:"runner-bot"}}' >>"$fixture/statuses.jsonl"
 jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" '{sha:$s,context:"fixture/required",state:"error",description:($m + " inputs_changed"),created_at:"2026-10-30T01:00:00Z",updated_at:"2026-10-30T01:00:00Z"}' >>"$fixture/statuses.jsonl"
 PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \
   invoke --branch main --repo acme/fixture
@@ -2544,14 +2548,14 @@ PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF
 expect_count "$((before_count + 1))"
 # The base the recipe was handed is main's prior tip, a commit of protected main's own history, and
 # it is not this head: the change set it judged is the merge that moved main, and non-empty.
-[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/main~1 $mainparent" ]] \
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "$mainparent $mainparent" ]] \
   || fail_pb '--branch main was not proved against the commit main moved from'
 [[ "$mainparent" != "$mainsha" ]] || fail_pb 'the fixture main tip is its own parent'
 read -r _ surface_base surface_count < <(tail -n 1 "$fixture/changed-surface.log")
 [[ "$surface_base" == "$mainparent" && "$surface_count" -gt 0 ]] \
   || fail_pb "--branch main gave its recipe no change set to judge (base $surface_base, $surface_count paths)"
 last_status "$mainsha" | jq -e --arg p "${mainparent:0:12}" '.state == "success" and (.description | test("; inputs [0-9a-f]{64}"))
-  and (.description | test("; proof base origin/main before this commit \\(" + $p + "\\)"))' >/dev/null \
+  and (.description | test("; proof base origin/main at its proved ancestor \\(" + $p + "\\)"))' >/dev/null \
   || fail_pb '--branch main did not publish a fresh required success naming the base it was proved against'
 # The receipt says the same: the variable, the branch and the exact base commit, so the retry is not
 # mistakable for the main-bound pull request gated at the same commit (whose base is main's own tip).
@@ -2570,15 +2574,21 @@ printf 'main moves on\n' >>"$fixture/source/marker"
 mainparent=$mainsha
 mainsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
 refs_json main release/v1
+# The commit main moved from is the baseline because it carries this identity's own required
+# success, and that is the newest row on it: the retry above published one, and this is the state the
+# forge is left in once the error that asked for that retry has been superseded.
+jq -nc --arg s "$mainparent" --arg m "pr-gate-runner@$(hostname -s)" \
+  '{sha:$s,context:"fixture/required",state:"success",description:($m + " operator-unsealed success"),created_at:"2026-10-30T01:30:00Z",updated_at:"2026-10-30T01:30:00Z",creator:{login:"runner-bot"}}' \
+  >>"$fixture/statuses.jsonl"
 printf 'release/v1\n' >"$fixture/pr-base-ref"
 ACME_PROOF_BASE_REF=origin/release/v1 PR_GATE_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \
   PR_GATE_MAIN_PROOF_BASE_VARS='' invoke --branch main --repo acme/fixture
 [[ "$runner_exit" == 0 ]] || fail_pb '--branch main with a mapping configured: runner failed'
 expect_count "$((before_count + 2))"
-[[ "$(tail -n 1 "$fixture/proof-base.log")" == "origin/main~1 $mainparent" ]] \
-  || fail_pb 'a configured mapping did not keep the prior-tip main baseline'
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "$mainparent $mainparent" ]] \
+  || fail_pb 'a configured mapping did not keep the proved-ancestor main baseline'
 last_status "$mainsha" | jq -e --arg p "${mainparent:0:12}" '.state == "success"
-  and (.description | test("; proof base origin/main before this commit \\(" + $p + "\\)"))' >/dev/null \
+  and (.description | test("; proof base origin/main at its proved ancestor \\(" + $p + "\\)"))' >/dev/null \
   || fail_pb '--branch main did not gate the new tip against the commit it moved from'
 printf 'main\n' >"$fixture/pr-base-ref"
 # The tip moved since the forge listed it: main no longer points at the sha admitted, so the branch
@@ -2624,6 +2634,127 @@ PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF
   || fail_pb 'an unprotected main was gated'
 refs_json main release/v1
 expect_count "$((before_count + 2))"
+# A landing of several commits at once (a merge queue draining, a fast-forward push of a reviewed
+# series): the tip's own parent landed with it and is unproved, so proving only the final commit
+# would leave the earlier ones out of the change set while publishing the ordinary required success.
+# The baseline is the nearest first-parent ancestor this gate identity has already proved.
+"$real_git" -C "$fixture/source" checkout -q main
+# From whatever the forge's main is now, so the commits below are the only ones this landing adds.
+proved_ancestor=$("$real_git" -C "$fixture/source.git" rev-parse refs/heads/main)
+"$real_git" -C "$fixture/source" reset -q --hard "$proved_ancestor"
+# What an earlier gate of that commit left on the forge: this identity's own success, and the newest
+# row on it (the mirror-race case above left an error there).
+jq -nc --arg s "$proved_ancestor" --arg m "pr-gate-runner@$(hostname -s)" \
+  '{sha:$s,context:"fixture/required",state:"success",description:($m + " operator-unsealed success"),created_at:"2099-02-01T00:00:00Z",updated_at:"2099-02-01T00:00:00Z",creator:{login:"runner-bot"}}' \
+  >>"$fixture/statuses.jsonl"
+for landed in first second; do
+  printf 'landing %s\n' "$landed" >"$fixture/source/landed-$landed"
+  "$real_git" -C "$fixture/source" add "landed-$landed"
+  "$real_git" -C "$fixture/source" commit -qm "landing-$landed"
+done
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+landing_parent=$("$real_git" -C "$fixture/source" rev-parse 'HEAD^1')
+mainsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+refs_json main release/v1
+# The fixture forge dates a status it accepts with its own increasing clock, so this row asking for
+# a retry is the newest on the tip now and the gate's own publication overtakes it afterwards.
+jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" \
+  '{sha:$s,context:"fixture/required",state:"error",description:($m + " inputs_changed"),created_at:0,updated_at:0}' \
+  >>"$fixture/statuses.jsonl"
+# A success on the unproved parent that this identity did not post is not evidence: with the search
+# bounded to the parent, the retry is refused and nothing is published, forged row or not.
+jq -nc --arg s "$landing_parent" --arg m "pr-gate-runner@$(hostname -s)" \
+  '{sha:$s,context:"fixture/required",state:"success",description:($m + " forged"),created_at:"2099-03-02T00:00:00Z",updated_at:"2099-03-02T00:00:00Z",creator:{login:"someone-else"}}' \
+  >>"$fixture/statuses.jsonl"
+before_count=$(count) before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+PR_GATE_MAIN_RETRY_BASELINE_DEPTH=1 PR_GATE_PROOF_BASE_VARS='' \
+  PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF invoke --branch main --repo acme/fixture
+expect_count "$before_count"
+grep -q "refusing acme/fixture main at $mainsha: no ancestor within 1 commits carries a fixture/required success from runner-bot" \
+  "$fixture/runner.log" || fail_pb 'a multi-commit landing was proved from an unverified parent'
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] \
+  || fail_pb 'a refused multi-commit landing got a status'
+# A count that is not a commit count is a configuration error, refused before anything is gated.
+PR_GATE_MAIN_RETRY_BASELINE_DEPTH=0 invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 2 ]] && grep -q 'PR_GATE_MAIN_RETRY_BASELINE_DEPTH: 0 is not a commit count' "$fixture/runner.log" \
+  || fail_pb 'a malformed baseline depth was accepted'
+expect_count "$before_count"
+# With the ordinary search depth the baseline is the proved ancestor, and both commits the landing
+# added are in the change set the recipe is given -- not just the final one.
+PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \
+  invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || fail_pb 'the multi-commit retry failed'
+expect_count "$((before_count + 1))"
+grep -q "${landing_parent:0:12} carries no fixture/required success from runner-bot; looking further back" \
+  "$fixture/runner.log" || fail_pb 'the unproved parent was not reported as skipped'
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "$proved_ancestor $proved_ancestor" ]] \
+  || fail_pb 'the multi-commit landing was not proved from the ancestor this runner had proved'
+read -r _ surface_base surface_count < <(tail -n 1 "$fixture/changed-surface.log")
+[[ "$surface_base" == "$proved_ancestor" && "$surface_count" == 2 ]] \
+  || fail_pb "the landing's earlier commit is not in the change set (base $surface_base, $surface_count paths)"
+last_status "$mainsha" | jq -e --arg p "${proved_ancestor:0:12}" '.state == "success"
+  and (.description | test("; proof base origin/main at its proved ancestor \\(" + $p + "\\)"))' >/dev/null \
+  || fail_pb 'the multi-commit retry did not name the ancestor it was proved from'
+jq -e --arg p "$proved_ancestor" '.inputs.proof_base == {variable:"ACME_PROOF_BASE_REF",branch:"main",sha:$p}' \
+  "$fixture/runner/attempts/acme-fixture-$mainsha/last-result.json" >/dev/null \
+  || fail_pb 'the receipt is not bound to the baseline the lanes were given'
+before_count=$(count)
+# main moves again by one commit: the success this gate just published is itself the baseline the
+# next retry binds, so consecutive landings chain without ever widening past what was proved.
+chained_ancestor=$mainsha
+printf 'and one more\n' >"$fixture/source/landed-third"
+"$real_git" -C "$fixture/source" add landed-third
+"$real_git" -C "$fixture/source" commit -qm landing-third
+"$real_git" -C "$fixture/source" push -q "$fixture/source.git" main
+mainsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+refs_json main release/v1
+jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" \
+  '{sha:$s,context:"fixture/required",state:"error",description:($m + " inputs_changed"),created_at:0,updated_at:0}' \
+  >>"$fixture/statuses.jsonl"
+PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \
+  invoke --branch main --repo acme/fixture
+[[ "$runner_exit" == 0 ]] || fail_pb 'the chained retry failed'
+expect_count "$((before_count + 1))"
+[[ "$(tail -n 1 "$fixture/proof-base.log")" == "$chained_ancestor $chained_ancestor" ]] \
+  || fail_pb "a retry did not bind the ancestor this runner's own published success proved"
+read -r _ surface_base surface_count < <(tail -n 1 "$fixture/changed-surface.log")
+[[ "$surface_base" == "$chained_ancestor" && "$surface_count" == 1 ]] \
+  || fail_pb "the chained retry judged more than the commit that landed (base $surface_base, $surface_count paths)"
+before_count=$(count)
+# A main whose whole first-parent history is unproved: the walk reaches the root commit and refuses
+# rather than binding something nothing proved. (Its tip is not a root commit itself, which is the
+# earlier refusal.) main is put back afterwards.
+restore_main=$mainsha
+"$real_git" -C "$fixture/source" checkout -q --orphan unproved-main
+"$real_git" -C "$fixture/source" rm -rq --cached . >/dev/null
+printf 'pass\n' >"$fixture/source/mode"
+printf 'unproved root\n' >"$fixture/source/unproved"
+"$real_git" -C "$fixture/source" add mode unproved
+"$real_git" -C "$fixture/source" commit -qm unproved-root
+printf 'unproved child\n' >>"$fixture/source/unproved"
+"$real_git" -C "$fixture/source" add unproved
+"$real_git" -C "$fixture/source" commit -qm unproved-child
+"$real_git" -C "$fixture/source" push -qf "$fixture/source.git" unproved-main:main
+mainsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+refs_json main release/v1
+jq -nc --arg s "$mainsha" --arg m "pr-gate-runner@$(hostname -s)" \
+  '{sha:$s,context:"fixture/required",state:"error",description:($m + " inputs_changed"),created_at:0,updated_at:0}' \
+  >>"$fixture/statuses.jsonl"
+before_statuses=$(wc -l <"$fixture/statuses.jsonl")
+PR_GATE_PROOF_BASE_VARS='' PR_GATE_MAIN_PROOF_BASE_VARS=acme=ACME_PROOF_BASE_REF \
+  invoke --branch main --repo acme/fixture
+expect_count "$before_count"
+grep -q "refusing acme/fixture main at $mainsha: its history reaches a root commit with no ancestor this runner has proved" \
+  "$fixture/runner.log" || fail_pb 'an unproved main history was proved against a root commit'
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$before_statuses" ]] \
+  || fail_pb 'a refused unproved history got a status'
+# The orphan commit tracks two files, so main's own files are untracked in this checkout now: take
+# them back from main rather than asking git to merge them.
+"$real_git" -C "$fixture/source" checkout -q -f main
+"$real_git" -C "$fixture/source" clean -qfd
+"$real_git" -C "$fixture/source" push -qf "$fixture/source.git" "$restore_main:refs/heads/main"
+mainsha=$restore_main
+refs_json main release/v1
 unset PR_GATE_MAIN_PROOF_BASE_VARS
 printf 'PASS --branch main: retried after a latest error with the strict baseline and nothing a caller controls, never over a success, a merged or closed PR, a moved tip or a non-main branch\n'
 
