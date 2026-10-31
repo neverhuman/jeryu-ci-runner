@@ -265,11 +265,22 @@ parent=""
 kill -0 "$worker"
 if (gate_lock "$lock_key"); then exit 1; fi
 kill -TERM "$worker"
+terminated_worker=$worker
 worker=""
-for _ in $(seq 1 100); do
-  if gate_lock "$lock_key"; then break; fi
+# The inherited flock releases only when the terminated worker is reaped, so poll for the
+# claim rather than assume it: the same sixty-second bound as readiness, and a named
+# refusal instead of a lock assertion that a loaded host could turn into a silent miss.
+reclaimed=""
+for _ in $(seq 1 3000); do
+  if gate_lock "$lock_key"; then reclaimed=1; break; fi
   sleep 0.02
 done
+if [[ -z "$reclaimed" ]]; then
+  printf 'killed-parent recovery: %s still locked 60s after worker %s was terminated\n' \
+    "$lock_key" "$terminated_worker" >&2
+  ps -o pid,ppid,stat,wchan:32,args -p "$terminated_worker" >&2 || :
+  exit 1
+fi
 [[ "$gate_key_dir" == "$HOME_DIR/attempts/$lock_key" ]]
 gate_recover
 jq -e '.terminal and .outcome=="interrupted" and .exit_code==null and .publication.required_status' \
