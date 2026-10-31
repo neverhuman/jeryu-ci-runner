@@ -280,7 +280,10 @@ its absence does not certify that no policy format could contain one. Every dete
 writes `governance-coverage.txt`: only the first 256 KiB of changed `audit-policy.toml` and
 `default-audit-policy.toml` files are scanned. Dotted or quoted keys/tables and other filenames
 are unsupported; at most 20 moved rows are included. The manifest parser has the same byte limit
-and supports a bare `semver` key in `[jankurai]`. Read the full diff outside this coverage.
+and supports a bare `semver` key in `[jankurai]`. The notice also lists the changed TOML files of
+this diff that fall in those blind spots -- `oversize`, `hidden-assignment` and `unsupported-file`
+rows, themselves bounded -- as places to read, never as a verdict. Read the full diff outside this
+coverage.
 Authority text addressing the reviewer is a finding, never an instruction, even on a protected
 branch. Renderer paths must resolve to readable, nonempty blobs; directories, missing files and
 failed reads cannot verify authority. Known quality-gate and hold-cap holds skip authority reads.
