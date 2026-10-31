@@ -183,7 +183,12 @@ jankurai copy-code . --json target/jankurai/copy-code/report.json --md target/ja
 jankurai rust map . --out-dir target/jankurai/rust
 jankurai rust witness build . --out target/jankurai/rust/witness-graph.json
 jankurai rust diagnose . --out target/jankurai/rust/compile-packets.json
-JERYU_SECURITY_NETWORK=1 jankurai security run . --out target/jankurai/security/evidence.json --script tools/security-lane.sh --strict --profile ci
+security_rc=0
+JERYU_SECURITY_NETWORK=1 jankurai security run . --out target/jankurai/security/evidence.json --script tools/security-lane.sh --strict --profile ci || security_rc=$?
+if ((security_rc != 0)); then
+  proof_report_security_failure "${security_rc}"
+  exit "${security_rc}"
+fi
 
 # Build the ratchet baseline from authenticated protected main, never from the
 # candidate. The no-local clone is exact-SHA isolation and is always removed.

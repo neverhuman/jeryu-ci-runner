@@ -3,6 +3,21 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
+# The auditor that drives this wrapper keeps its output to itself, so the lane
+# records its own: stdout, stderr, exit status and command identity land in
+# target/security/ and are replayed here. The proof lane copies them into the
+# attempt log when the lane fails (proof_report_security_failure).
+if [[ -z "${JERYU_SECURITY_LANE_INNER:-}" ]]; then
+  mkdir -p target/security
+  rc=0
+  JERYU_SECURITY_LANE_INNER=1 bash "${BASH_SOURCE[0]}" "$@" \
+    >target/security/lane.stdout 2>target/security/lane.stderr || rc=$?
+  cat target/security/lane.stdout
+  cat target/security/lane.stderr >&2
+  printf 'command=bash %s %s\nexit_status=%s\n' "tools/security-lane.sh" "$*" "${rc}" \
+    >target/security/lane.status
+  exit "${rc}"
+fi
 # shellcheck source=ops/ci/lib.sh
 source ops/ci/lib.sh
 

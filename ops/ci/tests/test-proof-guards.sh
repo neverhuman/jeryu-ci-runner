@@ -219,3 +219,32 @@ grep -q '^name = "proof-evidence"$' agent/proof-lanes.toml ||
 grep -q '^command = "bash ops/ci/proof_evidence.sh"$' agent/proof-lanes.toml ||
   fail 'the catalog does not name the command the gate runs'
 printf 'proof lane wiring ok\n'
+
+# --- security lane failure evidence survives cleanup of target/ ---------------
+sec="$fixture/security-lane"
+mkdir -p "$sec/tools" "$sec/ops/ci"
+cp tools/security-lane.sh "$sec/tools/security-lane.sh"
+cat > "$sec/ops/ci/lib.sh" <<'LIB'
+require_tool() {
+  printf 'wrapper-stdout-marker %s\n' "$1"
+  printf 'wrapper-stderr-marker missing tool %s\n' "$1" >&2
+  return 7
+}
+LIB
+sec_rc=0
+(cd "$sec" && bash tools/security-lane.sh --strict >/dev/null 2>&1) || sec_rc=$?
+[[ "$sec_rc" -ne 0 ]] || fail 'a failing security wrapper exited zero'
+# The attempt log is what outlives cleanup; replay into it, then delete target/.
+(cd "$sec" && proof_report_security_failure "$sec_rc") 2> "$fixture/attempt-build.log"
+rm -rf -- "$sec/target"
+grep -q 'command=bash tools/security-lane.sh --strict' "$fixture/attempt-build.log" ||
+  fail 'the failure evidence lost the wrapper command identity'
+grep -q "^exit_status=$sec_rc\$" "$fixture/attempt-build.log" ||
+  fail 'the failure evidence lost the wrapper exit status'
+grep -q 'wrapper-stdout-marker gitleaks' "$fixture/attempt-build.log" ||
+  fail 'the failure evidence lost the wrapper stdout'
+grep -q 'wrapper-stderr-marker missing tool gitleaks' "$fixture/attempt-build.log" ||
+  fail 'the failure evidence lost the wrapper stderr'
+grep -q 'proof_report_security_failure' ops/ci/proof_evidence.sh ||
+  fail 'the proof lane does not report a failed security run'
+printf 'security failure evidence ok\n'

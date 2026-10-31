@@ -185,3 +185,35 @@ proof_require_governed_policy() {
   printf 'candidate audit policy must be byte-identical to protected main except the governed1.7.6 version line\n' >&2
   return 1
 }
+
+# Replay a failed security lane's own record (tools/security-lane.sh writes it
+# under target/security/) into the attempt log, which outlives the cleanup of
+# target/. Each stream is bounded to its last 64 KiB. $1 is the failing status
+# of `jankurai security run`; $2 is the target directory, default ./target.
+proof_report_security_failure() {
+  local rc="${1:-1}" dir="${2:-target}" f
+  {
+    printf '== security lane failure evidence ==\n'
+    printf 'auditor: jankurai security run --script tools/security-lane.sh --strict --profile ci\n'
+    printf 'auditor_exit_status=%s\n' "${rc}"
+    if [[ -f "${dir}/security/lane.status" ]]; then
+      cat -- "${dir}/security/lane.status"
+    else
+      printf 'wrapper status: not recorded (the wrapper did not finish or did not run)\n'
+    fi
+    for f in lane.stdout lane.stderr; do
+      printf -- '-- %s (last 64 KiB) --\n' "${f}"
+      if [[ -f "${dir}/security/${f}" ]]; then
+        tail -c 65536 -- "${dir}/security/${f}"
+      else
+        printf '(absent)\n'
+      fi
+    done
+    if [[ -f "${dir}/jankurai/security/evidence.json" ]]; then
+      printf -- '-- auditor evidence.json (first 64 KiB) --\n'
+      head -c 65536 -- "${dir}/jankurai/security/evidence.json"
+      printf '\n'
+    fi
+    printf '== end security lane failure evidence ==\n'
+  } >&2
+}
