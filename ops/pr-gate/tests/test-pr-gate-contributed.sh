@@ -110,8 +110,9 @@ case "$method $url" in
     printf '%s\n' "$payload" >>"$FAKE_FORGE/check-runs.jsonl"
     printf '{"id":"check"}\n201';;
   'POST '*'/heartbeat') printf '{"accepted":true}\n200';;
-  # Any other route answers as the forge does for a route it lacks (gate-claims here: an older forge).
-  *) printf '{"code":"api_route_not_found","message":"unexpected fixture route"}\n404';;
+  'POST '*'/api/v1/gate-claims') printf '{"ttl_seconds":180}\n201';;
+  'POST '*'/api/v1/gate-claims/release') printf '{}\n200';;
+  *) printf '{"message":"unexpected fixture route"}\n404';;
 esac
 SH
 chmod +x "$fixture/tools/"*

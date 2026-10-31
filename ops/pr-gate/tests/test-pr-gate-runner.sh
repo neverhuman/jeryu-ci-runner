@@ -146,6 +146,11 @@ if [[ -f "$fixture_root/dirty-inputs" ]]; then
   # Both zero and nonzero recipes keep their original verdict semantics.
   exit "$(cat "$fixture_root/dirty-inputs")"
 fi
+# Lose the lease only after a completed recipe, to exercise terminal outbox recovery.
+if [[ -f "$fixture_root/steal-after-recipe" ]]; then
+  recipe_head=$("$worker_git" rev-parse HEAD)
+  printf 'gate-b/slot0 gate-b %s\n' "$(( $(date +%s) + 3600 ))" >"$fixture_root/claims/acme-fixture-$recipe_head"
+fi
 printf 'error: expected rejection in a passing negative test\n'
 # Step lines, one of them the gate's own credential: what a head's recipe may print, never publish.
 printf '[pr-ci] fixture recipe step\n==> %s\n' "$(cat "$fixture_root/token")"
@@ -245,6 +250,10 @@ case "$method $url" in
     else printf '{"statuses":[]}'; fi
     printf '\n200';;
   'POST '*'/statuses/'*)
+    publish_sha=${url##*/statuses/}
+    lease="$FAKE_FORGE/claims/acme-fixture-$publish_sha"
+    [[ "$url" != */gate-a/hubDB/* ]] || lease="$FAKE_FORGE/claims/gate-a-hubDB-$publish_sha"
+    [[ -f "$lease" ]] || { printf 'UNLEASED status %s\n' "$url" >>"$FAKE_FORGE/unleased"; printf '{}\n409'; exit; }
     # A forge that predates the status link refuses the field.
     if [[ -f "$FAKE_FORGE/reject-target-url" ]] && jq -e 'has("target_url")' <<<"$payload" >/dev/null; then
       printf 'Failed to deserialize the JSON body: unknown field `target_url`\n422'; exit
@@ -284,6 +293,7 @@ case "$method $url" in
         printf '{"message":"upstream unavailable"}\n503'; exit
       fi
     fi
+    if [[ "$(jq -r '.state' <<<"$payload")" == pending ]]; then touch "$FAKE_FORGE/pending-$publish_sha"; fi
     # pending-sleep: a forge slow to take `pending`, which keeps a slot in preparation that long.
     if [[ -f "$FAKE_FORGE/pending-sleep" && "$(jq -r '.state' <<<"$payload")" == pending ]]; then
       sleep "$(cat "$FAKE_FORGE/pending-sleep")"
@@ -332,7 +342,7 @@ case "$method $url" in
     fi
     if [[ -f "$file" ]]; then
       read -r held_runner held_host held_until <"$file"
-      if [[ -f "$FAKE_FORGE/steal-on-renew" && "$held_runner" == "$runner" ]]; then
+      if [[ -f "$FAKE_FORGE/steal-on-renew" && -f "$FAKE_FORGE/pending-$sha" && "$held_runner" == "$runner" ]]; then
         held_runner=gate-b/slot0 held_host=gate-b held_until=$((now + 3600))
         printf '%s %s %s\n' "$held_runner" "$held_host" "$held_until" >"$file"
       fi
@@ -1392,11 +1402,11 @@ rm -f "$fixture/runner/cache/forge-backoff" "$fixture/rate-limited.log"
 touch "$fixture/rate-limit"
 env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
 [[ -s "$fixture/runner/cache/forge-backoff" ]] || { printf 'a 429 started no back-off\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
-grep -q 'answered 429' "$fixture/runner.log"
+grep -q 'answered 429' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
 sent=$(wc -l <"$fixture/rate-limited.log")
 env -u GATE_RUNNER_FAMILY GATE_RUNNER_REPOS=fixture "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --list >"$fixture/runner.log" 2>&1 || true
 [[ "$(wc -l <"$fixture/rate-limited.log")" == "$sent" ]] || { printf 'a request went out during the back-off\n' >&2; exit 1; }
-grep -q 'rate limiting this identity' "$fixture/runner.log"
+grep -q 'rate limiting this identity' "$fixture/runner.log" || { cat "$fixture/runner.log" >&2; exit 1; }
 rm -f "$fixture/rate-limit" "$fixture/runner/cache/forge-backoff"
 printf 'PASS a 429 backs every slot off: no request goes out until the back-off passes\n'
 
@@ -2443,16 +2453,16 @@ jq -se 'last.state == "success"' "$fixture/statuses.jsonl" >/dev/null \
 rm -f "$fixture/require-host-ci"
 printf 'PASS gate claims: a head needing host-ci is refused to a host without it\n'
 
-# A forge that predates the route is gated as it was before the lease existed.
+# Without a lease route no host may publish. Upgrade the forge before the runner fleet.
 touch "$fixture/no-gate-claims"
+statuses=$(wc -l <"$fixture/statuses.jsonl")
 invoke --repo acme/fixture --pr 1
-[[ "$runner_exit" == 0 ]] || fail_claims 'an older forge stopped the gate'
-expect_count "$((claims_count + 3))"
+[[ "$runner_exit" == 0 ]] || fail_claims 'an older forge failed the tick'
+expect_count "$((claims_count + 2))"
 grep -q 'no gate-claims route' "$fixture/runner.log" || fail_claims 'the older forge was not reported'
-jq -se 'last.state == "success"' "$fixture/statuses.jsonl" >/dev/null \
-  || fail_claims 'an older forge lost the verdict'
+[[ "$(wc -l <"$fixture/statuses.jsonl")" == "$statuses" ]] || fail_claims 'an older forge got an unleased publication'
 rm -f "$fixture/no-gate-claims"
-printf 'PASS gate claims: a forge without the route gates on the local claim alone\n'
+printf 'PASS gate claims: a forge without the route leaves the head untouched\n'
 
 # An untyped 404 (a proxy, a misrouted forge URL) is not an older forge: the head is left for the
 # next tick, nothing is posted, and the route is asked again on the next pass.
@@ -2461,7 +2471,7 @@ statuses=$(wc -l <"$fixture/statuses.jsonl")
 released=$(cat "$fixture/claims-released.log" 2>/dev/null | wc -l)
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || fail_claims 'an untyped 404 failed the runner'
-expect_count "$((claims_count + 3))"
+expect_count "$((claims_count + 2))"
 [[ "$(wc -l <"$fixture/statuses.jsonl")" == "$statuses" ]] || fail_claims 'an untyped 404 was gated without a lease'
 ! grep -q 'no gate-claims route' "$fixture/runner.log" || fail_claims 'an untyped 404 switched the lease off'
 grep -q 'answered 404' "$fixture/runner.log" || fail_claims 'the untyped 404 was not reported'
@@ -2487,7 +2497,7 @@ printf '12\n' >"$fixture/pending-sleep"
 grants=$(grep -c "acme/fixture $head " "$fixture/claims-granted.log" || true)
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || fail_claims 'the slow-preparation gate failed'
-expect_count "$((claims_count + 4))"
+expect_count "$((claims_count + 3))"
 # The grant, at least one renewal while `pending` was in flight, and the check before publication.
 (( $(grep -c "acme/fixture $head " "$fixture/claims-granted.log") >= grants + 3 )) \
   || fail_claims 'the lease was not renewed during preparation'
@@ -2500,7 +2510,7 @@ claims_head
 touch "$fixture/steal-on-renew"
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || fail_claims 'a lost lease failed the runner'
-expect_count "$((claims_count + 4))"
+expect_count "$((claims_count + 3))"
 jq -se 'last.state == "pending"' "$fixture/statuses.jsonl" >/dev/null || fail_claims 'a slot without the lease published'
 grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'the lost lease was not reported'
 [[ "$(cut -d' ' -f1 <"$claim")" == gate-b/slot0 ]] || fail_claims 'the slot released the other host s lease'
@@ -2510,25 +2520,31 @@ jq -se 'map(select(.outcome == "claim_lost" and .publication.superseded_by != nu
 rm -f "$fixture/pending-sleep" "$claim"
 printf 'PASS gate claims: a lease lost during preparation stops the gate before its recipe\n'
 
-# The lease is confirmed once more before publication: a slot whose lease another host took while
-# its recipe ran posts no result, and the next tick does not publish the abandoned attempt either.
+# A completed result whose publication lease is refused stays in the outbox. The
+# next tick still posts nothing while another host holds it; after a new grant it
+# recovers exactly that verdict without executing the recipe a second time.
+rm -f "$fixture/steal-on-renew"
+claims_head
+touch "$fixture/steal-after-recipe"
 results=$(non_pending)
 invoke --repo acme/fixture --pr 1
-[[ "$runner_exit" == 0 ]] || fail_claims 'a lease lost before publication failed the runner'
-expect_count "$((claims_count + 5))"
+[[ "$runner_exit" != 0 ]] || fail_claims 'a refused publication was not retained for recovery'
+expect_count "$((claims_count + 4))"
 [[ "$(non_pending)" == "$results" ]] || fail_claims 'a result was published without the lease'
-grep -q 'renewal before publication answered 409' "$fixture/runner.log" || fail_claims 'the pre-publication check was not reported'
-abandoned=$(sed -n 's/.*abandoning attempt \([0-9a-f-]*\) without publishing.*/\1/p' "$fixture/runner.log")
-[[ -n "$abandoned" ]] || fail_claims 'the abandoned attempt is not named'
-rm -f "$fixture/steal-on-renew" "$claim"
+grep -q 'publication lease renewal refused' "$fixture/runner.log" || fail_claims 'the refusal was not reported'
+receipt="$fixture/runner/attempts/acme-fixture-$head/last-result.json"
+jq -e '.terminal and .outcome=="success" and .recovery_required!=null and (.publication.required_status|not)' "$receipt" >/dev/null \
+  || fail_claims 'the finished verdict was not retained'
+rm -f "$fixture/steal-after-recipe"
 invoke
-jq -se --arg id "$abandoned" 'all(.[]; .state == "pending" or ((.description // "") | contains($id) | not))' \
-  "$fixture/statuses.jsonl" >/dev/null || fail_claims 'the next tick published the abandoned attempt'
-jq -se --arg id "$abandoned" 'map(select(.id == $id)) | length == 1 and (.[0].publication.required_status | not)' \
-  "$fixture"/runner/attempts/acme-fixture-"$head"*/*/receipt.json >/dev/null \
-  || fail_claims 'the abandoned attempt was published later'
+expect_count "$((claims_count + 4))"
+[[ "$(non_pending)" == "$results" ]] || fail_claims 'recovery published while another host held the lease'
 rm -f "$claim"
-printf 'PASS gate claims: a lease lost before publication posts no result\n'
+invoke
+expect_count "$((claims_count + 4))"
+jq -e '.publication.required_status and .publication.check_run and .recovery_required==null' "$receipt" >/dev/null \
+  || fail_claims 'the saved result was not recovered under a fresh lease'
+printf 'PASS gate claims: publication loss retains the completed verdict and recovery requires a new lease\n'
 
 # A lease lost while the recipe runs stops the recipe: the slot does not spend the rest of a gate on
 # a head another host now gates, and publishes nothing for it.

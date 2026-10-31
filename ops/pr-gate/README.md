@@ -908,8 +908,10 @@ owner list an operator edits:
 1. a slot decides to execute a head, takes its own slot lock and local head
    claim as before, and then asks the forge for the head:
    `POST /api/v1/gate-claims {repo, number, head_sha|queue_sha, runner_id,
-   host}`. It asks after admission and **before** it posts `pending`, so a
-   host that is not gating a head posts nothing for it;
+   host}`. Every status or check write verifies a live lease immediately before
+   the write, including listing-time stale-green retirement, proof-base waits,
+   host-local preparation errors, progress, recovery and interrupted exits.
+   An early diagnostic may claim before admission; it cannot write without a grant;
 2. the forge answers `201` with `ttl_seconds` (the lease length) or refuses
    with `409`: `claim_held` names the host that is gating the head,
    `capability_missing` names what the repository needs. A refused head is
@@ -927,7 +929,9 @@ owner list an operator edits:
    (superseded, nothing owed) and the slot posts nothing more for the head;
 5. immediately before publication the slot asks once more (retried like a
    status post on a forge that cannot answer). Only a slot the forge confirms
-   as the holder publishes; any other answer abandons the attempt as in 4;
+   as the holder publishes. An unavailable renewal posts nothing and retains
+   the finished verdict for recovery under a newly confirmed lease on a later tick,
+   without executing the recipe again;
 6. on publication, or when its tiers end early (a reused, held or recovered
    result), the slot gives the head back (`POST /api/v1/gate-claims/release`),
    so the next host does not wait out the TTL. A slot that moves on to another
@@ -950,13 +954,19 @@ asks again and is answered from the lease it holds, while an ask from any other
 runner is refused for as long as the lease is live.
 
 A forge without the route answers `404` with the typed code
-`api_route_not_found`; it is gated the way it was before the lease existed: the
-local claim is the only exclusion, as on a single-host site. Any other `404` (a
+`api_route_not_found`; the runner posts nothing and leaves every head untouched
+until the forge is upgraded. There is no local-only publication fallback. Any other `404` (a
 proxy, a misrouted forge URL, a token that lost access) is not taken as an older
 forge: the head is left for the next tick and the route is asked again. A forge
 that cannot answer at all also leaves the head for the next tick -- posting
 `pending` for a head this host may not be gating is exactly what the lease
 prevents.
+
+Roll out in this order: deploy and verify the forge claim/release routes first;
+install this runner on **all** gate hosts while keeping owner assignments disjoint;
+verify each host's installed commit/version and heartbeat capabilities; only then
+allow overlapping owner/repository assignments. A mixed-version fleet must keep
+its existing partitions. The runner cannot prevent an older host from publishing.
 
 ### Capabilities instead of owners
 
