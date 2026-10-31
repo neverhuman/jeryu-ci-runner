@@ -765,13 +765,23 @@ frozen either way:
   `GATE_INSTALL_UPDATE_SECONDS` bound (default 600 seconds; `--update-timeout` overrides it),
   then restores those timers and records `{command, exit_code, finished_at, drained_slots,
   update_timeout_seconds, resume_failures}` in `tool-update.json`. Empty/failed slot enumeration or
-  failed process inspection refuses the update. GNU timeout sends TERM at the command deadline and
+  failed process inspection refuses the update. Pending systemd jobs and active/activating slot,
+  main-health, wake and audit services must also drain. Invalid `GATE_INSTALL_LOCK_WAIT` is a
+  configuration error, distinct from lock contention. GNU timeout sends TERM at the command deadline and
   KILL to its process group after another 10 seconds; timeout exits 124, or 137 when KILL was needed.
   A timer restoration failure is named in the receipt and makes an otherwise successful invocation
   fail. It exits the command's status, or 75 when nothing ran (an install holds the lock, or the slots did not drain in time), so
   the gate user's own timer can try again. An update command may also exit 75; the receipt tells
   whether it ran. INT/TERM stop the update group before restoring the prior active timers; SIGKILL or host loss requires operator
-  recovery of paused timers. Point the tool's updater at it instead of letting
+  recovery of paused timers. `tool-update-activity.json` records draining, running, interrupted or
+  finished state separately from the last finished command, plus the exact prior active timers.
+  A stale draining/running record or failed restoration blocks another update until recovery:
+  inspect that record, confirm the old updater and command are stopped, restore only its
+  `prior_active_timers`, then archive the activity record before retrying. Do not enable every timer.
+  The updater logs both time bounds before pausing: defaults can hold timers and the installer lock
+  for 55 minutes plus the KILL grace. SIGKILL cannot run cleanup; monitoring should alert on stale
+  activity. No watchdog changes timer policy automatically. Failed receipt temporary files are
+  removed without replacing the previous receipt. Point the tool's updater at it instead of letting
   the tool update itself whenever it happens to run.
 - a Cargo plugin for `~/.cargo/bin` (jeryu-ci-runner#193/#188, 2026-10-31: `cargo-gov03-rnk08-t0745` was linked and
   then its target rewritten mid-gate, discarding two score-94 passes): install it with
@@ -786,7 +796,11 @@ frozen either way:
   into the identity. The directory binding follows the rules above: system directories use listings
   and package metadata, while other directories bind file content. Absolute executable paths outside
   the configured PATH are not covered by this setting. Relocate tools recipes use into a gate-owned
-  directory rather than merely removing their directory from PATH.
+  directory rather than merely removing their directory from PATH. Put custom tool directories
+  outside package-managed `/usr` locations (for example use the gate user's home): `/usr/*` other
+  than `/usr/local*`, `/bin` and `/sbin` bind listings plus package metadata, which cannot detect
+  arbitrary same-size executable replacements. Empty PATH entries, newlines and `..` traversal
+  components are refused; names such as `tools..v2` are allowed.
 
 The required status carries the identity's digest (`; inputs <sha256>`, the SHA-256 of the compact,
 key-sorted inputs JSON; `gate_inputs_digest`). Who posted a status is the forge's `creator.login` on

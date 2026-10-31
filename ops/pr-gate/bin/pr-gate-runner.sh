@@ -132,13 +132,14 @@ recipe_dirs=() recipe_tail=()
 recipe_path="${PR_GATE_RECIPE_PATH:-$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin}"
 [[ "$recipe_path" != :* && "$recipe_path" != *: && "$recipe_path" != *::* ]] \
   || not_recipe_path 'it has an empty entry, which would mean the working directory'
+[[ "$recipe_path" != *$'\n'* && "$recipe_path" != *$'\r'* ]] || not_recipe_path 'it contains a newline'
 IFS=: read -r -a recipe_dirs <<<"$recipe_path"
 for recipe_dir in "${recipe_dirs[@]}"; do
   # Each entry on its own, as every other configured path is read: "~/x" and "x" are under the gate
   # user's home, and an empty entry (PATH's "the working directory") is never one of them.
   [[ -n "$recipe_dir" ]] || not_recipe_path 'it has an empty entry, which would mean the working directory'
   recipe_dir="$(pr_gate_path "$recipe_dir")"
-  [[ "$recipe_dir" != *..* ]] || not_recipe_path "$recipe_dir walks up out of itself"
+  [[ ! "/$recipe_dir/" =~ /\.\./ ]] || not_recipe_path "$recipe_dir walks up out of itself"
   recipe_tail+=("$recipe_dir")
 done
 ((${#recipe_tail[@]} > 0)) || not_recipe_path "it names no directory"

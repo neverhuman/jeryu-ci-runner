@@ -15,7 +15,18 @@ printf 'PR_GATE_CODE_REPO=example/gate-code\n' >"$fx/pr-gate.env"
 cat >"$fx/stub/systemctl" <<SH
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$fx/calls.log"
+if [[ "\$*" == *list-jobs* ]]; then
+  [[ ! -e "$fx/jobs-fail" ]] || exit 2
+  [[ ! -e "$fx/job-busy" ]] || printf '123 pr-gate-runner@3.service start waiting\n'
+  if [[ -e "$fx/job-transition" ]]; then touch "$fx/service-busy"; fi
+  exit 0
+fi
 if [[ "\$*" == *list-units* ]]; then
+  if [[ "\$*" == *service* ]]; then
+    [[ ! -e "$fx/services-fail" ]] || exit 2
+    [[ ! -e "$fx/service-busy" ]] || printf 'pr-gate-main-health@jeryu.service loaded activating start x\n'
+    exit 0
+  fi
   [[ ! -e "$fx/enum-fails" ]] || exit 2
   [[ ! -e "$fx/enum-empty" ]] || exit 0
   printf 'pr-gate-runner@0.timer loaded active waiting x\npr-gate-runner@1.timer loaded active waiting x\npr-gate-main-health@jeryu.timer loaded active waiting x\npr-gate-wake.timer loaded active waiting x\npr-gate-audit.timer loaded active waiting x\n'; fi
@@ -32,6 +43,7 @@ if [[ -e "$fx/dispatch-busy" && "\$*" == *wake* && "\$*" == *audit* ]]; then exi
 SH
 cat >"$fx/stub/fixture-update" <<SH
 #!/usr/bin/env bash
+jq -e '.state == "running"' "$fx/home/gate-runner/tool-update-activity.json" >/dev/null || exit 99
 printf 'update ran %s\n' "\$*" >>"$fx/calls.log"
 [[ ! -e "$fx/term-parent" ]] || kill -TERM "\$FIXTURE_UPDATE_PARENT"
 [[ ! -e "$fx/update-slow" ]] || sleep 3
@@ -46,6 +58,20 @@ fi
 exit 0
 SH
 chmod +x "$fx/stub/systemctl" "$fx/stub/pgrep" "$fx/stub/fixture-update"
+real_jq=$(command -v jq)
+cat >"$fx/stub/jq" <<SH
+#!/usr/bin/env bash
+if [[ -e "$fx/receipt-fails" && "\$*" == *'--argjson status'* ]]; then exit 2; fi
+exec "$real_jq" "\$@"
+SH
+chmod +x "$fx/stub/jq"
+real_flock=$(command -v flock)
+cat >"$fx/stub/flock" <<SH
+#!/usr/bin/env bash
+[[ ! -e "$fx/lock-fails" ]] || exit 64
+exec "$real_flock" "\$@"
+SH
+chmod +x "$fx/stub/flock"
 state="$fx/home/gate-runner/tool-update.json"
 run() { : >"$fx/calls.log"; status=0
   local -a update_environment=("GATE_INSTALL_UPDATE_SECONDS=${update_seconds:-30}")
@@ -160,6 +186,7 @@ must 'timer restore failure absent from receipt' jq -e '.exit_code == 0
   and .resume_failures == ["pr-gate-wake.timer"]' "$state" >/dev/null
 must 'a previously inactive timer was started' absent 'start pr-gate-runner@9.timer'
 rm -f "$fx/resume-fails"
+rm -f "$fx/home/gate-runner/tool-update-activity.json"
 printf 'PASS failed restoration is recorded and no inactive timer is started\n'
 
 # A TERM during the command still restores every scheduled entry point, and cannot claim
@@ -172,6 +199,8 @@ for timer in pr-gate-runner@0.timer pr-gate-main-health@jeryu.timer pr-gate-wake
   must "$timer not resumed after TERM" called "start $timer"
 done
 must 'TERM rewrote finished receipt' cmp -s "$state" "$fx/before-term.json"
+must 'TERM activity is not truthful' jq -e '.state == "interrupted" and .exit_code == 143
+  and (.prior_active_timers | index("pr-gate-wake.timer") != null)' "$fx/home/gate-runner/tool-update-activity.json" >/dev/null
 rm -f "$fx/term-parent"
 printf 'PASS TERM restores all scheduled gate sources and leaves finished receipt intact\n'
 
@@ -197,6 +226,38 @@ must 'the dispatcher timeout lost timer restoration' called 'start pr-gate-wake.
 rm -f "$fx/dispatch-busy"
 printf 'PASS active wake and audit dispatchers must drain before the update\n'
 
+for flag in job-busy service-busy jobs-fail services-fail job-transition; do
+  touch "$fx/$flag"
+  drain=0 run -- fixture-update
+  must "$flag allowed an update" test "$status" == 75
+  must "$flag ran command" absent 'update ran'
+  must "$flag lost restoration" called 'start pr-gate-wake.timer'
+  rm -f "$fx/$flag" "$fx/service-busy"
+done
+printf 'PASS pending systemd dispatch and activation must drain; inspection fails closed\n'
+
+lock_wait=invalid run -- fixture-update
+must 'invalid lock wait treated as contention' test "$status" == 2
+must 'invalid lock wait not named' grep -q 'GATE_INSTALL_LOCK_WAIT must' "$fx/out"
+must 'invalid lock wait touched timers' test ! -s "$fx/calls.log"
+touch "$fx/lock-fails"
+run -- fixture-update
+must 'flock failure reported as contention' test "$status" == 64
+must 'flock failure not diagnosed' grep -q 'could not acquire installer lock (flock exit 64)' "$fx/out"
+must 'flock failure touched timers' test ! -s "$fx/calls.log"
+rm -f "$fx/lock-fails"
+
+# A stale running record is recovery evidence, never a policy for automatic restart.
+activity="$fx/home/gate-runner/tool-update-activity.json"
+printf '{"state":"running","prior_active_timers":["pr-gate-runner@9.timer"]}\n' >"$activity"
+cp "$activity" "$fx/stale.json"
+run -- fixture-update
+must 'stale activity allowed update' test "$status" == 75
+must 'stale recovery evidence overwritten' cmp -s "$activity" "$fx/stale.json"
+must 'stale activity changed timer policy' test ! -s "$fx/calls.log"
+must 'recovery not explained' grep -q 'recovery required' "$fx/out"
+rm -f "$activity"
+
 # Failed process inspection and partial timer-stop failures are not a successful drain.
 for flag in pgrep-fails stop-fails; do
   touch "$fx/$flag"
@@ -217,5 +278,12 @@ must 'an update ran during an install' test "$(cat "$fx/status")" == 75
 must 'the install is named' grep -q 'an install is running; nothing updated' "$fx/out"
 must 'a locked-out update left no record of itself' cmp -s "$fx/before.json" "$state"
 printf 'PASS an update never overlaps an install\n'
+
+touch "$fx/receipt-fails"
+run -- fixture-update
+must 'receipt render failure hidden' test "$status" == 1
+must 'receipt failure overwrote last result' cmp -s "$fx/before.json" "$state"
+must 'failed temporary receipts retained' test -z "$(find "$fx/home/gate-runner" -name '*.new.*' -print)"
+rm -f "$fx/receipt-fails"
 
 printf 'pr-gate-tool-update: all checks passed\n'

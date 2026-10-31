@@ -43,6 +43,7 @@ BIN="${GATE_INSTALL_BIN:-$HOME_DIR/bin}"
 DRAIN_SECONDS="${GATE_INSTALL_DRAIN_SECONDS:-2700}"
 UPDATE_SECONDS="${GATE_INSTALL_UPDATE_SECONDS:-600}"
 STATE="$HOME_DIR/tool-update.json"
+ACTIVITY="$HOME_DIR/tool-update-activity.json"
 LOCK_WAIT="${GATE_INSTALL_LOCK_WAIT:-60}"
 
 say() { printf '[gate-tool-update %s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
@@ -61,6 +62,7 @@ done
 (($# > 0)) || usage
 [[ "$DRAIN_SECONDS" =~ ^[0-9]+$ ]] || { say "GATE_INSTALL_DRAIN_SECONDS must be a number of seconds, not $DRAIN_SECONDS"; exit 2; }
 [[ "$UPDATE_SECONDS" =~ ^[1-9][0-9]*$ ]] || { say "GATE_INSTALL_UPDATE_SECONDS must be positive seconds"; exit 2; }
+[[ "$LOCK_WAIT" =~ ^[0-9]+$ ]] || { say "GATE_INSTALL_LOCK_WAIT must be a number of seconds"; exit 2; }
 command -v timeout >/dev/null || { say "timeout is required; nothing updated"; exit 2; }
 command -v -- "$1" >/dev/null || { say "no such command: $1"; exit 2; }
 
@@ -68,7 +70,24 @@ mkdir -p "$HOME_DIR"
 # The installer's lock: it drains the same slots, and the two must not interleave. Waiting a little
 # covers an install that is merely verifying; a long one simply means later is better.
 exec 9>"$HOME_DIR/.install.lock"
-flock -w "$LOCK_WAIT" 9 || { say "an install is running; nothing updated"; exit 75; }
+lock_status=0
+flock -E 75 -w "$LOCK_WAIT" 9 || lock_status=$?
+if ((lock_status != 0)); then
+  if ((lock_status == 75)); then say "an install is running; nothing updated";
+  else say "could not acquire installer lock (flock exit $lock_status); nothing updated"; fi
+  exit "$lock_status"
+fi
+
+# Do this before enumerating timers: a killed invocation may have paused all of
+# them. Never replace its saved policy with the remaining active subset.
+if [[ -f "$ACTIVITY" ]]; then
+  prior_phase=$(jq -er '.state | select(type == "string")' "$ACTIVITY") \
+    || { say "could not inspect previous activity; recovery required in $ACTIVITY"; exit 1; }
+  case "$prior_phase" in
+    finished|stopped|interrupted) ;;
+    *) say "recovery required: inspect $ACTIVITY and restore its prior_active_timers before retrying"; exit 75;;
+  esac
+fi
 
 # Pause every scheduled source of gates, including wake when it has explicitly configured
 # slots. Restore only the timers that were active; an operator's paused timer stays paused.
@@ -81,6 +100,20 @@ slots=$(printf '%s\n' "$timers" | sed -n 's/^pr-gate-runner@\([0-9]\+\)\.timer$/
 [[ -n "$slots" ]] || { say "no active gate slots were enumerated; nothing updated"; exit 75; }
 command_args=("$@")
 command_finished=0 status=0 update_pid=""
+activity_phase=draining
+# The current invocation is separate from the last finished command. On host loss,
+# this record retains the exact timer policy an operator needs for recovery.
+record_activity() {
+  local phase=$1 code=${2:-null} tmp="$ACTIVITY.new.$$"
+  if jq -n --arg phase "$phase" --arg at "$(date -u +%FT%TZ)" \
+    --argjson pid "$$" --arg timers "$timers" --argjson code "$code" \
+    '{state:$phase,observed_at:$at,pid:$pid,exit_code:$code,
+      prior_active_timers:($timers|split("\n")|map(select(. != "")))}' >"$tmp" \
+    && mv -f -- "$tmp" "$ACTIVITY"; then return 0; fi
+  rm -f -- "$tmp"
+  say "could not record activity in $ACTIVITY"
+  return 1
+}
 finish() {
   local result=${1:-$?} timer
   local resume_failures=()
@@ -100,11 +133,17 @@ finish() {
       '{command:$command,exit_code:$status,finished_at:$at,update_timeout_seconds:$limit,
         drained_slots:($slots|split(" ")|map(select(. != ""))),resume_failures:$failed}' \
       >"$STATE.new.$$" || ! mv -f -- "$STATE.new.$$" "$STATE"; then
+      rm -f -- "$STATE.new.$$"
       say "could not record the update in $STATE"
       ((result != 0)) || result=1
     fi
   fi
   if ((${#resume_failures[@]} > 0 && result == 0)); then result=1; fi
+  local phase=stopped
+  if ((command_finished)); then phase=finished;
+  elif [[ "$activity_phase" == running ]]; then phase=interrupted; fi
+  if ((${#resume_failures[@]} > 0)); then phase=recovery_required; fi
+  record_activity "$phase" "$result" || { ((result != 0)) || result=1; }
   exit "$result"
 }
 stop_update() {
@@ -119,6 +158,9 @@ stop_update() {
 trap 'finish' EXIT
 trap 'stop_update; exit 130' INT
 trap 'stop_update; exit 143' TERM
+record_activity draining || exit 1
+say "drain bound ${DRAIN_SECONDS}s; update bound ${UPDATE_SECONDS}s plus 10s KILL grace; installs remain locked"
+say "SIGKILL/host loss requires manual timer recovery from $ACTIVITY; prior timer policy is preserved"
 for timer in $timers; do systemctl --user stop "$timer"; done
 deadline=$(( $(date +%s) + DRAIN_SECONDS ))
 # A wake or audit service already running when its timer was paused may still dispatch a gate.
@@ -126,8 +168,16 @@ deadline=$(( $(date +%s) + DRAIN_SECONDS ))
 while :; do
   busy=0
   pgrep -f "$BIN/pr-gate-(runner|wake|audit)\.sh" >/dev/null || busy=$?
-  if ((busy == 1)); then break; fi
-  if ((busy != 0)); then say "could not inspect running gates; nothing updated"; exit 75; fi
+  if ((busy != 0 && busy != 1)); then say "could not inspect running gates; nothing updated"; exit 75; fi
+  # Dispatch queues a job before exiting. Check jobs before services so a job
+  # transitioning into an active service cannot disappear between these queries.
+  jobs=$(systemctl --user list-jobs --no-legend --plain) \
+    || { say "could not inspect systemd jobs; nothing updated"; exit 75; }
+  services=$(systemctl --user list-units --no-legend --plain --state=active,activating \
+    'pr-gate-runner@*.service' 'pr-gate-main-health@*.service' pr-gate-wake.service pr-gate-audit.service) \
+    || { say "could not inspect systemd services; nothing updated"; exit 75; }
+  if ((busy == 1)) && ! printf '%s\n%s\n' "$jobs" "$services" \
+    | grep -E '(^|[[:space:]])pr-gate-(runner@[^[:space:]]+|main-health@[^[:space:]]+|wake|audit)\.service([[:space:]]|$)' >/dev/null; then break; fi
   if (( $(date +%s) >= deadline )); then
     say "slots still busy after ${DRAIN_SECONDS}s; nothing updated, run it again later"
     exit 75
@@ -137,8 +187,10 @@ done
 say "slots drained ($slots); running: $*"
 
 # A process group gives timeout authority over the update and its children. Waiting for it on
-# INT/TERM keeps timers paused until the command group has stopped; no finished receipt is written
-# for an interrupted invocation. SIGKILL/host loss still requires the documented manual recovery.
+# INT/TERM keeps timers paused until the command group has stopped. Activity records interruption
+# separately from the last finished receipt. SIGKILL/host loss requires manual recovery.
+activity_phase=running
+record_activity running || exit 1
 timeout --kill-after=10 "$UPDATE_SECONDS" "$@" <&0 &
 update_pid=$!
 wait "$update_pid" || status=$?

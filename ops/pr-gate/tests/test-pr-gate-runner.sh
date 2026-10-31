@@ -1970,12 +1970,15 @@ jq -e '.outcome == "success"' "$receipt" >/dev/null \
   || { printf 'a tool outside the configured recipe PATH still invalidated a gate\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
 rm -f "$fixture/recipe-tools/just" "$fixture/home/.local/bin/stray"
 # Empty entries and traversal are refused before anything is gated.
-for bad in "/usr/bin::/bin" "/usr/../bin" "/usr/bin:" ":/bin"; do
+for bad in "/usr/bin::/bin" "/usr/../bin" "/usr/bin:" ":/bin" $'/usr/bin\n:/bin' $'/usr/bin\r:/bin'; do
   runner_exit=0
   PR_GATE_RECIPE_PATH="$bad" invoke --list
   [[ "$runner_exit" == 2 ]] && grep -q 'PR_GATE_RECIPE_PATH is not usable' "$fixture/runner.log" \
     || { printf 'PR_GATE_RECIPE_PATH %s was accepted (exit %s)\n' "$bad" "$runner_exit" >&2; cat "$fixture/runner.log" >&2; exit 1; }
 done
+runner_exit=0
+PR_GATE_RECIPE_PATH="$fixture/tools..v2:/usr/bin:/bin" invoke --list
+[[ "$runner_exit" == 0 ]] || { printf 'innocent double-dot name refused\n' >&2; exit 1; }
 printf 'PASS the recipe PATH is the governed tools then PR_GATE_RECIPE_PATH, bound by content, unshadowable, and refuses empty entries and traversal\n'
 
 # Changing only a sourced backoff library invalidates verified inputs and re-runs the recipe.
