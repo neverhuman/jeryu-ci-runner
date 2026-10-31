@@ -270,35 +270,47 @@ printf 'PASS gate claims: a lease lost mid-recipe stops the recipe and publishes
 
 
 # A slot killed outright (kill -9) leaves no process renewing its head: the renewer ends with the
-# runner, so the lease lapses within one TTL and another host can take the head. A renewal request
-# may still be in flight at the kill, so the grants are counted only once the slot's own processes
-# and every fixture request are gone. The observation window is then the lease itself: it must run
-# out at the expiry the forge recorded, with no further grant, and a second runner is granted the head.
+# runner, so the lease lapses within one TTL and another host can take the head. The lease length is
+# one the production runner accepts (30s, renewed every 10s; a shorter one is clamped to 180s), so
+# the renewal interval is real. First a live renewal is observed, which proves the observation below
+# would see a renewer that survived. A renewal request may still be in flight at the kill, so the
+# grants are counted only once the slot's own processes and every fixture request are gone. The
+# window then covers at least one whole renewal interval and the lease itself: no further grant, and
+# the lease record untouched; then a second runner is granted the head.
 renewer_gone() {
   ! pgrep -f "$script_dir/pr-gate-runner.sh --repo acme/fixture --pr 1" >/dev/null \
     && ! pgrep -f "$fixture/tools/curl" >/dev/null
 }
-rm -f "$fixture/recipe-started" "$fixture/recipe-finished" "$fixture/recipe-release" "$fixture/recipe-ticks"
 touch "$fixture/recipe-hold"
-printf '3\n' >"$fixture/claim-ttl"
+rm -f "$fixture/recipe-started" "$fixture/recipe-finished" "$fixture/recipe-release" "$fixture/recipe-ticks"
+printf '30\n' >"$fixture/claim-ttl"
+renew_every=10
 "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --repo acme/fixture --pr 1 >"$fixture/runner.log" 2>&1 &
 killed=$!
 for _ in $(seq 300); do [[ -e "$fixture/recipe-started" ]] && break; sleep 0.1; done
 [[ -e "$fixture/recipe-started" ]] || fail_claims 'the killed slot never reached its recipe'
-grep -q 'gate claim held for' "$fixture/runner.log" || fail_claims 'the killed slot never took the lease'
+grep -q 'gate claim held for 30s' "$fixture/runner.log" || fail_claims 'the killed slot never took a 30s lease'
+granted_now() { grep -c "acme/fixture $head " "$fixture/claims-granted.log"; }
+# The grant and one renewal by the live slot (the recipe holds for a minute, longer than an interval).
+for _ in $(seq 400); do (( $(granted_now) >= 2 )) && break; sleep 0.1; done
+(( $(granted_now) >= 2 )) || fail_claims "the live slot never renewed its lease (renewer log: $(cat "$fixture/runner/cache/gate-claim-slot0/renewer.log" 2>/dev/null))"
 kill -9 "$killed"; wait "$killed" 2>/dev/null || true
 # The recipe is a fork of the runner and shares its command line: let it end so that what remains
 # under that command line can only be a renewer.
 touch "$fixture/recipe-release"
 for _ in $(seq 300); do [[ -e "$fixture/recipe-finished" ]] && break; sleep 0.1; done
 [[ -e "$fixture/recipe-finished" ]] || fail_claims 'the orphaned recipe did not end'
-for _ in $(seq 300); do renewer_gone && break; sleep 0.1; done
-renewer_gone || fail_claims "a renewer or request outlived its killed runner: $(cat "$fixture/runner/cache/gate-claim-slot0/renewer.log" 2>/dev/null)"
-grants=$(grep -c "acme/fixture $head " "$fixture/claims-granted.log")
+# A surviving renewer wakes within one interval and ends, or renews, then; wait that long.
+for _ in $(seq $(( (renew_every + 10) * 10 ))); do renewer_gone && break; sleep 0.1; done
+renewer_gone || fail_claims "a renewer or request outlived its killed runner: $(pgrep -af "pr-gate-runner.sh --repo acme/fixture|$fixture/tools/curl" 2>/dev/null) / $(cat "$fixture/runner/cache/gate-claim-slot0/renewer.log" 2>/dev/null)"
+drained=$(date +%s)
+grants=$(granted_now)
 read -r _ _ expiry <"$claim" || fail_claims 'the killed slot left no lease record'
-while (( $(date +%s) <= expiry )); do sleep 0.2; done
-[[ "$(grep -c "acme/fixture $head " "$fixture/claims-granted.log")" == "$grants" ]] \
+record=$(cat "$claim")
+while (( $(date +%s) <= expiry || $(date +%s) < drained + renew_every + 2 )); do sleep 0.2; done
+[[ "$(granted_now)" == "$grants" ]] \
   || fail_claims 'the lease was renewed after its runner was killed'
+[[ "$(cat "$claim")" == "$record" ]] || fail_claims 'the killed slot s lease record changed after it was killed'
 took=$("$fixture/tools/curl" -X POST --data "$(jq -nc --arg s "$head" \
   '{repo:"acme/fixture",head_sha:$s,runner_id:"gate-b/slot0",host:"gate-b"}')" \
   https://forge.invalid/api/v1/gate-claims | tail -n1)
