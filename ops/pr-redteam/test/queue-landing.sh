@@ -110,12 +110,15 @@ evidence() { # old new -> review dir (a dependent bumping acme/<name> from old t
   # A helper the fixture did not load fails with "command not found" and the run could still pass:
   # the production call's stderr is captured and any diagnostic other than the expected ones fails.
   # The status is kept and the captured stderr printed before failing, so neither is lost to the EXIT
-  # cleanup or to a command substitution. Only the old-Git scenario (old_git_stub=1) may print
-  # "error: unknown option".
+  # cleanup or to a command substitution. A blank line carries no diagnostic, so it is allowed in
+  # both cases; the allowance is written the same way in each, and only the old-Git scenario
+  # (old_git_stub=1) adds "error: unknown option" to it.
   local rc=0 allow='^$'
-  [ "${old_git_stub:-}" != 1 ] || allow='^error: unknown option$'
+  [ "${old_git_stub:-}" != 1 ] || allow='^(error: unknown option)?$'
   upstream_evidence "$D/.git" "$b" "$(snap)" "$o" acme "${budget:-100000}" 2>"$t/evidence.err" || rc=$?
-  grep -v "$allow" "$t/evidence.err" >"$t/evidence.unexpected" || true
+  grep -Ev "$allow" "$t/evidence.err" >"$t/evidence.unexpected" || true
+  # A nonzero status and unexpected stderr are separate failures, named separately so a regression
+  # diagnostic says which one happened; a nonzero status also prints whatever stderr it wrote.
   if [ "$rc" -ne 0 ]; then
     fail "upstream_evidence exited $rc; stderr: $(cat "$t/evidence.err")"
   fi
@@ -344,10 +347,18 @@ upstream_evidence() { echo "boom: helper diagnostic" >&2; return 7; }
 if out="$( (o="$(evidence "$w0" "$tip")" || exit 1; echo "$o") 2>&1 )"; then fail "a helper exiting 7 did not fail the fixture"; fi
 case "$out" in *"exited 7"*"boom: helper diagnostic"*) ;; *) fail "helper status or stderr not reported: $out" ;; esac
 unset -f upstream_evidence; eval "$upstream_evidence_real"
+declare -F upstream_evidence >/dev/null || fail "upstream_evidence was not restored after the stub"
+# A Git that prints the old-Git diagnostic in a scenario that may not: the production call still
+# succeeds, so this must fail on the stderr, not on a status. The two causes are told apart here so
+# a regression cannot pass this case off as the other.
 git() { echo "error: unknown option" >&2; command git "$@"; }
 if out="$( (o="$(evidence "$w0" "$tip")" || exit 1; echo "$o") 2>&1 )"; then unset -f git; fail "unknown-option stderr passed outside the old-Git scenario"; fi
 unset -f git
-case "$out" in *"unexpected stderr"*"unknown option"*) ;; *) fail "unrelated-scenario stderr not reported: $out" ;; esac
+case "$out" in
+  *"unexpected stderr"*"unknown option"*) ;;
+  *"exited "*) fail "the noisy-Git case failed on a nonzero status, not on the unexpected stderr: $out" ;;
+  *) fail "unrelated-scenario stderr not reported: $out" ;;
+esac
 ok 'a helper failure keeps its status and stderr; unknown-option stderr is accepted only in the old-Git scenario'
 
 # 5. A commit after the last landing belongs to no pull request.
