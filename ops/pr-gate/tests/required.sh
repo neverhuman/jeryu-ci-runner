@@ -5,7 +5,7 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 suites=()
-for suite in runner tiers claims config state progress contributed namespace locks heartbeat wake audit backoff retention prefetch gitcred install tool-update preflight grype-db-refresh; do
+for suite in runner tiers claims config state progress contributed namespace locks heartbeat wake audit backoff retention prefetch gitcred install tool-update cargo-plugin-install preflight grype-db-refresh; do
   suites+=("$here/test-pr-gate-$suite.sh")
 done
 [[ "${1:-}" != --list ]] || { printf '%s\n' "${suites[@]}"; exit 0; }

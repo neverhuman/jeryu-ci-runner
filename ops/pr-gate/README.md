@@ -21,6 +21,7 @@ identity authored.
 | `bin/pr-gate-wake.sh` | starts an idle slot as soon as a gated head appears, moves, or is asked for again -- on the forge's `gate-wanted` signal and from the open-PR view -- and hands it the head it started it for |
 | `bin/pr-gate-install.sh` | keeps the installed copy equal to the source branch (drains slots first) |
 | `bin/pr-gate-tool-update.sh` | runs one host tool update inside the same drain, so a self-updating tool never lands mid-gate |
+| `bin/pr-gate-cargo-plugin-install.sh` | installs one `cargo-*` plugin into `~/.cargo/bin` through that drain, as a copy |
 | `bin/pr-gate-audit.sh` | claims the forge's queued jankurai audit jobs, scores each head with the governed jankurai in a throwaway clone, and submits the report (see [Scoring heads with jankurai](#scoring-heads-with-jankurai)) |
 | `bin/pr-gate-advisory-refresh.sh`, `bin/pr-gate-grype-db-refresh.sh` | keep security databases fresh outside the gates |
 | `systemd/` | the `--user` units and timers; `pr-gate-runner@N` is one slot |
@@ -712,6 +713,12 @@ frozen either way:
   whether it ran. INT/TERM stop the update group before restoring the prior active timers; SIGKILL or host loss requires operator
   recovery of paused timers. Point the tool's updater at it instead of letting
   the tool update itself whenever it happens to run.
+- a Cargo plugin for `~/.cargo/bin` (jeryu-ci-runner#193/#188, 2026-10-31: `cargo-gov03-rnk08-t0745` was linked and
+  then its target rewritten mid-gate, discarding two score-94 passes): install it with
+  `bin/pr-gate-cargo-plugin-install.sh [--timeout SECONDS] [--update-timeout SECONDS] cargo-NAME SOURCE`. It accepts only a
+  bare `cargo-*` name and an executable SOURCE, copies the bytes (never a link whose target can be rewritten later) through
+  `pr-gate-tool-update.sh`, and exits 75 with nothing installed when the slots do not drain. An install made any other way
+  is still refused as `inputs_changed`.
 - keep it off the recipe's PATH: `PR_GATE_RECIPE_PATH` replaces everything after the governed tool
   directory (absolute paths separated by `:`, or home-relative as elsewhere; the governed directory
   always comes first and no setting can drop it or shadow it), so a host can give its recipes a
