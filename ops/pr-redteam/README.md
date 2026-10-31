@@ -274,6 +274,10 @@ that render each consumer from it. A site whose authority differs sets the three
 manifest path that is there but declares no readable version is reported
 (`AUTHORITY-VALUE-UNREADABLE`) rather than compared.
 
+The scalar detector reads the real generated root-level assignment and the legacy `[audit]`
+form, rejecting duplicate assignments anywhere in a policy. The packet records detected moves;
+its absence does not certify that no policy format could contain one. Read the full diff.
+
 A moved scalar is verified only by `status` `authority-verified` with its `consumers` row
 `matches-authority`: the manifest and the renderer sources were both read from one protected commit
 and the head value is `authority_version`. `DIFFERS-FROM-AUTHORITY` is a version the authority does
@@ -282,7 +286,7 @@ not hold -- a value that is not a version (`!invalid`) and a policy that stops d
 sentinel is ever compared with the authority's own: when the manifest itself declares no
 `[jankurai] semver` or declares something that is not a version, every row is
 `AUTHORITY-VALUE-UNREADABLE`, because there is nothing to compare against. When the manifest copy
-was cut or no renderer source could be read, the status is `authority-partial` and an agreeing row
+was cut, or any configured renderer was missing, skipped or truncated, the status is `authority-partial` and an agreeing row
 is `matches-authority-partial`: the values match, but the rule that writes the consumer scalar is
 not shown in full. Every other status (`authority-not-on-forge`, `authority-branch-unknown`,
 `authority-manifest-missing`, `authority-not-readable`, `authority-not-configured`) leaves every row

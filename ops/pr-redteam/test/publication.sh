@@ -321,7 +321,7 @@ printf 'unsigned\n' >> "$t/repo/README.md"
 # The same commit moves the generated governed tool version, so this head is one the governed
 # evidence would gather the authority for -- had it not been held first.
 mkdir -p "$t/repo/agent"
-printf '[audit]\nminimum_score = 85\nrequired_tool_version = "1.7.6"\n' > "$t/repo/agent/audit-policy.toml"
+printf 'minimum_score = 85\nrequired_tool_version = "1.7.6"\n' > "$t/repo/agent/audit-policy.toml"
 fixture_git -C "$t/repo" add agent/audit-policy.toml
 authority_reads="$(count "$t/authority-reads")"
 fixture_git -C "$t/repo" -c 'user.name=Your Name' -c user.email=you@example.com commit -qam placeholder
@@ -346,7 +346,7 @@ jq -e '.decision != "placeholder_author" and .posted == true' "$(receipt)" > /de
 [[ "$(count "$t/model-calls")" == "$((model_calls + 1))" ]]
 [[ "$(count "$t/authority-reads")" == "$authority_reads" ]]
 mkdir -p "$t/repo/agent"
-printf '[audit]\nminimum_score = 85\nrequired_tool_version = "1.7.6"\n' > "$t/repo/agent/audit-policy.toml"
+printf 'minimum_score = 85\nrequired_tool_version = "1.7.6"\n' > "$t/repo/agent/audit-policy.toml"
 g add agent/audit-policy.toml; g commit -qm 'render the governed version'; g rev-parse HEAD > "$t/head"
 review
 jq -e '.posted == true' "$(receipt)" > /dev/null

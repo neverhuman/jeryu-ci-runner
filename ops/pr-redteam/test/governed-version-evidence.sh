@@ -83,7 +83,12 @@ D=""
 dep() { D="$t/dep-$1"; git init -q -b main "$D"; }
 put() { mkdir -p "$(dirname "$D/$1")"; cat >"$D/$1"; }
 snap() { git -C "$D" add -A; git -C "$D" -c user.name=t -c user.email=t@t commit -q --allow-empty -m "$1"; git -C "$D" rev-parse HEAD; }
-policy() { printf '[audit]\nminimum_score = 85\nrequired_tool_version = "%s"\n' "$1"; }
+# Use this repository's real generated policy format, including its root scalar.
+policy() {
+  awk -v version="$1" '
+    /^required_tool_version[[:space:]]*=/ { $0 = "required_tool_version = \"" version "\"" }
+    { print }' "$here/../../../agent/audit-policy.toml"
+}
 evidence() { # base head -> review dir
   local o; o="$(mktemp -d "$t/out-XXXXXX")"; : >"$t/api.log"
   governed_version_evidence "$D/.git" "$1" "$2" "$o" acme "${budget:-200000}"; echo "$o"
@@ -121,6 +126,21 @@ grep -q "commit ${auth_commit:0:12}" "$o/governance/SUMMARY.txt" \
 grep -qx '/api/v1/repos/acme%2Fjeryu-tool' "$t/api.log" && grep -qx '/api/v1/repos/acme%2Fjeryu-tool/refs' "$t/api.log" \
   || fail "forge API paths: $(cat "$t/api.log")"
 ok 'a required_tool_version bump gets the protected manifest, the renderer rules and their identities'
+
+# Every configured renderer must be read completely for a verified packet, even
+# when other renderers are present and no bounded copy is truncated.
+dep missing-renderer; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
+policy 1.7.6 | put agent/audit-policy.toml; h="$(snap bump)"
+o="$(governed_renderer_paths="$governed_renderer_paths missing/rules.rs" evidence "$b" "$h")"
+[ "$(field "$o" status)" = authority-partial ] && [ "$(field "$o" verified)" = false ] \
+  && jq -e '(.renderers | length)==2 and all(.renderers[]; .truncated==false)' "$o/governance/authority.json" >/dev/null \
+  || fail 'one missing renderer was hidden by the renderers that were read'
+o="$(budget=2000 evidence "$b" "$h")"
+jq -e '.manifest_truncated==false and (.renderers | length)==1 and all(.renderers[]; .truncated==false)' "$o/governance/authority.json" >/dev/null \
+  || fail 'fixture did not isolate one budget-skipped and one fully read renderer'
+[ "$(field "$o" status)" = authority-partial ] && [ "$(field "$o" verified)" = false ] \
+  || fail 'a budget-skipped renderer was hidden by the renderer that fitted'
+ok 'a missing or budget-skipped renderer makes a partly read authority explicit'
 
 # 2. A version the authority does not declare is reported as differing, whatever the change says --
 # including a tool-manifest.toml the change commits into the consumer itself.
@@ -173,7 +193,7 @@ o="$(evidence "$b" "$(snap malformed)")"
   || fail "malformed rows: $(jq -c .consumers "$o/governance/authority.json")"
 ok 'a value that is not a version, and a policy that declares none, are reported'
 
-# A key outside [audit] cannot choose the consumer value. Duplicate assignments
+# A key outside the root or [audit] cannot choose the consumer value. Duplicate assignments
 # anywhere are invalid, including an authority-looking decoy before the real key.
 dep decoy; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
 printf '[decoy]\nrequired_tool_version = "1.7.6"\n[audit]\nrequired_tool_version = "9.9.9"\n' | put agent/audit-policy.toml
@@ -193,7 +213,7 @@ printf '[audit]\nrequired_tool_version = "1.7.6"\nrequired_tool_version = "1.7.6
 o="$(evidence "$b" "$(snap repeated-key)")"
 [ "$(jq -r '.consumers[0].head_value' "$o/governance/authority.json")" = '!invalid' ] \
   || fail "duplicate identical keys were accepted"
-ok 'only the audit table supplies a scalar, and duplicate assignments never verify'
+ok 'root and audit table scalars work, and duplicate assignments never verify'
 
 # 6. Nothing is written for a change that does not move the scalar.
 dep quiet; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
@@ -203,6 +223,25 @@ o="$(evidence "$b" "$(snap quiet)")"
 [ ! -e "$o/governance" ] || fail "governance/ written for a change that moves no governed version: $(find "$o" -type f)"
 ok 'a change that leaves the governed version alone gets no governance evidence'
 
+# The row cap counts scalar moves. Ordinary edits in many policies neither
+# create a false unknown-movement packet nor hide the one file that really moves.
+dep many-quiet
+for n in $(seq 21); do policy 1.7.5 | put "policies/$n/audit-policy.toml"; done
+b="$(snap base)"
+for n in $(seq 21); do printf '\n# ordinary edit\n' >>"$D/policies/$n/audit-policy.toml"; done
+quiet="$(snap quiet)"; o="$(evidence "$b" "$quiet")"
+[ ! -e "$o/governance" ] || fail 'more than20 unchanged scalar values produced a limit packet'
+policy 1.7.6 | put policies/21/audit-policy.toml
+o="$(evidence "$b" "$(snap one-move)")"
+jq -e '(.consumers | length)==1 and .consumers[0].path=="policies/21/audit-policy.toml" and .consumers[0].verdict=="matches-authority"' "$o/governance/authority.json" >/dev/null \
+  || fail 'unchanged scalar files consumed the movement row cap'
+for n in $(seq 21); do policy 9.9.9 | put "policies/$n/audit-policy.toml"; done
+o="$(evidence "$b" "$(snap many-moves)")"
+[ "$(jq -r '.consumers | length' "$o/governance/authority.json")" == 20 ] \
+  && grep -q 'NOT ANALYSED: more audit policy scalars moved' "$o/governance/SUMMARY.txt" \
+  || fail 'the actual scalar movement cap was lost'
+ok 'only moved scalar rows consume the policy cap'
+
 # 7. An authority manifest whose own value this parser cannot read never reads as agreement, however
 # the change spells its scalar: not a dropped key, not a floating string, not the same sentinel.
 mkdir -p "$t/odd"
@@ -210,6 +249,9 @@ odd_authority() { # manifest-text -> bare repo the stub serves as acme/jeryu-too
   local d="$t/odd/$1"; git init -q -b main "$d"
   printf '%s' "$2" >"$d/tool-manifest.toml"
   mkdir -p "$d/ops"; printf '#!/bin/sh\n# renders every consumer\n' >"$d/ops/render-tool-manifest.sh"
+  # Isolate manifest spelling from renderer completeness: both requested sources exist.
+  mkdir -p "$d/crates/jeryu-tool-control/src"
+  cp "$t/authority/crates/jeryu-tool-control/src/render_rules.rs" "$d/crates/jeryu-tool-control/src/render_rules.rs"
   git -C "$d" add -A; git -C "$d" -c user.name=t -c user.email=t@t commit -qm "$1"
   rm -rf "$t/forge/git/acme/jeryu-tool.git"; git clone -q --bare "$d" "$t/forge/git/acme/jeryu-tool.git"
 }
@@ -264,6 +306,15 @@ o="$(evidence "$b" "$h")"
   && [ "$(jq -r '.consumers[0].verdict' "$o/governance/authority.json")" = DIFFERS-FROM-AUTHORITY ] \
   || fail "a move inside a quoted path: $(jq -c .consumers "$o/governance/authority.json")"
 ok 'a move inside a path git quotes is read from the blobs, not dropped'
+
+# Tabs are display-sanitized like newlines, after reading the actual Git path.
+dep tab-path
+tab_path=$(printf 'pol\ticy/audit-policy.toml')
+policy 1.7.5 | put "$tab_path"; b="$(snap base)"
+policy 1.7.6 | put "$tab_path"; o="$(evidence "$b" "$(snap bump)")"
+jq -e '.consumers[0] == {path:"pol?icy/audit-policy.toml",base_value:"1.7.5",head_value:"1.7.6",verdict:"matches-authority"}' "$o/governance/authority.json" >/dev/null \
+  || fail 'a TAB in the actual path shifted evidence values between columns'
+ok 'TAB paths retain their real scalar values in one evidence row'
 
 # 10. A budget too small to hold the manifest still records the identity of the whole blob.
 dep tiny; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"

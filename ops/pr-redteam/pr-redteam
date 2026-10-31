@@ -2144,7 +2144,7 @@ governed_quoted_version() { # key
     }'
 }
 
-# The `required_tool_version` in [audit], !none when absent there, and !invalid
+# The generated root `required_tool_version` (or legacy [audit] form), !none when absent, and !invalid
 # for a malformed value or duplicate assignment anywhere in the policy.
 governed_scalar_value() { # < policy
   local policy count v
@@ -2156,6 +2156,7 @@ governed_scalar_value() { # < policy
     END { print n + 0 }')"
   if ((count > 1)); then printf '!invalid\n'; return 0; fi
   v="$(printf '%s\n' "$policy" | awk '
+    BEGIN { in_audit = 1 }
     /^[[:space:]]*\[/ {
       h = $0; sub(/[[:space:]]*(#.*)?$/, "", h); gsub(/[[:space:]]+/, "", h)
       in_audit = (h == "[audit]"); next
@@ -2185,7 +2186,7 @@ governed_manifest_version() { # < manifest
 # file that gains, loses or malforms the scalar is a row too (`!none`, `!invalid`), so a malformed
 # move is never read as no movement; more policy files than this reads is the single row `!limit`.
 governed_scalar_moves() { # git-dir base head
-  local g="$1" b="$2" h="$3" f n=0 old new
+  local g="$1" b="$2" h="$3" f n=0 old new display_path
   local -a files=()
   # NUL-delimited, the way changed_files reads paths, so no path is quoted or escaped: git quotes a
   # non-ASCII, quote, backslash or control-character path on the default listing, and that row then
@@ -2195,13 +2196,15 @@ governed_scalar_moves() { # git-dir base head
     ':(glob)**/default-audit-policy.toml' ':(glob)default-audit-policy.toml' 2>/dev/null)
   for f in "${files[@]}"; do
     [ -n "$f" ] || continue
-    if ((++n > 20)); then printf '!limit\t\t\n'; return 0; fi
     old="$(git --git-dir="$g" show "$b:$f" 2>/dev/null | governed_scalar_value)"
     new="$(git --git-dir="$g" show "$h:$f" 2>/dev/null | governed_scalar_value)"
     [ "$old" != "$new" ] || continue
-    # A row is one line, so a newline inside a path is shown as '?' (the values are read from the
+    if ((++n > 20)); then printf '!limit\t\t\n'; return 0; fi
+    # A row is one line with three columns, so LF/TAB inside a path are shown as '?' (the values are read from the
     # blobs at the real path above, as changed_files does).
-    printf '%s\t%s\t%s\n' "${f//$'\n'/?}" "$old" "$new"
+    display_path=${f//$'\n'/?}
+    display_path=${display_path//$'\t'/?}
+    printf '%s\t%s\t%s\n' "$display_path" "$old" "$new"
   done
 }
 
@@ -2224,7 +2227,7 @@ governed_version_evidence() { # git-dir base head review-dir default-owner budge
   local moves out="$4/governance" owner="$5" left="$6"
   local repo g key dir default="" b i kind tip commit="" tree="" branch="" branch_kind=""
   local fetched_at="" authority_version="!none" status="" row path base_v head_v p copied share
-  local manifest_oid="" manifest_sha="" manifest_bytes=0 manifest_cut=false renderer_cut=false
+  local manifest_oid="" manifest_sha="" manifest_bytes=0 manifest_cut=false renderer_cut=false renderer_unread=false
   local -a protected=() names=() kinds=() notes=() summary=() renderers=() paths=()
   moves="$(governed_scalar_moves "$1" "$2" "$3")"
   [ -n "$moves" ] || return 0
@@ -2312,12 +2315,14 @@ governed_version_evidence() { # git-dir base head review-dir default-owner budge
             fi
             local n=0
             for p in "${paths[@]}"; do
-              if ((++n > 12)); then notes+=("only 12 renderer paths were read"); break; fi
+              if ((++n > 12)); then renderer_unread=true; notes+=("only 12 renderer paths were read"); break; fi
               share=$((left / (${#paths[@]} - n + 1)))
               if [ "$share" -lt "$upstream_min_share" ]; then
+                renderer_unread=true
                 notes+=("renderer source $p was not read: its share of the governed evidence budget ($share bytes) is too small"); continue
               fi
               copied="$(governed_blob_copy "$g" "$commit" "$p" "$out/renderer" "$share")" || {
+                renderer_unread=true
                 notes+=("the authority commit carries no $p: the rules that own the scalar were not read from it"); continue; }
               local r_oid r_sha r_bytes r_cut
               read -r r_oid r_sha r_bytes r_cut <<<"$copied"
@@ -2331,11 +2336,11 @@ governed_version_evidence() { # git-dir base head review-dir default-owner budge
             [ "${#renderers[@]}" -gt 0 ] || notes+=("no renderer source was read: the rules that own the scalar are not in this evidence")
             # The manifest alone is not the whole authority: the rule that writes the consumer
             # scalar is what makes the manifest's value the one a consumer must carry. A packet
-            # with no renderer source, or any authority source cut short, is reported as partial so a
+            # with any missing, unread or truncated renderer, or a cut manifest, is partial so a
             # reviewer reading only the status is never told the rule was shown when it was not.
-            if [ "$status" = authority-verified ] && { ${manifest_cut:-false} || "$renderer_cut" || [ "${#renderers[@]}" -eq 0 ]; }; then
+            if [ "$status" = authority-verified ] && { ${manifest_cut:-false} || "$renderer_cut" || "$renderer_unread" || [ "${#renderers[@]}" -eq 0 ]; }; then
               status=authority-partial
-              notes+=("the authority was read only in part (an authority source was cut, or no renderer source was read): the rule that writes the consumer scalar is not shown in full")
+              notes+=("the authority was read only in part (an authority source was cut, missing, or not read): the rule that writes the consumer scalar is not shown in full")
             fi
           fi
           upstream_drop_refs "$g" "$ns"
@@ -2353,8 +2358,8 @@ governed_version_evidence() { # git-dir base head review-dir default-owner budge
   while IFS=$'\t' read -r path base_v head_v; do
     [ -n "$path" ] || continue
     if [ "$path" = '!limit' ]; then
-      notes+=("more than 20 audit policies changed: the moved scalars were not all read")
-      summary+=("NOT ANALYSED: more audit policies changed than this evidence reads; the governed scalar's movement is unknown")
+      notes+=("more than 20 audit policies moved the governed scalar: the moves were not all read")
+      summary+=("NOT ANALYSED: more audit policy scalars moved than this evidence reads; their remaining movement is unknown")
       continue
     fi
     # A sentinel is not a version, so it is never compared: `!none` on both sides is two policies
