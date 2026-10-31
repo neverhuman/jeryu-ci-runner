@@ -6,7 +6,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 script="$here/../pr-redteam"
 t="$(mktemp -d)"
 trap 'rm -rf "$t"' EXIT
-for f in prerequisite_evidence upstream_capped; do
+for f in prerequisite_evidence prerequisite_view upstream_capped; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
 done
 # The supplemental views must hide exactly what diff.patch hides, so they share its pathspecs.
@@ -97,6 +97,21 @@ g update-ref refs/pr/36/base "$tip"
 protected=true api_tip="$tip" api_code=200 api_shape=normal
 mkdir "$t/capped"
 prerequisite_evidence "$t/repo" acme/tool 36 "$base" "$head" "$t/capped" 10
-grep -q 'effective.patch: 3 bytes; truncated=true' "$t/capped/prerequisites/SUMMARY.txt"
+grep -q 'effective.patch: 3 bytes; truncated=true; git_error=false' "$t/capped/prerequisites/SUMMARY.txt"
+[[ "$(cat "$t/capped/prerequisites/"*.patch "$t/capped/prerequisites/accepted-commits.txt" | wc -c)" -le 10 ]]
+# A Git failure is reported as an error, not as truncation, and spends nothing of the allowance.
+mkdir "$t/giterr"
+g update-ref refs/pr/36/base "$tip"
+real_git="$(command -v git)"
+mkdir "$t/shim"
+printf '#!/bin/sh\ncase "$*" in *"diff %s...%s"*) exit 128 ;; esac\nexec "%s" "$@"\n' "$head" "$tip" "$real_git" >"$t/shim/git"
+chmod +x "$t/shim/git"
+PATH="$t/shim:$PATH" prerequisite_evidence "$t/repo" acme/tool 36 "$base" "$head" "$t/giterr" 100000
+grep -q 'main-only.patch: git_error=true' "$t/giterr/prerequisites/SUMMARY.txt"
+grep -q 'effective.patch: .*truncated=false; git_error=false' "$t/giterr/prerequisites/SUMMARY.txt"
+[[ ! -s "$t/giterr/prerequisites/main-only.patch" ]]
+if grep -q 'main-only.patch.*truncated' "$t/giterr/prerequisites/SUMMARY.txt"; then exit 1; fi
+[[ "$prerequisite_spent" -gt 0 ]]
+# The supplement is bounded by the allowance it is given, summed across views.
 [[ "$(cat "$t/capped/prerequisites/"*.patch "$t/capped/prerequisites/accepted-commits.txt" | wc -c)" -le 10 ]]
 echo 'ok stacked retained-base packet preserves complete diff, proves protected-main boundary, and discloses effective diff and limits'

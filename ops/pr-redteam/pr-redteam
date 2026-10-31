@@ -527,18 +527,31 @@ prerequisite_evidence() { # cache repo number retained-base head review-dir allo
     echo 'Lock files are excluded from effective.patch and main-only.patch exactly as from diff.patch.'
     echo "Exact PR head: $head"
   } >"$out/SUMMARY.txt"
-  # A separate, bounded supplement never changes PR sizing or pin-evidence room.
+  # A bounded supplement drawn from the allowance the caller computed: the room the full diff and
+  # the pin evidence leave of the shared reading limit. It is not authored PR size.
   local log_budget=$((allowance / 4)) patch_budget=$((allowance * 3 / 8))
   [ "$log_budget" -le 16384 ] || log_budget=16384
-  cut=false
-  bytes="$(git -C "$g" log --format='%H %s' "$original..$boundary" | upstream_capped "$out/accepted-commits.txt" "$log_budget")" || cut=true
-  echo "accepted-commits.txt: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
-  cut=false
-  bytes="$(git -C "$g" diff "$tip...$head" -- "${read_pathspecs[@]}" | upstream_capped "$out/effective.patch" "$patch_budget")" || cut=true
-  echo "effective.patch: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
-  cut=false
-  bytes="$(git -C "$g" diff "$head...$tip" -- "${read_pathspecs[@]}" | upstream_capped "$out/main-only.patch" "$patch_budget")" || cut=true
-  echo "main-only.patch: $bytes bytes; truncated=$cut" >>"$out/SUMMARY.txt"
+  prerequisite_spent=0
+  prerequisite_view "$out" accepted-commits.txt "$log_budget" git -C "$g" log --format='%H %s' "$original..$boundary"
+  prerequisite_view "$out" effective.patch "$patch_budget" git -C "$g" diff "$tip...$head" -- "${read_pathspecs[@]}"
+  prerequisite_view "$out" main-only.patch "$patch_budget" git -C "$g" diff "$head...$tip" -- "${read_pathspecs[@]}"
+}
+
+# One supplemental view, at most `limit` bytes, noted in SUMMARY.txt. A Git failure is reported as
+# git_error and never as truncation: only the reader cutting a view short is truncation.
+prerequisite_view() { # out-dir name limit git-command...
+  local out="$1" name="$2" limit="$3" bytes gst cst cut=false
+  shift 3
+  { read -r bytes; read -r gst cst; } <<<"$("$@" | upstream_capped "$out/$name" "$limit"; echo "${PIPESTATUS[0]} ${PIPESTATUS[1]}")"
+  [ "$cst" = 0 ] || cut=true
+  # A cut makes the reader leave early, so git may end on SIGPIPE (141); that is not a failure.
+  if [ "$gst" != 0 ] && { [ "$gst" != 141 ] || [ "$cut" = false ]; }; then
+    : >"$out/$name"
+    echo "$name: git_error=true (git exited $gst); no evidence was read" >>"$out/SUMMARY.txt"
+    return 0
+  fi
+  prerequisite_spent=$((prerequisite_spent + bytes))
+  echo "$name: $bytes bytes; truncated=$cut; git_error=false" >>"$out/SUMMARY.txt"
 }
 
 # What a review computed while jankurai/proof was pending is bound to: the review identity, the
@@ -2832,9 +2845,6 @@ review_one() { # owner/name number dry-run force include-drafts
   git -C "$cache" diff --numstat "$base_sha...$sha" >"$d/numstat.txt"
   changed_files "$cache" "$base_sha" "$sha" "$d/files.nul" >"$d/files.txt"
   git -C "$cache" diff "$base_sha...$sha" -- "${read_pathspecs[@]}" >"$d/diff.patch"
-  if [ "$base_ref" = main ]; then
-    prerequisite_evidence "$cache" "$repo" "$number" "$base_sha" "$sha" "$d" "$((max_diff_bytes / 4))"
-  fi
   git -C "$cache" archive "$sha" | tar -x -C "$d/checkout"
   signals "$d"
   { echo; lock_source_report "$cache" "$base_sha" "$sha" "$d/files.nul"; } >>"$d/signals.txt"
@@ -2849,6 +2859,18 @@ review_one() { # owner/name number dry-run force include-drafts
   if [ "$up_budget" -gt 0 ]; then
     upstream_evidence "$cache" "$base_sha" "$sha" "$d" "${repo%%/*}" "$up_budget" || say "$tag: upstream evidence failed; the review goes on without it"
     up_spent=$((up_budget - up_left))
+  fi
+  # The prerequisite supplement reads from what the diff and the pins leave of the shared limit, so
+  # it neither adds to the diff's size nor takes the pin evidence's room. Governed evidence keeps
+  # its own cap in reserve, at most a quarter of the limit.
+  local gov_keep="$governed_max_bytes" pre_room pre_spent=0
+  [ "$gov_keep" -le $((max_diff_bytes / 4)) ] || gov_keep=$((max_diff_bytes / 4))
+  pre_room=$((max_diff_bytes - diff_bytes - up_spent - gov_keep))
+  [ "$pre_room" -le $((max_diff_bytes / 4)) ] || pre_room=$((max_diff_bytes / 4))
+  if [ "$base_ref" = main ] && [ "$pre_room" -gt 0 ]; then
+    prerequisite_spent=0
+    prerequisite_evidence "$cache" "$repo" "$number" "$base_sha" "$sha" "$d" "$pre_room"
+    pre_spent="$prerequisite_spent"
   fi
   review_check_diff "$repo" "$number" "$sha" "$files_count" "$diff_bytes" "$me" "$check_publish"
   if [ "$diff_bytes" -gt "$max_diff_bytes" ]; then
@@ -2898,7 +2920,7 @@ review_one() { # owner/name number dry-run force include-drafts
   # above have passed: a head that is too large, outside the author domain or signed by git's
   # placeholder identity is never shown to the agent, so fetching the authority for it would cost
   # the forge two reads and a fetch for evidence nobody reads.
-  local gov_budget="$governed_max_bytes" gov_room=$((max_diff_bytes - diff_bytes - up_spent))
+  local gov_budget="$governed_max_bytes" gov_room=$((max_diff_bytes - diff_bytes - up_spent - pre_spent))
   [ "$gov_room" -ge "$gov_budget" ] || gov_budget="$gov_room"
   if [ "$gov_budget" -gt 0 ]; then
     governed_version_evidence "$cache" "$base_sha" "$sha" "$d" "${repo%%/*}" "$gov_budget" \

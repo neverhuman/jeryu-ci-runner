@@ -133,7 +133,7 @@ grep -q "Accepted prerequisite boundary: $(cat "$PUBLISH_FIXTURE/prerequisite")"
 grep -q '+accepted prerequisite' ../review/diff.patch
 if grep -q '+accepted prerequisite' ../review/prerequisites/effective.patch; then exit 1; fi
 grep -q '+candidate' ../review/prerequisites/effective.patch
-grep -q 'main-only.patch: 768 bytes; truncated=true' ../review/prerequisites/SUMMARY.txt
+grep -q 'main-only.patch: 768 bytes; truncated=true; git_error=false' ../review/prerequisites/SUMMARY.txt
 [[ "$(wc -c < ../review/diff.patch)" -lt 8192 ]]
 # The production check reports the retained PR bytes, without duplicate or main-only bytes.
 jq -se --arg measure "Diff: $(wc -l < ../review/files.txt) files, $(wc -c < ../review/diff.patch) bytes." \
