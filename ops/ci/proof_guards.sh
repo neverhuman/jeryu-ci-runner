@@ -170,19 +170,28 @@ proof_require_migration() {
   }
 }
 
-# Keep scoring/scan policy byte-identical. The sole transition allowed here is
-# the currently governed generated version line; normalize that exact line and
-# compare every other byte, so duplicates and additional settings still refuse.
+# Keep scoring/scan policy byte-identical to protected main. The one exception
+# is an explicit transition: AUTHZ (read from the protected-main tree, never from
+# the candidate) lists "<protected sha256> <candidate sha256>" lines, and the
+# candidate may differ only when both digests of this pair are pinned there.
+# Blank lines and #-comments are ignored; any other line shape is refused.
 proof_require_governed_policy() {
-  local candidate="$1" protected="$2"
+  local candidate="$1" protected="$2" authz="${3:-}" cd_ pd_ line a b
   cmp -s "$candidate" "$protected" && return 0
-  if [[ "${JERYU_JANKURAI_SEMVER:-}" == 1.7.6 &&
-        "$(grep -Fxc 'required_tool_version = "1.7.6"' "$candidate")" == 1 &&
-        "$(grep -Fxc 'required_tool_version = "1.7.5"' "$protected")" == 1 ]] &&
-     cmp -s <(sed 's/^required_tool_version = "1\.7\.6"$/required_tool_version = "1.7.5"/' "$candidate") "$protected"; then
-    return 0
+  if [[ -n "$authz" && -f "$authz" && ! -L "$authz" ]]; then
+    cd_="$(sha256sum -- "$candidate")" && cd_="${cd_%% *}" || return 1
+    pd_="$(sha256sum -- "$protected")" && pd_="${pd_%% *}" || return 1
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in ''|'#'*) continue ;; esac
+      if [[ ! "$line" =~ ^([0-9a-f]{64})\ ([0-9a-f]{64})$ ]]; then
+        printf 'malformed policy transition authorization line\n' >&2
+        return 1
+      fi
+      a="${BASH_REMATCH[1]}" b="${BASH_REMATCH[2]}"
+      [[ "$a" == "$pd_" && "$b" == "$cd_" ]] && return 0
+    done <"$authz"
   fi
-  printf 'candidate audit policy must be byte-identical to protected main except the governed1.7.6 version line\n' >&2
+  printf 'candidate audit policy must be byte-identical to protected main unless a digest-pinned transition is authorized\n' >&2
   return 1
 }
 

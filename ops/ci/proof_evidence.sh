@@ -243,20 +243,11 @@ if [[ ! -f "${baseline_policy}" || -L "${baseline_policy}" ||
   printf 'protected-main audit policy must be a canonical one-link regular file\n' >&2
   exit 1
 fi
-proof_require_governed_policy "$candidate_policy" "$baseline_policy"
+# The baseline is protected-main bytes and is never edited: a differing
+# candidate policy needs a digest-pinned transition recorded on protected main.
+proof_require_governed_policy "$candidate_policy" "$baseline_policy" \
+  "${baseline_parent}/repo/ops/ci/policy-transitions.txt"
 audit_base_commit="$base_commit"
-if ! cmp -s "$candidate_policy" "$baseline_policy"; then
-  # The baseline audit must remain clean and use the very same scoring policy
-  # as this head. Commit exactly the already-checked version line on main.
-  cp -- "$candidate_policy" "$baseline_policy"
-  git -C "${baseline_parent}/repo" -c user.name=proof-evidence \
-    -c user.email=proof-evidence@invalid -c commit.gpgsign=false \
-    commit --quiet -m 'proof baseline: governed version only' -- agent/audit-policy.toml
-  audit_base_commit="$(git -C "${baseline_parent}/repo" rev-parse HEAD)"
-  [[ "$(git -C "${baseline_parent}/repo" rev-parse HEAD^)" == "$base_commit" &&
-     "$(git -C "${baseline_parent}/repo" diff --name-only "$base_commit" "$audit_base_commit")" == agent/audit-policy.toml &&
-     -z "$(git -C "${baseline_parent}/repo" status --porcelain=v1 --untracked-files=all)" ]]
-fi
 (
   cd "${baseline_parent}/repo"
   mkdir -p .jankurai

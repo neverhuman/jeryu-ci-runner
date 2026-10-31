@@ -159,15 +159,28 @@ proof_require_migration "$fixture/base" /base "$fixture/head" . ||
   fail 'gated on free-text rollback notes'
 printf 'proof migration guard ok\n'
 
-# The rendered auditor version is the only policy transition allowed.
+# Policy stays protected-main bytes unless a digest-pinned transition is authorized.
+g=proof_require_governed_policy
 printf '%s\n' 'minimum_score = 80' 'required_tool_version = "1.7.5"' > "$fixture/protected-policy"
 printf '%s\n' 'minimum_score = 80' 'required_tool_version = "1.7.6"' > "$fixture/candidate-policy"
-JERYU_JANKURAI_SEMVER=1.7.6 proof_require_governed_policy "$fixture/candidate-policy" "$fixture/protected-policy" || fail 'governed version-only update refused'
-if JERYU_JANKURAI_SEMVER=1.7.5 proof_require_governed_policy "$fixture/candidate-policy" "$fixture/protected-policy"; then fail 'ungoverned version accepted'; fi
-printf '%s\n' 'minimum_score = 79' 'required_tool_version = "1.7.6"' > "$fixture/candidate-policy"
-if JERYU_JANKURAI_SEMVER=1.7.6 proof_require_governed_policy "$fixture/candidate-policy" "$fixture/protected-policy"; then fail 'lowered floor accepted'; fi
-printf '%s\n' 'minimum_score = 80' 'required_tool_version = "1.7.6"' 'required_tool_version = "1.7.7"' > "$fixture/candidate-policy"
-if JERYU_JANKURAI_SEMVER=1.7.6 proof_require_governed_policy "$fixture/candidate-policy" "$fixture/protected-policy"; then fail 'duplicate version accepted'; fi
+pd="$(sha256sum "$fixture/protected-policy" | cut -d' ' -f1)"
+cd_="$(sha256sum "$fixture/candidate-policy" | cut -d' ' -f1)"
+zero="$(printf '%064d' 0)"
+$g "$fixture/protected-policy" "$fixture/protected-policy" || fail 'identical policy refused'
+if $g "$fixture/candidate-policy" "$fixture/protected-policy" 2>/dev/null; then fail 'unauthorized policy change accepted'; fi
+if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/missing" 2>/dev/null; then fail 'missing authorization accepted'; fi
+printf '# pinned\n\n%s %s\n' "$pd" "$cd_" > "$fixture/authz"
+$g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz" || fail 'pinned transition refused'
+printf '%s %s\n' "$cd_" "$pd" > "$fixture/authz-rev"
+if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-rev" 2>/dev/null; then fail 'reversed pin accepted'; fi
+printf '%s %s\n' "$pd" "$zero" > "$fixture/authz-other"
+if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-other" 2>/dev/null; then fail 'pin for another candidate accepted'; fi
+printf '%s\n' 'minimum_score = 79' 'required_tool_version = "1.7.6"' > "$fixture/tampered-policy"
+if $g "$fixture/tampered-policy" "$fixture/protected-policy" "$fixture/authz" 2>/dev/null; then fail 'tampered floor accepted under a pin for other bytes'; fi
+printf '%s %s extra\n' "$pd" "$cd_" > "$fixture/authz-bad"
+if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-bad" 2>/dev/null; then fail 'malformed authorization accepted'; fi
+ln -s authz "$fixture/authz-link"
+if $g "$fixture/candidate-policy" "$fixture/protected-policy" "$fixture/authz-link" 2>/dev/null; then fail 'symlinked authorization accepted'; fi
 printf 'proof governed policy guard ok\n'
 
 # --- wiring tripwires ---------------------------------------------------------
@@ -181,6 +194,10 @@ grep -q 'agent/baselines' "$lane" &&
   fail 'the lane names agent/baselines, an in-tree baseline' || :
 grep -q 'proof_require_governed_policy "$candidate_policy" "$baseline_policy"' "$lane" ||
   fail 'the lane does not check that main policy judges this head'
+grep -q 'ops/ci/policy-transitions.txt' "$lane" ||
+  fail 'the lane does not read transitions from the protected-main tree'
+grep -q 'cp -- "$candidate_policy" "$baseline_policy"' "$lane" &&
+  fail 'the lane mutates the protected-main baseline policy' || :
 # Every `>` redirect into target/ is this run's summary; a `printf > target/...`
 # fallback would be a result nobody produced. (cp and tee are not covered.)
 while IFS= read -r line; do
