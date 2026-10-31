@@ -4,7 +4,18 @@ set -euo pipefail
 while read -r leaked; do unset "$leaked"; done < <(compgen -e | grep -E '^(GATE_RUNNER_|JERYU_|PR_GATE_)' || true)
 here=$(cd "$(dirname "$0")/../bin" && pwd)
 scratch=$(mktemp -d)
-trap 'rm -rf -- "$scratch"' EXIT
+claims_fixture_owner=$BASHPID
+cleanup_claims_fixture() {
+  # Forked renewers must never remove the fixture still used by their parent.
+  [[ "$BASHPID" == "$claims_fixture_owner" ]] || return 0
+  rm -rf -- "$scratch"
+}
+trap cleanup_claims_fixture EXIT
+# Exercise the inherited EXIT handler deterministically: a renewer killed during
+# Bash startup can still run the parent's trap before its child state is reset.
+claims_cleanup_trap=$(trap -p EXIT)
+( eval "$claims_cleanup_trap" )
+[[ -d "$scratch" ]] || { printf 'child cleanup removed the parent fixture\n' >&2; exit 1; }
 HOME_DIR="$scratch/state" SLOT=0 RUNNER_HOST=gate-a MARKER=fixture
 mkdir -p "$HOME_DIR/cache"
 AUTH_CONFIG="$scratch/auth" BASE=https://forge.invalid
