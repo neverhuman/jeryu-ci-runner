@@ -274,12 +274,28 @@ printf 'PASS gate claims: a lease lost mid-recipe stops the recipe and publishes
 # one the production runner accepts (30s, renewed every 10s; a shorter one is clamped to 180s), so
 # the renewal interval is real. First a live renewal is observed, which proves the observation below
 # would see a renewer that survived. A renewal request may still be in flight at the kill, so the
-# grants are counted only once the slot's own processes and every fixture request are gone. The
-# window then covers at least one whole renewal interval and the lease itself: no further grant, and
-# the lease record untouched; then a second runner is granted the head.
+# grants are counted only once this slot's own processes and its own in-flight requests are gone:
+# the children the live slot had, by pid (its renewer among them), and any request through this
+# fixture's curl. Only what belongs to this fixture may be waited for -- the suites of this
+# repository run side by side (ops/ci/run-suites.sh) and others gate `acme/fixture#1` through the
+# same runner path, so a wait on that command line would wait for another suite's slot and report a
+# renewer this slot never had. The window then covers at least one whole renewal interval and the
+# lease itself: no further grant, and the lease record untouched; then a second runner is granted
+# the head.
+slot_children=""
 renewer_gone() {
-  ! pgrep -f "$script_dir/pr-gate-runner.sh --repo acme/fixture --pr 1" >/dev/null \
-    && ! pgrep -f "$fixture/tools/curl" >/dev/null
+  local p
+  for p in $slot_children; do kill -0 "$p" 2>/dev/null && return 1; done
+  ! pgrep -f "$fixture/tools/curl" >/dev/null
+}
+# Exactly what renewer_gone still sees, so a failure names the processes it waited for rather than
+# re-asking a question whose answer has moved on.
+renewer_remains() {
+  local p
+  for p in $slot_children; do
+    kill -0 "$p" 2>/dev/null && ps -o pid=,ppid=,args= -p "$p" 2>/dev/null
+  done
+  pgrep -af "$fixture/tools/curl" || true
 }
 touch "$fixture/recipe-hold"
 rm -f "$fixture/recipe-started" "$fixture/recipe-finished" "$fixture/recipe-release" "$fixture/recipe-ticks"
@@ -294,15 +310,32 @@ granted_now() { grep -c "acme/fixture $head " "$fixture/claims-granted.log"; }
 # The grant and one renewal by the live slot (the recipe holds for a minute, longer than an interval).
 for _ in $(seq 400); do (( $(granted_now) >= 2 )) && break; sleep 0.1; done
 (( $(granted_now) >= 2 )) || fail_claims "the live slot never renewed its lease (renewer log: $(cat "$fixture/runner/cache/gate-claim-slot0/renewer.log" 2>/dev/null))"
+# Every process the live slot has, by pid, down the whole tree: the renewer is a fork of the
+# runner's own shell, and the renewal just observed proves one is there. A slot with nothing under
+# it would make the observation after the kill vacuous, so that is refused here.
+slot_tree() {
+  local p kids
+  for p in "$@"; do
+    printf '%s ' "$p"
+    kids=$(pgrep -P "$p" | tr '\n' ' ' || true)
+    [[ -z "$kids" ]] || slot_tree $kids
+  done
+}
+slot_children=$(slot_tree "$killed"); slot_children=${slot_children% }
+(( $(wc -w <<<"$slot_children") >= 2 )) \
+  || fail_claims "the live slot ran nothing that could outlive it: $(ps -o pid=,ppid=,args= -p "${slot_children// /,}" 2>/dev/null)"
 kill -9 "$killed"; wait "$killed" 2>/dev/null || true
-# The recipe is a fork of the runner and shares its command line: let it end so that what remains
-# under that command line can only be a renewer.
+# The orphaned recipe is one of those pids too: let it end, so that anything of this slot still
+# alive afterwards can only be renewing its head.
 touch "$fixture/recipe-release"
 for _ in $(seq 300); do [[ -e "$fixture/recipe-finished" ]] && break; sleep 0.1; done
 [[ -e "$fixture/recipe-finished" ]] || fail_claims 'the orphaned recipe did not end'
 # A surviving renewer wakes within one interval and ends, or renews, then; wait that long.
 for _ in $(seq $(( (renew_every + 10) * 10 ))); do renewer_gone && break; sleep 0.1; done
-renewer_gone || fail_claims "a renewer or request outlived its killed runner: $(pgrep -af "pr-gate-runner.sh --repo acme/fixture|$fixture/tools/curl" 2>/dev/null) / $(cat "$fixture/runner/cache/gate-claim-slot0/renewer.log" 2>/dev/null)"
+renewer_gone || fail_claims "a renewer or request outlived its killed runner (slot pids $slot_children):
+$(renewer_remains)
+--- renewer.log
+$(cat "$fixture/runner/cache/gate-claim-slot0/renewer.log" 2>/dev/null)"
 drained=$(date +%s)
 grants=$(granted_now)
 read -r _ _ expiry <"$claim" || fail_claims 'the killed slot left no lease record'
