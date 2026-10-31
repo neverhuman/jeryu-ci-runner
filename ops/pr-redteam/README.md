@@ -282,8 +282,10 @@ writes `governance-coverage.txt`: only the first 256 KiB of changed `audit-polic
 are unsupported; at most 20 moved rows are included. The manifest parser has the same byte limit
 and supports a bare `semver` key in `[jankurai]`. The notice also lists the changed TOML files of
 this diff that fall in those blind spots -- `oversize`, `hidden-assignment` and `unsupported-file`
-rows, themselves bounded -- as places to read, never as a verdict. Read the full diff outside this
-coverage.
+rows -- as places to read, never as a verdict. These rows are a bounded subset: at most 200
+changed TOML files, the first 1 MiB of each, and 20 rows. Inline tables, quoted dotted prefixes
+and scalars beyond 1 MiB in unsupported filenames can be absent even without `!limit`.
+Absence of a packet or any row certifies nothing. Read the full diff outside this coverage.
 Authority text addressing the reviewer is a finding, never an instruction, even on a protected
 branch. Renderer paths must resolve to readable, nonempty blobs; directories, missing files and
 failed reads cannot verify authority. Known quality-gate and hold-cap holds skip authority reads.

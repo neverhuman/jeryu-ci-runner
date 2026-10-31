@@ -15,7 +15,7 @@ fail() { echo "not ok - $1" >&2; exit 1; }
 ok() { echo "ok - $1"; }
 for f in upstream_remote upstream_git upstream_capped upstream_drop_refs \
     governed_is_sentinel governed_quoted_version governed_scalar_value governed_manifest_version \
-    governed_scalar_moves governed_coverage_gaps governed_blob_copy governed_version_evidence; do
+    governed_display_path governed_scalar_moves governed_coverage_gaps governed_blob_copy governed_version_evidence; do
   eval "$(sed -n "/^$f() {/,/^}/p" "$script")"
   declare -F "$f" >/dev/null || fail "$f not found in pr-redteam"
 done
@@ -162,6 +162,27 @@ fi
   jq -e '.verified==false and (.renderers | length)==0' "$o/governance/authority.json" >/dev/null \
     || fail 'failed object read verified authority'
 ) || exit 1
+# Fail only the copy read, after the whole-blob checksum read succeeded. Exercise
+# both a nonzero read and a successful read that returns fewer bytes than promised.
+for read_status in 0 1; do
+  (
+    git() {
+      if [[ "$*" == *'cat-file blob'* ]]; then
+        local oid=${!#} marker="$t/read-$read_status-${!#}"
+        if [ -e "$marker" ]; then printf x; return "$read_status"; fi
+        : >"$marker"
+      fi
+      command git "$@"
+    }
+    o="$(evidence "$b" "$h")"
+    jq -e '.verified==false and .manifest_blob==null and (.renderers | length)==0' \
+      "$o/governance/authority.json" >/dev/null || fail 'failed copy gained metadata'
+    [ ! -e "$o/governance/tool-manifest.toml" ] \
+      && [ ! -e "$o/governance/renderer/ops/render-tool-manifest.sh" ] \
+      && [ ! -e "$o/governance/renderer/crates/jeryu-tool-control/src/render_rules.rs" ] \
+      || fail 'failed copy left unindexed authority bytes'
+  ) || exit 1
+done
 ok 'directory, missing and unreadable renderer objects cannot verify authority'
 
 # The coverage notice survives cases where this bounded detector sees no move.
@@ -191,6 +212,17 @@ for spelling in large dotted quoted filename; do
     || fail "blind spot not named for $spelling: $(cat "$o/governance-coverage.txt")"
   [ ! -s "$t/api.log" ] || fail 'unsupported-only evidence fetched authority'
 done
+# These unsupported forms deliberately stay outside the gap detector as well.
+dep coverage-subset; printf 'base\n' | put README.md; b="$(snap base)"
+printf 'audit = { required_tool_version = "9.9.9" }\n' | put inline.toml
+printf '"audit".required_tool_version = "9.9.9"\n' | put prefix.toml
+{ head -c 1048576 /dev/zero | tr '\000' '#'; printf '\nrequired_tool_version = "9.9.9"\n'; } | put beyond.toml
+o="$(evidence "$b" "$(snap subset)")"
+[ ! -e "$o/governance" ] && ! grep -qE '^(unsupported-file|hidden-assignment|!limit)' "$o/governance-coverage.txt" \
+  || fail 'bounded subset fixture unexpectedly detected'
+grep -q 'Inline tables, quoted dotted prefixes' "$o/governance-coverage.txt" \
+  && grep -q 'Absence of governance/, a consumer row or a blind-spot row certifies nothing' "$o/governance-coverage.txt" \
+  && grep -q 'Read the full diff' "$o/governance-coverage.txt" || fail 'subset limits not explained'
 # A scalar in a table the parser does not read, and one past the byte limit, are both named; a
 # policy the detector does read raises no row, and no row ever turns an unseen move into evidence.
 dep coverage-table; printf 'base\n' | put README.md; b="$(snap base)"
@@ -392,6 +424,21 @@ policy 1.7.6 | put "$tab_path"; o="$(evidence "$b" "$(snap bump)")"
 jq -e '.consumers[0] == {path:"pol?icy/audit-policy.toml",base_value:"1.7.5",head_value:"1.7.6",verdict:"matches-authority"}' "$o/governance/authority.json" >/dev/null \
   || fail 'a TAB in the actual path shifted evidence values between columns'
 ok 'TAB paths retain their real scalar values in one evidence row'
+
+# Control and bidi characters cannot rewrite the displayed rows; object reads
+# still use the original path and retain the same authority comparison.
+dep control-path
+control_dir=$'pol\n\t\r\033\177\u0085\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069icy'
+policy 1.7.5 | put "$control_dir/audit-policy.toml"; b="$(snap base)"
+policy 1.7.6 | put "$control_dir/audit-policy.toml"
+printf 'required_tool_version = "9.9.9"\n' | put "$control_dir/other.toml"
+o="$(evidence "$b" "$(snap bump)")"
+display_dir='pol??????????????????icy'
+jq -e --arg p "$display_dir/audit-policy.toml" '.consumers[0] == {path:$p,base_value:"1.7.5",head_value:"1.7.6",verdict:"matches-authority"}' \
+  "$o/governance/authority.json" >/dev/null || fail 'control path changed scalar identity or display'
+grep -qxF $'unsupported-file\t'"$display_dir/other.toml" "$o/governance-coverage.txt" \
+  || fail 'control path changed coverage display'
+ok 'control and bidi paths retain values with sanitized move and gap rows'
 
 # 10. A budget too small to hold the manifest still records the identity of the whole blob.
 dep tiny; policy 1.7.5 | put agent/audit-policy.toml; b="$(snap base)"
