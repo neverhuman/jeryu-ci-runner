@@ -125,6 +125,12 @@ case "\$url" in
     printf '%s\n' "\$url" >>"$fx/forge/global-queue.log"
     answer '{"code":"invalid_query","message":"this fixture answers only the per-repository listing"}' 422;;
   */api/v1/repos/*/merge-queue\?*)
+    if [[ -e "$fx/forge/queue.status" ]]; then
+      st=\$(cat "$fx/forge/queue.status")
+      [[ "\$st" != timeout ]] || exit 28
+      [[ "\$st" != malformed ]] || { answer '{"entries":"not-an-array","page":{"has_more":false}}' 200; exit 0; }
+      answer nope "\$st"; exit 0
+    fi
     if [[ -e "$fx/forge/queue-strict" ]]; then
       # The route reads limit, per_page and page only (QueuePageQuery::KEYS); strict_query answers
       # any other key with invalid_query at 422, so model exactly that.
@@ -146,7 +152,10 @@ case "\$url" in
     elif [[ -e "$fx/forge/queue.json" ]]; then answer "\$(jq -c '{entries: ., page: {has_more: false}}' "$fx/forge/queue.json")" 200
     else answer 'missing queue fixture' 500; fi;;
   */pulls\?state=open*)
-    if [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"
+    if [[ -e "$fx/forge/pulls.status" ]]; then
+      st=\$(cat "$fx/forge/pulls.status")
+      [[ "\$st" != timeout ]] || exit 28
+      answer nope "\$st"
     elif [[ -e "$fx/forge/listing-overflow" ]]; then
       # A repository whose open pull requests outrun every page this host reads, as a large forge
       # answers it: each page reports another one after it.
@@ -1033,14 +1042,16 @@ must 'a bound queue job with contributed origin is released' test "$(released | 
 must 'a bound contributed queue job is never cloned' test ! -s "$fx/git-helper.log"
 must 'a bound contributed queue job submits nothing' test "$(scores)" == "$before"
 # Every bound queue refusal uses the existing ADR0011 vocabulary and releases immediately.
-for scenario in missing malformed unmarked http stale range bottom content duplicate; do
+for scenario in missing malformed unmarked listing-404 pulls-404 listing-unreadable stale range bottom content duplicate; do
   qlive
   bbranch=refs/queue/main/2; bbase=$QBASE
   case "$scenario" in
     missing) printf '[]\n' >"$fx/forge/queue.json" ;;
     malformed) jq 'map(if .number == 2 then del(.base_sha) else . end)' "$fx/forge/queue.json" >"$fx/forge/q.tmp"; mv "$fx/forge/q.tmp" "$fx/forge/queue.json" ;;
     unmarked) qlive '[]' ;;
-    http) printf '503\n' >"$fx/forge/pulls.status" ;;
+    listing-404) printf '404\n' >"$fx/forge/queue.status" ;;
+    pulls-404) printf '404\n' >"$fx/forge/pulls.status" ;;
+    listing-unreadable) printf 'malformed\n' >"$fx/forge/queue.status" ;;
     stale) git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ1" ;;
     range) bbase=$QQ1 ;;
     bottom) jq 'map(select(.number != 1))' "$fx/forge/queue.json" >"$fx/forge/q.tmp"; mv "$fx/forge/q.tmp" "$fx/forge/queue.json" ;;
@@ -1054,9 +1065,32 @@ for scenario in missing malformed unmarked http stale range bottom content dupli
   must "bound queue $scenario is released immediately" test "$(released | cut -d' ' -f2)" == "$want"
   must "bound queue $scenario is never checked out" test ! -s "$fx/checkout.log"
   must "bound queue $scenario produces no score" test "$(scores)" == "$before"
-  rm -f "$fx/forge/pulls.status"
+  rm -f "$fx/forge/pulls.status" "$fx/forge/queue.status"
   git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ2"
 done
+# A transient forge answer says nothing about the ticket. Such a listing failure must never hand a
+# valid queue job back as malformed data (a released job is never scored): it is left to its lease so
+# a later pass retries it, and the very same ticket is audited once the forge answers again.
+for listing in queue pulls; do
+  for fault in 429 503 timeout; do
+    qlive
+    printf '%s\n' "$fault" >"$fx/forge/$listing.status"
+    bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" internal proof "$SSHA" 9.9.9 refs/queue/main/2
+    : >"$fx/forge/releases.log"; : >"$fx/checkout.log"; : >"$fx/jankurai.log"; before=$(scores); run
+    must "a $fault listing $listing hands nothing back" test ! -s "$fx/forge/releases.log"
+    must "a $fault listing $listing leaves the ticket to its lease" grep -q 'leaving the ticket to its lease to retry' "$fx/out"
+    must "a $fault listing $listing is never called malformed" test "$(grep -c malformed "$fx/out" || true)" == 0
+    must "a $fault listing $listing checks out nothing" test ! -s "$fx/checkout.log"
+    must "a $fault listing $listing audits nothing" test ! -s "$fx/jankurai.log"
+    must "a $fault listing $listing submits nothing" test "$(scores)" == "$before"
+    rm -f "$fx/forge/$listing.status" "$fx/home/cache/forge-backoff"
+    bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" internal proof "$SSHA" 9.9.9 refs/queue/main/2
+    before=$(scores); run
+    must "the ticket held through a $fault listing $listing is still audited" test "$(scores)" == "$((before + 1))"
+  done
+done
+printf 'PASS transient listing failures keep a valid queue ticket claimable instead of discarding it\n'
+
 # A legal ordinary branch named queue/main/2 is not the forge's canonical refs/queue ref.
 # The head is advertised by the bare repository as refs/heads/queue/main/2, so a clone carries it by
 # ordinary branch reachability rather than through refs/queue.

@@ -581,7 +581,11 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    unsupported replay and asks for a simplified, conflict-free source and queue rebuild; it does
    not establish that the content is undeclared. A differing single-commit tree remains a content
    refusal. None of these failures permits checkout or proof submission. Bound refusals release
-   immediately with the existing ADR0011 vocabulary; the exact web-queue field contract is recorded in
+   immediately with the existing ADR0011 vocabulary, except a transient answer to either queue
+   listing (HTTP 429, 408, any 5xx, or no answer at all -- a timeout or a dropped connection), which
+   says nothing about the ticket: that job remains claimable after its lease expires, so a later
+   pass retries it instead of discarding a valid ticket as `malformed-ticket`. Any other 4xx or a
+   page this host cannot read is unusable queue data and refuses at once; the exact web-queue field contract is recorded in
    [ADR0003](../../docs/adr/0003-audit-admission-addendum.md#merge-queue-replay-contract-and-content-binding).
    Ordinary branches named `queue/...` keep ordinary admission. Bound queue jobs must also say `origin: internal`. Contributions in queue jobs remain refused,
    even on sandbox-ready hosts (see the ADR 0003 addendum). A job left alone is not refused on the forge (there is no route for

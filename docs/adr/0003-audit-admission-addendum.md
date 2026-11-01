@@ -136,7 +136,8 @@ forge shaped like that route: strict query keys, the recorded paging envelope
 split one entry per page so a multi-entry stack is assembled only by following
 `page.has_more`, and a dispatched base computed with the forge's own
 `merge-base` expression while `main` is ahead of the stack. A listing the route
-refuses (422) or fails (503) refuses the ticket before any checkout. This is
+refuses (422) releases the ticket before any checkout; a transient failure (503)
+leaves it claimable after its lease expires, also without checkout. This is
 consumer contract evidence, not a live governed audit.
 
 ### Forge link verification
@@ -161,3 +162,13 @@ IDs, matching `git ls-tree` in the protected repository's local mirror:
 
 These are dated link and content checks; the ADR link follows `main`, while
 the implementation link retains its immutable commit pin.
+
+A released job is never scored, so a release reason must describe the ticket,
+not the transport. A merge-queue or pull-request listing that fails transiently
+-- HTTP 429, 408 or any 5xx, or no answer at all, such as a timeout -- is
+therefore not a malformed ticket: the job is not released at all, so it lapses
+with its lease and a later pass claims and audits the same valid ticket. Structural
+refusals are unchanged and immediate: any other 4xx answer, an unreadable or
+non-array page, exceeding the queue-list pagination bound, and every queue-content check
+still release at once with the reasons above. Nothing is checked out on either
+path.

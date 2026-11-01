@@ -451,6 +451,25 @@ forge_pages() {
   return 1
 }
 
+# transient_listing_code CODE: true when a failed forge listing may well succeed on a later pass --
+# a rate limit, a server-side failure or a transport failure ($code 000 from curl, including a
+# timeout). Such an answer says nothing about the ticket, so it must never be mistaken for unusable
+# queue data.
+transient_listing_code() { [[ "$1" == 000 || "$1" == 408 || "$1" == 429 || "$1" =~ ^5[0-9][0-9]$ ]]; }
+
+# queue_listing_refusal WHAT: why a failed queue listing refuses this ticket, as
+# "<release reason>|<explanation>". A transient answer carries no release reason: the ticket is left
+# to its lease and comes back on a later pass, rather than being handed back as malformed data and
+# never scored. Anything else -- a 4xx, or a page this host cannot read -- is unusable queue data and
+# refuses terminally with the existing reason.
+queue_listing_refusal() {
+  if transient_listing_code "$pages_code"; then
+    printf '|the forge answered %s listing %s; leaving the ticket to its lease to retry' "$pages_code" "$1"
+  else
+    printf 'malformed-ticket|the forge answered %s listing %s' "$pages_code" "$1"
+  fi
+}
+
 # forge_pr OWNER REPO NUMBER: the forge's own row for one pull request in $pr_row, as a lookup bounded
 # by the stack depth rather than by how many pull requests the repository has open. The listing route
 # is filtered to open rows and this one is not, so a row stands in for a listed one only when the
@@ -504,7 +523,7 @@ queue_admission() {
   rm -f -- "$WORK_DIR/queue-bottom"
   : >"$WORK_DIR/queue-stack"
   forge_pages "/api/v1/repos/$owner%2F$repo/merge-queue" \
-    || { printf 'malformed-ticket|the forge answered %s listing its merge queue' "$pages_code"; return; }
+    || { queue_listing_refusal 'its merge queue'; return; }
   entries=$pages
   if forge_pages "/api/v1/repos/$owner%2F$repo/pulls?state=open"; then
     prs=$pages
@@ -513,7 +532,7 @@ queue_admission() {
     # then read by number instead, which binds the same head and marking without any listing.
     prs=unlisted
   else
-    printf 'malformed-ticket|the forge answered %s listing its pull requests' "$pages_code"; return
+    queue_listing_refusal 'its pull requests'; return
   fi
   entry="$(jq -c --arg r "$owner/$repo" --arg ref "$ref" --arg sha "$head" \
     '[.[] | select(.repo == $r and .queue_ref == $ref and .queue_sha == $sha and .state == "building")] | if length == 1 then .[0] else empty end' <<<"$entries")"
