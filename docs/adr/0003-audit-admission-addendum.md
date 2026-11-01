@@ -4,7 +4,7 @@ Status: Accepted (implementation; live host probe remains an owner step)
 Date: 2026-10-21
 
 This adds to jeryu-deploy's
-[ADR 0003](https://git.neverhuman.org/jeryu/jeryu-deploy/blob/main/docs/adr/0003-gating-runs-on-a-dedicated-gate-host.md)
+[ADR 0003](https://git.jeryu.ai/jeryu/jeryu-deploy/blob/main/docs/adr/0003-gating-runs-on-a-dedicated-gate-host.md)
 and uses its ADR 0011 bound audit-ticket contract (continued by ADR 0012).
 
 A served repository's bound ticket admits its exact head regardless of which
@@ -115,7 +115,7 @@ is introduced.
 
 The protected implementation is authoritative for all three couplings, in
 jeryu-deploy at `60da213c7cd1eb8d1459e5b1ceda252616b5de9d`
-(this installation's forge serves it at `https://git.neverhuman.org/jeryu/jeryu-deploy`):
+(this installation's forge serves it at `https://git.jeryu.ai/jeryu/jeryu-deploy`):
 
 - The listing this host reads is registered in `crates/jeryu-api/src/web.rs`
   as `("/api/v1/repos/:id/merge-queue", get(merge_queue::list_repo))`; it lists
@@ -138,3 +138,26 @@ split one entry per page so a multi-entry stack is assembled only by following
 `merge-base` expression while `main` is ahead of the stack. A listing the route
 refuses (422) or fails (503) refuses the ticket before any checkout. This is
 consumer contract evidence, not a live governed audit.
+
+### Forge link verification
+
+Documentation links here use `git.jeryu.ai`, the web origin advertised by
+both deployment aliases in `GET /api/v1/repos?limit=100` on 2026-11-01.
+`git.neverhuman.org` also resolves these files; it remains this runner's
+canonical Git transport host (see the repository README). This web-link choice
+does not change dependency URLs or Git transport policy.
+
+Read-only HTTPS checks returned 200 for both linked `/blob/` paths on both
+hosts. Because those responses contain the web app shell, file identity was
+also checked through `GET /api/v1/repos/<id>/raw?ref=<ref>&path=<path>` on
+each host. Both repository listings identified `jeryu/jeryu-deploy` as
+`83e8174f-e3e5-437d-a7ce-dd789c0d909d`. The returned bytes had these Git blob
+IDs, matching `git ls-tree` in the protected repository's local mirror:
+
+| File | Ref | Git blob ID |
+| --- | --- | --- |
+| `docs/adr/0003-gating-runs-on-a-dedicated-gate-host.md` | `main` | `af77eccb9f4d28171df4308c3e44485da460529c` |
+| `crates/jeryu-api/src/web/merge_queue.rs` | `60da213c7cd1eb8d1459e5b1ceda252616b5de9d` | `13fbf61683d4f1a261bd16191bda6eba5d2ba324` |
+
+These are dated link and content checks; the ADR link follows `main`, while
+the implementation link retains its immutable commit pin.
