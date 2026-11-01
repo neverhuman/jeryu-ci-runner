@@ -2187,15 +2187,23 @@ gate_finish "$state" "$worker_exit" "$log"
 if ((build_cache)) && [[ "$tier" == fast && "$state" == success && "${tiers[-1]}" != fast ]]; then
   :
 elif ((build_cache)); then
+  # The store is the whole host family's, and nothing in a receipt can take a write to it back: it
+  # is written only under the same granted lease a forge write needs. A green verdict the lease was
+  # lost for is saved and owed, but another host may hold this head and be publishing its own version
+  # now, so neither `current` nor the versions it keeps are touched here. The slot's copy goes below.
   if [[ "$state" == success ]] && { [[ "$qref" =~ ^refs/queue/ ]] || ((main_health)); }; then
-    publish_rc=0
-    gate_golden_publish "$build_cache_store" "$build_cache_key" "$run/$repo/target/build-cache" \
-      "$(jq -r '.id' "$gate_receipt")" || publish_rc=$?
-    case "$publish_rc" in
-      0) say "published $owner/$repo build cache as the shared version for its key";;
-      2) say "$owner/$repo build cache is over the size limit; withdrawn, the next landing gate starts it fresh";;
-      *) say "could not publish $owner/$repo build cache; the store keeps its current version";;
-    esac
+    if ! gate_claim_authorizes_shared; then
+      say "$owner/$repo build cache not published: no gate claim on the head; the store keeps its current version"
+    else
+      publish_rc=0
+      gate_golden_publish "$build_cache_store" "$build_cache_key" "$run/$repo/target/build-cache" \
+        "$(jq -r '.id' "$gate_receipt")" || publish_rc=$?
+      case "$publish_rc" in
+        0) say "published $owner/$repo build cache as the shared version for its key";;
+        2) say "$owner/$repo build cache is over the size limit; withdrawn, the next landing gate starts it fresh";;
+        *) say "could not publish $owner/$repo build cache; the store keeps its current version";;
+      esac
+    fi
   fi
   rm -rf -- "$run/$repo/target/build-cache"
 fi

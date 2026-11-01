@@ -231,6 +231,21 @@ gate_claim_recheck() {
   ((rc != 1)) || gate_claim_mark_lost "$(gate_claim_kind_of "$rc")" "recheck answered $code"
   return 0
 }
+# gate_claim_authorizes_shared -- 0 only when the forge confirms, right now, that this slot still
+# holds the head it is gating. Writes to the shared build-cache store (its `current` pointer and the
+# pruning of every other version) are the whole host family's, outside any receipt: unlike a forge
+# write they cannot be retained for recovery, and the host that does hold the head cannot undo them.
+# So they need the same granted, unlost lease every forge write needs (gate_claim_authorize_path),
+# and an answer that proves nothing authorizes nothing. A definitive refusal is recorded in the lost
+# marker, as every other check records it.
+gate_claim_authorizes_shared() {
+  local rc=0
+  ((GATE_CLAIM_HELD)) || return 1
+  [[ ! -f "$GATE_CLAIM_STATE/lost" ]] || return 1
+  gate_claim_renew || rc=$?
+  ((rc != 1)) || gate_claim_mark_lost "$(gate_claim_kind_of "$rc")" "shared-cache renewal answered $code"
+  ((rc == 0))
+}
 # gate_claim_abandon WHY -- the attempt this slot ran without its lease ends here, with nothing
 # published. What is owed afterwards follows from two facts, and from nothing else:
 #

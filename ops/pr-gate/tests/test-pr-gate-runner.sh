@@ -1649,6 +1649,7 @@ queue_gate() { # a fresh replay on refs/queue/main/1, gated through the queue
   "$real_git" -C "$fixture/source" add queued
   "$real_git" -C "$fixture/source" commit -qm "cache queue replay $queued_n"
   qsha=$("$real_git" -C "$fixture/source" rev-parse HEAD)
+  queued_sha=$qsha
   "$real_git" -C "$fixture/source" push -q -f "$fixture/source.git" "HEAD:refs/queue/main/1"
   "$real_git" -C "$fixture/source" checkout -q main
   queue_entry "$qsha" refs/queue/main/1
@@ -1697,6 +1698,33 @@ rm -f "$fixture/fail-build-cache"
 queue_gate
 read -r republished _ <"$store/current"
 [[ "$republished" != "$published" && ! -e "$store/versions/$published" && -d "$store/versions/$republished" ]]
+# A green queue gate that loses its lease as the recipe completes publishes nothing shared: the host
+# that holds the head now may be publishing its own version, so `current` keeps pointing where it
+# did and no other version is pruned. The verdict itself is still saved and owed for recovery.
+mkdir -p "$store/versions/parked"
+touch "$fixture/steal-after-recipe"
+queue_gate
+rm -f "$fixture/steal-after-recipe" "$fixture/steal-pending-$queued_sha" \
+  "$fixture/claims/acme-fixture-$queued_sha"
+grep -q 'build cache not published: no gate claim on the head' "$fixture/runner.log" \
+  || { printf 'a lease-lost queue gate published the shared cache\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+[[ "$(cat "$store/current")" == "$republished "* && -d "$store/versions/$republished" ]] \
+  || { printf 'a lease-lost queue gate replaced the shared current version\n' >&2; ls -laR "$store" >&2; exit 1; }
+[[ -d "$store/versions/parked" ]] \
+  || { printf 'a lease-lost queue gate pruned the previous shared versions\n' >&2; ls -laR "$store" >&2; exit 1; }
+[[ ! -e "$target/build-cache" ]] \
+  || { printf 'a lease-lost queue gate kept its slot copy of the build cache\n' >&2; exit 1; }
+! grep -q 'abandoning attempt' "$fixture/runner.log" \
+  || { printf 'a completed verdict was abandoned instead of retained\n' >&2; exit 1; }
+jq -e '.terminal and .outcome == "success" and .recovery_required != null' \
+  "$fixture/runner/attempts/acme-fixture-$queued_sha/last-result.json" >/dev/null \
+  || { printf 'the lease-lost queue verdict was not retained for recovery\n' >&2; exit 1; }
+# With the lease held, the same green queue gate publishes again and prunes what it replaced.
+queue_gate
+read -r third _ <"$store/current"
+[[ "$third" != "$republished" && -d "$store/versions/$third" \
+   && ! -e "$store/versions/$republished" && ! -e "$store/versions/parked" ]] \
+  || { printf 'an owned green queue gate stopped publishing the shared cache\n' >&2; ls -laR "$store" >&2; exit 1; }
 unset PR_GATE_BUILD_CACHE_REPOS
 new_head
 invoke

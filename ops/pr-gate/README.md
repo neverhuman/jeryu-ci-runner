@@ -172,8 +172,13 @@ the slot's copy is either published or deleted; no slot keeps a cache between ga
 holds one cache per repository plus one per busy slot.
 
 Only a green **merge-queue** gate or a green **main-health** gate publishes: commits that are
-approved and landing on main. A pull-request head is unreviewed until it is queued, so it reads the
-shared cache and never writes it. Contributions get a clean target and no cache variable, and the
+approved and landing on main, and only while the forge still confirms this slot as the holder of the
+head's lease. The store belongs to every slot on the host and no receipt can take a write to it
+back, so a slot whose lease was lost (or can no longer be proved) as its recipe finished publishes
+nothing shared: `current` keeps pointing where it did, no version is pruned, and the slot's copy is
+deleted. The green verdict itself is still saved and recovered separately, under a fresh lease.
+A pull-request head is unreviewed until it is queued, so it reads the shared cache and never
+writes it. Contributions get a clean target and no cache variable, and the
 store lives outside the slot tree a sandbox sees. Publishing is a rename onto the store's filesystem
 and an atomic replacement of `current`; older versions are pruned unless a gate is still copying
 them (each version has a lock a reader holds while copying). The key binds what cargo cannot see for itself:
@@ -986,8 +991,9 @@ owner list an operator edits:
      gated again instead of asked for forever;
 5. immediately before publication the slot asks once more (retried like a
    status post on a forge that cannot answer), and once more after the shared
-   build-cache upload, which can outlast a lease. Only a slot the forge confirms
-   as the holder publishes. An unavailable renewal posts nothing and retains
+   build-cache upload, which can outlast a lease. The shared build-cache
+   publication itself asks before it writes the store. Only a slot the forge
+   confirms as the holder publishes. An unavailable renewal posts nothing and retains
    the finished verdict for recovery under a newly confirmed lease on a later tick,
    without executing the recipe again;
 6. on publication, or when its tiers end early (a reused, held or recovered
