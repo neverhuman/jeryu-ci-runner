@@ -117,7 +117,29 @@ case "\$url" in
     cp "\${data#@}" "$fx/forge/score-\$n.json"
     printf '%s\n' "\${data#@}" >>"$fx/score-bodies.log"
     answer "\$(cat "$fx/forge/score.body" 2>/dev/null || echo '{"score":91}')" "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
-  */merge-queue\?*)
+  */api/v1/merge-queue\?*)
+    # The deployed forge also serves a global listing (web.rs: /api/v1/merge-queue -> list_all), but
+    # it filters by state and carries no gate_started_at: a repository-scoped read must not use it.
+    printf '%s\n' "\$url" >>"$fx/forge/global-queue.log"
+    answer '{"code":"invalid_query","message":"this fixture answers only the per-repository listing"}' 422;;
+  */api/v1/repos/*/merge-queue\?*)
+    if [[ -e "$fx/forge/queue-strict" ]]; then
+      # The route reads limit, per_page and page only (QueuePageQuery::KEYS); strict_query answers
+      # any other key with invalid_query at 422, so model exactly that.
+      q=\${url#*\?}
+      for pair in \${q//&/ }; do
+        case "\${pair%%=*}" in
+          limit|per_page|page) ;;
+          *) printf '%s\n' "\${pair%%=*}" >>"$fx/forge/queue-rejected-keys.log"
+             answer '{"code":"invalid_query","message":"unknown query key"}' 422; exit 0;;
+        esac
+      done
+      if [[ -e "$fx/forge/queue-refuses" ]]; then answer '{"code":"invalid_query"}' "\$(cat "$fx/forge/queue-refuses")"; exit 0; fi
+      p=\$(sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p' <<<"\$url")
+      if [[ -e "$fx/forge/queue-page-\${p:-1}.json" ]]; then answer "\$(cat "$fx/forge/queue-page-\${p:-1}.json")" 200
+      else answer '{"entries":[],"total":0,"page":{"has_more":false,"limit":500,"page":0,"total":0}}' 200; fi
+      exit 0
+    fi
     if [[ -e "$fx/forge/queue-envelope.json" ]]; then answer "\$(cat "$fx/forge/queue-envelope.json")" 200
     elif [[ -e "$fx/forge/queue.json" ]]; then answer "\$(jq -c '{entries: ., page: {has_more: false}}' "$fx/forge/queue.json")" 200
     else answer 'missing queue fixture' 500; fi;;
@@ -635,6 +657,73 @@ must 'the recorded deployed response admits and audits its complete replay stack
 must 'the production listing route consumes the recorded envelope' grep -q 'GET https://forge.example.test/api/v1/repos/acme%2Fqrepo/merge-queue?per_page=500&page=1' "$fx/curl.log"
 rm "$fx/forge/queue-envelope.json"
 printf 'PASS the deployed forge envelope and build_on replay-parent contract are pinned\n'
+
+# --- the production route, as the deployed forge serves it ------------------------------------------
+# `/api/v1/repos/:id/merge-queue` (web.rs:1396 -> merge_queue::list_repo) accepts the paging keys
+# `limit`, `per_page` and `page` only (QueuePageQuery::KEYS) and refuses any other key with
+# `invalid_query` at 422; the global `/api/v1/merge-queue` listing is a different contract. Serve the
+# recorded envelope's own entry schema one entry per page, so the whole live stack is only visible to
+# a consumer that reads this route and follows its `page.has_more`.
+qlive
+touch "$fx/forge/queue-strict"
+qpages() { # entries file -> one page per entry, with the deployed paging envelope
+  local total n i
+  total=$(jq length "$1")
+  for ((i = 0; i < total; i++)); do
+    n=$((i + 1))
+    jq -c --argjson i "$i" --argjson n "$n" --argjson total "$total" \
+      '{entries: [.[$i]], total: $total, page: {has_more: ($n < $total), limit: 1, page: $n, total: $total}}' \
+      "$1" >"$fx/forge/queue-page-$n.json"
+  done
+}
+qpages "$fx/forge/queue.json"
+: >"$fx/forge/global-queue.log"; : >"$fx/forge/queue-rejected-keys.log"; : >"$fx/curl.log"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"; before=$(scores); run
+must 'the live stack is read from the per-repository route and audited' test "$(scores)" == "$((before + 1))"
+must 'the route is asked with only the keys it accepts' test ! -s "$fx/forge/queue-rejected-keys.log"
+must 'the global merge-queue listing is never read for a repository ticket' test ! -s "$fx/forge/global-queue.log"
+must 'every page of the per-repository listing is followed' \
+  test "$(grep -c 'repos/acme%2Fqrepo/merge-queue?' "$fx/curl.log")" == 2
+must 'the entry below the ticketed one came from the second page' \
+  grep -q 'merge-queue?per_page=500&page=2' "$fx/curl.log"
+for status in 422 503; do
+  printf '%s\n' "$status" >"$fx/forge/queue-refuses"
+  : >"$fx/checkout.log"; before=$(scores)
+  qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+  must "a route answering $status refuses the ticket" grep -q "the forge answered $status listing its merge queue" "$fx/out"
+  must "a route answering $status checks out nothing" test ! -s "$fx/checkout.log"
+  must "a route answering $status submits nothing" test "$(scores)" == "$before"
+done
+rm -f "$fx/forge/queue-refuses" "$fx/forge/queue-page-"*.json "$fx/forge/queue-strict"
+printf 'PASS the per-repository listing route, its paging envelope and its strict query keys are the consumed contract\n'
+
+# --- the audit base the forge dispatches ------------------------------------------------------------
+# For a queue ref, plan_push_audit (ci_bridge/audit_queue.rs: `base = merge-base refs/heads/<base
+# branch> <queue sha>`) tickets the fork of the queue commit with the base branch, not the branch tip
+# and not the entry's replay parent. Advance main past the stack so the three differ, and prove the
+# host admits exactly that commit.
+qlive
+QMAIN2=$(qcommit main-moved "$QBASE")
+git -C "$qw" push -q "$fx/git/qrepo.git" "$QMAIN2:refs/heads/main"
+QDISPATCH=$(git -C "$fx/git/qrepo.git" merge-base refs/heads/main "$QQ2")
+must 'the forge dispatch base is the queue stack bottom' test "$QDISPATCH" == "$QBASE"
+must 'the moved main tip is not that base' test "$QMAIN2" != "$QDISPATCH"
+: >"$fx/jankurai.log"; before=$(scores)
+qticket refs/queue/main/2 "$QQ2" "$QDISPATCH"; run
+must 'the dispatched base is admitted while main is ahead of the stack' test "$(scores)" == "$((before + 1))"
+must 'the audit diffs the queue head against that dispatched base' \
+  grep -q "diff-audit .* --base-ref $QDISPATCH " "$fx/jankurai.log"
+must 'the proof is published for the queue head' \
+  test "$(jq -r '[.branch, .commit_sha, .base_sha] | join(" ")' "$fx/forge/score-$before.json")" == "refs/queue/main/2 $QQ2 $QDISPATCH"
+for wrong in "$QMAIN2" "$QQ1"; do
+  : >"$fx/checkout.log"; before=$(scores)
+  qticket refs/queue/main/2 "$QQ2" "$wrong"; run
+  must 'a base off the dispatched fork is refused' grep -q 'audit range does not cover the queue stack' "$fx/out"
+  must 'a base off the dispatched fork checks out nothing' test ! -s "$fx/checkout.log"
+  must 'a base off the dispatched fork submits nothing' test "$(scores)" == "$before"
+done
+git -C "$fx/git/qrepo.git" update-ref refs/heads/main "$QBASE"
+printf 'PASS the forge-selected queue audit base is admitted and audited, and other bases are refused\n'
 
 # Version errors are operational failures, distinct from forged queue content.
 for version in 'git version 2.39.5' 'git version 2.38.0' 'unrecognized-version'; do

@@ -110,3 +110,31 @@ release with existing ADR 0011 reasons: `malformed-ticket` for unusable queue
 mapping, fetch, range or replay content, `not-on-main` for an untrusted stack
 bottom, and `contributed` for contribution origin. No new release vocabulary
 is introduced.
+
+### Which forge code the queue contract comes from
+
+The protected implementation is authoritative for all three couplings, in
+jeryu-deploy at `60da213c7cd1eb8d1459e5b1ceda252616b5de9d`
+(this installation's forge serves it at `https://git.neverhuman.org/jeryu/jeryu-deploy`):
+
+- The listing this host reads is registered in `crates/jeryu-api/src/web.rs`
+  as `("/api/v1/repos/:id/merge-queue", get(merge_queue::list_repo))`; it lists
+  one repository's entries in every state and answers `{entries, total, page}`.
+  Its query reads `limit`, `per_page` and `page` only (`QueuePageQuery::KEYS`),
+  and `web/strict_query.rs` refuses any other key with `invalid_query` at 422.
+  The global `/api/v1/merge-queue` (`list_all`) is a separate, state-filtered
+  contract and is not read for a repository-scoped admission.
+- `merge_queue.rs::build_on` records the replay parent in `base_sha`.
+- `ci_bridge/audit_queue.rs::plan_push_audit` tickets a queue head against
+  `merge-base refs/heads/<base> <queue sha>`, which is why admission requires
+  the diff base to be an ancestor of the stack bottom: that fork is the bottom's
+  replay base whenever the stack is rooted on the base branch, and stays so
+  after the branch tip moves on.
+
+`ops/pr-gate/tests/test-pr-gate-audit.sh` exercises each one against a fixture
+forge shaped like that route: strict query keys, the recorded paging envelope
+split one entry per page so a multi-entry stack is assembled only by following
+`page.has_more`, and a dispatched base computed with the forge's own
+`merge-base` expression while `main` is ahead of the stack. A listing the route
+refuses (422) or fails (503) refuses the ticket before any checkout. This is
+consumer contract evidence, not a live governed audit.
