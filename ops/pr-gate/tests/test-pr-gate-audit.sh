@@ -5,6 +5,7 @@
 # harmless when the forge refuses, lacks the routes or asks for a back-off.
 set -euo pipefail
 while read -r leaked; do unset "$leaked"; done < <(compgen -e | grep -E '^(GATE_RUNNER_|GATE_INSTALL_|JERYU_|PR_GATE_)' || true)
+test_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 src_bin=$(cd "$(dirname "${BASH_SOURCE[0]}")/../bin" && pwd)
 fx=$(mktemp -d)
 trap 'rm -rf -- "$fx"' EXIT
@@ -31,6 +32,7 @@ real_git=$(command -v git)
 cat >"$fx/bin/git" <<SH
 #!/usr/bin/env bash
 [[ "\$*" != *AUDIT-TOKEN-5c1e* ]] || exit 9
+if [[ "\${1:-}" == --version && -e "$fx/git-version" ]]; then cat "$fx/git-version"; exit 0; fi
 if [[ "\${1:-}" == clone ]]; then
   printf '%s\n' "\${GIT_CONFIG_VALUE_1:-}" >>"$fx/git-helper.log"
   args=(); for a in "\$@"; do args+=("\${a/https:\/\/forge.example.test\/git\/acme\//$fx/git/}"); done
@@ -116,7 +118,8 @@ case "\$url" in
     printf '%s\n' "\${data#@}" >>"$fx/score-bodies.log"
     answer "\$(cat "$fx/forge/score.body" 2>/dev/null || echo '{"score":91}')" "\$(cat "$fx/forge/score.status" 2>/dev/null || echo 201)";;
   */merge-queue\?*)
-    if [[ -e "$fx/forge/queue.json" ]]; then answer "\$(jq -c '{entries: ., page: {has_more: false}}' "$fx/forge/queue.json")" 200
+    if [[ -e "$fx/forge/queue-envelope.json" ]]; then answer "\$(cat "$fx/forge/queue-envelope.json")" 200
+    elif [[ -e "$fx/forge/queue.json" ]]; then answer "\$(jq -c '{entries: ., page: {has_more: false}}' "$fx/forge/queue.json")" 200
     else answer 'missing queue fixture' 500; fi;;
   */pulls\?state=open*)
     if [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"
@@ -611,6 +614,44 @@ must 'it is submitted under its exact queue ref and sha' test "$(jq -r '[.branch
 must 'the audited tree is the queue commit' grep -q 'pr2' <(git -C "$fx/git/qrepo.git" ls-tree --name-only "$QQ2")
 printf 'PASS a queue commit reachable only through refs/queue is fetched, audited and submitted\n'
 
+# Recorded deployed build_on response: preserve its envelope and replay-parent
+# mapping while substituting only fixture object identities and PR numbers.
+recorded="$test_dir/fixtures/merge-queue-60da213.json"
+must 'the deployed stacked base is its preceding queue SHA, not the main tip' jq -e '
+  .page.has_more == false and .page.limit == 500 and .page.page == 1 and .total == 2
+  and ([.entries[] | select(.number == 29)][0] as $first
+    | [.entries[] | select(.number == 22)][0] as $second
+    | $first.state == "building" and $second.state == "building"
+      and $second.after == $first.number and $second.base_sha == $first.queue_sha
+      and $second.base_sha != $first.base_sha
+      and $first.queue_ref == "refs/queue/main/29" and $second.queue_ref == "refs/queue/main/22")' "$recorded"
+jq --arg b "$QBASE" --arg s1 "$QSRC1" --arg q1 "$QQ1" --arg s2 "$QSRC2" --arg q2 "$QQ2" '
+  .entries |= map(if .number == 29 then
+    .number=1 | .pr_head_sha=$s1 | .base_sha=$b | .queue_sha=$q1 | .queue_ref="refs/queue/main/1"
+    else .number=2 | .after=1 | .pr_head_sha=$s2 | .base_sha=$q1 | .queue_sha=$q2 | .queue_ref="refs/queue/main/2" end
+    | .repo="acme/qrepo")' "$recorded" >"$fx/forge/queue-envelope.json"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"; before=$(scores); run
+must 'the recorded deployed response admits and audits its complete replay stack' test "$(scores)" == "$((before + 1))"
+must 'the production listing route consumes the recorded envelope' grep -q 'GET https://forge.example.test/api/v1/repos/acme%2Fqrepo/merge-queue?per_page=500&page=1' "$fx/curl.log"
+rm "$fx/forge/queue-envelope.json"
+printf 'PASS the deployed forge envelope and build_on replay-parent contract are pinned\n'
+
+# Version errors are operational failures, distinct from forged queue content.
+for version in 'git version 2.39.5' 'git version 2.38.0' 'unrecognized-version'; do
+  printf '%s\n' "$version" >"$fx/git-version"
+  : >"$fx/checkout.log"; before=$(scores)
+  qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+  must 'unsupported Git is reported loudly as a tool-version error' grep -q 'tool-version error: queue replay verification requires Git >= 2.40' "$fx/out"
+  must 'unsupported Git is never reported as a forged queue tree' test "$(grep -c 'queue tree does not match' "$fx/out" || true)" == 0
+  must 'unsupported Git checks out nothing' test ! -s "$fx/checkout.log"
+  must 'unsupported Git submits no proof' test "$(scores)" == "$before"
+done
+printf 'git version 2.40.0\n' >"$fx/git-version"
+qticket refs/queue/main/2 "$QQ2" "$QBASE"; before=$(scores); run
+must 'Git 2.40 meets the replay-verifier requirement' test "$(scores)" == "$((before + 1))"
+rm "$fx/git-version"
+printf 'PASS unsupported Git produces an explicit host tool-version error before replay checkout\n'
+
 before=$(scores)
 git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ1"
 qticket refs/queue/main/2 "$QQ2" "$QBASE"
@@ -731,6 +772,14 @@ bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" internal proof "$SSHA" 9.9
 before=$(scores); run
 must 'a bound internal queue job is admitted with real binding' test "$(scores)" == "$((before + 1))"
 must 'a bound queue proof names the exact queue SHA and job' test "$(last_score | jq -r '[.head_sha,.job_id] | join(" ")')" == "$QQ2 job-${QQ2:0:8}"
+printf 'git version 2.39.5\n' >"$fx/git-version"
+bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" internal proof "$SSHA" 9.9.9 refs/queue/main/2
+: >"$fx/checkout.log"; before=$(scores); run
+must 'a bound job with unsupported Git is released as a verifier mismatch' test "$(released | cut -d' ' -f2)" == verifier-mismatch
+must 'its heartbeat names the host tool-version error' test "$(last_beat | jq -r .last.reason)" == 'verifier-mismatch: tool-version error: queue replay verification requires Git >= 2.40; found git version 2.39.5'
+must 'the bound version failure checks out nothing' test ! -s "$fx/checkout.log"
+must 'the bound version failure submits nothing' test "$(scores)" == "$before"
+rm "$fx/git-version"
 # This fixture already has a sandbox configured: a contribution remains refused for the queue path.
 bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" contributed proof "$SSHA" 9.9.9 refs/queue/main/2
 : >"$fx/git-helper.log"; before=$(scores); run

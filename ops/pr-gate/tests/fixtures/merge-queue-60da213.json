@@ -1,0 +1,70 @@
+{
+  "entries": [
+    {
+      "after": 29,
+      "approvers": [
+        {
+          "automation": true,
+          "login": "pragent"
+        }
+      ],
+      "attempts": [
+        {
+          "at": "2026-10-31T18:56:36.464865321+00:00",
+          "base_sha": "971485147b79db61fe4ee3202f1f58cba2ab6e78",
+          "conclusion": null,
+          "queue_sha": "b9d5e05d34b87c491941f309d42b0099b32d32ff"
+        }
+      ],
+      "base": "main",
+      "base_sha": "971485147b79db61fe4ee3202f1f58cba2ab6e78",
+      "enqueued_at": "2026-10-31T18:56:36.362119141+00:00",
+      "enqueued_by": "jain-merge-bot",
+      "gate_started_at": "2026-10-31T18:57:44.944981684+00:00",
+      "landed_sha": null,
+      "number": 22,
+      "pr_head_sha": "ef4d77800efcfed4c88c7a0ece8db9bdc1dc2390",
+      "queue_ref": "refs/queue/main/22",
+      "queue_sha": "b9d5e05d34b87c491941f309d42b0099b32d32ff",
+      "reason": null,
+      "repo": "root/jankurai",
+      "state": "building"
+    },
+    {
+      "approvers": [
+        {
+          "automation": true,
+          "login": "pragent"
+        }
+      ],
+      "attempts": [
+        {
+          "at": "2026-10-31T16:45:46.900376160+00:00",
+          "base_sha": "0f3a80102f813be2a1fcde0ef1c917dbf4a9bb97",
+          "conclusion": null,
+          "queue_sha": "971485147b79db61fe4ee3202f1f58cba2ab6e78"
+        }
+      ],
+      "base": "main",
+      "base_sha": "0f3a80102f813be2a1fcde0ef1c917dbf4a9bb97",
+      "enqueued_at": "2026-10-31T16:45:46.764203512+00:00",
+      "enqueued_by": "jain-merge-bot",
+      "gate_started_at": "2026-10-31T16:46:41.283779336+00:00",
+      "landed_sha": null,
+      "number": 29,
+      "pr_head_sha": "80026ec29190f030d505ecaef2ffc75126a9381e",
+      "queue_ref": "refs/queue/main/29",
+      "queue_sha": "971485147b79db61fe4ee3202f1f58cba2ab6e78",
+      "reason": null,
+      "repo": "root/jankurai",
+      "state": "building"
+    }
+  ],
+  "page": {
+    "has_more": false,
+    "limit": 500,
+    "page": 1,
+    "total": 2
+  },
+  "total": 2
+}

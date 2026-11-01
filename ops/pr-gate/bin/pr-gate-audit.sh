@@ -504,7 +504,23 @@ queue_admission() {
 # declared replay must also have the exact tree produced by merging its source onto its parent.
 # merge-tree writes Git objects only; no repository hooks, filters or checkout can execute here.
 queue_trees_match() {
-  local src=$1 row source parent queued number fork expected actual
+  local src=$1 row source parent queued number fork expected actual version major minor
+  # --merge-base was added in Git 2.40. An unsupported replay verifier is a host
+  # tool error, not evidence that the forge supplied a different tree.
+  queue_tree_error=""
+  version="$(git --version 2>/dev/null)" || version="unavailable"
+  if [[ "$version" =~ ^git\ version\ ([0-9]+)\.([0-9]+)(\.|$) ]]; then
+    major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
+    if ((10#$major > 2 || (10#$major == 2 && 10#$minor >= 40))); then
+      :
+    else
+      queue_tree_error="tool-version error: queue replay verification requires Git >= 2.40; found $version"
+      return 2
+    fi
+  else
+    queue_tree_error="tool-version error: queue replay verification requires Git >= 2.40; found $version"
+    return 2
+  fi
   while IFS= read -r row; do
     source="$(jq -r .pr_head_sha <<<"$row")" parent="$(jq -r .base_sha <<<"$row")"
     queued="$(jq -r .queue_sha <<<"$row")" number="$(jq -r .number <<<"$row")"
@@ -663,7 +679,11 @@ audit_one() { # ticket-json
        { [[ "$mode" == diff ]] && ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$base" "$bottom" 2>/dev/null; }; then
       refuse malformed-ticket "the audit range does not cover the queue stack" failed; return 0
     fi
-    if ! queue_trees_match "$src"; then
+    local tree_status=0 queue_tree_error=""
+    queue_trees_match "$src" || tree_status=$?
+    if ((tree_status == 2)); then
+      refuse verifier-mismatch "$queue_tree_error" failed; return 0
+    elif ((tree_status != 0)); then
       refuse malformed-ticket "the queue tree does not match its declared source replay" failed; return 0
     fi
   fi

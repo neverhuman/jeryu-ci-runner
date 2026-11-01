@@ -77,7 +77,12 @@ root/jankurai #29 was building at
 `971485147b79db61fe4ee3202f1f58cba2ab6e78`, while #22 had `after: 29`,
 `base_sha: 971485147b79db61fe4ee3202f1f58cba2ab6e78` and queue SHA
 `b9d5e05d34b87c491941f309d42b0099b32d32ff`.
-This response establishes field semantics; it is not a successful live audit.
+The authoritative producer contract is that deployed `build_on` implementation.
+The complete response, including the paging envelope, is recorded in
+`ops/pr-gate/tests/fixtures/merge-queue-60da213.json` (capture details beside
+it). The contract regression asserts the recorded replay-parent relation and
+runs the production consumer against its envelope with local object identities.
+This response corroborates field semantics; it is not a successful live audit.
 
 The fixture builds independent PR heads before main advances and cherry-picks
 them onto main and the previous queue replay, respectively. In addition to
@@ -87,6 +92,11 @@ fetched queue tree with `git merge-tree --write-tree --merge-base=<fork>
 source objects and ambiguous entries fail closed. A response that substitutes
 the branch tip for a stacked replay parent cannot hide another contribution:
 the expected tree excludes those undeclared changes and the comparison fails.
+The replay verifier requires Git >= 2.40 for `merge-tree --merge-base` and
+checks the version before reconstructing any queue tree. An unsupported or
+unreadable version is reported as a **tool-version error**, never a tree
+mismatch. Bound jobs are immediately released with the existing
+`verifier-mismatch` reason and the explicit Git diagnostic on `/runners`.
 This checks resulting content rather than trusting that source commits occur
 in replay ancestry. It may refuse a complex replay whose sequential
 cherry-picks differ from the resulting three-way merge; such a case needs a
