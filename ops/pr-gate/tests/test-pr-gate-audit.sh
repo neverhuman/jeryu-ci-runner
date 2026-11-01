@@ -1008,10 +1008,16 @@ for scenario in missing malformed unmarked http stale range bottom content dupli
   git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ2"
 done
 # A legal ordinary branch named queue/main/2 is not the forge's canonical refs/queue ref.
+# The head is advertised by the bare repository as refs/heads/queue/main/2, so a clone carries it by
+# ordinary branch reachability rather than through refs/queue.
+git -C "$fx/git/qrepo.git" update-ref refs/heads/queue/main/2 "$QQ2"
+git -C "$fx/git/qrepo.git" update-ref -d refs/queue/main/2
 bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" internal proof "$SSHA" 9.9.9 queue/main/2
 : >"$fx/curl.log"; before=$(scores); run
 must 'a queue-shaped ordinary branch remains an ordinary bound PR' test "$(scores)" == "$((before + 1))"
 must 'an ordinary branch does not consult the merge queue' test "$(grep -c '/merge-queue?' "$fx/curl.log" || true)" == 0
+git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ2"
+git -C "$fx/git/qrepo.git" update-ref -d refs/heads/queue/main/2
 printf 'PASS bound queue refusals release known reasons without checkout; ordinary queue-named branches stay ordinary\n'
 rm -f "$fx/forge/bound"; mv "$fx/verifier.bound-off" "$fx/install/pr-gate-ensure-jankurai.sh"
 printf 'PASS bound queue admission retains authoritative origin refusal even with a sandbox\n'
