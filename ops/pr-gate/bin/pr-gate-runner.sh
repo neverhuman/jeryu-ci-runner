@@ -457,7 +457,7 @@ main_retry_baseline() { # tree tip
   baseline_sha="" baseline_refusal=""
   while ((step < MAIN_RETRY_BASELINE_DEPTH)); do
     if ! walk=$(git -C "$tree" rev-parse --verify --quiet "$walk^1"); then
-      baseline_refusal="its history reaches a root commit with no ancestor this runner has proved"
+      baseline_refusal="its first-parent history is incomplete or reaches a root with no proved ancestor; fetch complete protected history and retry"
       return 1
     fi
     step=$((step + 1))

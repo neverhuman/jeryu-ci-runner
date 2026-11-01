@@ -403,15 +403,13 @@ gates the current tip of `<name>`:
   silently take its empty-change-set pass -- and refusing it in seconds rather than after a whole
   run. Main's tip is not re-bound from the shared
   mirror in this mode: the base is the tip observed and admitted, and a main that moved under the run
-  before execution leaves the head for the next tick with nothing posted. Main that lands another
-  commit *while* the recipe runs is not a verdict on this commit either: the runner re-reads
-  protected main before publishing, and when it moved the attempt is discharged as superseded --
-  nothing is posted, nothing is owed, and the attempt keeps its log. The next tick gates the new
-  tip, whose baseline search walks past this unproved commit to the same proved ancestor, so every
-  commit of both landings is judged together. (The discharged tip keeps the `pending` the run
-  posted; it is no longer main's tip, which is where main's health is read from.) A forge that will
-  not answer that re-read is not a reason to discard a finished verdict, which is published as
-  usual. The owner still needs a declared recipe
+  before execution leaves the head for the next tick with nothing posted. Once a recipe finishes,
+  its exact-head verdict is published under the live lease even if main moved while it ran.
+  A completed failure replaces pending and remains in the durable attempt receipt; main movement
+  does not discharge that verdict. A later operator retry of the new tip walks past failed or
+  unproved commits to the nearest proved ancestor and judges the entire intervening change set.
+  The ratchet therefore uses that proved ancestor, which may be older than the parent; the bounded
+  search keeps this trade explicit. The owner still needs a declared recipe
   variable, but it may come from `PR_GATE_MAIN_PROOF_BASE_VARS` (below) instead of
   `PR_GATE_PROOF_BASE_VARS`. The published context is the ordinary `<repo>/required`;
   `<repo>/main-health` stays the separate diagnostic context it is, and `--main-health` is unchanged;

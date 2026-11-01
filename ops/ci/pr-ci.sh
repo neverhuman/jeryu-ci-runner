@@ -20,6 +20,8 @@ source ops/ci/required-lane.sh
 # shellcheck source=ops/ci/proof_guards.sh
 source ops/ci/proof_guards.sh
 require_jankurai
+# shellcheck source=ops/ci/hosted-git-env.sh
+source "${repo_root}/ops/ci/hosted-git-env.sh"
 # A retry baseline answers for protected main's tip, and the gate runner admitted that tip some time
 # before this recipe started. Refresh protected main here, before the baseline is resolved, so a main
 # that has landed another commit since ends this recipe in seconds: the proof lane's own refresh
@@ -35,8 +37,6 @@ fi
 # proof_base_ref). An unaccepted JERYU_JANKURAI_BASE_REF fails the recipe here rather than letting a
 # lane quietly fall back to a baseline nobody checked.
 JERYU_CI_PROOF_BASE="$(proof_base_ref)"
-# shellcheck source=ops/ci/hosted-git-env.sh
-source "${repo_root}/ops/ci/hosted-git-env.sh"
 
 # jeryu governs the worker count from live load; never default high.
 ci_kit_resolve_jobs
@@ -97,8 +97,7 @@ bash ops/ci/score.sh
 # The pre-approval gate: the verdict the hosted jankurai/proof will publish for
 # this head, before the PR exists. Refuses only where the rollout is on
 # (agent/jankurai-gate.toml); elsewhere it reports and passes.
-# Against the same validated baseline: on main's retry the merge base with origin/main is the head
-# itself, and a diff audit of nothing scores nothing.
+# Audit from the same validated baseline, including every commit after a retry's proved ancestor.
 jankurai_gate_base="$(git merge-base "$JERYU_CI_PROOF_BASE" HEAD)" || {
   printf 'no merge base with %s; fetch the trunk first\n' "$JERYU_CI_PROOF_BASE" >&2
   exit 1

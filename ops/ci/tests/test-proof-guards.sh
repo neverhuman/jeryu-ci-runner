@@ -600,6 +600,8 @@ grep -q '^command = "bash ops/ci/proof_evidence.sh"$' agent/proof-lanes.toml ||
   fail 'pr-ci.sh fetches from origin before checking it is the hosted repository'
 (( $(line_of '^  proof_require_history$' "$pr_ci") < $(line_of '^JERYU_CI_PROOF_BASE=' "$pr_ci") )) ||
   fail 'pr-ci.sh resolves a retry baseline before refreshing protected main'
+(( $(line_of 'source.*ops/ci/hosted-git-env.sh' "$pr_ci") < $(line_of '^  proof_require_history$' "$pr_ci") )) ||
+  fail 'pr-ci.sh refreshes retry history before scrubbing Git transport'
 printf 'proof lane wiring ok\n'
 
 # --- security lane failure evidence survives cleanup of target/ ---------------
