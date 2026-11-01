@@ -58,3 +58,45 @@ is accepted only once its commit is on main. Bound queue jobs additionally
 require authoritative `origin: internal`. Queue contributions are handed back
 even on sandbox-ready hosts; enabling contributed queue audits requires a
 separate reviewed extension of this stack admission and sandbox contract.
+
+### Merge-queue replay contract and content binding
+
+The deployed forge at `60da213c7cd1eb8d1459e5b1ceda252616b5de9d`
+implements the queue in jeryu-deploy's
+[`web/merge_queue.rs`](https://git.jeryu.ai/jeryu/jeryu-deploy/blob/60da213c7cd1eb8d1459e5b1ceda252616b5de9d/crates/jeryu-api/src/web/merge_queue.rs).
+Its `build_on` calls `git.replay(parent, &entry.pr_head_sha, ...)` and then
+assigns `entry.base_sha = parent.to_string()`. Enqueue selects the last
+building entry on the same base, records `entry.after = Some(number)` and
+passes that entry's queue SHA as `parent`; only the first entry uses the
+base-branch tip. A **refused** replay separately records the branch tip for
+conflict repair. The redteam conflict-repair instructions and the scheduler
+IR are not the contract for building web queue entries.
+
+A read-only live response on 2026-11-01 confirmed the same contract:
+root/jankurai #29 was building at
+`971485147b79db61fe4ee3202f1f58cba2ab6e78`, while #22 had `after: 29`,
+`base_sha: 971485147b79db61fe4ee3202f1f58cba2ab6e78` and queue SHA
+`b9d5e05d34b87c491941f309d42b0099b32d32ff`.
+This response establishes field semantics; it is not a successful live audit.
+
+The fixture builds independent PR heads before main advances and cherry-picks
+them onto main and the previous queue replay, respectively. In addition to
+checking the authenticated mapping, admission independently compares each
+fetched queue tree with `git merge-tree --write-tree --merge-base=<fork>
+<parent> <source>` before checkout. Conflicts, extra queue bytes, missing
+source objects and ambiguous entries fail closed. A response that substitutes
+the branch tip for a stacked replay parent cannot hide another contribution:
+the expected tree excludes those undeclared changes and the comparison fails.
+This checks resulting content rather than trusting that source commits occur
+in replay ancestry. It may refuse a complex replay whose sequential
+cherry-picks differ from the resulting three-way merge; such a case needs a
+separate reviewed extension, never an unchecked checkout.
+
+This implementation admits queue stacks rooted on main only. Other protected
+release-line queue bases remain unsupported and fail closed. Only canonical
+`refs/queue/...` ticket refs select queue admission; an ordinary PR branch
+named `queue/main/3` retains ordinary admission. Bound refusals immediately
+release with existing ADR 0011 reasons: `malformed-ticket` for unusable queue
+mapping, fetch, range or replay content, `not-on-main` for an untrusted stack
+bottom, and `contributed` for contribution origin. No new release vocabulary
+is introduced.

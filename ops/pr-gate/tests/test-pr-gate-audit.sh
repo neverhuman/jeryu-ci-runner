@@ -119,8 +119,8 @@ case "\$url" in
     if [[ -e "$fx/forge/queue.json" ]]; then answer "\$(jq -c '{entries: ., page: {has_more: false}}' "$fx/forge/queue.json")" 200
     else answer 'missing queue fixture' 500; fi;;
   */pulls\?state=open*)
-    if [[ -e "$fx/forge/pulls-raw.json" ]]; then answer "\$(jq -c '{items: ., page: {has_more: false}}' "$fx/forge/pulls-raw.json")" 200
-    elif [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"; else
+    if [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"
+    elif [[ -e "$fx/forge/pulls-raw.json" ]]; then answer "\$(jq -c '{items: ., page: {has_more: false}}' "$fx/forge/pulls-raw.json")" 200; else
     page=\$(sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p' <<<"\$url")
     if [[ -e "$fx/forge/paged" && "\${page:-1}" == 1 ]]; then answer '{"items":[],"page":{"has_more":true}}' 200; else
     items=\$( { sed 's/.*/{"number":1,"head_sha":"&","labels":["origin:internal"]}/' "$fx/forge/internal-heads" 2>/dev/null
@@ -577,8 +577,15 @@ git clone -q --bare "$qw" "$fx/git/qrepo.git"
 qcommit() { # file -> sha of a commit on QBASE (or $2) that no branch holds
   qgit checkout -q --detach "${2:-$QBASE}"; echo "$1" >"$qw/$1"; qgit add "$1"; qgit commit -q -m "$1"; git -C "$qw" rev-parse HEAD
 }
-QSRC1=$(qcommit pr1); QQ1=$(qcommit queue1 "$QSRC1")
-QSRC2=$(qcommit pr2 "$QQ1"); QQ2=$(qcommit queue2 "$QSRC2")
+# Model the protected forge's real replay: two independent PRs fork before main advances,
+# then build_on replays the first onto main and the second onto the first queue commit.
+QFORK=$QBASE
+QSRC1=$(qcommit pr1 "$QFORK"); QSRC2=$(qcommit pr2 "$QFORK")
+QBASE=$(qcommit main-update "$QFORK")
+git -C "$fx/git/qrepo.git" fetch -q "$qw" "$QBASE:refs/heads/main"
+qreplay() { qgit checkout -q --detach "$1"; qgit cherry-pick "$2" >&2; git -C "$qw" rev-parse HEAD; }
+QQ1=$(qreplay "$QBASE" "$QSRC1"); QQ2=$(qreplay "$QQ1" "$QSRC2")
+git -C "$qw" push -q "$fx/git/qrepo.git" "$QSRC1:refs/pull/1/head" "$QSRC2:refs/pull/2/head"
 for sha in "$QSRC1" "$QQ1" "$QSRC2" "$QQ2"; do git -C "$qw" push -q "$fx/git/qrepo.git" "$sha:refs/qtmp/$sha"; done
 git -C "$fx/git/qrepo.git" update-ref refs/queue/main/1 "$QQ1"
 git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ2"
@@ -587,7 +594,7 @@ must 'the fixture queue commit is on no branch' test -z "$(git -C "$fx/git/qrepo
 qlive() { # writes the live queue and open pull requests the forge reports; $1 = labels of PR 1
   jq -n --arg b "$QBASE" --arg s1 "$QSRC1" --arg q1 "$QQ1" --arg s2 "$QSRC2" --arg q2 "$QQ2" '[
     {repo:"acme/qrepo",base:"main",number:1,pr_head_sha:$s1,base_sha:$b,queue_ref:"refs/queue/main/1",queue_sha:$q1,state:"building"},
-    {repo:"acme/qrepo",base:"main",number:2,pr_head_sha:$s2,base_sha:$q1,queue_ref:"refs/queue/main/2",queue_sha:$q2,state:"building"}]' >"$fx/forge/queue.json"
+    {repo:"acme/qrepo",base:"main",number:2,pr_head_sha:$s2,base_sha:$q1,after:1,queue_ref:"refs/queue/main/2",queue_sha:$q2,state:"building"}]' >"$fx/forge/queue.json"
   jq -n --arg s1 "$QSRC1" --arg s2 "$QSRC2" --argjson l1 "${1:-[\"origin:internal\"]}" \
     '[{number:1,head_sha:$s1,labels:$l1},{number:2,head_sha:$s2,labels:["origin:internal"]}]' >"$fx/forge/pulls-raw.json"
 }
@@ -601,7 +608,7 @@ qticket refs/queue/main/2 "$QQ2" "$QBASE"
 run
 must 'a stacked queue ticket is admitted and audited' grep -q "acme/qrepo@$QQ2 scored" "$fx/out"
 must 'it is submitted under its exact queue ref and sha' test "$(jq -r '[.branch, .commit_sha] | join(" ")' "$fx/forge/score-$before.json")" == "refs/queue/main/2 $QQ2"
-must 'the audited tree is the queue commit' grep -q 'queue2' <(git -C "$fx/git/qrepo.git" ls-tree --name-only "$QQ2")
+must 'the audited tree is the queue commit' grep -q 'pr2' <(git -C "$fx/git/qrepo.git" ls-tree --name-only "$QQ2")
 printf 'PASS a queue commit reachable only through refs/queue is fetched, audited and submitted\n'
 
 before=$(scores)
@@ -640,6 +647,30 @@ qticket refs/queue/main/2 "$QQ2" "$QBASE"
 run
 must 'a stack source the forge does not mark internal is refused' grep -q 'is not marked origin:internal' "$fx/out"
 must 'an unmarked stack is never cloned' test ! -s "$fx/git-helper.log"
+
+printf 'PASS a contributed or unmarked source anywhere in the stack refuses the queue ticket\n'
+
+# Even a response using base-branch-tip semantics must not undercount a hidden contribution.
+qlive '["origin:contributed"]'
+jq --arg b "$QBASE" 'map(if .number == 2 then .base_sha = $b else . end)' \
+  "$fx/forge/queue.json" >"$fx/forge/queue.tmp"; mv "$fx/forge/queue.tmp" "$fx/forge/queue.json"
+: >"$fx/checkout.log"; before=$(scores)
+qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'base-tip semantics cannot hide an earlier source in the queue tree' grep -q 'queue tree does not match its declared source replay' "$fx/out"
+must 'a hidden source is never checked out' test ! -s "$fx/checkout.log"
+must 'a hidden source produces no score' test "$(scores)" == "$before"
+# Nor may a queue ref carry extra bytes even if every declared PR is internal.
+qlive
+QEXTRA=$(qcommit hidden "$QQ2")
+git -C "$qw" push -q "$fx/git/qrepo.git" "$QEXTRA:refs/queue/main/2"
+jq --arg q "$QEXTRA" 'map(if .number == 2 then .queue_sha = $q else . end)' \
+  "$fx/forge/queue.json" >"$fx/forge/queue.tmp"; mv "$fx/forge/queue.tmp" "$fx/forge/queue.json"
+: >"$fx/checkout.log"
+qticket refs/queue/main/2 "$QEXTRA" "$QBASE"; run
+must 'extra queue bytes are refused' grep -q 'queue tree does not match its declared source replay' "$fx/out"
+must 'extra queue bytes are never checked out' test ! -s "$fx/checkout.log"
+git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ2"
+printf 'PASS fetched queue trees must match declared reviewed source replays before checkout\n'
 
 # A missing/non-building parent is not evidence of a reviewed replay base. Prove the bottom on main
 # after fetch, before checkout, even when the missing ancestor's source was a contribution.
@@ -706,8 +737,38 @@ bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" contributed proof "$SSHA" 
 must 'a bound queue job with contributed origin is released' test "$(released | cut -d' ' -f2)" == contributed
 must 'a bound contributed queue job is never cloned' test ! -s "$fx/git-helper.log"
 must 'a bound contributed queue job submits nothing' test "$(scores)" == "$before"
+# Every bound queue refusal uses the existing ADR0011 vocabulary and releases immediately.
+for scenario in missing malformed unmarked http stale range bottom content duplicate; do
+  qlive
+  bbranch=refs/queue/main/2; bbase=$QBASE
+  case "$scenario" in
+    missing) printf '[]\n' >"$fx/forge/queue.json" ;;
+    malformed) jq 'map(if .number == 2 then del(.base_sha) else . end)' "$fx/forge/queue.json" >"$fx/forge/q.tmp"; mv "$fx/forge/q.tmp" "$fx/forge/queue.json" ;;
+    unmarked) qlive '[]' ;;
+    http) printf '503\n' >"$fx/forge/pulls.status" ;;
+    stale) git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ1" ;;
+    range) bbase=$QQ1 ;;
+    bottom) jq 'map(select(.number != 1))' "$fx/forge/queue.json" >"$fx/forge/q.tmp"; mv "$fx/forge/q.tmp" "$fx/forge/queue.json" ;;
+    content) jq --arg b "$QBASE" 'map(if .number == 2 then .base_sha = $b else . end)' "$fx/forge/queue.json" >"$fx/forge/q.tmp"; mv "$fx/forge/q.tmp" "$fx/forge/queue.json" ;;
+    duplicate) jq '. + [.[1]]' "$fx/forge/queue.json" >"$fx/forge/q.tmp"; mv "$fx/forge/q.tmp" "$fx/forge/queue.json" ;;
+  esac
+  bticket qrepo "$bbase" "$QQ2" "$QBASE" "$DEFAULT_SHA" internal proof "$SSHA" 9.9.9 "$bbranch"
+  : >"$fx/forge/releases.log"; : >"$fx/checkout.log"; before=$(scores); run
+  want=malformed-ticket; [[ "$scenario" != bottom ]] || want=not-on-main
+  must "bound queue $scenario releases exactly once" test "$(wc -l <"$fx/forge/releases.log")" == 1
+  must "bound queue $scenario is released immediately" test "$(released | cut -d' ' -f2)" == "$want"
+  must "bound queue $scenario is never checked out" test ! -s "$fx/checkout.log"
+  must "bound queue $scenario produces no score" test "$(scores)" == "$before"
+  rm -f "$fx/forge/pulls.status"
+  git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ2"
+done
+# A legal ordinary branch named queue/main/2 is not the forge's canonical refs/queue ref.
+bticket qrepo "$QBASE" "$QQ2" "$QBASE" "$DEFAULT_SHA" internal proof "$SSHA" 9.9.9 queue/main/2
+: >"$fx/curl.log"; before=$(scores); run
+must 'a queue-shaped ordinary branch remains an ordinary bound PR' test "$(scores)" == "$((before + 1))"
+must 'an ordinary branch does not consult the merge queue' test "$(grep -c '/merge-queue?' "$fx/curl.log" || true)" == 0
+printf 'PASS bound queue refusals release known reasons without checkout; ordinary queue-named branches stay ordinary\n'
 rm -f "$fx/forge/bound"; mv "$fx/verifier.bound-off" "$fx/install/pr-gate-ensure-jankurai.sh"
 printf 'PASS bound queue admission retains authoritative origin refusal even with a sandbox\n'
 
 rm -f "$fx/forge/pulls-raw.json" "$fx/forge/queue.json"
-printf 'PASS a contributed or unmarked source anywhere in the stack refuses the queue ticket\n'

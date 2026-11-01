@@ -421,10 +421,9 @@ prepare_tree() {
 label_on() { jq -e --arg name "$2" 'any((.labels // .summary.labels // [])[]?; (if type == "string" then . else (.name // "") end) == $name)' <<<"$1" >/dev/null 2>&1; }
 
 # queue_ref_of BRANCH: the exact merge-queue ref a ticket names (refs/queue/<base>/<number>), else nothing.
-# The forge may spell it with or without the refs/ prefix; the ref fetched and compared is always the full one.
+# Only canonical refs/queue refs select this path; queue/main/3 can be an ordinary PR branch.
 queue_ref_of() {
   local ref=$1
-  [[ "$ref" == queue/* ]] && ref="refs/$ref"
   [[ "$ref" =~ ^refs/queue/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*/[0-9]+$ && "$ref" != *..* ]] && printf '%s' "$ref"
   return 0
 }
@@ -461,37 +460,64 @@ forge_pages() {
 queue_admission() {
   local owner=$1 repo=$2 ref=$3 head=$4 entries prs entry number pr_head parent base depth=0 pr
   rm -f -- "$WORK_DIR/queue-bottom"
+  : >"$WORK_DIR/queue-stack"
   forge_pages "/api/v1/repos/$owner%2F$repo/merge-queue" \
-    || { printf '|the forge answered %s listing its merge queue' "$pages_code"; return; }
+    || { printf 'malformed-ticket|the forge answered %s listing its merge queue' "$pages_code"; return; }
   entries=$pages
   forge_pages "/api/v1/repos/$owner%2F$repo/pulls?state=open" \
-    || { printf '|the forge answered %s listing its pull requests' "$pages_code"; return; }
+    || { printf 'malformed-ticket|the forge answered %s listing its pull requests' "$pages_code"; return; }
   prs=$pages
   entry="$(jq -c --arg r "$owner/$repo" --arg ref "$ref" --arg sha "$head" \
-    'first(.[] | select(.repo == $r and .queue_ref == $ref and .queue_sha == $sha and .state == "building")) // empty' <<<"$entries")"
-  [[ -n "$entry" ]] || { printf '|the merge queue holds no building entry %s at this head' "$ref"; return; }
+    '[.[] | select(.repo == $r and .queue_ref == $ref and .queue_sha == $sha and .state == "building")] | if length == 1 then .[0] else empty end' <<<"$entries")"
+  [[ -n "$entry" ]] || { printf 'malformed-ticket|the merge queue holds no building entry %s at this head' "$ref"; return; }
   local ref_base=${ref#refs/queue/}
   ref_base=${ref_base%/*}
   [[ "$(jq -r '.number' <<<"$entry")" == "${ref##*/}" &&
      "$(jq -r '.base' <<<"$entry")" == "$ref_base" ]] \
-    || { printf '|the queue entry does not match the ticket ref'; return; }
+    || { printf 'malformed-ticket|the queue entry does not match the ticket ref'; return; }
   while [[ -n "$entry" ]]; do
-    ((++depth <= 64)) || { printf '|the queue stack under %s is deeper than 64 entries' "$ref"; return; }
+    ((++depth <= 64)) || { printf 'malformed-ticket|the queue stack under %s is deeper than 64 entries' "$ref"; return; }
     number="$(jq -r '.number // ""' <<<"$entry")" pr_head="$(jq -r '.pr_head_sha // ""' <<<"$entry")"
     base="$(jq -r '.base // ""' <<<"$entry")" parent="$(jq -r '.base_sha // ""' <<<"$entry")"
     [[ "$number" =~ ^[0-9]+$ && "$pr_head" =~ ^[0-9a-f]{40}$ && "$parent" =~ ^[0-9a-f]{40}$ && "$base" == "$ref_base" ]] \
-      || { printf '|a queue entry under %s is malformed' "$ref"; return; }
+      || { printf 'malformed-ticket|a queue entry under %s is malformed' "$ref"; return; }
     pr="$(jq -c --argjson n "$number" --arg h "$pr_head" 'first(.[] | select(.number == $n and .head_sha == $h)) // empty' <<<"$prs")"
-    [[ -n "$pr" ]] || { printf '|no open pull request #%s holds the head %s queued under %s' "$number" "${pr_head:0:12}" "$ref"; return; }
+    [[ -n "$pr" ]] || { printf 'malformed-ticket|no open pull request #%s holds the head %s queued under %s' "$number" "${pr_head:0:12}" "$ref"; return; }
     if label_on "$pr" "$CONTRIBUTED_LABEL"; then
       printf 'contributed|a contribution (%s) is in the stack under %s: the gate host checks out nothing of it' "$CONTRIBUTED_LABEL" "$ref"; return
     fi
-    label_on "$pr" "$INTERNAL_LABEL" || { printf '|pull request #%s in the stack under %s is not marked %s' "$number" "$ref" "$INTERNAL_LABEL"; return; }
-    # If no building parent remains, its commit must be proved on main after fetch, before checkout.
+    label_on "$pr" "$INTERNAL_LABEL" || { printf 'malformed-ticket|pull request #%s in the stack under %s is not marked %s' "$number" "$ref" "$INTERNAL_LABEL"; return; }
+    printf '%s\n' "$entry" >>"$WORK_DIR/queue-stack"
+    # Protected forge build_on records the actual replay parent in base_sha, including a preceding
+    # queue commit. A missing parent is trusted only on main; fetched trees are checked independently.
+    if [[ "$(jq --arg r "$owner/$repo" --arg b "$base" --arg sha "$parent" \
+      '[.[] | select(.repo == $r and .base == $b and .queue_sha == $sha and .state == "building")] | length' <<<"$entries")" -gt 1 ]]; then
+      printf 'malformed-ticket|the queue stack has ambiguous parents'; return
+    fi
     entry="$(jq -c --arg r "$owner/$repo" --arg b "$base" --arg sha "$parent" \
       'first(.[] | select(.repo == $r and .base == $b and .queue_sha == $sha and .state == "building")) // empty' <<<"$entries")"
   done
   printf '%s\n' "$parent" >"$WORK_DIR/queue-bottom"
+}
+
+# Check objects without checkout. The authenticated forge declares the source mapping, but every
+# declared replay must also have the exact tree produced by merging its source onto its parent.
+# merge-tree writes Git objects only; no repository hooks, filters or checkout can execute here.
+queue_trees_match() {
+  local src=$1 row source parent queued number fork expected actual
+  while IFS= read -r row; do
+    source="$(jq -r .pr_head_sha <<<"$row")" parent="$(jq -r .base_sha <<<"$row")"
+    queued="$(jq -r .queue_sha <<<"$row")" number="$(jq -r .number <<<"$row")"
+    if ! "${git_auth[@]}" git -C "$src" cat-file -e "$source^{commit}" 2>/dev/null; then
+      "${git_auth[@]}" git -C "$src" fetch -q origin "+refs/pull/$number/head:refs/remotes/origin/queue-source-$number" 2>/dev/null || return 1
+    fi
+    "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$parent" "$queued" 2>/dev/null || return 1
+    fork="$("${git_auth[@]}" git -C "$src" merge-base "$parent" "$source" 2>/dev/null)" || return 1
+    expected="$("${git_auth[@]}" git -C "$src" -c core.hooksPath=/dev/null merge-tree --write-tree \
+      --merge-base="$fork" "$parent" "$source" 2>/dev/null)" || return 1
+    actual="$("${git_auth[@]}" git -C "$src" rev-parse "$queued^{tree}" 2>/dev/null)" || return 1
+    [[ "$expected" =~ ^[0-9a-f]{40}$ && "$expected" == "$actual" ]] || return 1
+  done <"$WORK_DIR/queue-stack"
 }
 
 # admission OWNER REPO BRANCH HEAD [ORIGIN]: nothing when this host can audit the ticket; else why not, as "<release reason>|<explanation>". main is reviewed by protection (checked after
@@ -623,7 +649,7 @@ audit_one() { # ticket-json
   if [[ -n "$qref" ]]; then
     if ! "${git_auth[@]}" git -C "$src" fetch -q origin "+$qref:refs/remotes/origin/queue-ticket" 2>&1 \
        || [[ "$("${git_auth[@]}" git -C "$src" rev-parse -q --verify 'refs/remotes/origin/queue-ticket^{commit}' 2>/dev/null)" != "$head" ]]; then
-      refuse stale-queue-ref "the queue ref $qref no longer names the ticketed commit" failed; return 0
+      refuse malformed-ticket "the queue ref $qref no longer names the ticketed commit" failed; return 0
     fi
   fi
   if [[ -n "$qref" ]]; then
@@ -631,11 +657,14 @@ audit_one() { # ticket-json
     bottom="$(cat "$WORK_DIR/queue-bottom" 2>/dev/null)" || bottom=""
     if [[ ! "$bottom" =~ ^[0-9a-f]{40}$ ]] ||
        ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$bottom" refs/remotes/origin/main 2>/dev/null; then
-      refuse untrusted-queue-base "the queue stack bottom is not on main" failed; return 0
+      refuse not-on-main "the queue stack bottom is not on main" failed; return 0
     fi
     if ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$bottom" "$head" 2>/dev/null ||
        { [[ "$mode" == diff ]] && ! "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$base" "$bottom" 2>/dev/null; }; then
-      refuse untrusted-queue-range "the audit range does not cover the queue stack" failed; return 0
+      refuse malformed-ticket "the audit range does not cover the queue stack" failed; return 0
+    fi
+    if ! queue_trees_match "$src"; then
+      refuse malformed-ticket "the queue tree does not match its declared source replay" failed; return 0
     fi
   fi
   # main is admitted only when the head really is main's: reachable from the clone's own main.

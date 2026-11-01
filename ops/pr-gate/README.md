@@ -542,14 +542,19 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    of open pull requests is read, and a label may sit on the row or under its summary). A contribution (`origin:contributed`), a head no open
    pull request holds, or a forge that cannot answer is left alone -- like the slots, this host checks
    out nothing of a contribution. A merge-queue ticket (branch `refs/queue/<base>/<number>`, under either
-   contract) is admitted only while the forge's live merge queue still holds that exact repository, ref
+   contract, currently for stacks rooted on main) is admitted only while the forge's live merge queue still holds that exact repository, ref
    and commit as a building entry and every source pull request of its stack is open, `origin:internal`
    and at the head the entry was built from; it is then fetched through that exact ref and must still
    match the ticket. The entry's number and base branch must match the ticket ref; every
    stack base must be a commit SHA. Before checkout, the bottom replay base must be an ancestor of
    the clone's own `main`; an absent/non-building parent is never treated as main by assumption.
    A diff ticket must cover the entire stack: its audit base must be an ancestor of that bottom,
-   and the bottom must be an ancestor of the queue head. Bound queue jobs must also say `origin: internal`. Contributions in queue jobs remain refused,
+   and the bottom must be an ancestor of the queue head. Before checkout, every fetched queue tree
+   must match Git's object-only three-way merge of its declared source and replay parent. Ambiguous
+   entries, undeclared changes and conflicting reconstruction fail closed. Bound refusals release
+   immediately with the existing ADR0011 vocabulary; the exact web-queue field contract is recorded in
+   [ADR0003](../../docs/adr/0003-audit-admission-addendum.md#merge-queue-replay-contract-and-content-binding).
+   Ordinary branches named `queue/...` keep ordinary admission. Bound queue jobs must also say `origin: internal`. Contributions in queue jobs remain refused,
    even on sandbox-ready hosts (see the ADR 0003 addendum). A job left alone is not refused on the forge (there is no route for
    that on the unbound contract); its claim lapses with its lease;
 3. clone the head under the gate home (`audit-work/`, swept at the start of each pass) with the gate's own credential (through a git credential
