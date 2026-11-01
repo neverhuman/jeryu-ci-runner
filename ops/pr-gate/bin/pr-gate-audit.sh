@@ -451,6 +451,47 @@ forge_pages() {
   return 1
 }
 
+# forge_pr OWNER REPO NUMBER: the forge's own row for one pull request in $pr_row, as a lookup bounded
+# by the stack depth rather than by how many pull requests the repository has open. The listing route
+# is filtered to open rows and this one is not, so a row stands in for a listed one only when the
+# forge itself reports it open and unmerged: a forge that reports neither resolves nothing here.
+# $pr_row_code says why a read produced no row.
+forge_pr() {
+  pr_row='' pr_row_code=200
+  api GET "/api/v1/repos/$1%2F$2/pulls/$3"
+  [[ "$code" == 200 ]] || { pr_row_code=$code; return 1; }
+  pr_row="$(jq -ce --argjson n "$3" 'select(type == "object")
+    | select(.number == $n and .state == "open" and (.merged // false) != true)' <<<"$body" 2>/dev/null)" \
+    || { pr_row=''; pr_row_code=not-open; return 1; }
+}
+
+# queue_source OWNER REPO NUMBER HEAD: the open pull request row holding exactly this queued source, in
+# $pr_row; else nothing, with why in $pr_row_code. Rows come from the accumulated open listing when the
+# forge could list it all, and from the per-number route when it could not, so a repository with more
+# open pull requests than this host can page is still auditable instead of permanently unadmittable.
+# Rows that disagree about one number resolve nothing: picking the first of a duplicate pair would let
+# an internal row stand for a contributed one with the same number, which is the marking the host
+# refuses on. Byte-identical duplicates are only the listing repeating itself across pages.
+queue_source() {
+  local rows
+  if [[ "$prs" == unlisted ]]; then
+    forge_pr "$1" "$2" "$3" || return 1
+    # The head binding is the same on either route: a row for the number is not a row for the commit.
+    [[ "$(jq -r '.head_sha // ""' <<<"$pr_row")" == "$4" ]] || { pr_row='' pr_row_code=other-head; return 1; }
+    return 0
+  fi
+  pr_row='' pr_row_code=no-row
+  rows="$(jq -c --argjson n "$3" '[.[] | select(type == "object" and .number == $n)] | unique' <<<"$prs")" \
+    || { pr_row_code=invalid-listing; return 1; }
+  case "$(jq -r 'length' <<<"$rows")" in
+    0) return 1 ;;
+    1) ;;
+    *) pr_row_code=ambiguous; return 1 ;;
+  esac
+  pr_row="$(jq -ce --arg h "$4" '.[0] | select(.head_sha == $h)' <<<"$rows" 2>/dev/null)" \
+    || { pr_row=''; return 1; }
+}
+
 # queue_admission OWNER REPO REF HEAD: nothing when the forge still holds exactly this queue entry and every
 # source pull request of its stack (the entry and each one below it, down to the base tip) is an open
 # pull request the forge marks internal with the head the entry was built from; else why not, as
@@ -459,14 +500,21 @@ forge_pages() {
 # anywhere in the stack refuses the whole ticket: the gate host checks out nothing of it.
 queue_admission() {
   local owner=$1 repo=$2 ref=$3 head=$4 entries prs entry number pr_head parent base depth=0 pr
+  local pr_row='' pr_row_code=''
   rm -f -- "$WORK_DIR/queue-bottom"
   : >"$WORK_DIR/queue-stack"
   forge_pages "/api/v1/repos/$owner%2F$repo/merge-queue" \
     || { printf 'malformed-ticket|the forge answered %s listing its merge queue' "$pages_code"; return; }
   entries=$pages
-  forge_pages "/api/v1/repos/$owner%2F$repo/pulls?state=open" \
-    || { printf 'malformed-ticket|the forge answered %s listing its pull requests' "$pages_code"; return; }
-  prs=$pages
+  if forge_pages "/api/v1/repos/$owner%2F$repo/pulls?state=open"; then
+    prs=$pages
+  elif [[ "$pages_code" == pagination-limit ]]; then
+    # A repository with more open pull requests than this host pages is legitimate; each source is
+    # then read by number instead, which binds the same head and marking without any listing.
+    prs=unlisted
+  else
+    printf 'malformed-ticket|the forge answered %s listing its pull requests' "$pages_code"; return
+  fi
   entry="$(jq -c --arg r "$owner/$repo" --arg ref "$ref" --arg sha "$head" \
     '[.[] | select(.repo == $r and .queue_ref == $ref and .queue_sha == $sha and .state == "building")] | if length == 1 then .[0] else empty end' <<<"$entries")"
   [[ -n "$entry" ]] || { printf 'malformed-ticket|the merge queue holds no building entry %s at this head' "$ref"; return; }
@@ -481,8 +529,13 @@ queue_admission() {
     base="$(jq -r '.base // ""' <<<"$entry")" parent="$(jq -r '.base_sha // ""' <<<"$entry")"
     [[ "$number" =~ ^[0-9]+$ && "$pr_head" =~ ^[0-9a-f]{40}$ && "$parent" =~ ^[0-9a-f]{40}$ && "$base" == "$ref_base" ]] \
       || { printf 'malformed-ticket|a queue entry under %s is malformed' "$ref"; return; }
-    pr="$(jq -c --argjson n "$number" --arg h "$pr_head" 'first(.[] | select(.number == $n and .head_sha == $h)) // empty' <<<"$prs")"
-    [[ -n "$pr" ]] || { printf 'malformed-ticket|no open pull request #%s holds the head %s queued under %s' "$number" "${pr_head:0:12}" "$ref"; return; }
+    if queue_source "$owner" "$repo" "$number" "$pr_head"; then
+      pr=$pr_row
+    elif [[ "$pr_row_code" == ambiguous ]]; then
+      printf 'malformed-ticket|the forge reports more than one open pull request #%s under %s' "$number" "$ref"; return
+    else
+      printf 'malformed-ticket|no open pull request #%s holds the head %s queued under %s' "$number" "${pr_head:0:12}" "$ref"; return
+    fi
     if label_on "$pr" "$CONTRIBUTED_LABEL"; then
       printf 'contributed|a contribution (%s) is in the stack under %s: the gate host checks out nothing of it' "$CONTRIBUTED_LABEL" "$ref"; return
     fi
@@ -564,18 +617,33 @@ admission() {
     return
   fi
   [[ "$branch" != main ]] || return 0
+  # A head can be held by several open pull requests, and only the forge's marking of every one of
+  # them says whether this host may check the head out. So the listing is read to its end rather
+  # than stopped at the first match: one contributed or unmarked holder refuses the head, whichever
+  # row the listing happened to put first. Byte-identical rows are the listing repeating itself
+  # across pages; distinct holders are counted, and more than 64 of them is nothing to resolve.
+  local rows='[]'
+  more=false
   for ((page = 1; page <= 20; page++)); do
     api GET "/api/v1/repos/$owner%2F$repo/pulls?state=open&per_page=500&page=$page"
     [[ "$code" == 200 ]] || { printf '|the forge answered %s listing its pull requests' "$code"; return; }
-    row="$(jq -c --arg h "$head" 'first(.items[]? | select(.head_sha == $h)) // empty' <<<"$body" 2>/dev/null)"
+    rows="$(jq -c --arg h "$head" --argjson seen "$rows" '$seen + [.items[]? | select(.head_sha == $h)] | unique' <<<"$body" 2>/dev/null)" \
+      || { printf '|the forge answered an unreadable pull request listing'; return; }
+    [[ "$(jq -r 'length' <<<"$rows")" -le 64 ]] \
+      || { printf '|more than 64 open pull requests hold this head'; return; }
     more="$(jq -r '.page.has_more // false' <<<"$body" 2>/dev/null)"
-    [[ -z "$row" && "$more" == true ]] || break
+    [[ "$more" == true ]] || break
   done
-  [[ -n "$row" ]] || { printf '|no open pull request holds this head'; return; }
-  if label_on "$row" "$CONTRIBUTED_LABEL"; then
-    printf 'contributed|a contribution (%s): the gate host checks out nothing of it' "$CONTRIBUTED_LABEL"; return
-  fi
-  label_on "$row" "$INTERNAL_LABEL" || printf '|its pull request is not marked %s' "$INTERNAL_LABEL"
+  [[ "$more" != true ]] || { printf '|the forge lists more open pull requests than this host can page'; return; }
+  [[ "$(jq -r 'length' <<<"$rows")" -gt 0 ]] || { printf '|no open pull request holds this head'; return; }
+  while IFS= read -r row; do
+    if label_on "$row" "$CONTRIBUTED_LABEL"; then
+      printf 'contributed|a contribution (%s): the gate host checks out nothing of it' "$CONTRIBUTED_LABEL"; return
+    fi
+  done < <(jq -c '.[]' <<<"$rows")
+  while IFS= read -r row; do
+    label_on "$row" "$INTERNAL_LABEL" || { printf '|its pull request is not marked %s' "$INTERNAL_LABEL"; return; }
+  done < <(jq -c '.[]' <<<"$rows")
 }
 
 # release JOB-ID REASON: hand a bound job back to the forge at once, with its reason. A forge that

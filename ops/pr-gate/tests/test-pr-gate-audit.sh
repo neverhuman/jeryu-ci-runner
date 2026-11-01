@@ -145,6 +145,10 @@ case "\$url" in
     else answer 'missing queue fixture' 500; fi;;
   */pulls\?state=open*)
     if [[ -e "$fx/forge/pulls.status" ]]; then answer nope "\$(cat "$fx/forge/pulls.status")"
+    elif [[ -e "$fx/forge/listing-overflow" ]]; then
+      # A repository whose open pull requests outrun every page this host reads, as a large forge
+      # answers it: each page reports another one after it.
+      answer '{"items":[],"page":{"has_more":true}}' 200
     elif [[ -e "$fx/forge/pulls-raw.json" ]]; then answer "\$(jq -c '{items: ., page: {has_more: false}}' "$fx/forge/pulls-raw.json")" 200; else
     page=\$(sed -n 's/.*[?&]page=\([0-9]*\).*/\1/p' <<<"\$url")
     if [[ -e "$fx/forge/paged" && "\${page:-1}" == 1 ]]; then answer '{"items":[],"page":{"has_more":true}}' 200; else
@@ -152,6 +156,16 @@ case "\$url" in
                sed 's/.*/{"number":2,"head_sha":"&","labels":["origin:contributed"]}/' "$fx/forge/contributed-heads" 2>/dev/null; } | jq -cs .)
     [[ ! -e "$fx/forge/summary-labels" ]] || items=\$(jq -c 'map({number, head_sha, summary: {labels}})' <<<"\$items")
     answer "\$(jq -c '{items: ., page: {has_more: false}}' <<<"\$items")" 200; fi; fi;;
+  */pulls/[0-9]*)
+    # One pull request by number, as the per-number route answers it: the row the listing would carry
+    # plus the state and merged flags that route reports, since it is not filtered to open rows.
+    n=\${url##*/}
+    if [[ -e "$fx/forge/pr-\$n.json" ]]; then answer "\$(cat "$fx/forge/pr-\$n.json")" 200
+    elif [[ -e "$fx/forge/pulls-raw.json" ]] \\
+      && jq -ce --argjson n "\$n" 'map(select(.number == \$n)) | select(length == 1) | .[0] + {state:"open",merged:false}' \\
+        "$fx/forge/pulls-raw.json" >"$fx/forge/pr-answer.json"; then
+      answer "\$(cat "$fx/forge/pr-answer.json")" 200
+    else answer '{"message":"not found"}' 404; fi;;
   */runners/heartbeat)
     b=\$(cat)
     if [[ -e "$fx/forge/old-heartbeat" ]] && jq -e 'has("tools") or has("code") or has("intervalSeconds")' >/dev/null <<<"\$b"; then answer nope 422
@@ -352,6 +366,31 @@ printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"orphanpr","branc
 run
 must 'main is reviewed code and needs no pull request' grep -q "acme/orphanpr@$h7 scored" "$fx/out"
 rm -f "$fx/forge/pulls.status"
+# A head several open pull requests hold is only as reviewed as the least reviewed of them: the
+# listing is read past the first match, so a contributed holder refuses the head even when an
+# internal row for the same head comes first.
+read -r b9 h9 < <(repo shared 'echo e >e' 'echo f >f')
+internal "$h9"; printf '%s\n' "$h9" >>"$fx/forge/contributed-heads"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"shared","branch":"feature/z","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$h9" "$b9" >"$fx/forge/claim.json"
+: >"$fx/git-helper.log"; before=$(scores)
+run
+must 'a head an internal and a contributed row both hold is a contribution' \
+  grep -q "not auditing acme/shared@$h9 here: a contribution (origin:contributed)" "$fx/out"
+must 'a head with a contributed holder is never cloned' test ! -s "$fx/git-helper.log"
+must 'a head with a contributed holder submits nothing' test "$(scores)" == "$before"
+grep -v "^$h9\$" "$fx/forge/contributed-heads" >"$fx/forge/heads.tmp"; mv "$fx/forge/heads.tmp" "$fx/forge/contributed-heads"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"shared","branch":"feature/z","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$h9" "$b9" >"$fx/forge/claim.json"
+run
+must 'the same head with only internal holders is audited' grep -q "acme/shared@$h9 scored" "$fx/out"
+# A listing this host cannot read to its end cannot say who holds the head, and says so.
+touch "$fx/forge/listing-overflow"; before=$(scores); : >"$fx/git-helper.log"
+printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"shared","branch":"feature/z","headSha":"%s","baseSha":"%s","auditMode":"diff"}]}' "$h9" "$b9" >"$fx/forge/claim.json"
+run
+must 'an unreadable listing refuses the head with its reason' \
+  grep -q 'lists more open pull requests than this host can page' "$fx/out"
+must 'an unreadable listing clones nothing' test ! -s "$fx/git-helper.log"
+must 'an unreadable listing submits nothing' test "$(scores)" == "$before"
+rm -f -- "$fx/forge/listing-overflow"
 printf 'PASS only main and internal pull request heads are checked out; contributions and unknowns are not\n'
 
 printf '{"leaseSeconds":1800,"tickets":[{"owner":"acme","repo":"orphanpr","branch":"main","headSha":"%s","baseSha":"","auditMode":"full"}]}' "$h7" >"$fx/forge/claim.json"
@@ -779,6 +818,74 @@ must 'a stack source the forge does not mark internal is refused' grep -q 'is no
 must 'an unmarked stack is never cloned' test ! -s "$fx/git-helper.log"
 
 printf 'PASS a contributed or unmarked source anywhere in the stack refuses the queue ticket\n'
+
+# --- duplicate and unlistable source rows ------------------------------------------------------------
+# Two open rows for the same number, disagreeing about the marking: the host must not audit the stack
+# on the strength of whichever row the listing put first.
+for order in internal-first contributed-first; do
+  qlive
+  jq -n --arg s1 "$QSRC1" --arg s2 "$QSRC2" --arg order "$order" \
+    '[{number:1,head_sha:$s1,labels:["origin:internal"]},{number:1,head_sha:$s1,labels:["origin:contributed"]}]
+     | (if $order == "contributed-first" then reverse else . end)
+     + [{number:2,head_sha:$s2,labels:["origin:internal"]}]' >"$fx/forge/pulls-raw.json"
+  : >"$fx/git-helper.log"; : >"$fx/jankurai.log"; before=$(scores)
+  qticket refs/queue/main/2 "$QQ2" "$QBASE"
+  run
+  must "duplicate rows ($order) refuse the ticket" \
+    grep -q 'reports more than one open pull request #1 under refs/queue/main/2' "$fx/out"
+  must "duplicate rows ($order) are never resolved to the internal one" \
+    test "$(grep -c "acme/qrepo@$QQ2 scored" "$fx/out" || true)" == 0
+  must "duplicate rows ($order) are never cloned" test ! -s "$fx/git-helper.log"
+  must "duplicate rows ($order) submit nothing" test "$(scores)" == "$before"
+done
+# The same listing repeated across pages is not a disagreement: identical rows resolve as one.
+qlive
+jq '. + [.[0]]' "$fx/forge/pulls-raw.json" >"$fx/forge/pulls.tmp"; mv "$fx/forge/pulls.tmp" "$fx/forge/pulls-raw.json"
+before=$(scores); qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'a row repeated byte for byte still admits the stack' grep -q "acme/qrepo@$QQ2 scored" "$fx/out"
+must 'a repeated row is audited once' test "$(scores)" == "$((before + 1))"
+printf 'PASS duplicate source rows that disagree refuse the ticket instead of picking the internal one\n'
+
+# A repository with more open pull requests than this host can page: every page reports another after
+# it, so no accumulated listing exists. The stack is still resolved, by number, and admission is
+# unchanged -- the same head binding, the same marking, the same refusal of a contribution.
+pr_row() { # number head labels [state] [merged]
+  jq -n --argjson n "$1" --arg h "$2" --argjson l "$3" --arg st "${4:-open}" --argjson m "${5:-false}" \
+    '{number:$n,head_sha:$h,labels:$l,state:$st,merged:$m}' >"$fx/forge/pr-$1.json"
+}
+qlive; : >"$fx/forge/listing-overflow"
+pr_row 1 "$QSRC1" '["origin:internal"]'; pr_row 2 "$QSRC2" '["origin:internal"]'
+before=$(scores); : >"$fx/curl.log"; qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'an unlistable repository is still admitted through the per-number route' grep -q "acme/qrepo@$QQ2 scored" "$fx/out"
+must 'the unlistable stack is submitted under its exact queue ref and sha' \
+  test "$(jq -r '[.branch, .commit_sha] | join(" ")' "$fx/forge/score-$before.json")" == "refs/queue/main/2 $QQ2"
+must 'the per-number route is the one read for each source' \
+  test "$(grep -c 'GET https://forge.example.test/api/v1/repos/acme%2Fqrepo/pulls/[12]$' "$fx/curl.log")" -ge 2
+must 'paging stopped at the bound this host reads' \
+  test "$(grep -c 'repos/acme%2Fqrepo/pulls?state=open&per_page=500&page=' "$fx/curl.log")" == 20
+# Nothing about full-stack admission is relaxed by that route.
+pr_row 1 "$QSRC1" '["origin:contributed"]'
+: >"$fx/git-helper.log"; before=$(scores); qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'an unlistable stack holding a contribution is refused' \
+  grep -q 'a contribution (origin:contributed) is in the stack under refs/queue/main/2' "$fx/out"
+must 'an unlistable contributed stack is never cloned' test ! -s "$fx/git-helper.log"
+must 'an unlistable contributed stack submits nothing' test "$(scores)" == "$before"
+pr_row 1 "$QSRC1" '[]'
+before=$(scores); qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'an unlistable unmarked source is refused' grep -q 'is not marked origin:internal' "$fx/out"
+must 'an unlistable unmarked source submits nothing' test "$(scores)" == "$before"
+pr_row 1 "$QSRC1" '["origin:internal"]' closed true
+before=$(scores); qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'a merged source is not an open pull request' grep -q "no open pull request #1 holds the head ${QSRC1:0:12}" "$fx/out"
+must 'a merged source submits nothing' test "$(scores)" == "$before"
+pr_row 1 "$QSRC1" '["origin:internal"]'
+jq '.head_sha = "'"$QQ1"'"' "$fx/forge/pr-1.json" >"$fx/forge/pr.tmp"; mv "$fx/forge/pr.tmp" "$fx/forge/pr-1.json"
+before=$(scores); qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'a per-number row with another head does not bind the queued source' \
+  grep -q "no open pull request #1 holds the head ${QSRC1:0:12}" "$fx/out"
+must 'a mismatched head submits nothing' test "$(scores)" == "$before"
+rm -f -- "$fx/forge/listing-overflow" "$fx/forge/pr-1.json" "$fx/forge/pr-2.json"
+printf 'PASS a repository too large to list resolves its queue sources by number, with the same bindings\n'
 
 # Even a response using base-branch-tip semantics must not undercount a hidden contribution.
 qlive '["origin:contributed"]'

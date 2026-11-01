@@ -549,13 +549,21 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    admission contract below. For unbound tickets, admit only reviewed code: a
    job for `main` whose head the clone's own `main` reaches (the ticket's word is not enough), or the
    head of an open pull request the forge marks `origin:internal` (`PR_GATE_INTERNAL_LABEL`; every page
-   of open pull requests is read, and a label may sit on the row or under its summary). A contribution (`origin:contributed`), a head no open
-   pull request holds, or a forge that cannot answer is left alone -- like the slots, this host checks
+   of open pull requests is read, and a label may sit on the row or under its summary). Several open
+   pull requests can hold one head, so the listing is read past the first match and *every* holder
+   must be marked internal: one contributed or unmarked holder refuses the head, whichever row came
+   first. A contribution (`origin:contributed`), a head no open
+   pull request holds, a listing longer than this host pages, or a forge that cannot answer is left alone -- like the slots, this host checks
    out nothing of a contribution. A merge-queue ticket (branch `refs/queue/<base>/<number>`, under either
    contract, currently for stacks rooted on main) is admitted only while the forge's live merge queue still holds that exact repository, ref
    and commit as a building entry and every source pull request of its stack is open, `origin:internal`
    and at the head the entry was built from; it is then fetched through that exact ref and must still
-   match the ticket. The entry's number and base branch must match the ticket ref; every
+   match the ticket. Each source is resolved from the open-pull-request listing when this host can
+   read it to its end, and from the per-number route (`GET /api/v1/repos/:id/pulls/:n`, accepted only
+   when the forge itself reports that row open and unmerged) when it cannot -- so a repository with
+   more open pull requests than the paging bound is still auditable, with the same number, head and
+   marking required. Two listed rows for one number resolve nothing: the first of a disagreeing pair
+   could stand an `origin:internal` row in for an `origin:contributed` one. The entry's number and base branch must match the ticket ref; every
    stack base must be a commit SHA. Before checkout, the bottom replay base must be an ancestor of
    the clone's own `main`; an absent/non-building parent is never treated as main by assumption.
    A diff ticket must cover the entire stack: its audit base must be an ancestor of that bottom,
