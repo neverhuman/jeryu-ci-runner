@@ -121,6 +121,20 @@ gate_claim_release() {
   GATE_CLAIM_HELD=0
   return 0
 }
+# gate_claim_recipe_end KIND -- record, once per recipe, what ended it: `stopped` (this slot's lost
+# lease signalled its process group before the recipe could end itself) or `completed` (the recipe
+# returned to the runner with no stop issued for it). The first writer wins, so what is recorded is
+# the order of those two events and never the recipe's exit code: GNU timeout forwards the stop into
+# the recipe, and a recipe trapping it and exiting 0 must not read as a verdict of its own.
+gate_claim_recipe_end() {
+  ( set -C; printf '%s\n' "$1" >"$GATE_CLAIM_STATE/recipe-end" ) 2>/dev/null
+}
+# gate_claim_recipe_completed -- 0 when the recipe ended itself, whatever verdict it reported.
+gate_claim_recipe_completed() {
+  local kind=""
+  read -r kind <"$GATE_CLAIM_STATE/recipe-end" 2>/dev/null || return 1
+  [[ "$kind" == completed ]]
+}
 # Stop a registered recipe for either background or publication-time lease loss.
 # Registration checks the marker too: loss can occur after the pre-spawn check
 # but before the parent writes the worker PID, when the renewer sees no worker yet.
@@ -136,9 +150,10 @@ gate_claim_stop_worker() {
       and .owner==$owner and .repo==$repo and .sha==$sha' "$receipt" >/dev/null 2>&1 || return 0
   read -r parent group < <(ps -o ppid=,pgid= -p "$worker") || return 0
   [[ "$parent" == "$$" && "$group" == "$worker" ]] || return 0
-  # Evidence that the loss, not the recipe, ended the worker: the runner abandons an attempt only
-  # when this stop reached a live group, and keeps a verdict the recipe completed on its own.
-  if kill -TERM -- "-$worker" 2>/dev/null; then : >"$GATE_CLAIM_STATE/worker-stopped"; fi
+  # Recorded before the signal, so a recipe that ends after it -- however it ends, and whatever it
+  # exits with -- is read as stopped and its attempt abandoned.
+  gate_claim_recipe_end stopped || true
+  kill -TERM -- "-$worker" 2>/dev/null || true
 }
 # gate_claim_mark_lost KIND WHY -- record that this slot no longer holds the lease. KIND is the
 # ownership this answer proves, as its own state and not as text inside WHY: `refused` (the forge

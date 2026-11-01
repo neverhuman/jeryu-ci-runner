@@ -230,11 +230,15 @@ printf 'PASS gate claims: an ownership that stays unknown is deferred after a bo
 claims_head
 printf '30\n' >"$fixture/claim-ttl"
 printf '25\n' >"$fixture/recipe-sleep"
-touch "$fixture/steal-on-renew"
+# The recipe itself hands the head over, so the renewal that discovers the loss cannot land before
+# the recipe: the loss under test is a mid-recipe one and not a preparation one.
+touch "$fixture/recipe-steal"
 results=$(non_pending)
-rm -f "$fixture/recipe-slept"
+started=$(count)
+rm -f "$fixture/recipe-slept" "$fixture/steal-now"
 invoke --repo acme/fixture --pr 1
 [[ "$runner_exit" == 0 ]] || fail_claims 'a lease lost mid-recipe failed the runner'
+expect_count "$((started + 1))"
 # The recipe marks the end of its sleep; a stopped recipe never reaches it, however long the host's
 # preparation took.
 [[ ! -e "$fixture/recipe-slept" ]] || fail_claims 'the recipe ran on after its lease was lost'
@@ -242,8 +246,9 @@ invoke --repo acme/fixture --pr 1
 grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'the mid-recipe loss was not reported'
 grep -qE 'renewal answered|publication renewal refused' "$fixture/runner/cache/gate-claim-slot0/lost" \
   || fail_claims 'the renewal loss that stopped the recipe was not recorded'
-rm -f "$fixture/steal-on-renew" "$claim"
+rm -f "$fixture/recipe-steal" "$fixture/steal-now" "$claim"
 printf 'PASS gate claims: a lease lost mid-recipe stops the recipe and publishes nothing\n'
+
 
 # A slot killed outright (kill -9) leaves no process renewing its head: the renewer ends with the
 # runner, so the lease lapses within one TTL and another host can take the head.
@@ -282,3 +287,56 @@ jq -se --arg sha "$first" '[.[] | select(.sha==$sha and .state!="pending")] | le
 jq -se --arg sha "$second" 'any(.[]; .sha==$sha and .state=="success")' "$fixture/statuses.jsonl" >/dev/null
 rm -f "$fixture/head2" "$fixture/steal-after-recipe" "$fixture/steal-pending-$first"
 printf 'PASS publication handover retains the first verdict and gates the remaining candidate\n'
+
+# A recipe that catches the stop and exits 0 was still ended by the loss, not by itself: the exit
+# code is no evidence of a verdict, so the attempt is abandoned and nothing for the head is kept or
+# published -- a stopped run must never become a retained green that later recovers.
+claims_head
+printf '30\n' >"$fixture/claim-ttl"
+printf '25\n' >"$fixture/recipe-sleep"
+touch "$fixture/recipe-steal" "$fixture/recipe-swallow-term"
+results=$(non_pending)
+started=$(count)
+rm -f "$fixture/recipe-slept" "$fixture/steal-now"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_claims 'a stop the recipe swallowed failed the runner'
+expect_count "$((started + 1))"
+[[ ! -e "$fixture/recipe-slept" ]] || fail_claims 'the recipe that swallowed the stop ran on'
+# The recipe caught the stop and exited 0, so only the recorded order of the two tells the attempt
+# from a verdict.
+grep -q 'stop signal swallowed' "$fixture"/runner/attempts/acme-fixture-"$head"*/*/build.log \
+  || fail_claims 'the recipe did not exit through its own stop handler'
+[[ "$(non_pending)" == "$results" ]] || fail_claims 'a swallowed stop published a verdict'
+grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'the swallowed stop was not abandoned'
+! jq -se 'any(.[]; .terminal and .outcome != "claim_lost")' \
+  "$fixture"/runner/attempts/acme-fixture-"$head"*/*/receipt.json >/dev/null \
+  || fail_claims 'a stop the recipe swallowed was retained as a finished verdict'
+jq -se 'map(select(.outcome == "claim_lost" and .publication.superseded_by != null)) | length >= 1' \
+  "$fixture"/runner/attempts/acme-fixture-"$head"*/*/receipt.json >/dev/null \
+  || fail_claims 'the swallowed stop is not recorded as superseded'
+rm -f "$fixture/recipe-swallow-term" "$fixture/recipe-sleep" "$fixture/recipe-steal" \
+  "$fixture/steal-now" "$claim"
+printf 'PASS gate claims: a recipe that swallows the stop is abandoned, not kept as a verdict\n'
+
+# A recipe that reached its own end red is as real a verdict as a green one. Here the lease is lost
+# in the race the runner's own post-recipe step opens: after a completed recipe and before the loss
+# is read. The red verdict is saved and owed for recovery, never abandoned.
+claims_head
+printf '30\n' >"$fixture/claim-ttl"
+printf '9\n' >"$fixture/recipe-exit"
+touch "$fixture/recipe-end-steal"
+results=$(non_pending)
+started=$(count)
+rm -f "$fixture/steal-now" "$fixture/slow-tool-seconds"
+invoke --repo acme/fixture --pr 1
+[[ "$runner_exit" == 0 ]] || fail_claims 'a completed red verdict failed the runner'
+expect_count "$((started + 1))"
+grep -qE 'gate claim lost|publication lease was lost' "$fixture/runner.log" \
+  || fail_claims 'the lease was not lost after the completed red recipe'
+[[ "$(non_pending)" == "$results" ]] || fail_claims 'a red verdict was published without the lease'
+! grep -q 'abandoning attempt' "$fixture/runner.log" || fail_claims 'a completed red verdict was abandoned'
+jq -e '.terminal and .outcome=="failure" and .recovery_required!=null and (.publication.required_status|not)' \
+  "$fixture/runner/attempts/acme-fixture-$head/last-result.json" >/dev/null \
+  || fail_claims 'the completed red verdict was not retained for recovery'
+rm -f "$fixture/recipe-exit" "$fixture/recipe-end-steal" "$fixture/steal-now" "$claim"
+printf 'PASS gate claims: a red verdict completed before a publication loss is retained\n'

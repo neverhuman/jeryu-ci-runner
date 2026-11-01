@@ -222,6 +222,22 @@ ln -sf "$gate_receipt" "$scratch/forged-receipt"
 printf '%s %s\n' "$worker" "$HOME_DIR/attempts/../../forged-receipt" >"$GATE_CLAIM_STATE/worker"
 gate_claim_stop_worker
 [[ ! -f "$scratch/signals" ]]
+# What ended the recipe is which of the stop and its own end was recorded first, never its exit
+# code: the stop is recorded before the signal, so a recipe that exits 0 after it is still stopped.
+rm -f "$GATE_CLAIM_STATE/recipe-end" "$scratch/signals"
+printf '%s %s\n' "$worker" "$gate_receipt" >"$GATE_CLAIM_STATE/worker"
+gate_claim_stop_worker
+grep -qx -- "-TERM -- -$worker" "$scratch/signals"
+[[ "$(cat "$GATE_CLAIM_STATE/recipe-end")" == stopped ]]
+gate_claim_recipe_end completed && exit 1
+! gate_claim_recipe_completed
+# A recipe that reached its own end before any stop was issued keeps its verdict.
+rm -f "$GATE_CLAIM_STATE/recipe-end"
+gate_claim_recipe_end completed
+gate_claim_recipe_end stopped && exit 1
+gate_claim_recipe_completed
+rm -f "$GATE_CLAIM_STATE/recipe-end"
+printf 'PASS the first of the stop and the recipe end recorded is what ended the recipe\n'
 unset -f kill
 kill -TERM -- "-$worker"
 wait "$worker" || true

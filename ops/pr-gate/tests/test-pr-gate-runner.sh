@@ -27,7 +27,15 @@ cat >"$fixture/tools/rustup" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$*" in
-  'which rustc'|'which cargo') printf '%s/toolchain/bin/%s\n' "$FAKE_FORGE" "$2";;
+  'which rustc'|'which cargo')
+    # slow-tool-seconds: one deliberately slow resolution, for the window a runner's own step leaves
+    # between a completed recipe and what it does with its result. Consumed by the first caller.
+    if [[ -s "$FAKE_FORGE/slow-tool-seconds" ]]; then
+      read -r slow <"$FAKE_FORGE/slow-tool-seconds"
+      rm -f -- "$FAKE_FORGE/slow-tool-seconds"
+      sleep "$slow"
+    fi
+    printf '%s/toolchain/bin/%s\n' "$FAKE_FORGE" "$2";;
   'component list --toolchain toolchain --installed') printf 'rustc-fixture\ncargo-fixture\n';;
   *) printf 'unexpected fixture rustup invocation: %s\n' "$*" >&2; exit 64;;
 esac
@@ -107,6 +115,14 @@ count=0
 [[ ! -f "$fixture_root/executions" ]] || read -r count <"$fixture_root/executions"
 printf '%s\n' "$((count + 1))" >"$fixture_root/executions"
 printf '%s\n' "$1" >>"$fixture_root/recipes"
+# recipe-swallow-term: a recipe that catches the stop signal and reports success anyway. GNU timeout
+# forwards the stop into the recipe, so this is what any real recipe trapping TERM does.
+if [[ -f "$fixture_root/recipe-swallow-term" ]]; then
+  trap 'printf "recipe: stop signal swallowed\n"; exit 0' TERM
+fi
+# recipe-steal: the recipe itself hands its head to the other host, so the loss the renewer then
+# discovers lands while this recipe is still running -- a mid-recipe loss and nothing earlier.
+[[ ! -f "$fixture_root/recipe-steal" ]] || "$worker_git" rev-parse HEAD >"$fixture_root/steal-now"
 # recipe-sleep: a recipe that runs that many seconds, for the lease renewal cases.
 [[ ! -f "$fixture_root/recipe-sleep" ]] || sleep "$(cat "$fixture_root/recipe-sleep")"
 # The one PATH the recipe got, for the PR_GATE_RECIPE_PATH assertions.
@@ -165,6 +181,16 @@ if [[ -f "$fixture_root/steal-after-recipe" ]]; then
 fi
 # recipe-slept: the recipe ran its whole sleep, which a lease lost mid-recipe must prevent.
 [[ ! -f "$fixture_root/recipe-sleep" ]] || touch "$fixture_root/recipe-slept"
+# recipe-end-steal: hand the head to the other host as this recipe ends, and make the inputs capture
+# that follows it slow enough for the renewer to discover that loss there: a lease lost after a
+# recipe reached its own end, and before the runner reads the loss.
+if [[ -f "$fixture_root/recipe-end-steal" ]]; then
+  printf '15\n' >"$fixture_root/slow-tool-seconds"
+  "$worker_git" rev-parse HEAD >"$fixture_root/steal-now"
+fi
+# recipe-exit: the verdict a recipe reaching its own end reports, red as well as green. After the
+# handovers above, so a lease lost through one of them still finds a recipe that ended itself.
+[[ ! -f "$fixture_root/recipe-exit" ]] || exit "$(cat "$fixture_root/recipe-exit")"
 printf 'error: expected rejection in a passing negative test\n'
 # Step lines, one of them the gate's own credential: what a head's recipe may print, never publish.
 printf '[pr-ci] fixture recipe step\n==> %s\n' "$(cat "$fixture_root/token")"
@@ -363,6 +389,11 @@ case "$method $url" in
     fi
     if [[ -f "$file" ]]; then
       read -r held_runner held_host held_until <"$file"
+      # steal-now: a head the running recipe has handed over; the holder's next renewal is refused.
+      if [[ -s "$FAKE_FORGE/steal-now" && "$held_runner" == "$runner" ]] && grep -qxF "$sha" "$FAKE_FORGE/steal-now"; then
+        held_runner=gate-b/slot0 held_host=gate-b held_until=$((now + 3600))
+        printf '%s %s %s\n' "$held_runner" "$held_host" "$held_until" >"$file"
+      fi
       if [[ -f "$FAKE_FORGE/steal-on-renew" && -f "$FAKE_FORGE/pending-$sha" && "$held_runner" == "$runner" ]]; then
         held_runner=gate-b/slot0 held_host=gate-b held_until=$((now + 3600))
         printf '%s %s %s\n' "$held_runner" "$held_host" "$held_until" >"$file"

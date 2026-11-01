@@ -2097,6 +2097,8 @@ if claim_lost_why=$(gate_claim_lost); then
   gate_claim_abandon "$claim_lost_why"
   break
 fi
+# One record per recipe: what ended an earlier tier's recipe must not answer for this one.
+rm -f -- "$GATE_CLAIM_STATE/recipe-end"
 if ((sandbox)); then
   # The sandbox contract: <command> <tree-root> <repo> <recipe...>. The site's command puts the tree
   # root in an ephemeral, network-restricted VM or container at that same path, enters <repo> there
@@ -2138,6 +2140,9 @@ gate_progress_watch "$log" "$steps_tsv" "$gate_worker" "$owner" "$repo" "$sha" \
 progress_watcher=$!
 worker_exit=0
 wait "$gate_worker" || worker_exit=$?
+# The recipe has returned here, so with no stop recorded for it yet its end is its own; a stop that
+# lands from now on cannot have changed what it reported.
+gate_claim_recipe_end completed || true
 rm -f -- "$GATE_CLAIM_STATE/worker"
 gate_worker=""
 kill "$progress_watcher" 2>/dev/null || true
@@ -2162,11 +2167,12 @@ if ! PATH="$RECIPE_PATH" gate_inputs "$after_inputs" "$log" \
   fi
 fi
 # A definitive background loss that stopped this worker interrupted its execution, which cannot be
-# recovered as a completed verdict. A loss that landed after the recipe finished on its own (it
-# exited 0 or never received the stop) leaves a real verdict: it is saved below and publication,
-# which refuses without the lease, retains it for recovery. Transient renewal outages are handled
-# at the publication boundary too.
-if claim_lost_why=$(gate_claim_lost) && [[ -f "$GATE_CLAIM_STATE/worker-stopped" ]] && ((worker_exit != 0)); then
+# recovered as a completed verdict. Which of the stop and the recipe's own end came first is what
+# decides that (gate_claim_recipe_end), not the recipe's exit code: the stop is forwarded into the
+# recipe, and one trapping it can exit 0. A recipe that did end itself leaves a real verdict, red or
+# green: it is saved below and publication, which refuses without the lease, retains it for
+# recovery. Transient renewal outages are handled at the publication boundary too.
+if claim_lost_why=$(gate_claim_lost) && ! gate_claim_recipe_completed; then
   ((build_cache == 0)) || rm -rf -- "$run/$repo/target/build-cache"
   gate_claim_abandon "$claim_lost_why"
   break
