@@ -23,6 +23,7 @@ identity authored.
 | `bin/pr-gate-tool-update.sh` | runs one host tool update inside the same drain, so a self-updating tool never lands mid-gate |
 | `bin/pr-gate-cargo-plugin-install.sh` | installs one `cargo-*` plugin into `~/.cargo/bin` through that drain, as a copy |
 | `bin/pr-gate-audit.sh` | claims the forge's queued jankurai audit jobs, scores each head with the governed jankurai in a throwaway clone, and submits the report (see [Scoring heads with jankurai](#scoring-heads-with-jankurai)) |
+| `bin/pr-gate-git-capability.sh` | prints whether the host's Git (>= 2.40) can verify merge-queue replays; runs from a checkout, before installation, with no configuration |
 | `bin/pr-gate-advisory-refresh.sh`, `bin/pr-gate-grype-db-refresh.sh` | keep security databases fresh outside the gates |
 | `systemd/` | the `--user` units and timers; `pr-gate-runner@N` is one slot |
 | `tests/` | the offline regression suite (`tests/required.sh`) |
@@ -32,6 +33,15 @@ identity authored.
 On a gate host the scripts live in `~/gate-runner/bin`, the units in `~/.config/systemd/user`, and
 the state under `~/gate-runner` (`installed-main.json`, `tools.json`, `attempts/`, `cache/`,
 `regate/`, mirrors and trees). The units run `%h/gate-runner/bin/<script>`.
+
+## Host requirements
+
+Merge-queue audit replay verification (`pr-gate-audit.sh`) uses `git merge-tree --merge-base`, so the
+host needs **Git >= 2.40**. Check before installing, from a source checkout:
+`sh ops/pr-gate/bin/pr-gate-git-capability.sh` (exit 0 supported, 1 not). `pr-gate-install.sh` prints the
+same finding as a warning and `pr-gate-runner.sh --preflight` reports it as a finding. None of these
+block ordinary pull-request admission or weaken any proof. On an unsupported Git the audit still refuses a
+queue job at claim time with a `tool-version error`, releases it, and scores nothing.
 
 ## Fast and full validation
 

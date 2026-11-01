@@ -67,7 +67,12 @@ must 'missing source named' grep -q 'PR_GATE_SOURCE_URL is not configured' "$fx/
 must 'nothing installed unconfigured' test ! -e "$bin/pr-gate-runner.sh"
 printf 'PASS no configured source: refused by name, nothing installed\n'
 
-run >"$fx/out"
+# An unsupported Git warns about queue replay but never blocks the install.
+mkdir -p "$fx/oldgit"
+printf '#!/bin/sh\n[ "$1" = --version ] && echo "git version 2.39.5" && exit 0\nexec %s "$@"\n' "$(command -v git)" >"$fx/oldgit/git"
+chmod +x "$fx/oldgit/git"
+PATH="$fx/oldgit:$PATH" run >"$fx/out"
+must 'unsupported Git warned before install' grep -q 'warning: tool-version error: queue replay verification requires Git >= 2.40; found git version 2.39.5' "$fx/out"
 must 'runner v1 installed' grep -q 'echo runner v1' "$bin/pr-gate-runner.sh"
 must 'runner executable' test -x "$bin/pr-gate-runner.sh"
 must 'config library installed' test -x "$bin/pr-gate-config.sh"

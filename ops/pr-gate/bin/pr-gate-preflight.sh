@@ -13,6 +13,8 @@
 #      digest when one is given, and come from an installed package version that was reviewed.
 #      An unattended upgrade of the package shows here.
 #   3. each family main's latest <repo>/required status.
+#   4. queue-replay Git capability (Git >= 2.40), the same requirement pr-gate-audit.sh enforces
+#      when it claims a queue job (see pr-gate-git-capability.sh, which also runs without a config).
 #
 # Exit 0: nothing to fix. Exit 1: at least one finding. Exit 2: not configured.
 # ---------------------------------------------------------------------------
@@ -40,6 +42,10 @@ deadline=$((SECONDS + BUDGET))
 ok() { printf 'ok    %s\n' "$*"; }
 bad() { findings=$((findings + 1)); printf 'FIND  %s\n' "$*"; }
 note() { printf 'note  %s\n' "$*"; }
+
+# 0. Git capability for queue replay verification
+printf '== queue replay Git capability\n'
+cap="$("$(dirname -- "$PREFLIGHT_SCRIPT")/pr-gate-git-capability.sh")" && ok "${cap#ok    }" || bad "${cap#FIND  }"
 
 # 1. stale index locks under the slot trees
 printf '== stale slot locks (.git/index.lock older than %s min)\n' "$LOCK_AGE_MIN"

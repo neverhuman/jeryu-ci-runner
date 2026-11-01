@@ -60,6 +60,23 @@ printf 'pdfinfo poppler-utils 25.03.0-5ubuntu2 %s\nnope poppler-utils 1\n' "$(pr
 GATE_RUNNER_REPOS="acme/good" run
 [[ "$rc" == 1 ]] && grep -q 'pdfinfo: .* has digest' "$fx/out" && grep -q 'nope: not found' "$fx/out" || fail 'digest drift / missing tool'
 
+# queue-replay Git capability: direct script, then preflight and installer with a stub git
+cap="$script_dir/pr-gate-git-capability.sh"
+for v in 'git version 2.40.0' 'git version 2.50.1.windows.1' 'git version 3.0.0' 'git version 2.40'; do
+  sh "$cap" "$v" >"$fx/cap" || fail "$v must be supported"
+done
+for v in 'git version 2.39.5' 'git version 1.9.0' 'git version 2.x' 'unavailable' ''; do
+  sh "$cap" "$v" >"$fx/cap" && fail "'$v' must be unsupported"
+  grep -q 'tool-version error: queue replay verification requires Git >= 2.40' "$fx/cap" || fail 'unsupported message'
+done
+mkdir -p "$fx/oldgit"
+printf '#!/bin/sh\n[ "$1" = --version ] && echo "git version 2.39.5" && exit 0\nexec %s "$@"\n' "$(command -v git)" >"$fx/oldgit/git"
+chmod +x "$fx/oldgit/git"
+PATH="$fx/oldgit:$PATH" GATE_RUNNER_REPOS="acme/good" run
+[[ "$rc" == 1 ]] && grep -q 'FIND  tool-version error: queue replay verification requires Git >= 2.40; found git version 2.39.5' "$fx/out" \
+  || fail 'preflight must report unsupported Git'
+PATH="$fx/oldgit:$PATH" sh "$cap" >/dev/null && fail 'default probe must use git --version' || true
+
 # extra arguments are refused
 bash "$script_dir/pr-gate-runner.sh" --preflight --list >/dev/null 2>&1 && fail 'extra args accepted' || true
 echo "pr-gate preflight: ok"

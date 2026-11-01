@@ -75,6 +75,12 @@ forge_serves_gate_wanted() {
   [[ "$code" == 200 ]]
 }
 
+# Merge-queue replay verification needs Git >= 2.40 (pr-gate-audit.sh refuses a queue job otherwise).
+# Say so at install time; ordinary PR admission does not depend on it, so this never blocks the install.
+if cap="$(sh "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")/pr-gate-git-capability.sh")"; then :; else
+  printf '[gate-install] warning: %s\n' "${cap#FIND  }"
+fi
+
 say() { printf '[gate-install %s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
 [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ && "$BRANCH" != *..* ]] || { say "PR_GATE_SOURCE_BRANCH $BRANCH is not a branch name"; exit 2; }
 [[ "$SUBDIR" =~ ^[A-Za-z0-9._/-]+$ && "$SUBDIR" != *..* && "$SUBDIR" != /* ]] || { say "PR_GATE_SOURCE_SUBDIR $SUBDIR is not a relative path"; exit 2; }
