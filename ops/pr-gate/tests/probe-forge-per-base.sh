@@ -24,13 +24,13 @@
 #
 # Both principals need push access under --owner: the author token creates the
 # scratch repository, pushes its branches and opens the pull requests, and the
-# runner token posts the statuses. The probe stops with the forge's own status
+# runner token posts the statuses and performs the independent merge. The probe stops with the forge's own status
 # code the first time either is refused, so a missing permission reads as a
 # refusal and never as a per-base answer.
 #
 # It creates the scratch repository and leaves it archived; it never touches a
 # repository that already exists. The scratch clone goes under --work-dir (a
-# fresh temporary directory by default).
+# fresh directory under this checkout’s target/ by default).
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -69,8 +69,23 @@ evidence=""
 fail() { printf 'probe FAIL: %s\n' "$*" >&2; [[ -z "$evidence" ]] || printf '%s\n' "$evidence" >&2; failures=$((failures + 1)); }
 ok() { printf 'probe ok: %s\n' "$*"; }
 
-work="${work_dir:-$(mktemp -d "${TMPDIR:-/tmp}/pr-gate-probe.XXXXXXXX")}"
-mkdir -p "$work"
+# Keep every Git fixture in owned physical target storage. A caller supplies a
+# parent, never an existing tree that the probe could overwrite or remove.
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd -P)"
+storage="$repo_root/target"
+[[ "$repo_root" != /tmp && "$repo_root" != /tmp/* && ! -L "$storage" ]] || {
+  printf 'probe storage must be outside /tmp and cannot be a symlink\n' >&2; exit 2;
+}
+mkdir -p "$storage"
+parent="${work_dir:-$storage}"
+[[ -d "$parent" && ! -L "$parent" && -O "$parent" ]] || {
+  printf '--work-dir must be an owned physical directory under target\n' >&2; exit 2;
+}
+parent="$(cd "$parent" && pwd -P)"
+[[ "$parent" == "$storage" || "$parent" == "$storage/"* ]] || {
+  printf '--work-dir must be under this checkout target\n' >&2; exit 2;
+}
+work="$(mktemp -d "$parent/pr-gate-probe.XXXXXXXX")"
 chmod 700 "$work"
 cleanup() { rm -f -- "$work/auth-author" "$work/auth-runner"; }
 trap cleanup EXIT
@@ -116,8 +131,7 @@ printf 'probe: when this run ends, archive or remove the scratch repository %s/%
 
 # 2. One commit as the head of two pull requests, into two protected bases.
 tree="$work/tree"
-rm -rf -- "$tree"
-mkdir -p "$tree"
+mkdir "$tree"
 # shellcheck disable=SC2016  # expanded by git's helper shell, not here
 git_helper='!f() { [ "$3" = get ] || exit 0; printf "username=%s\npassword=%s\n" "$1" "$(cat "$2")"; }; f'
 git_env=(GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=2
@@ -242,12 +256,12 @@ post success release/probe
 expect_blocker "$pr_main" passport_blocked_checks "main is red again"
 expect_blocker "$pr_release" none "release/probe is green again"
 if ((merge_proof)); then
-  api author PUT "/api/v3/repos/$owner/$repo/pulls/$pr_main/merge" '{}'
+  api runner PUT "/api/v3/repos/$owner/$repo/pulls/$pr_main/merge" '{}'
   evidence="  merge #$pr_main -> $code: $body"
   if [[ "$code" == 405 ]]; then ok "the forge refuses to merge the main pull request"
   else fail "merging the main pull request answered $code, expected 405"; fi
   evidence=""
-  api author PUT "/api/v3/repos/$owner/$repo/pulls/$pr_release/merge" '{}'
+  api runner PUT "/api/v3/repos/$owner/$repo/pulls/$pr_release/merge" '{}'
   evidence="  merge #$pr_release -> $code: $body"
   if [[ "$code" == 200 ]]; then ok "and merges the release pull request on its own base's result"
   else fail "merging the release pull request answered $code, expected 200"; fi

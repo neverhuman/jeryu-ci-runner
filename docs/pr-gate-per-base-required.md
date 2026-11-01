@@ -134,6 +134,9 @@ no gate can run it and no environment can point it at a repository that matters.
 scratch repository, refuses a name that already exists, and archives it at the end (the forge has
 no repository-delete route, so the operator removes it; the probe says so).
 
+The scratch Git fixture is created in a fresh directory under this checkout’s `target/`.
+`--work-dir` may choose an owned physical parent within that storage; existing trees are never removed.
+
 Two credentials, not one: the forge refuses a required status produced by the author of the change
 it vouches for, so the author of the pull requests and the poster of the statuses must be different
 principals, and the probe checks the two logins differ before asserting anything.
@@ -151,7 +154,7 @@ principals, and the probe checks the two logins differ before asserting anything
    satisfied.
 5. POST a base-less `success`; assert neither is held; POST a base-less `error`; assert both are
    (the fail-closed behaviour section 4 relies on).
-6. Restore the split state and then exercise **the merge path itself**, which no reader can fake:
+6. Restore the split state and then, as the status producer (never the PR author), exercise **the merge path itself**, which no reader can fake:
    `PUT .../pulls/<main>/merge` must answer 405 and `PUT .../pulls/<release>/merge` must answer 200.
    This step needs a head whose only required context is the gate's own. On a forge that requires
    something else of every head (`jankurai/proof`) a scratch repository can never be mergeable; the
