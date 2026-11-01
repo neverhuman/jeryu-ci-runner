@@ -557,7 +557,7 @@ queue_admission() {
 # declared replay must also have the exact tree produced by merging its source onto its parent.
 # merge-tree writes Git objects only; no repository hooks, filters or checkout can execute here.
 queue_trees_match() {
-  local src=$1 row source parent queued number fork expected actual version major minor
+  local src=$1 row source parent queued number fork expected actual version major minor help count merge_status
   # --merge-base was added in Git 2.40. An unsupported replay verifier is a host
   # tool error, not evidence that the forge supplied a different tree.
   queue_tree_error=""
@@ -574,6 +574,12 @@ queue_trees_match() {
     queue_tree_error="tool-version error: queue replay verification requires Git >= 2.40; found $version"
     return 2
   fi
+  # Inspect the installed command, including vendor builds, before reconstructing objects.
+  help="$(git merge-tree -h 2>&1 || :)"
+  if [[ "$help" != *merge-base* || "$help" != *--write-tree* ]]; then
+    queue_tree_error="tool-capability error: queue replay verification needs merge-tree --write-tree --merge-base; install Git >= 2.40 with these options"
+    return 2
+  fi
   while IFS= read -r row; do
     source="$(jq -r .pr_head_sha <<<"$row")" parent="$(jq -r .base_sha <<<"$row")"
     queued="$(jq -r .queue_sha <<<"$row")" number="$(jq -r .number <<<"$row")"
@@ -583,9 +589,28 @@ queue_trees_match() {
     "${git_auth[@]}" git -C "$src" merge-base --is-ancestor "$parent" "$queued" 2>/dev/null || return 1
     fork="$("${git_auth[@]}" git -C "$src" merge-base "$parent" "$source" 2>/dev/null)" || return 1
     expected="$("${git_auth[@]}" git -C "$src" -c core.hooksPath=/dev/null merge-tree --write-tree \
-      --merge-base="$fork" "$parent" "$source" 2>/dev/null)" || return 1
+      --merge-base="$fork" "$parent" "$source" 2>/dev/null)" || {
+      merge_status=$?
+      if ((merge_status == 1)); then
+        queue_tree_error="unsupported replay: PR #$number cannot be reconstructed by an object-only three-way merge; rebuild the queue with a conflict-free source replay"
+      else
+        queue_tree_error="tool-reconstruction error: merge-tree failed for PR #$number (exit $merge_status); check the host Git installation and fetched objects before retrying"
+      fi
+      return 2
+    }
     actual="$("${git_auth[@]}" git -C "$src" rev-parse "$queued^{tree}" 2>/dev/null)" || return 1
-    [[ "$expected" =~ ^[0-9a-f]{40}$ && "$expected" == "$actual" ]] || return 1
+    [[ "$expected" =~ ^[0-9a-f]{40}$ ]] || {
+      queue_tree_error="tool-capability error: merge-tree returned no usable tree; check the host Git installation"
+      return 2
+    }
+    if [[ "$expected" != "$actual" ]]; then
+      count="$("${git_auth[@]}" git -C "$src" rev-list --count "$fork..$source")" || return 1
+      if ((count > 1)); then
+        queue_tree_error="unsupported complex replay: PR #$number has $count source commits and its sequential replay may differ from three-way reconstruction; simplify the source history and rebuild the queue (undeclared content cannot be ruled out)"
+        return 2
+      fi
+      return 1
+    fi
   done <"$WORK_DIR/queue-stack"
 }
 
@@ -752,7 +777,7 @@ audit_one() { # ticket-json
     if ((tree_status == 2)); then
       refuse verifier-mismatch "$queue_tree_error" failed; return 0
     elif ((tree_status != 0)); then
-      refuse malformed-ticket "the queue tree does not match its declared source replay" failed; return 0
+      refuse malformed-ticket "the queue tree does not match its declared source replay; inspect undeclared content and rebuild the queue from the reviewed source" failed; return 0
     fi
   fi
   # main is admitted only when the head really is main's: reachable from the clone's own main.

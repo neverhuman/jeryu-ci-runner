@@ -33,6 +33,8 @@ cat >"$fx/bin/git" <<SH
 #!/usr/bin/env bash
 [[ "\$*" != *AUDIT-TOKEN-5c1e* ]] || exit 9
 if [[ "\${1:-}" == --version && -e "$fx/git-version" ]]; then cat "$fx/git-version"; exit 0; fi
+if [[ " \$* " == *" merge-tree --write-tree "* && -e "$fx/merge-failure" ]]; then exit "\$(cat "$fx/merge-failure")"; fi
+if [[ " \$* " == *" merge-tree -h "* && -e "$fx/no-merge-base" ]]; then echo 'usage: git merge-tree --write-tree'; exit 129; fi
 if [[ "\${1:-}" == clone ]]; then
   printf '%s\n' "\${GIT_CONFIG_VALUE_1:-}" >>"$fx/git-helper.log"
   args=(); for a in "\$@"; do args+=("\${a/https:\/\/forge.example.test\/git\/acme\//$fx/git/}"); done
@@ -779,6 +781,54 @@ qticket refs/queue/main/2 "$QQ2" "$QBASE"; before=$(scores); run
 must 'Git 2.40 meets the replay-verifier requirement' test "$(scores)" == "$((before + 1))"
 rm "$fx/git-version"
 printf 'PASS unsupported Git produces an explicit host tool-version error before replay checkout\n'
+
+# A vendor build can report a recent version while lacking the required option.
+touch "$fx/no-merge-base"
+: >"$fx/checkout.log"; before=$(scores)
+qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+must 'missing merge-base capability has a repair diagnostic' grep -q 'tool-capability error:.*install Git >= 2.40' "$fx/out"
+must 'missing capability checks out nothing' test ! -s "$fx/checkout.log"
+must 'missing capability submits nothing' test "$(scores)" == "$before"
+rm "$fx/no-merge-base"
+
+for failure in 1 128; do
+  printf '%s\n' "$failure" >"$fx/merge-failure"
+  : >"$fx/checkout.log"; before=$(scores)
+  qticket refs/queue/main/2 "$QQ2" "$QBASE"; run
+  diagnostic='unsupported replay:'
+  [[ "$failure" == 1 ]] || diagnostic='tool-reconstruction error:'
+  must 'reconstruction failures explain the operator action' grep -q "$diagnostic" "$fx/out"
+  must 'reconstruction failures check out nothing' test ! -s "$fx/checkout.log"
+  must 'reconstruction failures submit nothing' test "$(scores)" == "$before"
+done
+rm "$fx/merge-failure"
+
+# Sequential rename then replacement preserves a main edit in the renamed file;
+# an aggregate three-way merge instead preserves it in the original file.
+saved_base=$QBASE saved_src=$QSRC1 saved_queue=$QQ1
+qgit checkout -q --detach "$QFORK"
+printf 'start\n' >"$qw/name"; qgit add name; qgit commit -q -m name
+cfork=$(qgit rev-parse HEAD)
+qgit mv name renamed; qgit commit -q -m rename
+rename_sha=$(qgit rev-parse HEAD)
+printf 'start\n' >"$qw/name"; qgit add name; qgit commit -q -m replacement
+QSRC1=$(qgit rev-parse HEAD)
+qgit checkout -q --detach "$cfork"
+printf 'main edit\n' >"$qw/name"; qgit add name; qgit commit -q -m edit
+QBASE=$(qgit rev-parse HEAD)
+qgit cherry-pick "$rename_sha" "$QSRC1"
+QQ1=$(qgit rev-parse HEAD)
+qgit push -q "$fx/git/qrepo.git" "+$QBASE:refs/heads/main" "+$QSRC1:refs/pull/1/head" "+$QQ1:refs/queue/main/1"
+qlive
+jq '[.[0]]' "$fx/forge/queue.json" >"$fx/forge/q.tmp"; mv "$fx/forge/q.tmp" "$fx/forge/queue.json"
+: >"$fx/checkout.log"; before=$(scores)
+qticket refs/queue/main/1 "$QQ1" "$QBASE"; run
+must 'a legitimate sequential replay difference is diagnosed distinctly' grep -q 'unsupported complex replay:.*simplify the source history' "$fx/out"
+must 'unsupported complex replay checks out nothing' test ! -s "$fx/checkout.log"
+must 'unsupported complex replay submits nothing' test "$(scores)" == "$before"
+QBASE=$saved_base QSRC1=$saved_src QQ1=$saved_queue
+qgit push -q "$fx/git/qrepo.git" "+$QBASE:refs/heads/main" "+$QSRC1:refs/pull/1/head" "+$QQ1:refs/queue/main/1"
+qlive
 
 before=$(scores)
 git -C "$fx/git/qrepo.git" update-ref refs/queue/main/2 "$QQ1"

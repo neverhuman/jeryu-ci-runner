@@ -569,7 +569,12 @@ back through its authenticated ingest and matches the job. `pr-gate-audit.sh`, f
    A diff ticket must cover the entire stack: its audit base must be an ancestor of that bottom,
    and the bottom must be an ancestor of the queue head. Before checkout, every fetched queue tree
    must match Git's object-only three-way merge of its declared source and replay parent. Ambiguous
-   entries, undeclared changes and conflicting reconstruction fail closed. Bound refusals release
+   entries, undeclared changes and conflicting reconstruction fail closed. Git >= 2.40 and
+   `merge-tree --write-tree --merge-base` capability are required. Tool failures report a host
+   upgrade/repair action. Conflicting reconstruction or a differing multi-commit replay reports
+   unsupported replay and asks for a simplified, conflict-free source and queue rebuild; it does
+   not establish that the content is undeclared. A differing single-commit tree remains a content
+   refusal. None of these failures permits checkout or proof submission. Bound refusals release
    immediately with the existing ADR0011 vocabulary; the exact web-queue field contract is recorded in
    [ADR0003](../../docs/adr/0003-audit-admission-addendum.md#merge-queue-replay-contract-and-content-binding).
    Ordinary branches named `queue/...` keep ordinary admission. Bound queue jobs must also say `origin: internal`. Contributions in queue jobs remain refused,
