@@ -303,8 +303,19 @@ printf '30\n' >"$fixture/claim-ttl"
 renew_every=10
 "${runner_env[@]}" bash "$script_dir/pr-gate-runner.sh" --repo acme/fixture --pr 1 >"$fixture/runner.log" 2>&1 &
 killed=$!
-for _ in $(seq 300); do [[ -e "$fixture/recipe-started" ]] && break; sleep 0.1; done
-[[ -e "$fixture/recipe-started" ]] || fail_claims 'the killed slot never reached its recipe'
+# Receipt preparation fingerprints inputs before starting the recipe; loaded hosted
+# slots can take longer here than the lease interval. The renewal assertions below
+# still use the real 30-second lease and require an observed renewal.
+for _ in $(seq 1200); do
+  [[ -e "$fixture/recipe-started" ]] && break
+  kill -0 "$killed" 2>/dev/null || break
+  sleep 0.1
+done
+if [[ ! -e "$fixture/recipe-started" ]]; then
+  kill "$killed" 2>/dev/null || true
+  wait "$killed" 2>/dev/null || true
+  fail_claims 'the killed slot never reached its recipe within 120 seconds'
+fi
 grep -q 'gate claim held for 30s' "$fixture/runner.log" || fail_claims 'the killed slot never took a 30s lease'
 granted_now() { grep -c "acme/fixture $head " "$fixture/claims-granted.log"; }
 # The grant and one renewal by the live slot (the recipe holds for a minute, longer than an interval).
