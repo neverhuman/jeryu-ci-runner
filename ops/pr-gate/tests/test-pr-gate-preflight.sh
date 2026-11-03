@@ -13,7 +13,9 @@ cat >"$fx/bin/curl" <<'SH'
 url=''; for a in "$@"; do case "$a" in https://*) url=$a;; esac; done
 printf '%s\n' "$url" >>"$PREFLIGHT_CURL_LOG"
 case "$url" in
-  */branches/main) printf '{"commit":{"sha":"%s"}}\n200' "$(printf 'a%.0s' $(seq 40))";;
+  */branches/main) printf '{"message":"no such route"}\n404';;
+  */refs) printf '[{"name":"topic","sha":"%s","kind":"branch","protected":false},{"name":"main","sha":"%s","kind":"branch","protected":true}]\n200' \
+    "$(printf 'b%.0s' $(seq 40))" "$(printf 'a%.0s' $(seq 40))";;
   */repos/acme/good/commits/*) printf '{"statuses":[{"context":"good/required","state":"failure","updated_at":"2026-01-01"},{"context":"good/required","state":"success","updated_at":"2026-02-01"}]}\n200';;
   */repos/acme/red/commits/*) printf '{"statuses":[{"context":"red/required","state":"failure"}]}\n200';;
   *) printf '{}\n404';;
@@ -47,6 +49,8 @@ grep -q 'pdfinfo: poppler-utils is 25.03.0-5ubuntu2, reviewed: 25.03.0-5ubuntu1'
 grep -q 'acme/red main .*red/required is failure' "$fx/out" || fail 'red main not named'
 grep -q 'ok    acme/good main .*good/required success' "$fx/out" || fail 'latest status must win'
 ! grep -q PREFLIGHT-TOKEN "$fx/out" "$fx/curl.log" || fail 'token leaked'
+! grep -q '/branches/main$' "$fx/curl.log" || fail 'main was read from a branch route the forge does not serve'
+grep -q '/api/v1/repos/acme%2Fgood/refs$' "$fx/curl.log" || fail 'main was not read from the ref listing'
 [[ -f "$fx/home/tree-other-slot2/repo-b/.git/index.lock" ]] || fail 'preflight must not remove the lock'
 
 # clean host

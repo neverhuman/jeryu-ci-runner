@@ -939,8 +939,14 @@ for qualified in $REPOS; do
   fi
   if ((main_health)); then
     main_sha=""
-    api GET "/api/v3/repos/$owner/$repo/branches/main"
-    [[ "$code" != 200 ]] || main_sha="$(jq -r '.commit.sha // .sha // ""' <<<"$body")"
+    # main's tip from the forge's ref listing, the same read the --branch path uses: jeryu serves no
+    # GET /repos/{owner}/{repo}/branches/{branch} (only .../protection), so asking for it answered 404
+    # and main-health never gated anything.
+    api GET "/api/v1/repos/$owner%2F$repo/refs"
+    if [[ "$code" == 200 ]]; then
+      main_row=$(gate_ref_protection "$body" main)
+      main_sha="${main_row%% *}"
+    fi
     if [[ ! "$main_sha" =~ ^[0-9a-f]{40}$ ]]; then
       say "cannot resolve $owner/$repo main ($code); skipping main-health"
       continue
@@ -1879,10 +1885,11 @@ fi
 # keyed for the base it had, and the next tick gates it for the one it has now.
 checks_url=""
 if [[ "$main_health" == 1 ]]; then
-  api GET "/api/v3/repos/$owner/$repo/branches/main"
+  api GET "/api/v1/repos/$owner%2F$repo/refs"
   [[ "$code" == 200 ]] || die "cannot refresh main before admission ($code)"
   admitted=0
-  [[ "$(jq -r '.commit.sha // .sha // ""' <<<"$body")" == "$sha" ]] && admitted=1
+  main_row=$(gate_ref_protection "$body" main)
+  [[ "${main_row%% *}" == "$sha" ]] && admitted=1
 elif [[ -n "$only_branch" ]]; then
   api GET "/api/v1/repos/$owner%2F$repo/refs"
   [[ "$code" == 200 ]] || die "cannot refresh $owner/$repo branches before admission ($code)"

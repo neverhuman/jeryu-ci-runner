@@ -128,8 +128,9 @@ else
     fi
     owner="${q%%/*}" repo="${q#*/}"
     if ((SECONDS >= deadline)); then bad "$q: not checked, the $BUDGET s budget ran out"; continue; fi
-    body="$(get "/api/v3/repos/$owner/$repo/branches/main")"; rc=$?
-    sha=""; ((rc != 0)) || sha="$(jq -r '.commit.sha // .sha // ""' <<<"$body" 2>/dev/null)"
+    # The forge's ref listing, as the runner reads main: there is no GET .../branches/{branch}.
+    body="$(get "/api/v1/repos/$owner%2F$repo/refs")"; rc=$?
+    sha=""; ((rc != 0)) || { sha="$(gate_ref_protection "$body" main)"; sha="${sha%% *}"; }
     if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then bad "$q: cannot resolve main"; continue; fi
     body="$(get "/repos/$owner/$repo/commits/$sha/status")"; rc=$?
     if ((rc != 0)); then bad "$q: cannot read the statuses of main ${sha:0:12}"; continue; fi

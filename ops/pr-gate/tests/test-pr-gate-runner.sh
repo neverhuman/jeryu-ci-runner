@@ -303,8 +303,9 @@ case "$method $url" in
     else jq -nc '{required_status_checks:{contexts:["fixture/required"]}}'; fi
     printf '\n200';;
   'GET '*'/branches/main')
-    jq -nc --arg sha "$head" '{name:"main",commit:{sha:$sha}}'
-    printf '\n200';;
+    # jeryu serves only .../branches/{branch}/protection; a branch read is a missing route, as there.
+    printf '%s\n' "$url" >>"$FAKE_FORGE/branch-reads"
+    printf '{"message":"no such route"}\n404';;
   'GET '*'/gate-regate'*)
     if [[ -f "$FAKE_FORGE/refuse-regate" ]]; then printf '{"message":"re-gate list denied"}\n403'; exit; fi
     if [[ -f "$FAKE_FORGE/regate.json" ]]; then cat "$FAKE_FORGE/regate.json"; else printf '{"requests":[]}'; fi
@@ -1304,8 +1305,18 @@ printf 'PASS runner capabilities are validated, advertised and omitted on older 
 
 
 # Main-health gates the protected main commit under its own context. A green main SHA is skipped on
-# the next scheduled pass, but an explicit repo pass runs on demand.
+# the next scheduled pass, but an explicit repo pass runs on demand. main's tip comes from the forge's
+# ref listing: jeryu has no GET .../branches/{branch}, so a forge without refs gates nothing.
 before_count=$(count)
+invoke --main-health
+[[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
+expect_count "$before_count"
+grep -q 'cannot resolve acme/fixture main (404); skipping main-health' "$fixture/runner.log" \
+  || { printf 'main-health without a ref listing did not say why it skipped\n' >&2; cat "$fixture/runner.log" >&2; exit 1; }
+jq -nc --arg s "$(cat "$fixture/head")" \
+  '[{name:"main",sha:$s,kind:"branch",protected:true},{name:"topic",sha:$s,kind:"branch",protected:false}]' \
+  >"$fixture/refs.json"
+rm -f "$fixture/branch-reads"
 before_statuses=$(wc -l <"$fixture/statuses.jsonl")
 invoke --main-health
 [[ "$runner_exit" == 0 ]] || { cat "$fixture/runner.log"; exit 1; }
@@ -1343,6 +1354,10 @@ grep -q 'woken for acme/fixture (push)' "$fixture/runner.log" \
   || { printf 'the main-health wake-up line was not taken\n' >&2; exit 1; }
 [[ -s "$fixture/runner/cache/wake-dispatch" ]] \
   || { printf 'the main-health pass took a pull-request hint\n' >&2; exit 1; }
+[[ ! -s "$fixture/branch-reads" ]] \
+  || { printf 'main-health asked for a branch route the forge does not serve:\n' >&2; cat "$fixture/branch-reads" >&2; exit 1; }
+rm -f "$fixture/refs.json"
+printf 'PASS main-health resolves main from the ref listing, never from GET .../branches/main\n'
 : >"$fixture/runner/cache/wake-dispatch"
 printf 'PASS a main-health pass reads its own wake-up hints and leaves the pull-request ones alone\n'
 
